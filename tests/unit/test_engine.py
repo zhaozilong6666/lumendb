@@ -8,7 +8,9 @@ from lumendb.errors import (
     DuplicateKeyError,
     NotNullViolationError,
     NotSupportedError,
+    SQLSyntaxError,
     TableNotFoundError,
+    TypeMismatchError,
 )
 
 
@@ -302,6 +304,64 @@ class TestUpdateDelete:
         db.execute_one("UPDATE big SET v = v + 1")
         assert rows(db, "SELECT COUNT(*) FROM big") == [(500,)]
         assert rows(db, "SELECT v FROM big WHERE id = 500") == [(501,)]
+
+
+class TestCaseWhen:
+    def setup(self, db):
+        db.execute_one("CREATE TABLE people (id INT PRIMARY KEY, age INT, name TEXT)")
+        db.execute_one("INSERT INTO people VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c')")
+
+    def test_searched_case(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END FROM people ORDER BY id") == [
+            ("minor",),
+            ("adult",),
+            ("adult",),
+        ]
+
+    def test_simple_case_compares_operand(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT CASE id WHEN 2 THEN 'two' WHEN 3 THEN 'three' ELSE 'other' END FROM people ORDER BY id") == [
+            ("other",),
+            ("two",),
+            ("three",),
+        ]
+
+    def test_else_is_optional(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT CASE WHEN age IS NULL THEN 0 END FROM people ORDER BY id") == [
+            (None,),
+            (None,),
+            (0,),
+        ]
+
+    def test_null_operand_matches_nothing(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT CASE age WHEN 10 THEN 'ten' ELSE 'none' END FROM people ORDER BY id") == [
+            ("ten",),
+            ("none",),
+            ("none",),
+        ]
+
+    def test_case_inside_aggregate(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT SUM(CASE WHEN age >= 18 THEN 1 ELSE 0 END) FROM people") == [(1,)]
+
+    def test_branch_type_mismatch_is_rejected(self, db):
+        self.setup(db)
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT CASE WHEN id = 1 THEN 1 ELSE 'x' END FROM people")
+
+    def test_non_boolean_when_condition_is_rejected(self, db):
+        self.setup(db)
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT CASE WHEN age THEN 1 END FROM people")
+
+    def test_parser_requires_at_least_one_branch(self):
+        from lumendb.sql.parser import parse_statement
+
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("SELECT CASE END")
 
 
 class TestJoin:

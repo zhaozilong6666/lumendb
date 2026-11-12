@@ -8,6 +8,7 @@ from lumendb.sql.ast import (
     Between,
     BinaryOp,
     Cast,
+    CaseWhen,
     Exists,
     InList,
     InSubquery,
@@ -275,9 +276,25 @@ class TestExpressions:
     def test_string_literal(self):
         assert parse_statement("SELECT 'x'").select.items[0].expr == Literal("x")
 
-    def test_case_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("SELECT CASE WHEN a THEN 1 END FROM t")
+    def test_searched_case(self):
+        stmt = parse_statement("SELECT CASE WHEN a > 0 THEN 'p' ELSE 'n' END FROM t")
+        expr = stmt.select.items[0].expr
+        assert isinstance(expr, CaseWhen)
+        assert expr.operand is None
+        assert expr.otherwise is not None
+        assert len(expr.branches) == 1
+
+    def test_simple_case(self):
+        stmt = parse_statement("SELECT CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t")
+        expr = stmt.select.items[0].expr
+        assert isinstance(expr, CaseWhen)
+        assert expr.operand is not None
+        assert expr.otherwise is None
+        assert len(expr.branches) == 2
+
+    def test_case_requires_a_branch(self):
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("SELECT CASE END")
 
 
 class TestTransactions:

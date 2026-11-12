@@ -34,7 +34,7 @@ SELECT [DISTINCT] expr [AS alias], ...
 FROM t [alias] [, t2 ...]
   [INNER | LEFT] JOIN t2 ON cond
 WHERE cond
-GROUP BY expr, ...
+GROUP BY col [, col...]          -- 只接受列引用，表达式分组会明确报错
 HAVING cond
 ORDER BY expr [ASC|DESC], ...
 LIMIT n [OFFSET m]
@@ -43,6 +43,17 @@ LIMIT n [OFFSET m]
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`。
 
 表达式：`+ - * / %`、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
+
+条件表达式（两种形式都支持）：
+
+```sql
+CASE WHEN cond THEN value [WHEN cond THEN value ...] [ELSE value] END
+CASE expr WHEN value THEN result [...] [ELSE result] END
+```
+
+分支的返回类型必须一致（数值之间会自动提升为 `FLOAT`），否则绑定阶段报
+`TypeMismatchError`；`CASE` 可以出现在聚合参数里，`SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+就是常见的条件计数写法。
 
 子查询：标量子查询、`IN (SELECT ...)`、`EXISTS (SELECT ...)`。
 
@@ -73,7 +84,6 @@ CHECKPOINT;
 | **`GROUP BY <表达式>`** | 只接受列引用；表达式分组未实现 |
 | **`COUNT(DISTINCT x)` 等聚合去重** | 未实现；可用 `SELECT DISTINCT` 先降维 |
 | **`PREPARE` 参数占位符 `$1`** | wire 协议里的参数绑定未实现 |
-| **`CASE WHEN` 表达式** | 未实现 |
 | `NULLS FIRST/LAST` | `NULL` 固定排在最后 |
 
 ## 已知的行为细节

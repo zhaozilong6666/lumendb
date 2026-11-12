@@ -150,6 +150,30 @@ class Cast(Expr):
 
 
 @dataclass(frozen=True)
+class CaseWhen(Expr):
+    """``CASE [operand] WHEN cond THEN value ... [ELSE value] END``。
+
+    ``operand`` 为空时每个 ``WHEN`` 都是布尔条件（搜索式 CASE）；
+    不为空时按 ``operand = cond`` 比较（简单式 CASE）。
+    """
+
+    operand: Optional[Expr]
+    branches: tuple[tuple[Expr, Expr], ...]
+    otherwise: Optional[Expr]
+
+    def render(self) -> str:
+        parts = ["CASE"]
+        if self.operand is not None:
+            parts.append(self.operand.render())
+        for cond, value in self.branches:
+            parts.append(f"WHEN {cond.render()} THEN {value.render()}")
+        if self.otherwise is not None:
+            parts.append(f"ELSE {self.otherwise.render()}")
+        parts.append("END")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class ScalarSubquery(Expr):
     query: "Select"
 

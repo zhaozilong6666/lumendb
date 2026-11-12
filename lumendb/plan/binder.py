@@ -29,6 +29,7 @@ from ..sql.ast import (
     Between,
     BinaryOp,
     Cast,
+    CaseWhen,
     ColumnRef,
     Exists,
     Expr,
@@ -486,6 +487,47 @@ class Binder:
 
         return _cast, target
 
+    def _case(self, expr: CaseWhen, schema, allow_agg):
+        operand_fn = None
+        if expr.operand is not None:
+            operand_fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+
+        tests: list[tuple[Callable[[EvalContext], bool], Callable[[EvalContext], Any]]] = []
+        result_type: Optional[TypeSpec] = None
+
+        for cond, value in expr.branches:
+            cond_fn, cond_type = self.compile(cond, schema, allow_agg=allow_agg)
+            if operand_fn is None:
+                if cond_type.kind != DataType.BOOLEAN:
+                    raise TypeMismatchError(
+                        "CASE WHEN 的条件必须是布尔值",
+                        detail=f"实际类型 {cond_type.sql}",
+                        hint="写成 WHEN age > 18 THEN ... 这种能产生布尔值的比较",
+                    )
+                test = _bool_test(cond_fn)
+            else:
+                test = _equality_test(operand_fn, cond_fn)
+
+            value_fn, value_type = self.compile(value, schema, allow_agg=allow_agg)
+            result_type = _merge_branch_types(result_type, value_type)
+            tests.append((test, value_fn))
+
+        otherwise_fn = None
+        if expr.otherwise is not None:
+            otherwise_fn, other_type = self.compile(expr.otherwise, schema, allow_agg=allow_agg)
+            result_type = _merge_branch_types(result_type, other_type)
+
+        if result_type is None:
+            result_type = TypeSpec(DataType.TEXT)
+
+        def _case(ctx):
+            for test, value in tests:
+                if test(ctx):
+                    return value(ctx)
+            return otherwise_fn(ctx) if otherwise_fn is not None else None
+
+        return _case, result_type
+
     def _scalar_subquery(self, expr: ScalarSubquery, schema, allow_agg):
         runner = self.subquery_runner
         if runner is None:
@@ -805,6 +847,43 @@ class Binder:
 # ---------------------------------------------------------------------------
 
 
+def _bool_test(fn: Callable[[Any], Any]) -> Callable[[Any], bool]:
+    """把"可能返回 NULL 的表达式"包装成严格布尔判断：NULL 视为假。"""
+
+    def _test(ctx):
+        value = fn(ctx)
+        return False if value is None else bool(value)
+
+    return _test
+
+
+def _equality_test(left_fn, right_fn):
+    """简单式 CASE 的比较：``CASE x WHEN v`` 等价于 ``x = v``，NULL 不匹配。"""
+
+    def _test(ctx):
+        a = left_fn(ctx)
+        b = right_fn(ctx)
+        if a is None or b is None:
+            return False
+        return a == b
+
+    return _test
+
+
+def _merge_branch_types(current, candidate):
+    if current is None:
+        return candidate
+    if current.kind == candidate.kind:
+        return current
+    if current.is_numeric and candidate.is_numeric:
+        return TypeSpec(DataType.FLOAT)
+    raise TypeMismatchError(
+        "CASE 各分支的返回类型必须一致",
+        detail=f"{current.sql} 与 {candidate.sql}",
+        hint="用 CAST 把各分支统一到同一个类型",
+    )
+
+
 def _contains_aggregate(expr: Expr) -> bool:
     if isinstance(expr, FunctionCall) and expr.name.upper() in AGGREGATE_FUNCTIONS:
         return True
@@ -828,6 +907,16 @@ def _children(expr: Expr) -> list[Expr]:
         return list(expr.args)
     if isinstance(expr, Cast):
         return [expr.operand]
+    if isinstance(expr, CaseWhen):
+        kids: list[Expr] = []
+        if expr.operand is not None:
+            kids.append(expr.operand)
+        for cond, value in expr.branches:
+            kids.append(cond)
+            kids.append(value)
+        if expr.otherwise is not None:
+            kids.append(expr.otherwise)
+        return kids
     return []
 
 
@@ -940,6 +1029,7 @@ _DISPATCH = {
     Like: Binder._like,
     FunctionCall: Binder._function,
     Cast: Binder._cast,
+    CaseWhen: Binder._case,
     ScalarSubquery: Binder._scalar_subquery,
     Exists: Binder._exists,
 }

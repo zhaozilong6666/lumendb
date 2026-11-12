@@ -16,6 +16,7 @@ from .ast import (
     Begin,
     BinaryOp,
     Cast,
+    CaseWhen,
     Checkpoint,
     ColumnDef,
     ColumnRef,
@@ -663,8 +664,8 @@ class Parser:
             self._expect_punct("rparen", ")")
             return Exists(query)
 
-        if tok.is_keyword("CASE", "COALESCE_NULL"):
-            raise NotSupportedError("CASE 表达式尚未实现", hint="可用多个嵌套函数或 WHERE 条件替代")
+        if tok.is_keyword("CASE"):
+            return self._parse_case()
 
         if tok.is_punct("lparen"):
             self._advance()
@@ -696,6 +697,31 @@ class Parser:
             return ColumnRef(table=None, name=name)
 
         raise self._error(f"表达式中出现意外的 {tok.value!r}")
+
+    def _parse_case(self) -> CaseWhen:
+        start = self._cur
+        self._advance()  # CASE
+        operand = None
+        if not self._cur.is_keyword("WHEN"):
+            operand = self._parse_expr()
+        branches: list[tuple[object, object]] = []
+        while self._cur.is_keyword("WHEN"):
+            self._advance()
+            cond = self._parse_expr()
+            self._expect_kw("THEN")
+            value = self._parse_expr()
+            branches.append((cond, value))
+        otherwise = None
+        if self._match_kw("ELSE") is not None:
+            otherwise = self._parse_expr()
+        self._expect_kw("END")
+        if not branches:
+            raise SQLSyntaxError(
+                "CASE 至少需要一个 WHEN 分支",
+                detail=f"位置：第 {start.line} 行第 {start.col} 列",
+                hint="写成 CASE WHEN cond THEN value ... END",
+            )
+        return CaseWhen(operand, tuple(branches), otherwise)
 
     def _parse_function_call(self, name: str) -> FunctionCall:
         self._expect_punct("lparen", "(")

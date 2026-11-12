@@ -112,7 +112,7 @@ python examples/demo.py
 | 查询 | `SELECT`、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT` |
 | 连接 | `INNER JOIN`、`LEFT JOIN`、多表连接 |
 | 聚合 | `GROUP BY`、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` |
-| 表达式 | 算术、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST` |
+| 表达式 | 算术、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN` |
 | 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
 | 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，MVCC 快照隔离 |
 | 运维 | `EXPLAIN`、`SHOW TABLES`、`CHECKPOINT` |
@@ -154,7 +154,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **389 个自动化测试**（`python -m pytest tests -q`，约 11 秒），覆盖页格式、WAL 与恢复、
+- **407 个自动化测试**（`python -m pytest tests -q`，约 13 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -186,6 +186,13 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [ ] 相关子查询
 - [ ] 组提交与 WAL 分段回收
 - [ ] 复制 / 只读副本
+
+## 想把它讲出来
+
+面试前想快速回忆"哪些点值得深挖、被追问怎么答"，见
+[`docs/portfolio.md`](docs/portfolio.md)——里面记了三个真实的调试故事
+（无限自更新的 UPDATE、键里多塞 RID 的索引、目录尾部的填充零字节），
+以及"为什么不做代价模型"这类问题的回答。
 
 ## 设计取舍
 
