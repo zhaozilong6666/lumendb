@@ -105,6 +105,110 @@ class TestStartup:
         db.close()
 
 
+async def _connect(port):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    payload = (
+        struct.pack("!i", 196608)
+        + b"user\x00lumendb\x00database\x00lumendb\x00\x00"
+    )
+    writer.write(struct.pack("!i", len(payload) + 4) + payload)
+    await writer.drain()
+    await _read_until_ready(reader)
+    return reader, writer
+
+
+async def _query(reader, writer, sql):
+    body = sql.encode()
+    writer.write(b"Q" + struct.pack("!i", 4 + len(body)) + body)
+    await writer.drain()
+    return await _read_until_ready(reader)
+
+
+def _ready_status(messages):
+    for kind, payload in messages:
+        if kind == b"Z":
+            return payload
+    return None
+
+
+class TestSessionIsolation:
+    """每个连接必须有自己的事务状态。"""
+
+    def test_uncommitted_rows_are_invisible_to_other_connection(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            c1 = await _connect(port)
+            c2 = await _connect(port)
+            begin = await _query(c1[0], c1[1], "BEGIN")
+            assert _ready_status(begin) == b"T"
+            await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
+
+            msgs = await _query(c2[0], c2[1], "SELECT COUNT(*) FROM t")
+            rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
+            assert rows == [["0"]], "其它连接不能读到未提交的行"
+
+            await _query(c1[0], c1[1], "COMMIT")
+            msgs = await _query(c2[0], c2[1], "SELECT COUNT(*) FROM t")
+            rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
+            assert rows == [["1"]]
+            for reader, writer in (c1, c2):
+                writer.close()
+                await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_two_connections_can_open_transactions_simultaneously(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            c1 = await _connect(port)
+            c2 = await _connect(port)
+            await _query(c1[0], c1[1], "BEGIN")
+            await _query(c2[0], c2[1], "BEGIN")  # 不能报“已经在事务中”
+            await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
+            await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
+            await _query(c1[0], c1[1], "COMMIT")
+            await _query(c2[0], c2[1], "COMMIT")
+            msgs = await _query(c2[0], c2[1], "SELECT COUNT(*) FROM t")
+            rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
+            assert rows == [["2"]]
+            for reader, writer in (c1, c2):
+                writer.close()
+                await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_error_marks_transaction_failed_and_commit_rolls_back(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            c1 = await _connect(port)
+            await _query(c1[0], c1[1], "BEGIN")
+            await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
+            failed = await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'dup')")
+            assert b"E" in [k for k, _ in failed]
+            assert _ready_status(failed) == b"E"
+            commit = await _query(c1[0], c1[1], "COMMIT")
+            assert _ready_status(commit) == b"I"
+            msgs = await _query(c1[0], c1[1], "SELECT COUNT(*) FROM t")
+            rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
+            assert rows == [["0"]], "失败事务的 COMMIT 必须回滚"
+            c1[1].close()
+            await c1[1].wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+
 class TestExtendedQuery:
     """扩展协议：Parse/Bind/Describe/Execute/Sync + ``$n`` 参数。"""
 

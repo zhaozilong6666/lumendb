@@ -27,7 +27,9 @@ from ..errors import (
     LumenError,
     NotSupportedError,
     ProtocolError,
+    TransactionError,
 )
+from ..sql.ast import Begin, Commit, Rollback
 from ..sql.parser import parse_sql
 
 PROTOCOL_VERSION = 196608  # 3.0
@@ -77,6 +79,10 @@ class Session:
     portals: dict[str, Portal] = field(default_factory=dict)
     #: 扩展协议里"已经执行过、等 Sync 后一起回 ReadyForQuery"的状态
     in_extended: bool = False
+    #: 每个连接自己的事务：多个连接各自 BEGIN 时不能共用同一个 Transaction
+    txn: Optional[Any] = None
+    #: 事务里出过错之后，PostgreSQL 语义是"只能 ROLLBACK"
+    failed: bool = False
 
 
 class PGWireServer:
@@ -113,6 +119,12 @@ class PGWireServer:
         except Exception:  # pragma: no cover - 兜底，避免连接协程把服务器带崩
             pass
         finally:
+            if session.txn is not None:
+                try:
+                    self.database.txns.abort(session.txn)
+                except Exception:  # pragma: no cover
+                    pass
+                session.txn = None
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -198,7 +210,7 @@ class PGWireServer:
             await self._execute(session, writer, payload)
             return True
         if kind == b"S":  # Sync
-            self._send(writer, b"Z", b"I")
+            self._send_ready(session, writer)
             await writer.drain()
             return True
         if kind == b"H":  # Flush
@@ -208,29 +220,106 @@ class PGWireServer:
             self._send(writer, b"3", b"")
             return True
         # 其它消息（如 Describe 变体）暂不实现，回 ReadyForQuery 保持连接
-        self._send(writer, b"Z", b"I")
+        self._send_ready(session, writer)
         await writer.drain()
         return True
 
     # -- 简单查询 -------------------------------------------------------
 
+    def _run_statements(
+        self, session: Session, sql: str, params: Optional[list[Any]] = None
+    ) -> list[Result]:
+        """按会话自己的事务状态执行若干语句。
+
+        ``Database`` 只有一个 ``_txn`` 字段，适合单连接 CLI；线协议是多连接
+        的，所以事务必须挂在 ``Session`` 上。否则 A 连接 BEGIN 之后，B 连接
+        的查询会直接加入 A 的事务，读到未提交数据。
+        """
+        database = session.database
+        results: list[Result] = []
+        for statement in parse_sql(sql):
+            if isinstance(statement, Begin):
+                if session.txn is not None:
+                    raise TransactionError(
+                        "已经在事务中", hint="先 COMMIT 或 ROLLBACK"
+                    )
+                session.txn = database.txns.begin()
+                session.failed = False
+                results.append(Result(tag="BEGIN"))
+                continue
+            if isinstance(statement, (Commit, Rollback)):
+                if session.txn is None:
+                    raise TransactionError("没有活动事务")
+                txn = session.txn
+                session.txn = None
+                if isinstance(statement, Commit) and not session.failed:
+                    database.txns.commit(txn)
+                    results.append(Result(tag="COMMIT"))
+                else:
+                    # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
+                    database.txns.abort(txn)
+                    session.failed = False
+                    results.append(Result(tag="ROLLBACK"))
+                continue
+
+            if session.failed:
+                raise TransactionError(
+                    "当前事务已失败",
+                    hint="执行 ROLLBACK 之后再继续",
+                )
+
+            if session.txn is not None:
+                results.append(database.executor.run(statement, session.txn, params))
+                continue
+
+            txn = database.txns.begin()
+            try:
+                result = database.executor.run(statement, txn, params)
+            except BaseException:
+                database.txns.abort(txn)
+                raise
+            database.txns.commit(txn)
+            results.append(result)
+        return results
+
+    def _run_one(
+        self, session: Session, sql: str, params: Optional[list[Any]] = None
+    ) -> Result:
+        results = self._run_statements(session, sql, params)
+        if not results:
+            raise TransactionError("SQL 里没有可执行的语句")
+        return results[-1]
+
+    def _send_ready(self, session: Session, writer) -> None:
+        if session.failed:
+            status = b"E"
+        elif session.txn is not None:
+            status = b"T"
+        else:
+            status = b"I"
+        self._send(writer, b"Z", status)
+
     async def _simple_query(self, session: Session, writer, sql: str) -> None:
         if not sql.strip():
             self._send(writer, b"I", b"")
-            self._send(writer, b"Z", b"I")
+            self._send_ready(session, writer)
             await writer.drain()
             return
         async with self._lock:
             try:
-                results = session.database.execute(sql)
+                results = self._run_statements(session, sql)
             except LumenError as exc:
+                if session.txn is not None:
+                    session.failed = True
                 self._send_error(writer, exc)
-                self._send(writer, b"Z", b"I")
+                self._send_ready(session, writer)
                 await writer.drain()
                 return
             except Exception as exc:  # pragma: no cover
+                if session.txn is not None:
+                    session.failed = True
                 self._send_error(writer, LumenError(str(exc)))
-                self._send(writer, b"Z", b"I")
+                self._send_ready(session, writer)
                 await writer.drain()
                 return
 
@@ -240,7 +329,7 @@ class PGWireServer:
                 for row in result.rows:
                     self._send_data_row(writer, row)
             self._send(writer, b"C", _cstr(result.tag or "OK"))
-        self._send(writer, b"Z", b"I")
+        self._send_ready(session, writer)
         await writer.drain()
 
     # -- 扩展查询 -------------------------------------------------------
@@ -350,8 +439,8 @@ class PGWireServer:
         # 执行一次拿到列信息（结果集很小，代价可接受）
         async with self._lock:
             try:
-                result = session.database.execute_one(
-                    portal.statement.sql, portal.params
+                result = self._run_one(
+                    session, portal.statement.sql, portal.params
                 )
             except LumenError as exc:
                 self._send_error(writer, exc)
@@ -369,8 +458,8 @@ class PGWireServer:
             return
         async with self._lock:
             try:
-                result = session.database.execute_one(
-                    portal.statement.sql, portal.params
+                result = self._run_one(
+                    session, portal.statement.sql, portal.params
                 )
             except LumenError as exc:
                 self._send_error(writer, exc)

@@ -145,9 +145,15 @@ hash join 都在路线图里但**没有实现**——`EXPLAIN` 输出的是真�
 - `Describe` 语句返回 `ParameterDescription`（真实 OID 列表）；结果列要等 `Bind`
   之后 `Describe` 门户才能确定，此时回 `RowDescription`；
 - 错误：`ErrorResponse` 带 `SQLSTATE`、`MESSAGE`、`DETAIL`、`HINT`，
-  客户端（psql / JDBC）能按标准字段展示。
+  客户端（psql / JDBC）能按标准字段展示；
+- **会话事务**：`BEGIN` 创建的事务挂在 `Session` 上，而不是共用 `Database`
+  的单个 `_txn`。否则 A 连接 `BEGIN` 后，B 连接的查询会直接加入 A 的事务，
+  读到未提交数据。`ReadyForQuery` 按状态回 `I` / `T` / `E`；事务内出错后
+  只能 `ROLLBACK`，此时 `COMMIT` 按 PostgreSQL 语义等价于回滚；连接断开时
+  未提交事务自动中止。
 
-多连接共享同一个 `Database`，服务端用一把 asyncio 锁把语句串行化——
+多连接共享同一个 `Database`，服务端用一把 asyncio 锁把**单条语句**串行化；
+事务之间的隔离由每个会话自己的 `Transaction` 与 MVCC 提供。
 这不是"高并发数据库"，而是"协议正确、语义正确"的单机引擎。
 
 ## 6. 为什么这样切分

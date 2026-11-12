@@ -50,10 +50,10 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 489 automated tests including crash-injection and a 20-seed randomized
+> - 492 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
-## 六个可深挖的点（面试主力）
+## 七个可深挖的点（面试主力）
 
 ### 1. 为什么用物理日志（page-level redo）而不是逻辑日志
 
@@ -122,6 +122,13 @@ WAL 与事务机制，原子性由已有的基础设施保证。
 `Parse` 记下客户端声明的类型 OID，`Bind` 把文本/二进制参数解码，`Describe` 回
 `ParameterDescription`。JDBC 风格的"预处理语句 + 参数"能跑通，这条边界是我
 主动划的，不是"忘了"。
+
+多连接隔离还踩过一个坑：`Database._txn` 是单连接时代的字段，而 wire 服务端
+所有连接共用一个 `Database`。结果 A 连接 `BEGIN` 之后，B 连接的查询会直接
+加入 A 的事务，**读到未提交数据**。修法是把事务挂到 `Session` 上，`Database`
+退回纯执行门面；连接断开时回滚未提交事务，失败事务的 `COMMIT` 按 PostgreSQL
+语义变成 `ROLLBACK`。这条行为由两个真实 socket 连接的测试覆盖，而不是只测
+单连接的 SQL 语义。
 
 ## 常见追问（准备好了就答得出来）
 
