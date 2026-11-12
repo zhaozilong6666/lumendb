@@ -38,6 +38,7 @@ from .ast import (
     Literal,
     OrderItem,
     Query,
+    Reindex,
     Rollback,
     ScalarSubquery,
     Select,
@@ -219,10 +220,14 @@ class Parser:
         if kw == "CHECKPOINT":
             self._advance()
             return Checkpoint()
+        if kw == "REINDEX":
+            self._advance()
+            table = self._parse_ident("表名")
+            return Reindex(table)
         raise self._error(
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "
-            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT",
+            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / REINDEX",
         )
 
     def _parse_create(self) -> Statement:

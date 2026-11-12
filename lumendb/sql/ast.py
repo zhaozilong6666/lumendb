@@ -366,6 +366,13 @@ class Checkpoint(Statement):
     pass
 
 
+@dataclass
+class Reindex(Statement):
+    """``REINDEX table``：按堆表当前内容重建该表所有索引。"""
+
+    table: str
+
+
 __all__ = [
     "Expr",
     "Literal",

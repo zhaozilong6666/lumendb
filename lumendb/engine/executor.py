@@ -32,6 +32,7 @@ from ..sql.ast import (
     Explain,
     Insert,
     Query,
+    Reindex,
     ShowTables,
     Statement,
     Update,
@@ -116,6 +117,8 @@ class Executor:
                 return self._create_index(stmt, txn)
             if isinstance(stmt, DropIndex):
                 return self._drop_index(stmt, txn)
+            if isinstance(stmt, Reindex):
+                return self._reindex(stmt, txn)
             if isinstance(stmt, ShowTables):
                 return self._show_tables()
             if isinstance(stmt, Explain):
@@ -377,6 +380,35 @@ class Executor:
                 return Result(tag="DROP INDEX", notice="索引不存在，已跳过")
             raise
         return Result(tag="DROP INDEX")
+
+    def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
+        """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
+        table = self._catalog.get_table(stmt.table)
+        heap = HeapFile(self._bp, table, self._txns)
+        snapshot = list(heap.scan(txn))
+
+        rebuilt = 0
+        entries_total = 0
+        for idx in table.indexes.values():
+            entries: list[tuple[list, tuple[int, int]]] = []
+            for rid, values in snapshot:
+                key = self._key_for(table, idx, values)
+                if key is not None:
+                    entries.append((key, rid))
+            tree = self._tree_for(table, idx)
+            tree.rebuild(txn, entries)
+            idx.root_page = tree.root_page
+            rebuilt += 1
+            entries_total += len(entries)
+
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        if rebuilt == 0:
+            return Result(tag="REINDEX 0 indexes", notice="该表没有索引")
+        return Result(
+            affected=entries_total,
+            tag=f"REINDEX {rebuilt} indexes ({entries_total} entries)",
+        )
 
     def _show_tables(self) -> Result:
         rows = [

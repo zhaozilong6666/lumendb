@@ -65,6 +65,7 @@ COMMIT; ROLLBACK;
 EXPLAIN <query>;
 SHOW TABLES;
 CHECKPOINT;
+REINDEX table;   -- 按堆表当前内容重建该表所有索引
 ```
 
 ## 明确不支持（会报 `NotSupportedError`）

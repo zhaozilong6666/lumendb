@@ -116,7 +116,7 @@ python examples/demo.py
 | 表达式 | 算术、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN` |
 | 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
 | 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，MVCC 快照隔离 |
-| 运维 | `EXPLAIN`、`SHOW TABLES`、`CHECKPOINT` |
+| 运维 | `EXPLAIN`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX` |
 
 未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
 
@@ -155,7 +155,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **417 个自动化测试**（`python -m pytest tests -q`，约 28 秒），覆盖页格式、WAL 与恢复、
+- **419 个自动化测试**（`python -m pytest tests -q`，约 13 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -199,7 +199,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 
 - **单文件页式存储 + 物理日志**：牺牲了压缩率，换来恢复逻辑的可验证性。
 - **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
-  少了一套最容易出错的分支，代价是稀疏页需要 `REINDEX` 式的 `rebuild()` 回收。
+  少了一套最容易出错的分支，代价是稀疏页要靠 `REINDEX table` 重建来回收。
 - **目录存进数据文件的页链**：不用独立的 `catalog.json`，让表定义和用户数据
   共享同一份 WAL——否则"表建好了但数据没落盘"这类中间状态要另立机制处理。
 - **Python**：这个项目的目标是"把机制写清楚、可被测出来"，不是吞吐量竞赛。

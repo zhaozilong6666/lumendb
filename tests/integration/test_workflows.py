@@ -89,6 +89,26 @@ class TestIndexConsistency:
         assert rows(shop, "SELECT id FROM products WHERE cat = 'mixed' ORDER BY id") == [(1,), (2,)]
 
 
+class TestReindex:
+    def test_rebuild_keeps_queries_and_constraints_correct(self, shop):
+        shop.execute_one("CREATE INDEX idx_price ON products (price)")
+        shop.execute_one("DELETE FROM products WHERE id = 4")
+        shop.execute_one("UPDATE products SET price = 5 WHERE id = 1")
+        result = shop.execute_one("REINDEX products")
+        assert "2 indexes" in result.tag, result.tag
+
+        assert rows(shop, "SELECT id FROM products WHERE price = 5") == [(1,)]
+        assert rows(shop, "SELECT COUNT(*) FROM products") == [(3,)]
+        with pytest.raises(DuplicateKeyError):
+            shop.execute_one("INSERT INTO products VALUES (1, 'dup', 1, 'x')")
+
+    def test_table_without_index_reports_zero(self, db):
+        db.execute_one("CREATE TABLE plain (id INT, v INT)")
+        db.execute_one("INSERT INTO plain VALUES (1, 2)")
+        result = db.execute_one("REINDEX plain")
+        assert result.tag == "REINDEX 0 indexes"
+
+
 class TestCombinedQueries:
     def test_join_group_having_order_limit(self, shop):
         result = rows(
