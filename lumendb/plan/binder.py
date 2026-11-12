@@ -24,6 +24,7 @@ from ..errors import (
     NotSupportedError,
     TableNotFoundError,
     TypeMismatchError,
+    UndefinedParameterError,
 )
 from ..sql.ast import (
     Between,
@@ -39,6 +40,7 @@ from ..sql.ast import (
     IsNull,
     Like,
     Literal,
+    ParamRef,
     ScalarSubquery,
     Star,
     UnaryOp,
@@ -204,8 +206,10 @@ class AggregateAccumulatorGroup:
 
 
 class Binder:
-    def __init__(self, catalog: Catalog) -> None:
+    def __init__(self, catalog: Catalog, params: Optional[list[Any]] = None) -> None:
         self.catalog = catalog
+        #: ``$n`` 的绑定值。绑定阶段直接折成字面量，执行计划里不存在参数数组。
+        self.params: list[Any] = list(params) if params else []
         #: 聚合节点 id -> 在聚合输出行里的下标
         self._agg_slots: dict[int, int] = {}
         self._agg_specs: list[AggSpec] = []
@@ -248,6 +252,16 @@ class Binder:
         if isinstance(value, float):
             return (lambda ctx: value), TypeSpec(DataType.FLOAT)
         return (lambda ctx: value), TypeSpec(DataType.TEXT)
+
+    def _param(self, expr: ParamRef, schema, allow_agg):
+        index = expr.index - 1
+        if index < 0 or index >= len(self.params):
+            raise UndefinedParameterError(
+                f"参数 ${expr.index} 没有绑定值",
+                detail=f"本次调用提供了 {len(self.params)} 个参数",
+                hint="扩展协议要在 Bind 里给参数赋值；简单查询里不支持 $n",
+            )
+        return self._literal(Literal(self.params[index]), schema, allow_agg)
 
     def _column(self, expr: ColumnRef, schema, allow_agg):
         index = schema.resolve(expr.table, expr.name)
@@ -313,6 +327,12 @@ class Binder:
             return _or, TypeSpec(DataType.BOOLEAN)
 
         if op in ("=", "<>", "<", "<=", ">", ">="):
+            if not _comparable_types(lt, rt):
+                raise TypeMismatchError(
+                    f"无法比较 {lt.sql} 与 {rt.sql}",
+                    detail=f"运算符 {op} 两侧的类型不兼容",
+                    hint="用 CAST 显式转换后再比较",
+                )
             return _make_comparison(op, left_fn, right_fn, lt, rt), TypeSpec(DataType.BOOLEAN)
 
         if op in ("+", "-", "*", "/", "%"):
@@ -697,15 +717,46 @@ class Binder:
         if sort_keys:
             node = Sort(child=node, keys=sort_keys, columns=node.columns)
 
-        if select.limit is not None or select.offset:
+        limit_value = self._limit_value(select.limit, "LIMIT")
+        offset_value = self._limit_value(select.offset, "OFFSET")
+        if limit_value is not None or offset_value:
             node = Limit(
                 child=node,
-                limit=select.limit,
-                offset=select.offset or 0,
+                limit=limit_value,
+                offset=offset_value or 0,
                 columns=node.columns,
             )
 
         return node, proj_cols
+
+    def _limit_value(self, value, clause: str) -> Optional[int]:
+        """把 ``LIMIT`` / ``OFFSET`` 的整数或 ``$n`` 统一成 int（None 表示不限）。"""
+        if value is None:
+            return None
+        if isinstance(value, ParamRef):
+            index = value.index - 1
+            if index < 0 or index >= len(self.params):
+                raise UndefinedParameterError(
+                    f"参数 ${value.index} 没有绑定值",
+                    detail=f"{clause} 引用了这个参数",
+                )
+            bound = self.params[index]
+            if bound is None:
+                return None
+            if isinstance(bound, bool) or not isinstance(bound, int):
+                raise TypeMismatchError(
+                    f"{clause} 需要整数",
+                    detail=f"实际是 {type(bound).__name__}",
+                )
+            if bound < 0:
+                raise TypeMismatchError(
+                    f"{clause} 不能为负数",
+                    detail=f"实际是 {bound}",
+                )
+            return bound
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeMismatchError(f"{clause} 需要整数")
+        return value
 
     def _try_index_lookup(
         self, where, schema: Schema, scan: PlanNode
@@ -948,6 +999,26 @@ def re_escape(ch: str) -> str:
     return re.escape(ch)
 
 
+_NUMERIC_KINDS = frozenset({DataType.INT, DataType.BIGINT, DataType.FLOAT})
+_TEXT_KINDS = frozenset({DataType.TEXT, DataType.VARCHAR})
+
+
+def _comparable_types(left: TypeSpec, right: TypeSpec) -> bool:
+    """比较运算两侧的类型是否兼容。
+
+    数值之间可以互比（INT/BIGINT/FLOAT）；TEXT 与 VARCHAR 可以互比；
+    其它情况要求类型完全相同。``WHERE id = 'oops'`` 这类错误应该在绑定阶段
+    报出来，而不是等执行到某一行才抛异常或者悄悄返回 False。
+    """
+    if left.kind is right.kind:
+        return True
+    if left.kind in _NUMERIC_KINDS and right.kind in _NUMERIC_KINDS:
+        return True
+    if left.kind in _TEXT_KINDS and right.kind in _TEXT_KINDS:
+        return True
+    return False
+
+
 def _make_comparison(op: str, left_fn, right_fn, lt: TypeSpec, rt: TypeSpec):
     def _cmp(a, b):
         if op == "=":
@@ -1028,6 +1099,7 @@ _SCALAR_FUNCTIONS["COALESCE"] = _coalesce
 
 _DISPATCH = {
     Literal: Binder._literal,
+    ParamRef: Binder._param,
     ColumnRef: Binder._column,
     Star: Binder._star,
     UnaryOp: Binder._unary,

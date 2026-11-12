@@ -118,8 +118,15 @@ hash join 都在路线图里但**没有实现**——`EXPLAIN` 输出的是真�
   `ParameterStatus*` → `BackendKeyData` → `ReadyForQuery`；客户端发
   `SSLRequest` 时回 `N`（不做 TLS），让它退回明文；
 - 简单查询：`Query` → `RowDescription` / `DataRow*` / `CommandComplete` / `ReadyForQuery`；
-- 扩展查询：`Parse` / `Bind` / `Describe` / `Execute` / `Sync` 的最小实现。
-  **带参数占位符（`$1`）的语句会明确报 `NotSupportedError`**，不猜、不静默忽略；
+- 扩展查询：`Parse` / `Bind` / `Describe` / `Execute` / `Sync`。`Parse` 记录客户端
+  声明的参数类型 OID 并**在这里就做语法检查**；`Bind` 按格式码（文本 0 / 二进制 1）
+  把参数解码成 Python 值；绑定阶段把 `$n` **折成字面量**，所以执行计划里没有
+  "参数数组"，代价是没有计划缓存；
+- 参数：支持 `INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR` 的文本与二进制格式；
+  OID 0（客户端未声明）时按字面量推断。参数个数与 `Bind` 不一致报 `08P01`，
+  `$n` 没有值报 `42P02`；
+- `Describe` 语句返回 `ParameterDescription`（真实 OID 列表）；结果列要等 `Bind`
+  之后 `Describe` 门户才能确定，此时回 `RowDescription`；
 - 错误：`ErrorResponse` 带 `SQLSTATE`、`MESSAGE`、`DETAIL`、`HINT`，
   客户端（psql / JDBC）能按标准字段展示。
 

@@ -92,14 +92,23 @@ class Executor:
         self._wal = wal
         self._disk = disk if disk is not None else getattr(buffer_pool, "disk", None)
         self._txn: Optional[Transaction] = None
+        #: 当前语句的 ``$n`` 绑定值；run() 每次覆盖，子查询 binder 共享
+        self._params: list[Any] = []
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
     # 公共入口
     # ------------------------------------------------------------------
 
-    def run(self, stmt: Statement, txn: Transaction) -> Result:
+    def run(
+        self,
+        stmt: Statement,
+        txn: Transaction,
+        params: Optional[list[Any]] = None,
+    ) -> Result:
         self._txn = txn
+        self._params = list(params) if params else []
+        self.binder.params = self._params
         try:
             if isinstance(stmt, Query):
                 return self._select(stmt, txn)
@@ -151,7 +160,7 @@ class Executor:
         )
 
     def _new_binder(self) -> Binder:
-        binder = Binder(self._catalog)
+        binder = Binder(self._catalog, self._params)
         binder.subquery_runner = self._run_subquery
         return binder
 

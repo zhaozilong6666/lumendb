@@ -37,6 +37,7 @@ from .ast import (
     Like,
     Literal,
     OrderItem,
+    ParamRef,
     Query,
     Reindex,
     Rollback,
@@ -448,9 +449,9 @@ class Parser:
         limit = None
         offset = None
         if self._match_kw("LIMIT"):
-            limit = self._expect_int()
+            limit = self._parse_limit_value("LIMIT")
             if self._match_kw("OFFSET"):
-                offset = self._expect_int()
+                offset = self._parse_limit_value("OFFSET")
 
         return Select(
             items=items,
@@ -637,6 +638,12 @@ class Parser:
         if tok.kind == "int":
             self._advance()
             return Literal(int(tok.value))
+        if tok.kind == "param":
+            self._advance()
+            index = int(tok.value)
+            if index < 1:
+                raise self._error("参数占位符从 $1 开始，$0 不合法")
+            return ParamRef(index)
         if tok.kind == "float":
             self._advance()
             return Literal(float(tok.value))
@@ -759,6 +766,20 @@ class Parser:
             self._advance()
             return int(tok.value)
         raise self._error("期望一个非负整数")
+
+    def _parse_limit_value(self, clause: str):
+        """``LIMIT n`` / ``LIMIT $1``：参数在绑定阶段解析成整数。"""
+        tok = self._cur
+        if tok.kind == "int":
+            self._advance()
+            return int(tok.value)
+        if tok.kind == "param":
+            self._advance()
+            index = int(tok.value)
+            if index < 1:
+                raise self._error("参数占位符从 $1 开始，$0 不合法")
+            return ParamRef(index)
+        raise self._error(f"{clause} 期望一个非负整数或参数占位符 $n")
 
 
 def parse_sql(sql: str) -> list[Statement]:

@@ -147,6 +147,20 @@ class TestComments:
         assert "*/" in str(exc.value)
 
 
+class TestParameters:
+    def test_param_token(self):
+        toks = tokenize("$1 $23")
+        assert [(t.kind, t.value) for t in toks[:2]] == [
+            ("param", "1"),
+            ("param", "23"),
+        ]
+
+    def test_dollar_without_digits(self):
+        with pytest.raises(SQLSyntaxError) as exc:
+            tokenize("SELECT $ FROM t")
+        assert "$" in str(exc.value)
+
+
 class TestPositions:
     def test_line_and_column(self):
         toks = tokenize("a\n  b")

@@ -39,6 +39,20 @@ class Literal(Expr):
 
 
 @dataclass(frozen=True)
+class ParamRef(Expr):
+    """参数占位符 ``$n``（n 从 1 开始）。
+
+    绑定阶段会被折叠成 ``Literal``：本引擎不做计划缓存，所以"参数"只存在于
+    语法树里，执行计划里看到的就是一个常量，不需要参数数组的运行时查找。
+    """
+
+    index: int
+
+    def render(self) -> str:
+        return f"${self.index}"
+
+
+@dataclass(frozen=True)
 class ColumnRef(Expr):
     table: Optional[str]
     name: str
@@ -259,8 +273,8 @@ class Select:
     group_by: list[Expr] = field(default_factory=list)
     having: Optional[Expr] = None
     order_by: list[OrderItem] = field(default_factory=list)
-    limit: Optional[int] = None
-    offset: Optional[int] = None
+    limit: Optional[Union[int, ParamRef]] = None
+    offset: Optional[Union[int, ParamRef]] = None
     distinct: bool = False
 
 

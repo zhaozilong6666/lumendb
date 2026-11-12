@@ -124,6 +124,8 @@ class Lexer:
 
         if ch == "'":
             return self._read_string()
+        if ch == "$":
+            return self._read_param()
         if ch in _DIGITS or (ch == "." and self._peek(1) in _DIGITS):
             return self._read_number()
         if ch == '"':
@@ -184,6 +186,21 @@ class Lexer:
                     raise SQLSyntaxError("块注释没有闭合（缺少 */）")
             else:
                 return
+
+    def _read_param(self) -> Token:
+        """``$1`` / ``$12``：PostgreSQL 风格的参数占位符。"""
+        line, col = self._line, self._col
+        self._advance()  # $
+        if self._pos >= len(self._text) or self._text[self._pos] not in _DIGITS:
+            raise SQLSyntaxError(
+                "参数占位符 $ 后面必须跟数字",
+                detail=f"第 {line} 行第 {col} 列",
+            )
+        digits = []
+        while self._pos < len(self._text) and self._text[self._pos] in _DIGITS:
+            digits.append(self._text[self._pos])
+            self._advance()
+        return Token("param", "".join(digits), line, col)
 
     def _read_string(self) -> Token:
         line, col = self._line, self._col

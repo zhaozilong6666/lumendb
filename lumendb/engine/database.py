@@ -6,7 +6,7 @@ CLI 与 PostgreSQL 协议服务端都只依赖这一层，它们不需要知道�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
@@ -46,23 +46,26 @@ class Database:
     def in_transaction(self) -> bool:
         return self._txn is not None
 
-    def execute(self, sql: str) -> list[Result]:
+    def execute(self, sql: str, params: Optional[list[Any]] = None) -> list[Result]:
         """执行一段 SQL，返回每条语句的结果。
 
         没有显式 ``BEGIN`` 时，每条语句各自成为一个事务（自动提交）。
+        ``params`` 依次绑定 SQL 里的 ``$1``、``$2``……（扩展协议用）。
         """
         statements = parse_sql(sql)
-        return [self._run(statement) for statement in statements]
+        return [self._run(statement, params) for statement in statements]
 
-    def execute_one(self, sql: str) -> Result:
-        results = self.execute(sql)
+    def execute_one(
+        self, sql: str, params: Optional[list[Any]] = None
+    ) -> Result:
+        results = self.execute(sql, params)
         if not results:
             raise TransactionError("SQL 里没有可执行的语句")
         return results[-1]
 
     # ------------------------------------------------------------------
 
-    def _run(self, statement) -> Result:
+    def _run(self, statement, params: Optional[list[Any]] = None) -> Result:
         if isinstance(statement, Begin):
             if self._txn is not None:
                 raise TransactionError(
@@ -89,11 +92,11 @@ class Database:
             return Result(tag="ROLLBACK")
 
         if self._txn is not None:
-            return self.executor.run(statement, self._txn)
+            return self.executor.run(statement, self._txn, params)
 
         txn = self.txns.begin()
         try:
-            result = self.executor.run(statement, txn)
+            result = self.executor.run(statement, txn, params)
         except BaseException:
             self.txns.abort(txn)
             raise

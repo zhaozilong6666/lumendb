@@ -77,6 +77,12 @@ class TypeMismatchError(BinderError):
     sqlstate = "42804"
 
 
+class UndefinedParameterError(BinderError):
+    """``$n`` 没有对应的绑定值。"""
+
+    sqlstate = "42P02"
+
+
 class NotSupportedError(LumenError):
     """语法本身合法，但本引擎尚未实现。"""
 

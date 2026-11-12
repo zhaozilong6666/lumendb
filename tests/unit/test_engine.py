@@ -11,6 +11,7 @@ from lumendb.errors import (
     SQLSyntaxError,
     TableNotFoundError,
     TypeMismatchError,
+    UndefinedParameterError,
 )
 
 
@@ -21,8 +22,8 @@ def db(tmp_path):
     database.close()
 
 
-def rows(db, sql):
-    return db.execute_one(sql).rows
+def rows(db, sql, params=None):
+    return db.execute_one(sql, params).rows
 
 
 def setup_users(db):
@@ -32,6 +33,64 @@ def setup_users(db):
     db.execute_one(
         "INSERT INTO users VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 35)"
     )
+
+
+class TestParameters:
+    """``$n`` 参数：绑定阶段折成字面量，类型检查照常生效。"""
+
+    def test_select_with_param(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "SELECT name FROM users WHERE id = $1", params=[2]
+        )
+        assert result.rows == [("bob",)]
+
+    def test_insert_with_params(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES ($1, $2), ($1, $3)",
+            params=[7, "x", "y"],
+        )
+        assert result.affected == 2
+        assert rows(db, "SELECT a, b FROM t ORDER BY b") == [(7, "x"), (7, "y")]
+
+    def test_update_and_delete_with_params(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "UPDATE users SET age = $1 WHERE id = $2", params=[40, 1]
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT age FROM users WHERE id = 1") == [(40,)]
+        result = db.execute_one("DELETE FROM users WHERE id = $1", params=[2])
+        assert result.affected == 1
+        assert rows(db, "SELECT id FROM users ORDER BY id") == [(1,), (3,)]
+
+    def test_param_type_mismatch_is_reported(self, db):
+        setup_users(db)
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT name FROM users WHERE id = $1", params=["oops"])
+
+    def test_missing_param(self, db):
+        setup_users(db)
+        with pytest.raises(UndefinedParameterError):
+            db.execute_one("SELECT name FROM users WHERE id = $1")
+        with pytest.raises(UndefinedParameterError):
+            db.execute_one("SELECT name FROM users WHERE id = $2", params=[1])
+
+    def test_param_in_expression_and_case(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT CASE WHEN id = $1 THEN 'me' ELSE 'other' END FROM users "
+            "ORDER BY id",
+            params=[2],
+        ) == [("other",), ("me",), ("other",)]
+
+    def test_param_in_order_by_and_limit(self, db):
+        setup_users(db)
+        assert rows(
+            db, "SELECT id FROM users ORDER BY id DESC LIMIT $1", params=[2]
+        ) == [(3,), (2,)]
 
 
 class TestDdl:

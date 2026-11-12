@@ -105,7 +105,183 @@ class TestStartup:
         db.close()
 
 
-class TestSimpleQuery:
+class TestExtendedQuery:
+    """扩展协议：Parse/Bind/Describe/Execute/Sync + ``$n`` 参数。"""
+
+    @staticmethod
+    def _msg(kind: bytes, body: bytes) -> bytes:
+        return kind + struct.pack("!i", len(body) + 4) + body
+
+    def _parse(self, sql: str, oids: list[int]) -> bytes:
+        body = b"\x00" + sql.encode() + b"\x00"
+        body += struct.pack("!h", len(oids))
+        body += b"".join(struct.pack("!I", oid) for oid in oids)
+        return self._msg(b"P", body)
+
+    def _bind(self, values, *, formats=None, portal="") -> bytes:
+        body = portal.encode() + b"\x00" + b"\x00"
+        if formats is None:
+            body += struct.pack("!h", 0)
+        else:
+            body += struct.pack("!h", len(formats))
+            body += b"".join(struct.pack("!h", f) for f in formats)
+        body += struct.pack("!h", len(values))
+        for value in values:
+            if value is None:
+                body += struct.pack("!i", -1)
+            else:
+                body += struct.pack("!i", len(value)) + value
+        body += struct.pack("!h", 0)  # 结果格式：全部文本
+        return self._msg(b"B", body)
+
+    def _execute(self, portal="") -> bytes:
+        return self._msg(b"E", portal.encode() + b"\x00" + struct.pack("!i", 0))
+
+    async def _ready(self, reader, writer):
+        payload = (
+            struct.pack("!i", 196608)
+            + b"user\x00lumendb\x00database\x00lumendb\x00\x00"
+        )
+        writer.write(struct.pack("!i", len(payload) + 4) + payload)
+        await writer.drain()
+        await _read_until_ready(reader)
+
+    def test_select_with_param(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT name FROM t WHERE id = $1", [23]))
+            writer.write(self._bind([b"2"]))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            kinds = [k for k, _ in messages]
+            assert kinds[:2] == [b"1", b"2"]  # ParseComplete + BindComplete
+            rows = [_parse_data_row(p) for k, p in messages if k == b"D"]
+            assert rows == [["y"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_binary_int8_param(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT name FROM t WHERE id = $1", [20]))
+            writer.write(self._bind([struct.pack("!q", 1)], formats=[1]))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in messages if k == b"D"]
+            assert rows == [["x"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_unknown_oid_infers_int(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT name FROM t WHERE id = $1", [0]))
+            writer.write(self._bind([b"1"]))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in messages if k == b"D"]
+            assert rows == [["x"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_parameter_description_oids(self, tmp_path):
+        db = Database(tmp_path / "db")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT * FROM t WHERE a = $1", [23]))
+            writer.write(self._msg(b"D", b"S\x00"))
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            param_desc = next(p for k, p in messages if k == b"t")
+            count = struct.unpack("!h", param_desc[:2])[0]
+            oid = struct.unpack("!I", param_desc[2:6])[0]
+            assert (count, oid) == (1, 23)
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_missing_param_reports_42p02(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (a INT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            sql = "SELECT * FROM t WHERE a = $1"
+            body_bytes = sql.encode() + b"\x00"
+            writer.write(
+                b"Q" + struct.pack("!i", len(body_bytes) + 4) + body_bytes
+            )
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            err = next(p for k, p in messages if k == b"E")
+            assert b"42P02" in err
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_bind_count_mismatch(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (a INT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT * FROM t WHERE a = $1", [23]))
+            writer.write(self._bind([]))
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            err = next(p for k, p in messages if k == b"E")
+            assert b"08P01" in err
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
     def test_select_returns_rows(self, tmp_path):
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (a INT, name TEXT)")

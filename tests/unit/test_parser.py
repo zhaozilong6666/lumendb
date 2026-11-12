@@ -15,6 +15,7 @@ from lumendb.sql.ast import (
     IsNull,
     Like,
     Literal,
+    ParamRef,
     ScalarSubquery,
     Star,
     UnaryOp,
@@ -295,6 +296,22 @@ class TestExpressions:
     def test_case_requires_a_branch(self):
         with pytest.raises(SQLSyntaxError):
             parse_statement("SELECT CASE END")
+
+
+class TestParameters:
+    def test_param_in_where(self):
+        stmt = parse_statement("SELECT * FROM t WHERE id = $2")
+        assert isinstance(stmt.select.where.right, ParamRef)
+        assert stmt.select.where.right.index == 2
+
+    def test_param_in_limit(self):
+        stmt = parse_statement("SELECT * FROM t LIMIT $1")
+        assert isinstance(stmt.select.limit, ParamRef)
+        assert stmt.select.limit.index == 1
+
+    def test_zero_parameter_rejected(self):
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("SELECT * FROM t WHERE id = $0")
 
 
 class TestTransactions:

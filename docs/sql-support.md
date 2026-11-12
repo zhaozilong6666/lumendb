@@ -37,7 +37,7 @@ WHERE cond
 GROUP BY col [, col...]          -- 只接受列引用，表达式分组会明确报错
 HAVING cond
 ORDER BY expr [ASC|DESC], ...
-LIMIT n [OFFSET m]
+LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
 ```
 
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`。
@@ -56,6 +56,23 @@ CASE expr WHEN value THEN result [...] [ELSE result] END
 就是常见的条件计数写法。
 
 子查询：标量子查询、`IN (SELECT ...)`、`EXISTS (SELECT ...)`。
+
+### 参数占位符
+
+```sql
+SELECT * FROM t WHERE id = $1;
+INSERT INTO t VALUES ($1, $2);
+SELECT * FROM t ORDER BY id LIMIT $1;
+```
+
+- 走 PostgreSQL **扩展查询协议**（`Parse` / `Bind` / `Describe` / `Execute`）时，
+  客户端在 `Bind` 里给参数赋值；文本格式和二进制格式（INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR）
+  都支持。
+- 客户端没声明类型（OID 0）时按字面量推断（整数 → `INT`，小数 → `FLOAT`，其余 → `TEXT`）。
+- 参数在**绑定阶段折成字面量**，所以执行计划里不存在"参数数组"；这也意味着
+  没有计划缓存（每次 Bind 都重新绑定）。
+- **简单查询（`Q`）里写 `$1` 会报 `42P02 undefined_parameter`**，因为简单查询没有
+  带参数值的通道。这不是遗漏，是协议本身的区别。
 
 ### 事务与运维
 
@@ -84,7 +101,7 @@ REINDEX table;   -- 按堆表当前内容重建该表所有索引
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
 | **`GROUP BY <表达式>`** | 只接受列引用；表达式分组未实现 |
 | **`COUNT(DISTINCT x)` 等聚合去重** | 未实现；可用 `SELECT DISTINCT` 先降维 |
-| **`PREPARE` 参数占位符 `$1`** | wire 协议里的参数绑定未实现 |
+| 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | `NULLS FIRST/LAST` | `NULL` 固定排在最后 |
 
 ## 已知的行为细节

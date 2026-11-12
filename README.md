@@ -1,6 +1,6 @@
 # LumenDB
 
-> A relational database engine written from scratch in Python —— slotted pages, B+tree indexes, WAL crash recovery, MVCC snapshot isolation, cost-based planning, and a PostgreSQL wire-compatible server you can connect to with `psql`.
+> A relational database engine written from scratch in Python —— slotted pages, B+tree indexes, WAL crash recovery, MVCC snapshot isolation, rule-based index selection, and a PostgreSQL wire-compatible server you can connect to with `psql`.
 
 LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任何第三方数据库组件，也没有把工作外包给 SQLite——SQL 解析、查询优化、执行算子、页式存储、B+ 树索引、预写日志、崩溃恢复、并发控制，全部是项目自己实现的代码。
 
@@ -19,7 +19,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 | 崩溃恢复 | WAL + ARIES 风格 redo/undo，pageLSN 幂等重放 | `tests/crash/test_recovery.py`：数据页不落盘直接"崩溃"，重开后校验 |
 | 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
 | 查询执行 | 火山模型算子 + 等值条件索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
-| 协议 | PostgreSQL v3 wire protocol（simple + extended query 最小实现） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
+| 协议 | PostgreSQL v3 wire protocol（simple + extended query，支持 `$1` 参数绑定） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
 | 进程模型 | 数据目录独占锁（OS 级字节锁），拒绝双开 | `tests/unit/test_filelock.py`：第二个打开者必须失败 |
 
 ## 架构
@@ -158,7 +158,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **423 个自动化测试**（`python -m pytest tests -q`，约 12 秒），覆盖页格式、WAL 与恢复、
+- **441 个自动化测试**（`python -m pytest tests -q`，约 12 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

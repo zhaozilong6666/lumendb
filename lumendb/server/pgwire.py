@@ -8,8 +8,8 @@
 - 客户端 StartupMessage 没有类型码，直接 长度 + 协议号 + 键值对；
 - 认证走 ``AuthenticationOk``（trust 模式，不校验密码）；
 - 简单查询 ``Q`` 的响应是 RowDescription + 若干 DataRow + CommandComplete + ReadyForQuery；
-- 扩展查询 ``Parse/Bind/Describe/Execute/Sync`` 做一个最小实现：只接受没有
-  参数占位符的语句，有 ``$1`` 就明确报不支持，而不是猜。
+- 扩展查询 ``Parse/Bind/Describe/Execute/Sync`` 支持 ``$1`` 参数：Parse 记下客户端声明的
+  参数类型 OID，Bind 把文本/二进制参数解码成 Python 值，绑定阶段折成字面量再执行。
 """
 
 from __future__ import annotations
@@ -22,7 +22,13 @@ from typing import Any, Optional
 from ..datatypes import DataType
 from ..engine.database import Database
 from ..engine.executor import ColumnMeta, Result
-from ..errors import ClientDisconnected, LumenError, NotSupportedError, ProtocolError
+from ..errors import (
+    ClientDisconnected,
+    LumenError,
+    NotSupportedError,
+    ProtocolError,
+)
+from ..sql.parser import parse_sql
 
 PROTOCOL_VERSION = 196608  # 3.0
 SSL_REQUEST_CODE = 80877103
@@ -52,12 +58,16 @@ _TYPLEN_BY_TYPE = {
 class PreparedStatement:
     name: str
     sql: str
+    #: 客户端在 Parse 里声明的参数类型 OID；0 表示"未指定"
+    param_oids: list[int] = field(default_factory=list)
 
 
 @dataclass
 class Portal:
     name: str
     statement: PreparedStatement
+    #: Bind 解码后的参数值
+    params: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -239,16 +249,27 @@ class PGWireServer:
         name, rest = _split_cstr(payload)
         sql, rest = _split_cstr(rest)
         nparams = struct.unpack("!h", rest[:2])[0]
-        if nparams > 0:
+        rest = rest[2:]
+        oids = [
+            struct.unpack("!I", rest[i * 4 : i * 4 + 4])[0] for i in range(nparams)
+        ]
+        # Parse 阶段就检查语法：PostgreSQL 的行为是"语法错在 Parse 就报"，
+        # 而不是等到 Execute 才失败。
+        try:
+            statements = parse_sql(sql)
+        except LumenError as exc:
+            self._send_error(writer, exc)
+            return
+        if len(statements) != 1:
             self._send_error(
                 writer,
                 NotSupportedError(
-                    "扩展协议里的参数占位符尚未实现",
-                    hint="用简单查询（psql / DBeaver 默认）执行带参数之外的语句",
+                    "扩展协议一次只能准备一条语句",
+                    detail=f"这次 Parse 里有 {len(statements)} 条语句",
                 ),
             )
             return
-        session.prepared[name] = PreparedStatement(name=name, sql=sql)
+        session.prepared[name] = PreparedStatement(name=name, sql=sql, param_oids=oids)
         self._send(writer, b"1", b"")  # ParseComplete
 
     async def _bind(self, session: Session, writer, payload: bytes) -> None:
@@ -258,7 +279,55 @@ class PGWireServer:
         if stmt is None:
             self._send_error(writer, ProtocolError(f"未找到预处理语句 {stmt_name!r}"))
             return
-        session.portals[portal_name] = Portal(name=portal_name, statement=stmt)
+
+        nformats = struct.unpack("!h", rest[:2])[0]
+        rest = rest[2:]
+        formats = [
+            struct.unpack("!h", rest[i * 2 : i * 2 + 2])[0] for i in range(nformats)
+        ]
+        rest = rest[nformats * 2 :]
+        nparams = struct.unpack("!h", rest[:2])[0]
+        rest = rest[2:]
+        raw_values: list[Optional[bytes]] = []
+        for _ in range(nparams):
+            size = struct.unpack("!i", rest[:4])[0]
+            rest = rest[4:]
+            if size < 0:
+                raw_values.append(None)
+            else:
+                raw_values.append(rest[:size])
+                rest = rest[size:]
+        nresult_formats = struct.unpack("!h", rest[:2])[0]
+        rest = rest[2:]
+        result_formats = [
+            struct.unpack("!h", rest[i * 2 : i * 2 + 2])[0]
+            for i in range(nresult_formats)
+        ]
+        if any(code != 0 for code in result_formats):
+            self._send_error(
+                writer,
+                NotSupportedError(
+                    "暂不支持二进制结果格式",
+                    hint="客户端请用文本格式（format code 0）请求结果",
+                ),
+            )
+            return
+        if nparams != len(stmt.param_oids):
+            self._send_error(
+                writer,
+                ProtocolError(
+                    f"Bind 给了 {nparams} 个参数，但语句声明了 {len(stmt.param_oids)} 个",
+                ),
+            )
+            return
+        try:
+            values = _decode_params(stmt.param_oids, formats, raw_values)
+        except LumenError as exc:
+            self._send_error(writer, exc)
+            return
+        session.portals[portal_name] = Portal(
+            name=portal_name, statement=stmt, params=values
+        )
         self._send(writer, b"2", b"")  # BindComplete
 
     async def _describe(self, session: Session, writer, payload: bytes) -> None:
@@ -269,8 +338,10 @@ class PGWireServer:
             if stmt is None:
                 self._send_error(writer, ProtocolError(f"未找到预处理语句 {name!r}"))
                 return
-            # 参数描述：0 个参数
-            self._send(writer, b"t", struct.pack("!h", 0))
+            self._send_parameter_description(writer, stmt.param_oids)
+            # 结果列要等 Bind 之后才知道（参数会影响类型推断），先回 NoData；
+            # 客户端按协议会在 Bind 之后 Describe 门户再拿 RowDescription。
+            self._send(writer, b"n", b"")
             return
         portal = session.portals.get(name)
         if portal is None:
@@ -279,7 +350,9 @@ class PGWireServer:
         # 执行一次拿到列信息（结果集很小，代价可接受）
         async with self._lock:
             try:
-                result = session.database.execute_one(portal.statement.sql)
+                result = session.database.execute_one(
+                    portal.statement.sql, portal.params
+                )
             except LumenError as exc:
                 self._send_error(writer, exc)
                 return
@@ -296,7 +369,9 @@ class PGWireServer:
             return
         async with self._lock:
             try:
-                result = session.database.execute_one(portal.statement.sql)
+                result = session.database.execute_one(
+                    portal.statement.sql, portal.params
+                )
             except LumenError as exc:
                 self._send_error(writer, exc)
                 return
@@ -304,6 +379,12 @@ class PGWireServer:
             for row in result.rows:
                 self._send_data_row(writer, row)
         self._send(writer, b"C", _cstr(result.tag or "OK"))
+
+    def _send_parameter_description(self, writer, oids: list[int]) -> None:
+        payload = struct.pack("!h", len(oids)) + b"".join(
+            struct.pack("!I", oid) for oid in oids
+        )
+        self._send(writer, b"t", payload)
 
     # -- 结果与错误 -----------------------------------------------------
 
@@ -377,6 +458,107 @@ def _format_value(value: Any) -> str:
     if isinstance(value, float) and value == int(value):
         return str(int(value)) if abs(value) < 1e16 else repr(value)
     return str(value)
+
+
+# -- 参数解码 ------------------------------------------------------------
+
+_OID_BOOL = 16
+_OID_INT8 = 20
+_OID_INT4 = 23
+_OID_FLOAT4 = 700
+_OID_FLOAT8 = 701
+_OID_TEXT = 25
+_OID_VARCHAR = 1043
+
+
+def _decode_params(
+    oids: list[int], formats: list[int], raw_values: list[Optional[bytes]]
+) -> list[Any]:
+    n = len(raw_values)
+    if not formats:
+        codes = [0] * n
+    elif len(formats) == 1:
+        codes = formats * n
+    elif len(formats) == n:
+        codes = formats
+    else:
+        raise ProtocolError(
+            f"Bind 给了 {len(formats)} 个格式码，但参数有 {n} 个"
+        )
+    values: list[Any] = []
+    for i, (oid, code, raw) in enumerate(zip(oids, codes, raw_values)):
+        if raw is None:
+            values.append(None)
+            continue
+        if code == 0:
+            values.append(_decode_text_param(oid, raw, i))
+        elif code == 1:
+            values.append(_decode_binary_param(oid, raw, i))
+        else:
+            raise ProtocolError(f"参数格式码只能是 0（文本）或 1（二进制），收到 {code}")
+    return values
+
+
+def _decode_text_param(oid: int, raw: bytes, index: int) -> Any:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(
+            f"参数 ${index + 1} 不是合法的 UTF-8 文本",
+            detail=str(exc),
+        ) from None
+    stripped = text.strip()
+    try:
+        if oid == _OID_BOOL:
+            low = stripped.lower()
+            if low in ("t", "true", "1", "y", "yes", "on"):
+                return True
+            if low in ("f", "false", "0", "n", "no", "off"):
+                return False
+            raise ValueError
+        if oid in (_OID_INT8, _OID_INT4):
+            return int(stripped)
+        if oid in (_OID_FLOAT4, _OID_FLOAT8):
+            return float(stripped)
+        if oid == 0:
+            # 客户端没声明类型：按字面量推断，交给绑定阶段的类型检查兜底
+            if stripped.lstrip("-").isdigit():
+                return int(stripped)
+            try:
+                return float(stripped)
+            except ValueError:
+                return text
+        return text
+    except ValueError:
+        raise ProtocolError(
+            f"参数 ${index + 1} 的值 {text!r} 不能解析为 OID {oid} 对应的类型",
+            hint="检查客户端声明的参数类型和实际值是否一致",
+        ) from None
+
+
+def _decode_binary_param(oid: int, raw: bytes, index: int) -> Any:
+    try:
+        if oid == _OID_BOOL:
+            return raw != b"\x00"
+        if oid == _OID_INT8:
+            return struct.unpack("!q", raw)[0]
+        if oid == _OID_INT4:
+            return struct.unpack("!i", raw)[0]
+        if oid == _OID_FLOAT4:
+            return struct.unpack("!f", raw)[0]
+        if oid == _OID_FLOAT8:
+            return struct.unpack("!d", raw)[0]
+        if oid in (_OID_TEXT, _OID_VARCHAR, 0):
+            return raw.decode("utf-8")
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise ProtocolError(
+            f"参数 ${index + 1} 的二进制值长度或编码不合法",
+            detail=str(exc),
+        ) from None
+    raise NotSupportedError(
+        f"暂不支持用二进制格式传 OID {oid} 的参数",
+        hint="改成文本格式（format code 0），或换成 INT/BIGINT/FLOAT/BOOL/TEXT",
+    )
 
 
 __all__ = ["PGWireServer", "Session"]
