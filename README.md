@@ -104,6 +104,21 @@ python examples/demo.py
 
 它会打印每一步的真实输出，包括 `EXPLAIN` 里命中的索引名。
 
+## 真实客户端
+
+协议不是只有自带的测试客户端在跑：`examples/psycopg2_smoke.py` 用 **libpq**
+（psycopg2）连服务端，覆盖 DDL、参数化查询、事务隔离与 SQLSTATE `23505`。
+
+```bash
+python -m pip install psycopg2-binary
+python -m lumendb serve --path ./mydb     # 另开一个终端
+python examples/psycopg2_smoke.py
+```
+
+`psql` 用的是同一个 libpq，本机没装 psql，所以用同源驱动做互操作验证：
+握手、`RowDescription`、`DataRow`、`CommandComplete` 任何一处不合协议，
+psycopg2 都不会正常返回结果。
+
 ## SQL 支持
 
 | 类别 | 支持 |
@@ -168,6 +183,8 @@ python -m bench.run --rows 2000
   重启后分别校验"已提交必须存活、未提交必须回滚"；
 - **随机崩溃一致性测试**：20 个固定种子，随机执行插入/更新/删除并随机提交、回滚或
   直接崩溃，每次重开后与测试侧维护的"已提交模型"逐行比对；失败信息带 seed，可复现；
+- **真实客户端互操作**：`examples/psycopg2_smoke.py` 用 libpq（psycopg2）走一遍
+  握手、DDL、参数化查询、两连接事务隔离与 SQLSTATE `23505`；
 - **基准数字由脚本产出**，README 里没有手写性能；
 - CI 在 Ubuntu / Windows × Python 3.12 / 3.13 上跑全量测试 + CLI 冒烟。
 

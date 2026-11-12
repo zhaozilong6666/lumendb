@@ -130,6 +130,11 @@ WAL 与事务机制，原子性由已有的基础设施保证。
 语义变成 `ROLLBACK`。这条行为由两个真实 socket 连接的测试覆盖，而不是只测
 单连接的 SQL 语义。
 
+互操作也不是"自己测自己"：本机没有 psql，我用同源的 libpq 驱动 psycopg2
+跑通了 `examples/psycopg2_smoke.py`——DDL、参数化查询、两连接隔离、唯一键
+冲突的 SQLSTATE `23505` 都按客户端预期返回。协议字段只要错一个，libpq 就
+不会给出正常结果。
+
 ## 常见追问（准备好了就答得出来）
 
 **"你的 MVCC 和 PostgreSQL 差在哪？"**
