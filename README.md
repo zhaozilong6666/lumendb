@@ -47,6 +47,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
         │  storage/wal.py          │  预写日志、LSN、fsync
         │  storage/recovery.py     │  analysis / redo / undo / checkpoint
         │  storage/txn.py, lock.py │  事务状态、快照隔离、行锁与死锁检测
+        │  storage/filelock.py     │  数据目录独占锁（拒绝双开）
         │  catalog/*               │  表定义持久化（存进数据文件页链）
         └────────────┬─────────────┘
                      │
@@ -154,7 +155,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **407 个自动化测试**（`python -m pytest tests -q`，约 13 秒），覆盖页格式、WAL 与恢复、
+- **417 个自动化测试**（`python -m pytest tests -q`，约 28 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

@@ -814,14 +814,24 @@ class Binder:
             group_cols.append(col)
             group_fns.append(lambda ctx, i=index: ctx.row[i])
 
-        # 第一遍：用原 schema 编译，触发聚合函数注册（结果丢弃）
+        # 第一遍：用原 schema 编译，触发聚合函数注册（结果丢弃）。
+        # ORDER BY 里如果是 SELECT 的输出别名，在这里解析会失败（输入 schema
+        # 里没有这一列），留给输出层处理即可。
+        aliases = {item.alias.lower() for item in select.items if item.alias}
         for item in select.items:
             if not isinstance(item.expr, Star):
                 self.compile(item.expr, schema, allow_agg=True)
         if select.having is not None:
             self.compile(select.having, schema, allow_agg=True)
         for item in select.order_by:
-            self.compile(item.expr, schema, allow_agg=True)
+            expr = item.expr
+            if (
+                isinstance(expr, ColumnRef)
+                and expr.table is None
+                and expr.name.lower() in aliases
+            ):
+                continue
+            self.compile(expr, schema, allow_agg=True)
 
         agg_schema = Schema(
             group_cols
