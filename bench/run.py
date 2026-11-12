@@ -87,8 +87,8 @@ def bench_insert_no_index(root: Path, rows: int) -> dict:
     }
 
 
-def _prepare_scan_db(root: Path, rows: int) -> Path:
-    path = root / "scan"
+def _prepare_scan_db(root: Path, rows: int, name: str = "scan") -> Path:
+    path = root / name
     if path.exists():
         shutil.rmtree(path)
     db = Database(path, pool_size=1024)
@@ -207,12 +207,55 @@ def bench_group_by(root: Path, rows: int) -> dict:
     }
 
 
+def bench_vacuum(root: Path, rows: int) -> dict:
+    """先制造 500 个死版本，再单独计时 VACUUM 的压实成本。"""
+    updated = min(500, rows)
+    samples = []
+    for _ in range(3):
+        path = _prepare_scan_db(root, rows, name="vacuum")
+        db = Database(path, pool_size=1024)
+        db.execute_one(f"UPDATE t SET score = score + 1 WHERE id < {updated}")
+        start = time.perf_counter()
+        result = db.execute_one("VACUUM t")
+        samples.append(time.perf_counter() - start)
+        assert "rows kept" in result.tag
+        db.close()
+    best = min(samples)
+    return {
+        "name": f"VACUUM 压实 {rows} 行（回收 {updated} 个死版本）",
+        "rows": rows,
+        "seconds": best,
+        "per_sec": rows / best,
+    }
+
+
+def bench_truncate(root: Path, rows: int) -> dict:
+    samples = []
+    for _ in range(3):
+        path = _prepare_scan_db(root, rows, name="truncate")
+        db = Database(path, pool_size=1024)
+        start = time.perf_counter()
+        result = db.execute_one("TRUNCATE TABLE t")
+        samples.append(time.perf_counter() - start)
+        assert result.affected == rows
+        db.close()
+    best = min(samples)
+    return {
+        "name": f"TRUNCATE 清空 {rows} 行",
+        "rows": rows,
+        "seconds": best,
+        "per_sec": rows / best,
+    }
+
+
 BENCHMARKS = [
     bench_insert,
     bench_insert_no_index,
     bench_scan,
     bench_group_by,
     bench_update,
+    bench_vacuum,
+    bench_truncate,
     bench_point_lookup_index,
     bench_point_lookup_scan,
 ]
