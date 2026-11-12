@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..errors import CorruptedPageError, PageNotFoundError, StorageError
+from .filelock import DataDirLockedError, FileLock
 from .page import INVALID_PAGE_ID, MAGIC, PAGE_SIZE, Page, PageType
 
 VERSION = 1
@@ -108,23 +109,31 @@ class DiskManager:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        existed = self.path.exists() and self.path.stat().st_size > 0
-        self._fh = open(self.path, "r+b" if self.path.exists() else "w+b")
+        # 先拿独占锁再碰数据文件：两个进程同时打开同一目录会互相覆盖脏页。
+        self._lock = FileLock(self.path.with_name(self.path.name + ".lock"))
+        self._lock.acquire()
 
-        if not existed:
-            self._initialize()
-        else:
-            self._size = os.path.getsize(self.path)
-            if self._size % PAGE_SIZE != 0:
-                raise CorruptedPageError(
-                    "数据文件大小不是页大小的整数倍",
-                    detail=f"size={self._size} page_size={PAGE_SIZE}",
-                )
-            if self._size == 0:  # pragma: no cover - 防御
+        try:
+            existed = self.path.exists() and self.path.stat().st_size > 0
+            self._fh = open(self.path, "r+b" if self.path.exists() else "w+b")
+
+            if not existed:
                 self._initialize()
+            else:
+                self._size = os.path.getsize(self.path)
+                if self._size % PAGE_SIZE != 0:
+                    raise CorruptedPageError(
+                        "数据文件大小不是页大小的整数倍",
+                        detail=f"size={self._size} page_size={PAGE_SIZE}",
+                    )
+                if self._size == 0:  # pragma: no cover - 防御
+                    self._initialize()
 
-        self._meta = MetaPage(0, self.read_page(0))
-        self._meta.validate()
+            self._meta = MetaPage(0, self.read_page(0))
+            self._meta.validate()
+        except BaseException:
+            self._lock.release()
+            raise
 
     # -- 初始化 -------------------------------------------------------------
 
@@ -217,6 +226,7 @@ class DiskManager:
             self._persist_meta()
             self._fh.flush()
             self._fh.close()
+        self._lock.release()
 
     def __enter__(self) -> "DiskManager":
         return self

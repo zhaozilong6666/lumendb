@@ -19,3 +19,4 @@ bench/results/*.jsonl
 .vscode/
 .DS_Store
 Thumbs.db
+*.lock
