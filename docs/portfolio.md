@@ -50,7 +50,7 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 492 automated tests including crash-injection and a 20-seed randomized
+> - 497 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -152,13 +152,16 @@ oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级�
 
 **"为什么不做代价模型？"**
 因为没有统计信息（没有 `ANALYZE`），估算基数只能靠猜，做一个假的代价模型
-不如不做。当前只有一条规则：单表等值 + 有索引 → 索引扫描。`EXPLAIN` 输出
-的是真实计划，不是理想计划。
+不如不做。当前只有两条规则：单表等值 + 有索引 → 索引查找；单列范围条件
+（`>`/`>=`/`<`/`<=`/`BETWEEN`）→ B+ 树范围扫描。`EXPLAIN` 输出的是真实计划，
+不是理想计划。范围扫描按索引列前缀比较，忽略键尾自动追加的 RID——否则
+`age > 30` 会把 `(30, rid)` 当成大于边界，把 30 本身也扫出来。
 
 **"性能怎么样？"**
 `bench/results/benchmark.md` 是实测：扫描/聚合 4.6 万行/秒；带索引插入
-4905 行/秒，不带索引 16602 行/秒；索引点查 1.4ms/次，全表扫描 8.7ms/次；
-`TRUNCATE` 2000 行 5ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.31s。
+4053 行/秒，不带索引 19234 行/秒；索引点查 1.5ms/次，全表扫描 10ms/次；
+范围查询（`score >= 99`）走索引 4.6ms/次，全表 46ms/次，约 10 倍；
+`TRUNCATE` 2000 行 5ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.49s。
 
 这里有一个我主动做的优化，也是最能讲的一段：最初带索引插入只有 498 行/秒，
 cProfile 显示每次插入都调用 `codec.decode` 十几万次——因为叶子页是按

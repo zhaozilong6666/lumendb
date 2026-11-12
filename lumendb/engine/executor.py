@@ -54,6 +54,7 @@ from ..plan.nodes import (
     EvalContext,
     Filter,
     IndexLookup,
+    IndexRange,
     Join,
     Limit,
     PlanNode,
@@ -194,6 +195,9 @@ class Executor:
         if isinstance(node, IndexLookup):
             yield from self._index_lookup(node, txn)
             return
+        if isinstance(node, IndexRange):
+            yield from self._index_range(node, txn)
+            return
         if isinstance(node, Filter):
             assert node.child is not None and node.predicate is not None
             for row in self._execute(node.child, txn):
@@ -252,6 +256,27 @@ class Executor:
         tree = self._tree_for(table, index)
         heap = HeapFile(self._bp, table, self._txns)
         for rid in tree.lookup(txn, list(node.key)):
+            values = heap.get(txn, rid)
+            if values is not None:
+                yield tuple(values)
+
+    def _index_range(self, node: IndexRange, txn: Transaction) -> Iterator[tuple]:
+        table = self._catalog.get_table(node.table)
+        index = table.indexes.get(node.index_name)
+        if index is None:
+            yield from self._scan(
+                Scan(columns=node.columns, table=node.table, alias=node.alias), txn
+            )
+            return
+        tree = self._tree_for(table, index)
+        heap = HeapFile(self._bp, table, self._txns)
+        for _key, rid in tree.scan_range(
+            len(node.index_columns),
+            low=node.low,
+            high=node.high,
+            low_inclusive=node.low_inclusive,
+            high_inclusive=node.high_inclusive,
+        ):
             values = heap.get(txn, rid)
             if values is not None:
                 yield tuple(values)

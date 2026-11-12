@@ -248,6 +248,51 @@ def bench_truncate(root: Path, rows: int) -> dict:
     }
 
 
+def bench_range_index(root: Path, rows: int) -> dict:
+    path = _prepare_scan_db(root, rows, name="range_idx")
+    builder = Database(path, pool_size=1024)
+    builder.execute_one("CREATE INDEX idx_score ON t (score)")
+    builder.close()
+    probes = min(100, max(20, rows // 40))
+
+    def run() -> None:
+        db = Database(path, pool_size=1024)
+        db.execute_one("BEGIN")
+        for _ in range(probes):
+            db.execute_one("SELECT COUNT(*) FROM t WHERE score >= 99")
+        db.execute_one("COMMIT")
+        db.close()
+
+    best, median = timed(run, repeat=1)
+    return {
+        "name": f"索引范围查询（score >= 99，{probes} 次）",
+        "rows": probes,
+        "seconds": best,
+        "per_sec": probes / best,
+    }
+
+
+def bench_range_scan(root: Path, rows: int) -> dict:
+    path = _prepare_scan_db(root, rows, name="range_scan")
+    probes = min(30, max(10, rows // 100))
+
+    def run() -> None:
+        db = Database(path, pool_size=1024)
+        db.execute_one("BEGIN")
+        for _ in range(probes):
+            db.execute_one("SELECT COUNT(*) FROM t WHERE score >= 99")
+        db.execute_one("COMMIT")
+        db.close()
+
+    best, median = timed(run, repeat=1)
+    return {
+        "name": f"无索引范围查询（score >= 99，{probes} 次，全表扫描）",
+        "rows": probes,
+        "seconds": best,
+        "per_sec": probes / best,
+    }
+
+
 BENCHMARKS = [
     bench_insert,
     bench_insert_no_index,
@@ -258,6 +303,8 @@ BENCHMARKS = [
     bench_truncate,
     bench_point_lookup_index,
     bench_point_lookup_scan,
+    bench_range_index,
+    bench_range_scan,
 ]
 
 

@@ -102,10 +102,15 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 
 ### 3.3 计划与优化
 
-老实说：**当前没有代价模型**。规则只有一条能被 `EXPLAIN` 看见的：
+老实说：**当前没有代价模型**。规则只有两条能被 `EXPLAIN` 看见：
 
-- 单表查询、`WHERE` 形如 `col = 常量`、且该列上有索引 → 生成 `IndexLookup`；
+- 单表查询、`WHERE` 形如 `col = 常量`、且该列上有索引 → `IndexLookup`；
+- `WHERE` 是单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）→ `IndexRangeScan`，
+  范围谓词仍会在上层 `Filter` 再判一次，保证边界与剩余条件正确；
 - 其余一律 `SeqScan + Filter`。
+
+范围扫描按"索引列前缀"比较，忽略 `KeyCodec` 追加的 RID；否则
+`col > 10` 会把 RID 更大的 `(10, ...)` 当成大于边界，结果里混进 10 本身。
 
 `LEFT JOIN`/`INNER JOIN` 走 nested loop。谓词下推、常量折叠、连接顺序枚举、
 hash join 都在路线图里但**没有实现**——`EXPLAIN` 输出的是真实执行的计划，

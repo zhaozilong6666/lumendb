@@ -41,9 +41,14 @@ def main() -> None:
             "INSERT INTO users VALUES (1, 'Ada', 36), (2, 'Linus', 55), (3, 'Grace', 45)",
         )
         run(db, "INSERT INTO orders VALUES (10, 1, 120), (11, 1, 300), (12, 3, 80)")
+        run(db, "CREATE INDEX idx_users_age ON users (age)")
 
         print("\n--- EXPLAIN：等值条件命中主键索引 ---")
         for row in db.execute_one("EXPLAIN SELECT name FROM users WHERE id = 2").rows:
+            print(row[0])
+
+        print("\n--- EXPLAIN：范围条件命中 age 索引 ---")
+        for row in db.execute_one("EXPLAIN SELECT name FROM users WHERE age > 40").rows:
             print(row[0])
 
         run(db, "SELECT name, age FROM users WHERE age > 40 ORDER BY age DESC")

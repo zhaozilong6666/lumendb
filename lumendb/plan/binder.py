@@ -53,6 +53,7 @@ from .nodes import (
     EvalContext,
     Filter,
     IndexLookup,
+    IndexRange,
     Join,
     Limit,
     OutputColumn,
@@ -654,8 +655,12 @@ class Binder:
             if lookup is not None:
                 node = lookup
             else:
+                range_node = self._try_index_range(select.where, schema, node)
                 predicate, _ = self.compile(select.where, schema, allow_agg=False)
-                node = Filter(child=node, predicate=predicate, columns=node.columns)
+                child = range_node if range_node is not None else node
+                node = Filter(
+                    child=child, predicate=predicate, columns=child.columns
+                )
         elif select.where is not None:
             predicate, _ = self.compile(select.where, schema, allow_agg=False)
             node = Filter(child=node, predicate=predicate, columns=node.columns)
@@ -836,6 +841,77 @@ class Binder:
             index_name=index.name,
             index_columns=index.columns,
             key=(value,),
+        )
+
+    def _try_index_range(
+        self, where, schema: Schema, scan: PlanNode
+    ) -> Optional[PlanNode]:
+        """识别单列范围条件：``>`` / ``>=`` / ``<`` / ``<=`` / ``BETWEEN``。
+
+        只在整条 WHERE 就是这一个范围条件时生效；``a > 1 AND b = 2`` 这种
+        留给全表扫描 + Filter。原因和等值查找一样：只做能保证正确的匹配。
+        """
+        if not isinstance(scan, Scan):
+            return None
+
+        low = high = None
+        low_inclusive = high_inclusive = True
+        column_ref: Optional[ColumnRef] = None
+
+        if isinstance(where, Between):
+            if where.negated or not isinstance(where.operand, ColumnRef):
+                return None
+            if not isinstance(where.low, Literal) or not isinstance(where.high, Literal):
+                return None
+            if where.low.value is None or where.high.value is None:
+                return None
+            column_ref = where.operand
+            low, high = where.low.value, where.high.value
+        elif isinstance(where, BinaryOp) and where.op in (">", ">=", "<", "<="):
+            left, right = where.left, where.right
+            op = where.op
+            if isinstance(left, Literal) and isinstance(right, ColumnRef):
+                left, right = right, left
+                op = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}[op]
+            if not isinstance(left, ColumnRef) or not isinstance(right, Literal):
+                return None
+            if right.value is None:
+                return None
+            column_ref = left
+            if op == ">":
+                low, low_inclusive = right.value, False
+            elif op == ">=":
+                low = right.value
+            elif op == "<":
+                high, high_inclusive = right.value, False
+            else:
+                high = right.value
+        else:
+            return None
+
+        table = self.catalog.get_table(scan.table)
+        if not table.indexes:
+            return None
+        index = table.index_for_columns((column_ref.name.lower(),))
+        if index is None or len(index.columns) != 1:
+            return None
+        column = table.column(column_ref.name.lower())
+        try:
+            low_key = (column.type.coerce(low),) if low is not None else None
+            high_key = (column.type.coerce(high),) if high is not None else None
+        except ValueError:
+            return None
+
+        return IndexRange(
+            columns=scan.columns,
+            table=scan.table,
+            alias=scan.alias,
+            index_name=index.name,
+            index_columns=index.columns,
+            low=low_key,
+            high=high_key,
+            low_inclusive=low_inclusive,
+            high_inclusive=high_inclusive,
         )
 
     def _bind_from(self, refs) -> tuple[PlanNode, Schema]:

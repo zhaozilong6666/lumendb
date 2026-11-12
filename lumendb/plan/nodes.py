@@ -78,6 +78,31 @@ class IndexLookup(PlanNode):
 
 
 @dataclass
+class IndexRange(PlanNode):
+    """范围条件（``>`` / ``>=`` / ``<`` / ``<=`` / ``BETWEEN``）命中索引。"""
+
+    table: str = ""
+    alias: str = ""
+    index_name: str = ""
+    index_columns: tuple = ()
+    low: Optional[tuple] = None
+    high: Optional[tuple] = None
+    low_inclusive: bool = True
+    high_inclusive: bool = True
+
+    def describe(self) -> str:
+        lower = ", ".join(repr(v) for v in self.low) if self.low else "-inf"
+        upper = ", ".join(repr(v) for v in self.high) if self.high else "+inf"
+        left = "[" if self.low_inclusive else "("
+        right = "]" if self.high_inclusive else ")"
+        return (
+            f"IndexRangeScan {self.table} "
+            f"[{self.index_name}({', '.join(self.index_columns)}) "
+            f"{left}{lower}, {upper}{right}]"
+        )
+
+
+@dataclass
 class Values(PlanNode):
     rows: list[tuple] = field(default_factory=list)
 

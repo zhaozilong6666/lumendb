@@ -449,6 +449,64 @@ class TestAggregate:
             db.execute_one("SELECT SUM(s) FROM t")
 
 
+class TestIndexRange:
+    def _ages(self, db):
+        db.execute_one("CREATE TABLE t (id INT, age INT)")
+        db.execute_one("CREATE INDEX idx_age ON t (age)")
+        db.execute_one(
+            "INSERT INTO t VALUES "
+            + ", ".join(f"({i}, {10 + i})" for i in range(10))
+        )
+
+    def test_explain_shows_range_scan(self, db):
+        self._ages(db)
+        plan = "\n".join(r[0] for r in rows(db, "EXPLAIN SELECT id FROM t WHERE age > 12"))
+        assert "IndexRangeScan" in plan
+        assert "idx_age" in plan
+
+    def test_range_operators_and_boundaries(self, db):
+        self._ages(db)
+        assert rows(db, "SELECT id FROM t WHERE age > 12 ORDER BY id") == [
+            (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+        ]
+        assert rows(db, "SELECT id FROM t WHERE age >= 12 ORDER BY id") == [
+            (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+        ]
+        assert rows(db, "SELECT id FROM t WHERE age < 12 ORDER BY id") == [(0,), (1,)]
+        assert rows(db, "SELECT id FROM t WHERE age <= 12 ORDER BY id") == [
+            (0,), (1,), (2,)
+        ]
+        assert rows(db, "SELECT id FROM t WHERE 12 < age ORDER BY id") == [
+            (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+        ]
+        assert rows(db, "SELECT id FROM t WHERE age BETWEEN 12 AND 14 ORDER BY id") == [
+            (2,), (3,), (4,)
+        ]
+
+    def test_range_excludes_all_duplicate_boundary_values(self, db):
+        """边界值的 RID 不能让它"漏"进结果。"""
+        db.execute_one("CREATE TABLE t (age INT)")
+        db.execute_one("CREATE INDEX idx_age ON t (age)")
+        db.execute_one("INSERT INTO t VALUES (30), (30), (30), (31)")
+        assert rows(db, "SELECT COUNT(*) FROM t WHERE age > 30") == [(1,)]
+        assert rows(db, "SELECT COUNT(*) FROM t WHERE age >= 30") == [(4,)]
+        assert rows(db, "SELECT COUNT(*) FROM t WHERE age < 31") == [(3,)]
+
+    def test_range_on_text_index(self, db):
+        setup_users(db)
+        db.execute_one("CREATE INDEX idx_name ON users (name)")
+        assert rows(db, "SELECT id FROM users WHERE name > 'b' ORDER BY id") == [
+            (2,), (3,)
+        ]
+        assert rows(db, "SELECT id FROM users WHERE name <= 'b' ORDER BY id") == [(1,)]
+
+    def test_range_without_index_falls_back(self, db):
+        setup_users(db)
+        plan = "\n".join(r[0] for r in rows(db, "EXPLAIN SELECT id FROM users WHERE age > 30"))
+        assert "SeqScan" in plan
+        assert rows(db, "SELECT id FROM users WHERE age > 30") == [(3,)]
+
+
 class TestUpdateDelete:
     def test_update_all(self, db):
         setup_users(db)

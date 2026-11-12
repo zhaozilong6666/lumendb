@@ -754,6 +754,53 @@ class BPlusTree:
             if page is not None:
                 self._bp.unpin(page.page_id)
 
+    def scan_range(
+        self,
+        width: int,
+        low: Optional[tuple] = None,
+        high: Optional[tuple] = None,
+        low_inclusive: bool = True,
+        high_inclusive: bool = True,
+    ) -> Iterator[Tuple[tuple, RID]]:
+        """按"索引列前缀"做范围扫描。
+
+        边界只比较前 ``width`` 个索引列，忽略 KeyCodec 自动追加的 RID。
+        否则 ``col > 10`` 会把 RID 更大的 ``(10, ...)`` 也当成大于边界，
+        结果里混进边界值本身。
+        """
+        if self.root_page == INVALID_PAGE_ID:
+            return
+        page = self._descend(low) if low is not None else self._leftmost_leaf()
+        try:
+            start = self._leaf_bisect(page, low) if low is not None else 0
+            while True:
+                n = self._nkeys(page)
+                for i in range(start, n):
+                    k, rid, _ = self._leaf_key_at(page, i)
+                    prefix = k[:width]
+                    if low is not None:
+                        if prefix < low:
+                            continue
+                        if not low_inclusive and prefix == low:
+                            continue
+                    if high is not None:
+                        if prefix > high:
+                            return
+                        if not high_inclusive and prefix == high:
+                            return
+                    yield k, rid
+                next_id = page.next_page
+                if next_id == INVALID_PAGE_ID:
+                    return
+                current = page
+                page = None
+                self._bp.unpin(current.page_id)
+                page = self._bp.fetch_page(next_id)
+                start = 0
+        finally:
+            if page is not None:
+                self._bp.unpin(page.page_id)
+
     def scan_all(self, txn: Transaction) -> Iterator[Tuple[tuple, RID]]:
         if self.root_page == INVALID_PAGE_ID:
             return
