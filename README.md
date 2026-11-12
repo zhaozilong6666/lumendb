@@ -1,5 +1,9 @@
 # LumenDB
 
+[![CI](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 > A relational database engine written from scratch in Python —— slotted pages, B+tree indexes, WAL crash recovery, MVCC snapshot isolation, rule-based index selection, and a PostgreSQL wire-compatible server you can connect to with `psql`.
 
 LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任何第三方数据库组件，也没有把工作外包给 SQLite——SQL 解析、查询优化、执行算子、页式存储、B+ 树索引、预写日志、崩溃恢复、并发控制，全部是项目自己实现的代码。
@@ -61,6 +65,9 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 无需任何第三方依赖，只需要 Python 3.12+。
 
 ```bash
+git clone https://github.com/zhaozilong6666/lumendb.git
+cd lumendb
+
 # 交互式 shell
 python -m lumendb shell --path ./mydb
 
