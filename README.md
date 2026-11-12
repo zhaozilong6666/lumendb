@@ -91,8 +91,16 @@ ROLLBACK;
 也可以用内置 REPL：
 
 ```bash
-python -m lumendb shell --data ./mydb
+python -m lumendb shell --path ./mydb
 ```
+
+想一次性看完整个链路（建表、索引、连接、聚合、更新、重开校验），跑：
+
+```bash
+python examples/demo.py
+```
+
+它会打印每一步的真实输出，包括 `EXPLAIN` 里命中的索引名。
 
 ## SQL 支持
 
@@ -115,7 +123,7 @@ python -m lumendb shell --data ./mydb
 `bench/run.py` 是可复现的脚本，所有数字由它实测产生（不是手写）。
 
 ```bash
-python -m bench.run --rows 5000
+python -m bench.run --rows 2000
 ```
 
 <!-- BENCH_TABLE_START -->
@@ -142,6 +150,15 @@ python -m bench.run --rows 5000
   查询更能看出索引的实际收益。
 - 扫描与聚合是纯内存操作，吞吐在 4.5 万行/秒量级，符合 Python 的预期。
 <!-- BENCH_TABLE_END -->
+
+## 怎么验证它真的能跑
+
+- **389 个自动化测试**（`python -m pytest tests -q`，约 11 秒），覆盖页格式、WAL 与恢复、
+  B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
+- **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
+  重启后分别校验"已提交必须存活、未提交必须回滚"；
+- **基准数字由脚本产出**，README 里没有手写性能；
+- CI 在 Ubuntu / Windows × Python 3.12 / 3.13 上跑全量测试 + CLI 冒烟。
 
 ## 开发
 
