@@ -65,10 +65,6 @@ class TestCreateTable:
             parse_statement("CREATE TABLE t (a INT REFERENCES other(id))")
         assert "外键" in str(exc.value)
 
-    def test_alter_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("ALTER TABLE t ADD COLUMN x INT")
-
     def test_create_view_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement("CREATE VIEW v AS SELECT 1")
@@ -413,6 +409,22 @@ class TestCompoundSelect:
     def test_except_still_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement("SELECT 1 EXCEPT SELECT 2")
+
+
+class TestAlterTable:
+    def test_add_column(self):
+        stmt = parse_statement("ALTER TABLE users ADD COLUMN age INT DEFAULT 18")
+        assert stmt.table == "users"
+        assert stmt.column.name == "age"
+        assert stmt.column.default is not None
+
+    def test_add_column_without_column_keyword(self):
+        stmt = parse_statement("ALTER TABLE users ADD age INT")
+        assert stmt.column.name == "age"
+
+    def test_primary_key_rejected(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement("ALTER TABLE users ADD COLUMN id INT PRIMARY KEY")
 
 
 class TestMultipleStatements:

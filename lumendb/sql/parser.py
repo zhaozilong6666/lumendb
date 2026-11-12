@@ -53,6 +53,7 @@ from .ast import (
     Update,
     Vacuum,
     Truncate,
+    AlterTableAddColumn,
 )
 from .lexer import RESERVED, Token, tokenize
 
@@ -177,11 +178,7 @@ class Parser:
         if kw == "DROP":
             return self._parse_drop()
         if kw == "ALTER":
-            raise NotSupportedError(
-                "ALTER TABLE 尚未实现",
-                detail="当前只支持建表时定义列",
-                hint="可以 DROP TABLE 后重建，或用新表名 + INSERT ... SELECT 迁移",
-            )
+            return self._parse_alter_table()
         if kw == "WITH":
             raise NotSupportedError(
                 "公共表表达式（CTE）尚未实现",
@@ -259,6 +256,20 @@ class Parser:
         if self._match_kw("VIEW", "TRIGGER", "PROCEDURE"):
             raise NotSupportedError("视图 / 触发器 / 存储过程尚未实现")
         raise self._error("CREATE 之后期望 TABLE 或 INDEX")
+
+    def _parse_alter_table(self) -> AlterTableAddColumn:
+        self._expect_kw("ALTER")
+        self._expect_kw("TABLE")
+        table = self._parse_ident("表名")
+        self._expect_kw("ADD")
+        self._match_kw("COLUMN")
+        column = self._parse_column_def()
+        if column.primary_key or column.unique:
+            raise NotSupportedError(
+                "ALTER TABLE ADD COLUMN 暂不支持主键或唯一约束",
+                hint="先加普通列，再 CREATE UNIQUE INDEX",
+            )
+        return AlterTableAddColumn(table=table, column=column)
 
     def _parse_create_table(self) -> CreateTable:
         if_not_exists = False

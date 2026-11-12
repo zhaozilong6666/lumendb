@@ -185,7 +185,7 @@ class HeapFile:
         raw = page.get_record(slot)
         if raw is None:
             return None
-        return decode_record(self.table.columns, raw)
+        return decode_record(self.table.columns, raw, allow_missing=True)
 
     def _read_rid(self, rid: RID) -> Optional[Tuple[HeapPage, DecodedRecord]]:
         """读取物理版本，返回仍处于 pin 状态的页。调用方负责 unpin。

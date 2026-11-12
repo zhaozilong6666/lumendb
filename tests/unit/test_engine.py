@@ -733,6 +733,57 @@ class TestJoin:
         ) == [(1, "b1", "c1"), (3, "b3", "c3")]
 
 
+class TestAlterTable:
+    def test_add_column_with_default_pads_old_rows(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("ALTER TABLE t ADD COLUMN age INT DEFAULT 18")
+        assert rows(db, "SELECT id, name, age FROM t ORDER BY id") == [
+            (1, "a", 18), (2, "b", 18)
+        ]
+        db.execute_one("INSERT INTO t (id, name) VALUES (3, 'c')")
+        assert rows(db, "SELECT age FROM t WHERE id = 3") == [(18,)]
+
+    def test_add_nullable_column_pads_null(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ALTER TABLE t ADD COLUMN note TEXT")
+        assert rows(db, "SELECT id, note FROM t") == [(1, None)]
+
+    def test_old_rows_can_be_updated_and_indexed(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("ALTER TABLE t ADD COLUMN age INT DEFAULT 10")
+        db.execute_one("UPDATE t SET age = 20 WHERE id = 2")
+        db.execute_one("CREATE INDEX idx_age ON t (age)")
+        assert rows(db, "SELECT id FROM t WHERE age = 10 ORDER BY id") == [(1,)]
+        assert rows(db, "SELECT id FROM t WHERE age = 20 ORDER BY id") == [(2,)]
+
+    def test_duplicate_column_rejected(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        with pytest.raises(Exception):
+            db.execute_one("ALTER TABLE t ADD COLUMN id INT")
+
+    def test_not_null_without_default_rejected(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t ADD COLUMN age INT NOT NULL")
+
+    def test_survives_reopen(self, tmp_path):
+        path = tmp_path / "alter_db"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a')")
+        db.execute_one("ALTER TABLE t ADD COLUMN age INT DEFAULT 7")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT id, name, age FROM t") == [(1, "a", 7)]
+        db2.execute_one("VACUUM")
+        assert rows(db2, "SELECT age FROM t") == [(7,)]
+        db2.close()
+
+
 class TestUnion:
     def test_union_all_keeps_duplicates(self, db):
         assert rows(db, "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 2") == [
@@ -925,7 +976,7 @@ class TestErrorQuality:
 
     def test_unsupported_syntax(self, db):
         with pytest.raises(NotSupportedError):
-            db.execute_one("ALTER TABLE t ADD COLUMN x INT")
+            db.execute_one("WITH x AS (SELECT 1) SELECT * FROM x")
 
     def test_keyword_as_name_rejected(self, db):
         with pytest.raises(Exception):

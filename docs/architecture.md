@@ -77,6 +77,17 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 扫描会跳过。没有 autovacuum、没有增量回收、没有 oldest-xmin 水位——
 一旦放开并发事务，这些就是下一件必须做的事，写在 `docs/sql-support.md` 里。
 
+### 2.7 加列与旧记录
+
+`ALTER TABLE ... ADD COLUMN` **不重写堆页**：目录里追加列定义并持久化，旧记录的
+`ncols` 仍是旧值。`decode_record(..., allow_missing=True)` 在读取时按新列的
+`DEFAULT`（没有默认值就是 `NULL`）补齐尾部；`UPDATE` / `VACUUM` 把该行重新编码时
+才会写成包含新列的完整格式。
+
+这样做的好处是 DDL 是 O(1)，不需要停机搬表；代价是"同一张表里新旧两种行格式
+共存"，解码路径必须显式知道缺列是合法的。`ALTER TABLE` 的其它动作（删列、改类型、
+重命名）需要真正的行格式迁移，未实现。
+
 ## 3. SQL 与计划
 
 ### 3.1 解析

@@ -60,6 +60,10 @@
 +..  列数据，按 schema 顺序、紧凑排列
 ```
 
+`ncols` 是**写入时的列数**。`ALTER TABLE ADD COLUMN` 之后，目录里的列数可能
+比旧记录的 `ncols` 多；解码时缺失的尾列按该列的 `DEFAULT`（没有默认值则
+`NULL`）补齐，`UPDATE` / `VACUUM` 会把它重写成新格式。
+
 `root_page/root_slot` 与 `newest_page/newest_slot` 是"版本链"的核心：
 
 - 索引里存的是**根 RID**，它在行的整个生命周期内不变；

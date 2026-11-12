@@ -331,6 +331,12 @@ class CreateIndex(Statement):
 
 
 @dataclass
+class AlterTableAddColumn(Statement):
+    table: str
+    column: ColumnDef
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
@@ -442,6 +448,7 @@ __all__ = [
     "CreateTable",
     "DropTable",
     "CreateIndex",
+    "AlterTableAddColumn",
     "DropIndex",
     "Insert",
     "Update",

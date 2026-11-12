@@ -187,28 +187,43 @@ def decode_header(data: bytes) -> RecordHeader:
     return RecordHeader(*fields)
 
 
-def decode_record(columns: Sequence, data: bytes) -> DecodedRecord:
+def decode_record(
+    columns: Sequence,
+    data: bytes,
+    *,
+    allow_missing: bool = False,
+) -> DecodedRecord:
     header = decode_header(data)
     ncols = len(columns)
-    if header.ncols != ncols:
+    if header.ncols > ncols:
+        raise CorruptedPageError(
+            "记录的列数比表定义多",
+            detail=f"record ncols={header.ncols} schema ncols={ncols}",
+        )
+    if header.ncols < ncols and not allow_missing:
         raise CorruptedPageError(
             "记录的列数与表定义不一致",
             detail=f"record ncols={header.ncols} schema ncols={ncols}",
             hint="表结构在不支持 ALTER TABLE 的情况下被改动过",
         )
 
-    bm_bytes = null_bitmap_size(ncols)
+    stored = header.ncols
+    bm_bytes = null_bitmap_size(stored)
     pos = HEADER_SIZE
     bitmap = data[pos : pos + bm_bytes]
     pos += bm_bytes
 
     values: list[Any] = []
-    for i, col in enumerate(columns):
+    for i in range(stored):
+        col = columns[i]
         if bitmap[i // 8] & (1 << (i % 8)):
             values.append(None)
             continue
         v, pos = decode_value(col.type, data, pos)
         values.append(v)
+    # ALTER TABLE ADD COLUMN 之后的旧记录没有新列：按默认值补齐
+    for i in range(stored, ncols):
+        values.append(columns[i].default)
 
     return DecodedRecord(header=header, values=values, size=len(data))
 

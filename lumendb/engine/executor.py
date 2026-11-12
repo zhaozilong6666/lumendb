@@ -25,6 +25,7 @@ from ..errors import (
     TypeMismatchError,
 )
 from ..sql.ast import (
+    AlterTableAddColumn,
     CreateIndex,
     CreateTable,
     Delete,
@@ -127,6 +128,8 @@ class Executor:
                 return self._delete(stmt, txn)
             if isinstance(stmt, CreateTable):
                 return self._create_table(stmt, txn)
+            if isinstance(stmt, AlterTableAddColumn):
+                return self._alter_add_column(stmt, txn)
             if isinstance(stmt, DropTable):
                 return self._drop_table(stmt, txn)
             if isinstance(stmt, CreateIndex):
@@ -444,6 +447,31 @@ class Executor:
             )
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
+
+    def _alter_add_column(self, stmt: AlterTableAddColumn, txn: Transaction) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        name = stmt.column.name.lower()
+        if table.has_column(name):
+            raise BinderError(
+                f"列 {name!r} 已存在",
+                hint="换一个列名，或先 DROP TABLE 重建",
+            )
+        column = _to_column(stmt.column)
+        if not column.nullable and column.default is None:
+            raise NotSupportedError(
+                "ADD COLUMN NOT NULL 需要提供 DEFAULT",
+                hint="已有行没有这个列的值；先加可空列，再 UPDATE 后改约束",
+            )
+        table.columns.append(column)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            tag="ALTER TABLE",
+            notice=(
+                f"已添加列 {name}；旧记录在读取时按默认值补齐，"
+                "不重写堆页"
+            ),
+        )
 
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:
         for name in stmt.names:
@@ -888,13 +916,32 @@ def _describe_plan(
 
 def _to_column(col_def):
     from ..catalog.schema import Column
+    from ..sql.ast import Literal
+
+    default = None
+    if col_def.default is not None:
+        if not isinstance(col_def.default, Literal):
+            raise NotSupportedError(
+                "DEFAULT 目前只支持字面常量",
+                hint="默认值不能引用列或函数",
+            )
+        value = col_def.default.value
+        if value is not None:
+            try:
+                value = col_def.type.coerce(value)
+            except ValueError as exc:
+                raise TypeMismatchError(
+                    f"列 {col_def.name} 的默认值类型不匹配",
+                    detail=str(exc),
+                ) from exc
+        default = value
 
     return Column(
         name=col_def.name.lower(),
         type=col_def.type,
         nullable=col_def.nullable,
         primary_key=col_def.primary_key,
-        default=None,
+        default=default,
     )
 
 
