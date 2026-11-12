@@ -486,6 +486,30 @@ class HeapFile:
         self._bp.log_page_update(txn.xid, page, 0, old, new)
         self._bp.mark_dirty(page)
 
+    def truncate(self, txn: Transaction) -> int:
+        """清空整表：页链保留，每一页重置为空堆页。
+
+        比"逐行 DELETE + VACUUM"便宜得多：只需要按页写整页日志，代价与行数无关。
+        索引由调用方重建（执行器的 ``TRUNCATE`` 会做），返回清空前的行数估计。
+        """
+        txn.require_active()
+        removed = self.table.row_count_hint
+        page_id = self.table.root_page
+        while page_id != INVALID_PAGE_ID:
+            page = self._fetch(page_id)
+            next_id, prev_id = page.next_page, page.prev_page
+            try:
+                old = bytes(page.buf)
+                page.init_heap(page_id)
+                page.next_page = next_id
+                page.prev_page = prev_id
+                self._log_page_image(txn, page, old)
+            finally:
+                self._release(page, dirty=True)
+            page_id = next_id
+        self.table.row_count_hint = 0
+        return removed
+
 
 def _record_u64(page: HeapPage, slot: int, rel: int) -> int:
     entry_off = 32 + 4 * slot

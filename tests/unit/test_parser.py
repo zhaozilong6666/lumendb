@@ -20,6 +20,8 @@ from lumendb.sql.ast import (
     Star,
     UnaryOp,
     Vacuum,
+    Truncate,
+    Insert,
     ColumnRef,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
@@ -308,6 +310,35 @@ class TestMaintenance:
     def test_vacuum_all_tables(self):
         assert isinstance(parse_statement("VACUUM"), Vacuum)
         assert parse_statement("VACUUM").table is None
+
+    def test_truncate_with_table_keyword(self):
+        stmt = parse_statement("TRUNCATE TABLE users")
+        assert isinstance(stmt, Truncate)
+        assert stmt.table == "users"
+
+    def test_truncate_without_table_keyword(self):
+        assert parse_statement("TRUNCATE users").table == "users"
+
+
+class TestInsertConflict:
+    def test_on_conflict_do_nothing(self):
+        stmt = parse_statement(
+            "INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING"
+        )
+        assert isinstance(stmt, Insert)
+        assert stmt.on_conflict_nothing is True
+
+    def test_conflict_columns_accepted(self):
+        stmt = parse_statement(
+            "INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING"
+        )
+        assert stmt.on_conflict_nothing is True
+
+    def test_do_update_not_supported(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 2"
+            )
 
 
 class TestParameters:

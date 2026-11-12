@@ -34,6 +34,7 @@ from ..sql.ast import (
     Query,
     Reindex,
     Vacuum,
+    Truncate,
     ShowTables,
     Statement,
     Update,
@@ -131,6 +132,8 @@ class Executor:
                 return self._reindex(stmt, txn)
             if isinstance(stmt, Vacuum):
                 return self._vacuum(stmt, txn)
+            if isinstance(stmt, Truncate):
+                return self._truncate(stmt, txn)
             if isinstance(stmt, ShowTables):
                 return self._show_tables()
             if isinstance(stmt, Explain):
@@ -450,6 +453,19 @@ class Executor:
             ),
         )
 
+    def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
+        """清空整表：页链保留但每一页重置为空页，索引随之重建为空。"""
+        table = self._catalog.get_table(stmt.table)
+        heap = HeapFile(self._bp, table, self._txns)
+        removed = heap.truncate(txn)
+        self._rebuild_indexes(table, txn)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            affected=removed,
+            tag=f"TRUNCATE TABLE ({removed} rows removed)",
+        )
+
     def _show_tables(self) -> Result:
         rows = [
             (t.name, len(t.columns), t.row_count_hint)
@@ -500,7 +516,15 @@ class Executor:
                 values.append(fn(EvalContext(())))
 
             prepared = self._prepare_values(table, stmt.columns, values)
-            self._check_constraints(table, prepared, txn)
+            self._check_constraints(
+                table, prepared, txn, skip_unique=stmt.on_conflict_nothing
+            )
+
+            if stmt.on_conflict_nothing and self._has_unique_conflict(
+                table, prepared, txn
+            ):
+                # 先查再写：这样跳过冲突行不会在堆里留下一条死版本
+                continue
 
             rid = heap.insert(txn, prepared)
             for idx in table.indexes.values():
@@ -515,6 +539,18 @@ class Executor:
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
         return Result(affected=count, tag=f"INSERT {count}")
+
+    def _has_unique_conflict(self, table, values, txn: Transaction) -> bool:
+        """ON CONFLICT DO NOTHING 的前置检查：任一唯一索引上已有同样的键。"""
+        for idx in table.indexes.values():
+            if not idx.unique:
+                continue
+            key = self._key_for(table, idx, values)
+            if key is None:
+                continue
+            if self._tree_for(table, idx).lookup_one(txn, key) is not None:
+                return True
+        return False
 
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
@@ -645,8 +681,17 @@ class Executor:
         return prepared
 
     def _check_constraints(
-        self, table: TableDef, values: list[Any], txn: Transaction
+        self,
+        table: TableDef,
+        values: list[Any],
+        txn: Transaction,
+        *,
+        skip_unique: bool = False,
     ) -> None:
+        if skip_unique:
+            # ON CONFLICT DO NOTHING：唯一冲突由调用方判断并跳过，
+            # 但 NOT NULL 之类的约束仍然必须报错。
+            return
         for idx in table.indexes.values():
             if not idx.unique:
                 continue

@@ -51,6 +51,7 @@ from .ast import (
     UnaryOp,
     Update,
     Vacuum,
+    Truncate,
 )
 from .lexer import RESERVED, Token, tokenize
 
@@ -232,6 +233,10 @@ class Parser:
             if self._cur.kind == "ident":
                 table = self._parse_ident("表名")
             return Vacuum(table)
+        if kw == "TRUNCATE":
+            self._advance()
+            self._match_kw("TABLE")
+            return Truncate(self._parse_ident("表名"))
         raise self._error(
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "
@@ -385,7 +390,29 @@ class Parser:
             rows.append(row)
             if not self._match_punct("comma"):
                 break
-        return Insert(table=table, columns=columns, rows=rows)
+
+        on_conflict_nothing = False
+        if self._match_kw("ON"):
+            self._expect_kw("CONFLICT")
+            if self._match_punct("lparen"):
+                self._parse_ident("列名")
+                while self._match_punct("comma"):
+                    self._parse_ident("列名")
+                self._expect_punct("rparen", ")")
+            self._expect_kw("DO")
+            if self._match_kw("NOTHING"):
+                on_conflict_nothing = True
+            else:
+                raise NotSupportedError(
+                    "ON CONFLICT DO UPDATE 尚未实现",
+                    hint="当前只支持 ON CONFLICT DO NOTHING",
+                )
+        return Insert(
+            table=table,
+            columns=columns,
+            rows=rows,
+            on_conflict_nothing=on_conflict_nothing,
+        )
 
     def _parse_update(self) -> Update:
         self._expect_kw("UPDATE")
@@ -618,7 +645,7 @@ class Parser:
 
     def _parse_additive(self):
         left = self._parse_multiplicative()
-        while self._cur.is_op("+", "-"):
+        while self._cur.is_op("+", "-", "||"):
             op = self._advance().value
             left = BinaryOp(op, left, self._parse_multiplicative())
         return left

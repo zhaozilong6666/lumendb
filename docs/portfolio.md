@@ -50,10 +50,10 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 406 automated tests including crash-injection; CI matrix covers
+> - 468 automated tests including crash-injection; CI matrix covers
 >   Ubuntu/Windows × Python 3.12/3.13.
 
-## 五个可深挖的点（面试主力）
+## 六个可深挖的点（面试主力）
 
 ### 1. 为什么用物理日志（page-level redo）而不是逻辑日志
 
@@ -87,7 +87,21 @@
 显示 scan 调用次数远超行数——这个 bug 只在跨页时出现，小数据量的单测
 永远测不到。
 
-### 4. 为什么系统目录存在数据文件里，而不是单独的 JSON 文件
+### 5. 一个"看起来支持、其实没接线"的 HAVING bug
+
+最危险的一类 bug 不是崩溃，而是**功能静默失效**：解析器认识 `HAVING`，绑定器
+会编译它，`docs/sql-support.md` 也写着支持——但执行计划里根本没有这个过滤节点，
+`HAVING SUM(v) > 30` 会把所有分组原样返回。
+
+它之所以长期没被发现，是因为原来的测试数据让每个分组都满足条件：
+`(1,10),(1,20),(2,30)` 两组 `SUM(v)` 都是 30，`> 25` 恒真。测试通过，功能是假的。
+修的时候把数据改成 `(2,30),(2,1)`，让一组满足、一组不满足，测试才真正有判别力。
+
+现在 `HAVING` 被编译成 `Aggregate` 之上的 `Filter`；同时 `GROUP BY` 支持任意
+表达式，SELECT 里的同形表达式会被改写成对分组键的引用。这件事的教训是：
+**测试用例必须能让错误实现失败**，否则它只是给"已经写了代码"盖章。
+
+### 6. 为什么系统目录存在数据文件里，而不是单独的 JSON 文件
 
 如果目录是外部文件，它和数据页就无法"一起"崩溃或一起回滚：DDL 提交到
 一半进程被杀，可能出现"目录里有这张表，但数据页没建"。把目录编码成 JSON
@@ -97,7 +111,7 @@ WAL 与事务机制，原子性由已有的基础设施保证。
 代价是每次 DDL 都要重写整条目录链（目录小，可接受），而且目录加载要
 处理"页尾填充零字节"这类细节（踩过：直接 `json.loads` 会报 `Extra data`）。
 
-### 5. 为什么选 PostgreSQL 协议而不是自己写个 HTTP 接口
+### 7. 为什么选 PostgreSQL 协议而不是自己写个 HTTP 接口
 
 因为"能直接用 `psql` 连上"是一个无法伪造的验收标准：握手字节、类型 OID、
 `RowDescription` 的字段顺序、`ReadyForQuery` 的事务状态，任何一处不对，

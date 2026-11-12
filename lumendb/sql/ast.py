@@ -330,6 +330,8 @@ class Insert(Statement):
     table: str
     columns: Optional[list[str]]
     rows: list[list[Expr]]
+    #: ``ON CONFLICT DO NOTHING``：唯一键冲突时跳过该行而不是报错
+    on_conflict_nothing: bool = False
 
 
 @dataclass
@@ -394,6 +396,13 @@ class Vacuum(Statement):
     table: Optional[str] = None
 
 
+@dataclass
+class Truncate(Statement):
+    """``TRUNCATE [TABLE] name``：清空整表并重建索引。"""
+
+    table: str
+
+
 __all__ = [
     "Expr",
     "Literal",
@@ -433,5 +442,6 @@ __all__ = [
     "Checkpoint",
     "Reindex",
     "Vacuum",
+    "Truncate",
     "render_expr",
 ]

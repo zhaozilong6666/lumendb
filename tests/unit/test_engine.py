@@ -130,6 +130,63 @@ class TestVacuum:
             db.execute_one("VACUUM nope")
 
 
+class TestOnConflict:
+    def test_do_nothing_skips_duplicate(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users VALUES (1, 'dup', 9) ON CONFLICT DO NOTHING"
+        )
+        assert result.affected == 0
+        assert rows(db, "SELECT name FROM users WHERE id = 1") == [("alice",)]
+
+    def test_do_nothing_mixed_rows(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users VALUES (4, 'dave', 20), (1, 'dup', 1) "
+            "ON CONFLICT DO NOTHING"
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT id FROM users ORDER BY id") == [(1,), (2,), (3,), (4,)]
+
+    def test_do_nothing_leaves_no_dead_version(self, db):
+        setup_users(db)
+        db.execute_one("VACUUM users")
+        db.execute_one("INSERT INTO users VALUES (1, 'dup', 1) ON CONFLICT DO NOTHING")
+        result = db.execute_one("VACUUM users")
+        assert "0 versions reclaimed" in result.tag
+
+    def test_without_clause_still_errors(self, db):
+        setup_users(db)
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO users VALUES (1, 'dup', 1)")
+
+
+class TestTruncate:
+    def test_truncate_clears_rows_and_indexes(self, db):
+        setup_users(db)
+        result = db.execute_one("TRUNCATE TABLE users")
+        assert result.affected == 3
+        assert rows(db, "SELECT id FROM users") == []
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT name FROM users WHERE id = 1")
+        )
+        assert "IndexScan" in plan
+        assert rows(db, "SELECT name FROM users WHERE id = 1") == []
+        # 唯一索引已清空，同一个主键可以重新插入
+        db.execute_one("INSERT INTO users VALUES (1, 'new', 1)")
+        assert rows(db, "SELECT name FROM users WHERE id = 1") == [("new",)]
+
+    def test_truncate_without_table_keyword(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (2)")
+        assert db.execute_one("TRUNCATE t").affected == 2
+        assert rows(db, "SELECT a FROM t") == []
+
+    def test_truncate_unknown_table(self, db):
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("TRUNCATE nope")
+
+
 class TestDdl:
     def test_create_and_show(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
@@ -336,10 +393,46 @@ class TestAggregate:
         db.execute_one("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)")
         assert rows(db, "SELECT k, SUM(v) FROM t GROUP BY k ORDER BY k") == [(1, 30), (2, 30)]
 
-    def test_having(self, db):
+    def test_having_filters_groups(self, db):
         db.execute_one("CREATE TABLE t (k INT, v INT)")
-        db.execute_one("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)")
-        assert rows(db, "SELECT k FROM t GROUP BY k HAVING SUM(v) > 25 ORDER BY k") == [(1,), (2,)]
+        db.execute_one("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30), (2, 1)")
+        assert rows(db, "SELECT k FROM t GROUP BY k HAVING SUM(v) > 30 ORDER BY k") == [(2,)]
+        assert rows(db, "SELECT k FROM t GROUP BY k HAVING COUNT(*) > 5") == []
+
+    def test_group_by_expression(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (2), (3), (4), (5), (6)")
+        assert rows(
+            db, "SELECT id % 2, COUNT(*) FROM t GROUP BY id % 2 ORDER BY id % 2"
+        ) == [(0, 3), (1, 3)]
+        # 别名可以用于 ORDER BY，分组表达式按同形匹配
+        assert rows(
+            db,
+            "SELECT id % 2 AS parity, COUNT(*) AS n FROM t "
+            "GROUP BY id % 2 ORDER BY parity DESC",
+        ) == [(1, 3), (0, 3)]
+
+    def test_group_by_expression_in_having(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        assert rows(
+            db,
+            "SELECT id % 2 FROM t GROUP BY id % 2 HAVING COUNT(*) > 2",
+        ) == [(1,)]
+
+    def test_distinct_aggregates(self, db):
+        db.execute_one("CREATE TABLE t (v INT)")
+        db.execute_one("INSERT INTO t VALUES (10), (10), (20), (NULL)")
+        assert rows(
+            db, "SELECT COUNT(DISTINCT v), SUM(DISTINCT v), AVG(DISTINCT v) FROM t"
+        ) == [(2, 30, 15.0)]
+
+    def test_string_concat(self, db):
+        setup_users(db)
+        db.execute_one("UPDATE users SET name = name || '!' WHERE id = 1")
+        assert rows(db, "SELECT name FROM users WHERE id = 1") == [("alice!",)]
+        assert rows(db, "SELECT 'a' || 'b'") == [("ab",)]
+        assert rows(db, "SELECT 'a' || NULL") == [(None,)]
 
     def test_aggregate_on_empty_table(self, db):
         db.execute_one("CREATE TABLE t (a INT)")

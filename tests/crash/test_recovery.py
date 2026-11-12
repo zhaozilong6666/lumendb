@@ -104,6 +104,34 @@ class TestVacuumRecovery:
         h2.dm.close()
 
 
+class TestTruncateRecovery:
+    def test_truncate_page_images_replay(self, db_path):
+        h = open_db(db_path)
+        txn = h.txns.begin()
+        h.cat.create_table(txn, "t", columns())
+        heap = h.heap("t")
+        for i in range(20):
+            heap.insert(txn, [i, f"v{i}"])
+        h.cat.persist(txn)
+        h.txns.commit(txn)
+
+        txn = h.txns.begin()
+        removed = heap.truncate(txn)
+        h.cat.persist(txn)
+        h.txns.commit(txn)
+        assert removed == 20
+
+        crash(h)
+
+        h2 = open_db(db_path)
+        txn = h2.txns.begin()
+        assert list(h2.heap("t").scan(txn)) == []
+        h2.txns.commit(txn)
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+
 class TestCommittedSurvives:
     def test_committed_rows_survive_crash(self, db_path):
         h = open_db(db_path)

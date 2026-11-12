@@ -23,6 +23,7 @@ DROP INDEX idx_name;
 ```sql
 INSERT INTO t VALUES (1, 'a', 3), (2, 'b', 4);
 INSERT INTO t (id, name) VALUES (1, 'a');
+INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING;  -- 唯一键冲突时跳过该行
 UPDATE t SET age = age + 1 WHERE id = 1;
 DELETE FROM t WHERE age < 0;
 ```
@@ -34,15 +35,15 @@ SELECT [DISTINCT] expr [AS alias], ...
 FROM t [alias] [, t2 ...]
   [INNER | LEFT] JOIN t2 ON cond
 WHERE cond
-GROUP BY col [, col...]          -- 只接受列引用，表达式分组会明确报错
+GROUP BY expr [, expr...]        -- 列引用或任意标量表达式，同形表达式可直接用于 SELECT
 HAVING cond
 ORDER BY expr [ASC|DESC], ...
 LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
 ```
 
-聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`。
+聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
-表达式：`+ - * / %`、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
+表达式：`+ - * / %`、`||`（字符串拼接，`NULL` 传染）、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
 
 条件表达式（两种形式都支持）：
 
@@ -84,6 +85,7 @@ SHOW TABLES;
 CHECKPOINT;
 REINDEX table;   -- 按堆表当前内容重建该表所有索引
 VACUUM [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
+TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索引重建为空
 ```
 
 ## 明确不支持（会报 `NotSupportedError`）
@@ -100,8 +102,8 @@ VACUUM [table];  -- 回收死版本、压实堆页并重建索引；不带表名
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
-| **`GROUP BY <表达式>`** | 只接受列引用；表达式分组未实现 |
-| **`COUNT(DISTINCT x)` 等聚合去重** | 未实现；可用 `SELECT DISTINCT` 先降维 |
+| `ON CONFLICT DO UPDATE` / 指定冲突目标 | 只支持 `ON CONFLICT DO NOTHING`，且按"任意唯一索引冲突"跳过 |
+| `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
 | `VACUUM FULL` / 缩小数据文件 | 回收页内空间，但文件大小不缩，空页留在链上 |
@@ -114,6 +116,9 @@ VACUUM [table];  -- 回收死版本、压实堆页并重建索引；不带表名
 - `ORDER BY` 先按输出别名解析，解析不到再按输入列编译成隐藏列。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。
 - `LEFT JOIN` 的右侧无匹配时补 `NULL`。
+- `HAVING` 作用在聚合输出行上：分组键与聚合结果之外的原表列不可见。
+- `GROUP BY` 表达式按语法树同形匹配：`SELECT id % 2 ... GROUP BY id % 2` 合法；
+  `GROUP BY id % 2` 与 `GROUP BY id%2` 视为同一个表达式。
 - `COUNT(*)` 在没有 `GROUP BY` 且输入为空时返回 `0`，`SUM` 返回 `NULL`。
 - 除以 0 报错而不是返回 `NULL`。
 - `UPDATE` 的赋值表达式在**旧行**上求值（`SET a = a + 1` 语义正确）。

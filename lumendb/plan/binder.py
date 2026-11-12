@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -43,6 +44,7 @@ from ..sql.ast import (
     ParamRef,
     ScalarSubquery,
     Star,
+    render_expr,
     UnaryOp,
 )
 from .nodes import (
@@ -138,13 +140,14 @@ class AggSpec:
 
 
 class _Accumulator:
-    __slots__ = ("spec", "count", "total", "best")
+    __slots__ = ("spec", "count", "total", "best", "seen")
 
     def __init__(self, spec: AggSpec) -> None:
         self.spec = spec
         self.count = 0
         self.total: Any = None
         self.best: Any = None
+        self.seen: set[Any] = set()
 
     def update(self, ctx: EvalContext) -> None:
         kind = self.spec.kind
@@ -155,10 +158,11 @@ class _Accumulator:
         if value is None:
             return
         if self.spec.distinct:
-            raise NotSupportedError(
-                "聚合函数里的 DISTINCT 尚未实现",
-                hint="可以先用 SELECT DISTINCT 去重，或在应用层聚合",
-            )
+            # MIN/MAX 对重复值不敏感，但仍然去重一次也无害；主要收益在
+            # COUNT(DISTINCT x) / SUM(DISTINCT x) / AVG(DISTINCT x)。
+            if value in self.seen:
+                return
+            self.seen.add(value)
         if kind == "COUNT":
             self.count += 1
         elif kind == "SUM":
@@ -334,6 +338,16 @@ class Binder:
                     hint="用 CAST 显式转换后再比较",
                 )
             return _make_comparison(op, left_fn, right_fn, lt, rt), TypeSpec(DataType.BOOLEAN)
+
+        if op == "||":
+            # 字符串拼接：SQL 的 || 对 NULL 是"传染"的——任一侧为 NULL 结果就是 NULL
+            def _concat(ctx):
+                a, b = left_fn(ctx), right_fn(ctx)
+                if a is None or b is None:
+                    return None
+                return str(a) + str(b)
+
+            return _concat, TypeSpec(DataType.TEXT)
 
         if op in ("+", "-", "*", "/", "%"):
             if not lt.is_numeric or not rt.is_numeric:
@@ -653,8 +667,20 @@ class Binder:
             or any(_contains_aggregate(item.expr) for item in select.order_by)
         )
 
+        column_group: dict[int, str] = {}
+        expr_group: dict[str, str] = {}
         if has_agg:
-            node, out_schema = self._bind_aggregate(node, schema, select)
+            node, out_schema, (column_group, expr_group) = self._bind_aggregate(
+                node, schema, select
+            )
+            if select.having is not None:
+                having_expr = self._rewrite_group_refs(
+                    select.having, schema, column_group, expr_group
+                )
+                having_fn, _ = self.compile(having_expr, out_schema, allow_agg=True)
+                node = Filter(
+                    child=node, predicate=having_fn, columns=node.columns
+                )
         else:
             out_schema = schema
 
@@ -675,7 +701,13 @@ class Binder:
                     proj_cols.append(OutputColumn(col.name, col.type))
                 continue
 
-            fn, type_spec = self.compile(item.expr, out_schema, allow_agg=has_agg)
+            fn, type_spec = self.compile(
+                self._rewrite_group_refs(item.expr, schema, column_group, expr_group)
+                if has_agg
+                else item.expr,
+                out_schema,
+                allow_agg=has_agg,
+            )
             proj_fns.append(fn)
             name = item.alias
             if name is None:
@@ -698,7 +730,14 @@ class Binder:
                 if lowered in out_names:
                     index = out_names.index(lowered)
             if index is None:
-                fn, _ = self.compile(item.expr, out_schema, allow_agg=has_agg)
+                sort_expr = (
+                    self._rewrite_group_refs(
+                        item.expr, schema, column_group, expr_group
+                    )
+                    if has_agg
+                    else item.expr
+                )
+                fn, _ = self.compile(sort_expr, out_schema, allow_agg=has_agg)
                 extra_fns.append(fn)
                 index = len(proj_fns) + len(extra_fns) - 1
             sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))
@@ -851,19 +890,33 @@ class Binder:
             schema = merged
         return node, schema
 
-    def _bind_aggregate(self, child: PlanNode, schema: Schema, select) -> tuple[PlanNode, Schema]:
+    def _bind_aggregate(
+        self, child: PlanNode, schema: Schema, select
+    ) -> tuple[PlanNode, Schema, tuple[dict[int, str], dict[str, str]]]:
         group_fns: list[Callable[[EvalContext], Any]] = []
         group_cols: list[SchemaColumn] = []
-        for gexpr in select.group_by:
-            if not isinstance(gexpr, ColumnRef):
-                raise NotSupportedError(
-                    "GROUP BY 目前只支持列引用",
-                    hint="可以先把表达式放进子查询，再对结果分组",
-                )
-            index = schema.resolve(gexpr.table, gexpr.name)
-            col = schema.columns[index]
-            group_cols.append(col)
-            group_fns.append(lambda ctx, i=index: ctx.row[i])
+        group_labels: list[str] = []
+        # 分组的列 -> 聚合输出行里的物理下标；表达式 -> 合成列名。
+        # SELECT/HAVING/ORDER BY 里的同形表达式会被改写成对合成列的引用。
+        column_group: dict[int, str] = {}
+        expr_group: dict[str, str] = {}
+        for i, gexpr in enumerate(select.group_by):
+            synthetic = f"$g{i}"
+            if isinstance(gexpr, ColumnRef):
+                index = schema.resolve(gexpr.table, gexpr.name)
+                col = schema.columns[index]
+                group_cols.append(SchemaColumn(None, synthetic, col.type))
+                group_fns.append(lambda ctx, i=index: ctx.row[i])
+                group_labels.append(col.name)
+                column_group[index] = synthetic
+                expr_group.setdefault(col.name.lower(), synthetic)
+                expr_group.setdefault(render_expr(gexpr).lower(), synthetic)
+                continue
+            fn, spec = self.compile(gexpr, schema, allow_agg=False)
+            group_cols.append(SchemaColumn(None, synthetic, spec))
+            group_fns.append(fn)
+            group_labels.append(render_expr(gexpr))
+            expr_group[render_expr(gexpr).lower()] = synthetic
 
         # 第一遍：用原 schema 编译，触发聚合函数注册（结果丢弃）。
         # ORDER BY 里如果是 SELECT 的输出别名，在这里解析会失败（输入 schema
@@ -895,12 +948,68 @@ class Binder:
         agg_node = Aggregate(
             child=child,
             group_exprs=group_fns,
-            group_labels=[c.name for c in group_cols],
+            group_labels=group_labels,
             aggs=list(self.agg_specs),
             columns=[OutputColumn(c.name, c.type) for c in group_cols]
             + [OutputColumn(f"$agg{i}", s.result_type) for i, s in enumerate(self.agg_specs)],
         )
-        return agg_node, agg_schema
+        return agg_node, agg_schema, (column_group, expr_group)
+
+    def _rewrite_group_refs(
+        self,
+        expr: Expr,
+        base_schema: Schema,
+        column_group: dict[int, str],
+        expr_group: dict[str, str],
+    ) -> Expr:
+        """把 SELECT/HAVING/ORDER BY 里与 GROUP BY 同形的表达式换成合成列。
+
+        聚合输出行里只有分组键和聚合结果，原表的列已经不存在了；这一步
+        让 ``SELECT a % 2 ... GROUP BY a % 2`` 这类查询能按分组键读结果。
+        没有发生替换的子树原样返回，保证聚合函数对象还是同一个（聚合槽位
+        是按对象身份登记的）。
+        """
+        if isinstance(expr, ColumnRef):
+            try:
+                index = base_schema.resolve(expr.table, expr.name)
+            except (ColumnNotFoundError, AmbiguousColumnError):
+                index = None
+            if index is not None and index in column_group:
+                return ColumnRef(None, column_group[index])
+        key = render_expr(expr).lower()
+        if key in expr_group:
+            return ColumnRef(None, expr_group[key])
+        if not dataclasses.is_dataclass(expr):
+            return expr
+
+        changed = False
+        updates: dict[str, Any] = {}
+        for field in dataclasses.fields(expr):
+            value = getattr(expr, field.name)
+            if isinstance(value, Expr):
+                new = self._rewrite_group_refs(
+                    value, base_schema, column_group, expr_group
+                )
+                if new is not value:
+                    updates[field.name] = new
+                    changed = True
+            elif isinstance(value, list):
+                items = []
+                for item in value:
+                    if isinstance(item, Expr):
+                        new_item = self._rewrite_group_refs(
+                            item, base_schema, column_group, expr_group
+                        )
+                        if new_item is not item:
+                            changed = True
+                        items.append(new_item)
+                    else:
+                        items.append(item)
+                if changed:
+                    updates[field.name] = items
+        if not changed:
+            return expr
+        return dataclasses.replace(expr, **updates)
 
 
 # ---------------------------------------------------------------------------
