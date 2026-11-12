@@ -97,8 +97,8 @@ class IndexRange(PlanNode):
         right = "]" if self.high_inclusive else ")"
         return (
             f"IndexRangeScan {self.table} "
-            f"[{self.index_name}({', '.join(self.index_columns)}) "
-            f"{left}{lower}, {upper}{right}]"
+            f"[{self.index_name}({', '.join(self.index_columns)})] "
+            f"{left}{lower}, {upper}{right}"
         )
 
 

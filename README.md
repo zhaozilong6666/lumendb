@@ -138,7 +138,7 @@ psycopg2 都不会正常返回结果。
 | 表达式 | 算术、`\|\|` 拼接、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN` |
 | 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
 | 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，MVCC 快照隔离 |
-| 运维 | `EXPLAIN`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX`、`VACUUM`、`TRUNCATE` |
+| 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX`、`VACUUM`、`TRUNCATE` |
 
 未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
 
@@ -188,7 +188,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **497 个自动化测试**（`python -m pytest tests -q`，约 17 秒），覆盖页格式、WAL 与恢复、
+- **501 个自动化测试**（`python -m pytest tests -q`，约 17 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

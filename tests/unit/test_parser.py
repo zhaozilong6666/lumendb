@@ -377,6 +377,12 @@ class TestTransactions:
     def test_explain(self):
         stmt = parse_statement("EXPLAIN SELECT 1")
         assert stmt.statement.select is not None
+        assert stmt.analyze is False
+
+    def test_explain_analyze(self):
+        stmt = parse_statement("EXPLAIN ANALYZE SELECT 1")
+        assert stmt.analyze is True
+        assert stmt.statement.select is not None
 
     def test_show_tables(self):
         assert parse_statement("SHOW TABLES") is not None

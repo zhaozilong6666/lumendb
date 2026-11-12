@@ -370,6 +370,7 @@ class Rollback(Statement):
 @dataclass
 class Explain(Statement):
     statement: Statement
+    analyze: bool = False
 
 
 @dataclass

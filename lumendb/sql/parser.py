@@ -214,8 +214,9 @@ class Parser:
             return Rollback()
         if kw == "EXPLAIN":
             self._advance()
+            analyze = self._match_kw("ANALYZE") is not None
             inner = self._parse_statement()
-            return Explain(inner)
+            return Explain(inner, analyze=analyze)
         if kw == "SHOW":
             self._advance()
             self._expect_kw("TABLES")

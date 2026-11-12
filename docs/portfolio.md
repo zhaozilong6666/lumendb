@@ -24,10 +24,11 @@
 >   用"绕过缓冲池直接写数据页"的方式模拟断电，验证已提交数据存活、
 >   未提交数据回滚；
 > - 手写 SQL 词法分析器与递归下降解析器，把表达式编译成闭包以消除执行期的
->   名字解析开销；实现等值条件索引选择，`EXPLAIN` 输出真实执行路径；
+>   名字解析开销；等值和范围条件命中索引时生成索引计划，`EXPLAIN` 输出真实执行路径，
+>   `EXPLAIN ANALYZE` 给每个算子标注实际耗时、行数与循环次数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 406 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 501 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -45,12 +46,13 @@
 >   uncommitted ones roll back.
 > - Wrote the SQL lexer and recursive-descent parser by hand, and compile
 >   expressions into closures so name resolution is paid once at bind time.
->   Equality predicates on indexed columns become index scans; `EXPLAIN` reports
->   the plan that actually runs.
+>   Equality and range predicates on indexed columns become index scans;
+>   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
+>   annotates each operator with actual time, rows and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 497 automated tests including crash-injection and a 20-seed randomized
+> - 501 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -151,10 +153,11 @@ oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级�
 "abort 之后又 update 同一行"。
 
 **"为什么不做代价模型？"**
-因为没有统计信息（没有 `ANALYZE`），估算基数只能靠猜，做一个假的代价模型
+因为没有表统计信息（不支持独立的 `ANALYZE` 统计），估算基数只能靠猜，做一个假的代价模型
 不如不做。当前只有两条规则：单表等值 + 有索引 → 索引查找；单列范围条件
 （`>`/`>=`/`<`/`<=`/`BETWEEN`）→ B+ 树范围扫描。`EXPLAIN` 输出的是真实计划，
-不是理想计划。范围扫描按索引列前缀比较，忽略键尾自动追加的 RID——否则
+不是理想计划；`EXPLAIN ANALYZE` 再把每个算子的实际耗时、行数、循环次数打出来。
+范围扫描按索引列前缀比较，忽略键尾自动追加的 RID——否则
 `age > 30` 会把 `(30, rid)` 当成大于边界，把 30 本身也扫出来。
 
 **"性能怎么样？"**

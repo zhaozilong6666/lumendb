@@ -81,6 +81,7 @@ SELECT * FROM t ORDER BY id LIMIT $1;
 BEGIN;  START TRANSACTION;
 COMMIT; ROLLBACK;
 EXPLAIN <query>;
+EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
 CHECKPOINT;
 REINDEX table;   -- 按堆表当前内容重建该表所有索引

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
@@ -95,6 +96,8 @@ class Executor:
         self._wal = wal
         self._disk = disk if disk is not None else getattr(buffer_pool, "disk", None)
         self._txn: Optional[Transaction] = None
+        #: EXPLAIN ANALYZE 期间按节点累计的执行统计
+        self._profile: Optional[dict[int, list]] = None
         #: 当前语句的 ``$n`` 绑定值；run() 每次覆盖，子查询 binder 共享
         self._params: list[Any] = []
         self.binder = self._new_binder()
@@ -186,6 +189,29 @@ class Executor:
     # -- 计划执行 -------------------------------------------------------
 
     def _execute(self, node: PlanNode, txn: Transaction) -> Iterator[tuple]:
+        if self._profile is None:
+            yield from self._execute_inner(node, txn)
+            return
+        start = time.perf_counter()
+        rows = 0
+        try:
+            for row in self._execute_inner(node, txn):
+                rows += 1
+                yield row
+        finally:
+            entry = self._profile.get(id(node))
+            if entry is None:
+                self._profile[id(node)] = [
+                    time.perf_counter() - start,
+                    1,
+                    rows,
+                ]
+            else:
+                entry[0] += time.perf_counter() - start
+                entry[1] += 1
+                entry[2] += rows
+
+    def _execute_inner(self, node: PlanNode, txn: Transaction) -> Iterator[tuple]:
         if isinstance(node, Values):
             yield from node.rows
             return
@@ -510,7 +536,24 @@ class Executor:
         inner = stmt.statement
         if isinstance(inner, Query):
             plan, cols = self.binder.bind_select(inner.select)
-            lines = list(_describe_plan(plan))
+            if stmt.analyze:
+                assert self._txn is not None
+                profile: dict[int, list] = {}
+                self._profile = profile
+                started = time.perf_counter()
+                count = 0
+                try:
+                    for _row in self._execute(plan, self._txn):
+                        count += 1
+                finally:
+                    self._profile = None
+                elapsed = (time.perf_counter() - started) * 1000
+                lines = list(_describe_plan(plan, profile=profile))
+                lines.append(
+                    f"Execution: {elapsed:.2f} ms, {count} rows"
+                )
+            else:
+                lines = list(_describe_plan(plan))
             text = "\n".join(lines)
             return Result(
                 columns=[ColumnMeta("plan", TypeSpec(DataType.TEXT))],
@@ -772,11 +815,26 @@ def _sort_key(value: Any):
     return (1, None) if value is None else (0, value)
 
 
-def _describe_plan(node: PlanNode, depth: int = 0) -> Iterator[str]:
+def _describe_plan(
+    node: PlanNode,
+    depth: int = 0,
+    profile: Optional[dict[int, list]] = None,
+) -> Iterator[str]:
     prefix = "  " * depth
-    yield prefix + node.describe()
+    line = prefix + node.describe()
+    if profile is not None:
+        entry = profile.get(id(node))
+        if entry is None:
+            line += " (never executed)"
+        else:
+            total_ms, calls, rows = entry
+            line += (
+                f" (actual time={total_ms / calls:.2f} ms rows={rows} "
+                f"loops={calls})"
+            )
+    yield line
     for child in node.children():
-        yield from _describe_plan(child, depth + 1)
+        yield from _describe_plan(child, depth + 1, profile)
 
 
 def _to_column(col_def):

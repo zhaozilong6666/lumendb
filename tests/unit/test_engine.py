@@ -323,6 +323,32 @@ class TestSelectBasics:
         assert rows(db, "SELECT age * 2 FROM users WHERE id = 1") == [(60,)]
 
 
+class TestExplainAnalyze:
+    def test_reports_actual_time_and_rows(self, db):
+        setup_users(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN ANALYZE SELECT name FROM users WHERE age > 30")
+        )
+        assert "actual time=" in plan
+        assert "rows=1" in plan
+        assert "Execution:" in plan
+        assert "SeqScan" in plan
+
+    def test_uses_index_and_shows_it(self, db):
+        setup_users(db)
+        db.execute_one("CREATE INDEX idx_age ON users (age)")
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN ANALYZE SELECT id FROM users WHERE age > 30")
+        )
+        assert "IndexRangeScan" in plan
+        assert "rows=1" in plan
+
+    def test_query_still_works_after_analyze(self, db):
+        setup_users(db)
+        rows(db, "EXPLAIN ANALYZE SELECT id FROM users")
+        assert rows(db, "SELECT COUNT(*) FROM users") == [(3,)]
+
+
 class TestIndexLookup:
     def test_uses_index_in_explain(self, db):
         setup_users(db)
