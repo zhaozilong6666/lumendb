@@ -1,0 +1,955 @@
+"""名字绑定、类型检查与表达式编译。
+
+这里做的事情是数据库教科书上 "semantic analysis + binding" 的部分：
+
+1. 把列名（可能带表前缀）解析成"这一行里的第几列"；
+2. 推导每个表达式的类型，提前发现不可能成立的运算；
+3. 把 AST 编译成闭包，执行时不需要再走一遍语法树。
+
+编译而不是"边遍历边求值"是有理由的：树遍历每行都要做类型判断和字典查找，
+而闭包把名字解析的结果固化成下标访问。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional
+
+from ..catalog.catalog import Catalog
+from ..catalog.schema import Column, TableDef
+from ..datatypes import DataType, TypeSpec
+from ..errors import (
+    AmbiguousColumnError,
+    ColumnNotFoundError,
+    NotSupportedError,
+    TableNotFoundError,
+    TypeMismatchError,
+)
+from ..sql.ast import (
+    Between,
+    BinaryOp,
+    Cast,
+    ColumnRef,
+    Exists,
+    Expr,
+    FunctionCall,
+    InList,
+    InSubquery,
+    IsNull,
+    Like,
+    Literal,
+    ScalarSubquery,
+    Star,
+    UnaryOp,
+)
+from .nodes import (
+    Aggregate,
+    Distinct,
+    EvalContext,
+    Filter,
+    IndexLookup,
+    Join,
+    Limit,
+    OutputColumn,
+    PlanNode,
+    Project,
+    Scan,
+    Sort,
+)
+from .nodes import Values
+
+AGGREGATE_FUNCTIONS = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
+
+
+# ---------------------------------------------------------------------------
+# schema
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SchemaColumn:
+    qualifier: str
+    name: str
+    type: TypeSpec
+
+
+class Schema:
+    """一行数据的列布局，用于把名字解析成下标。"""
+
+    def __init__(self, columns: Iterable[SchemaColumn]) -> None:
+        self.columns = list(columns)
+
+    def __len__(self) -> int:
+        return len(self.columns)
+
+    def resolve(self, table: Optional[str], name: str) -> int:
+        lowered = name.lower()
+        qualifier = table.lower() if table else None
+        matches = [
+            i
+            for i, col in enumerate(self.columns)
+            if col.name == lowered and (qualifier is None or col.qualifier == qualifier)
+        ]
+        if not matches:
+            hint = ""
+            if qualifier:
+                tables = {c.qualifier for c in self.columns}
+                if qualifier not in tables:
+                    hint = f"可用表：{', '.join(sorted(tables))}"
+                else:
+                    cols = [c.name for c in self.columns if c.qualifier == qualifier]
+                    hint = f"表 {qualifier} 有列：{', '.join(cols)}"
+            else:
+                hint = f"可用列：{', '.join(c.name for c in self.columns)}"
+            raise ColumnNotFoundError(
+                f"列 {name!r} 不存在" + (f"（表 {table}）" if table else ""),
+                hint=hint,
+            )
+        if len(matches) > 1:
+            owners = ", ".join(self.columns[i].qualifier for i in matches)
+            raise AmbiguousColumnError(
+                f"列名 {name!r} 有歧义",
+                detail=f"多张表都有该列：{owners}",
+                hint="用表名限定，例如 t.name",
+            )
+        return matches[0]
+
+    def type_of(self, index: int) -> TypeSpec:
+        return self.columns[index].type
+
+    def concat(self, other: "Schema") -> "Schema":
+        return Schema(self.columns + other.columns)
+
+
+# ---------------------------------------------------------------------------
+# 聚合
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AggSpec:
+    kind: str
+    arg: Optional[Callable[[EvalContext], Any]]
+    distinct: bool
+    result_type: TypeSpec
+
+
+class _Accumulator:
+    __slots__ = ("spec", "count", "total", "best")
+
+    def __init__(self, spec: AggSpec) -> None:
+        self.spec = spec
+        self.count = 0
+        self.total: Any = None
+        self.best: Any = None
+
+    def update(self, ctx: EvalContext) -> None:
+        kind = self.spec.kind
+        if kind == "COUNT" and self.spec.arg is None:
+            self.count += 1
+            return
+        value = self.spec.arg(ctx)
+        if value is None:
+            return
+        if self.spec.distinct:
+            raise NotSupportedError(
+                "聚合函数里的 DISTINCT 尚未实现",
+                hint="可以先用 SELECT DISTINCT 去重，或在应用层聚合",
+            )
+        if kind == "COUNT":
+            self.count += 1
+        elif kind == "SUM":
+            self.total = value if self.total is None else self.total + value
+            self.count += 1
+        elif kind == "AVG":
+            self.total = value if self.total is None else self.total + value
+            self.count += 1
+        elif kind == "MIN":
+            self.best = value if self.best is None else min(self.best, value)
+        elif kind == "MAX":
+            self.best = value if self.best is None else max(self.best, value)
+
+    def result(self) -> Any:
+        kind = self.spec.kind
+        if kind == "COUNT":
+            return self.count
+        if kind == "SUM":
+            return self.total
+        if kind == "AVG":
+            return (self.total / self.count) if self.count else None
+        if kind in ("MIN", "MAX"):
+            return self.best
+        raise NotSupportedError(f"未知聚合函数 {kind}")
+
+
+class AggregateAccumulatorGroup:
+    """一组聚合累积器，用一次遍历完成所有聚合。"""
+
+    def __init__(self, specs: list[AggSpec]) -> None:
+        self.specs = specs
+        self.accumulators = [_Accumulator(s) for s in specs]
+
+    def update(self, ctx: EvalContext) -> None:
+        for acc in self.accumulators:
+            acc.update(ctx)
+
+    def results(self) -> tuple:
+        return tuple(acc.result() for acc in self.accumulators)
+
+
+# ---------------------------------------------------------------------------
+# 表达式编译
+# ---------------------------------------------------------------------------
+
+
+class Binder:
+    def __init__(self, catalog: Catalog) -> None:
+        self.catalog = catalog
+        #: 聚合节点 id -> 在聚合输出行里的下标
+        self._agg_slots: dict[int, int] = {}
+        self._agg_specs: list[AggSpec] = []
+        self._agg_base: int = 0
+        #: 需要执行子查询时由执行器注入的钩子
+        self.subquery_runner: Optional[Callable[[Any, EvalContext], Any]] = None
+
+    # -- 表达式 ---------------------------------------------------------
+
+    def compile(
+        self,
+        expr: Expr,
+        schema: Schema,
+        *,
+        allow_agg: bool = True,
+    ) -> tuple[Callable[[EvalContext], Any], TypeSpec]:
+        method = _DISPATCH.get(type(expr))
+        if method is None:
+            raise NotSupportedError(
+                f"表达式 {type(expr).__name__} 尚不支持",
+                hint="检查 SELECT / WHERE 里是否用了未实现的语法",
+            )
+        return method(self, expr, schema, allow_agg)
+
+    def _compile_children(
+        self, expr: Expr, schema: Schema, allow_agg: bool
+    ) -> list[tuple[Callable, TypeSpec]]:
+        return [self.compile(c, schema, allow_agg=allow_agg) for c in _children(expr)]
+
+    # -- 各节点 ---------------------------------------------------------
+
+    def _literal(self, expr: Literal, schema, allow_agg):
+        value = expr.value
+        if value is None:
+            return (lambda ctx: None), TypeSpec(DataType.TEXT)
+        if isinstance(value, bool):
+            return (lambda ctx: value), TypeSpec(DataType.BOOLEAN)
+        if isinstance(value, int):
+            return (lambda ctx: value), TypeSpec(DataType.INT)
+        if isinstance(value, float):
+            return (lambda ctx: value), TypeSpec(DataType.FLOAT)
+        return (lambda ctx: value), TypeSpec(DataType.TEXT)
+
+    def _column(self, expr: ColumnRef, schema, allow_agg):
+        index = schema.resolve(expr.table, expr.name)
+        return (lambda ctx, i=index: ctx.row[i]), schema.type_of(index)
+
+    def _star(self, expr: Star, schema, allow_agg):
+        raise TypeMismatchError(
+            "* 不能出现在这里",
+            hint="* 只能用在 SELECT 列表或 COUNT(*) 中",
+        )
+
+    def _unary(self, expr: UnaryOp, schema, allow_agg):
+        operand, t = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        if expr.op == "-":
+            if not t.is_numeric:
+                raise TypeMismatchError(
+                    "一元负号只能作用于数值",
+                    detail=f"实际类型 {t.sql}",
+                )
+            return (lambda ctx: None if operand(ctx) is None else -operand(ctx)), t
+        if expr.op == "NOT":
+            fn = operand
+
+            def _not(ctx):
+                v = fn(ctx)
+                return None if v is None else (not v)
+
+            return _not, TypeSpec(DataType.BOOLEAN)
+        raise NotSupportedError(f"未知一元运算符 {expr.op}")
+
+    def _binary(self, expr: BinaryOp, schema, allow_agg):
+        left_fn, lt = self.compile(expr.left, schema, allow_agg=allow_agg)
+        right_fn, rt = self.compile(expr.right, schema, allow_agg=allow_agg)
+        op = expr.op
+
+        if op in ("AND", "OR"):
+            if op == "AND":
+
+                def _and(ctx):
+                    l = left_fn(ctx)
+                    if l is False:
+                        return False
+                    r = right_fn(ctx)
+                    if r is False:
+                        return False
+                    if l is None or r is None:
+                        return None
+                    return bool(l) and bool(r)
+
+                return _and, TypeSpec(DataType.BOOLEAN)
+
+            def _or(ctx):
+                l = left_fn(ctx)
+                if l is True:
+                    return True
+                r = right_fn(ctx)
+                if r is True:
+                    return True
+                if l is None or r is None:
+                    return None
+                return bool(l) or bool(r)
+
+            return _or, TypeSpec(DataType.BOOLEAN)
+
+        if op in ("=", "<>", "<", "<=", ">", ">="):
+            return _make_comparison(op, left_fn, right_fn, lt, rt), TypeSpec(DataType.BOOLEAN)
+
+        if op in ("+", "-", "*", "/", "%"):
+            if not lt.is_numeric or not rt.is_numeric:
+                raise TypeMismatchError(
+                    f"运算符 {op} 需要数值操作数",
+                    detail=f"左边 {lt.sql}，右边 {rt.sql}",
+                )
+            result_type = (
+                TypeSpec(DataType.FLOAT)
+                if lt.kind is DataType.FLOAT or rt.kind is DataType.FLOAT or op == "/"
+                else TypeSpec(DataType.INT)
+            )
+
+            def _arith(ctx):
+                a, b = left_fn(ctx), right_fn(ctx)
+                if a is None or b is None:
+                    return None
+                if op == "+":
+                    return a + b
+                if op == "-":
+                    return a - b
+                if op == "*":
+                    return a * b
+                if op == "/":
+                    if b == 0:
+                        raise TypeMismatchError(
+                            "除数为 0",
+                            hint="SQL 语义里除以 0 是错误，不是返回 NULL",
+                        )
+                    return a / b
+                if b == 0:
+                    raise TypeMismatchError("取模的除数为 0")
+                return a % b
+
+            return _arith, result_type
+
+        raise NotSupportedError(f"未知二元运算符 {op}")
+
+    def _is_null(self, expr: IsNull, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        negated = expr.negated
+        return (lambda ctx: (fn(ctx) is not None) if negated else (fn(ctx) is None)), TypeSpec(
+            DataType.BOOLEAN
+        )
+
+    def _in_list(self, expr: InList, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        items = [self.compile(i, schema, allow_agg=allow_agg)[0] for i in expr.items]
+        negated = expr.negated
+
+        def _in(ctx):
+            value = fn(ctx)
+            if value is None:
+                return None
+            hit = any(value == i(ctx) for i in items)
+            return (not hit) if negated else hit
+
+        return _in, TypeSpec(DataType.BOOLEAN)
+
+    def _between(self, expr: Between, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        low, _ = self.compile(expr.low, schema, allow_agg=allow_agg)
+        high, _ = self.compile(expr.high, schema, allow_agg=allow_agg)
+        negated = expr.negated
+
+        def _between(ctx):
+            v = fn(ctx)
+            lo, hi = low(ctx), high(ctx)
+            if v is None or lo is None or hi is None:
+                return None
+            inside = lo <= v <= hi
+            return (not inside) if negated else inside
+
+        return _between, TypeSpec(DataType.BOOLEAN)
+
+    def _like(self, expr: Like, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        pat, _ = self.compile(expr.pattern, schema, allow_agg=allow_agg)
+        negated = expr.negated
+        import re
+
+        cache: dict[str, Any] = {}
+
+        def _like(ctx):
+            value = fn(ctx)
+            pattern = pat(ctx)
+            if value is None or pattern is None:
+                return None
+            rx = cache.get(pattern)
+            if rx is None:
+                rx = re.compile(_like_to_regex(pattern), re.DOTALL)
+                if len(cache) < 256:
+                    cache[pattern] = rx
+            hit = rx.fullmatch(str(value)) is not None
+            return (not hit) if negated else hit
+
+        return _like, TypeSpec(DataType.BOOLEAN)
+
+    def _function(self, expr: FunctionCall, schema, allow_agg):
+        name = expr.name.upper()
+        if name in AGGREGATE_FUNCTIONS:
+            if not allow_agg:
+                raise NotSupportedError(
+                    "聚合函数不能出现在这里",
+                    detail="WHERE / GROUP BY 里不允许聚合",
+                    hint="把聚合放到 SELECT 或 HAVING",
+                )
+            return self._aggregate_ref(expr, schema)
+
+        args = [self.compile(a, schema, allow_agg=allow_agg) for a in expr.args]
+        build = _SCALAR_FUNCTIONS.get(name)
+        if build is None:
+            raise NotSupportedError(
+                f"函数 {name} 尚未实现",
+                hint="支持 COUNT/SUM/AVG/MIN/MAX/LENGTH/UPPER/LOWER/ABS/COALESCE",
+            )
+        return build(args)
+
+    def _aggregate_ref(self, expr: FunctionCall, schema):
+        key = id(expr)
+        slot = self._agg_slots.get(key)
+        if slot is None:
+            spec = self._make_agg_spec(expr, schema)
+            slot = len(self._agg_specs)
+            self._agg_specs.append(spec)
+            self._agg_slots[key] = slot
+
+        # 聚合输出行 = 分组列 + 聚合结果，因此聚合结果的物理下标是
+        # ``_agg_base + slot``。这里直接按 row 下标读，避免再引入一层上下文。
+        def _ref(ctx, i=self._agg_base + slot):
+            return ctx.row[i]
+
+        return _ref, self._agg_specs[slot].result_type
+
+    def _make_agg_spec(self, expr: FunctionCall, schema) -> AggSpec:
+        kind = expr.name.upper()
+        if kind == "COUNT" and len(expr.args) == 1 and isinstance(expr.args[0], Star):
+            return AggSpec(kind, None, expr.distinct, TypeSpec(DataType.BIGINT))
+        if len(expr.args) != 1:
+            raise TypeMismatchError(f"{kind} 需要且只需要 1 个参数")
+        arg_fn, arg_type = self.compile(expr.args[0], schema, allow_agg=False)
+        if kind in ("SUM", "AVG") and not arg_type.is_numeric:
+            raise TypeMismatchError(
+                f"{kind} 需要数值参数",
+                detail=f"实际类型 {arg_type.sql}",
+            )
+        result = {
+            "COUNT": TypeSpec(DataType.BIGINT),
+            "SUM": arg_type,
+            "AVG": TypeSpec(DataType.FLOAT),
+            "MIN": arg_type,
+            "MAX": arg_type,
+        }[kind]
+        return AggSpec(kind, arg_fn, expr.distinct, result)
+
+    def _cast(self, expr: Cast, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        target = expr.target
+
+        def _cast(ctx):
+            value = fn(ctx)
+            if value is None:
+                return None
+            try:
+                return target.coerce(value)
+            except ValueError as exc:
+                raise TypeMismatchError(
+                    f"无法把 {value!r} 转换成 {target.sql}",
+                    detail=str(exc),
+                ) from exc
+
+        return _cast, target
+
+    def _scalar_subquery(self, expr: ScalarSubquery, schema, allow_agg):
+        runner = self.subquery_runner
+        if runner is None:
+            raise NotSupportedError("子查询在当前上下文不可用")
+
+        def _sub(ctx):
+            rows = runner(expr.query, ctx) or []
+            if not rows:
+                return None
+            if len(rows) > 1:
+                raise TypeMismatchError(
+                    "标量子查询返回了多行",
+                    detail=f"实际返回 {len(rows)} 行",
+                    hint="用 LIMIT 1，或改用 IN / EXISTS",
+                )
+            return rows[0][0]
+
+        return _sub, TypeSpec(DataType.TEXT)
+
+    def _in_subquery(self, expr: InSubquery, schema, allow_agg):
+        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        runner = self.subquery_runner
+        if runner is None:
+            raise NotSupportedError("子查询在当前上下文不可用")
+        negated = expr.negated
+
+        def _in(ctx):
+            value = fn(ctx)
+            if value is None:
+                return None
+            rows = runner(expr.query, ctx) or []
+            hit = any(r[0] == value for r in rows)
+            return (not hit) if negated else hit
+
+        return _in, TypeSpec(DataType.BOOLEAN)
+
+    def _exists(self, expr: Exists, schema, allow_agg):
+        runner = self.subquery_runner
+        if runner is None:
+            raise NotSupportedError("子查询在当前上下文不可用")
+        negated = expr.negated
+
+        def _exists(ctx):
+            rows = runner(expr.query, ctx)
+            found = bool(rows) if rows is not None else False
+            return (not found) if negated else found
+
+        return _exists, TypeSpec(DataType.BOOLEAN)
+
+    # -- 表达式里的聚合收集 ---------------------------------------------
+
+    def reset_aggregates(self) -> None:
+        self._agg_slots.clear()
+        self._agg_specs.clear()
+        self._agg_base = 0
+
+    @property
+    def agg_specs(self) -> list[AggSpec]:
+        return self._agg_specs
+
+    # -- 语句绑定 -------------------------------------------------------
+
+    def bind_table_schema(self, refs) -> tuple[Schema, list[Scan]]:
+        schema_cols: list[SchemaColumn] = []
+        scans: list[Scan] = []
+        for ref in refs:
+            table = self.catalog.get_table(ref.name)
+            alias = (ref.alias or table.name).lower()
+            columns = [
+                OutputColumn(col.name, col.type) for col in table.columns
+            ]
+            scans.append(Scan(columns=columns, table=table.name, alias=alias))
+            for col in table.columns:
+                schema_cols.append(SchemaColumn(alias, col.name, col.type))
+        return Schema(schema_cols), scans
+
+    # -- SELECT 绑定 -----------------------------------------------------
+
+    def bind_select(self, select) -> tuple[PlanNode, list[OutputColumn]]:
+        self.reset_aggregates()
+
+        node, schema = self._bind_from(select.from_)
+
+        if (
+            select.where is not None
+            and len(select.from_) == 1
+            and not select.from_[0].joins
+        ):
+            lookup = self._try_index_lookup(select.where, schema, node)
+            if lookup is not None:
+                node = lookup
+            else:
+                predicate, _ = self.compile(select.where, schema, allow_agg=False)
+                node = Filter(child=node, predicate=predicate, columns=node.columns)
+        elif select.where is not None:
+            predicate, _ = self.compile(select.where, schema, allow_agg=False)
+            node = Filter(child=node, predicate=predicate, columns=node.columns)
+
+        has_agg = (
+            bool(select.group_by)
+            or any(_contains_aggregate(item.expr) for item in select.items)
+            or (select.having is not None and _contains_aggregate(select.having))
+            or any(_contains_aggregate(item.expr) for item in select.order_by)
+        )
+
+        if has_agg:
+            node, out_schema = self._bind_aggregate(node, schema, select)
+        else:
+            out_schema = schema
+
+        proj_fns: list[Callable[[EvalContext], Any]] = []
+        proj_cols: list[OutputColumn] = []
+        for item in select.items:
+            if isinstance(item.expr, Star):
+                if item.expr.table:
+                    wanted = item.expr.table.lower()
+                    picked = [c for c in out_schema.columns if c.qualifier == wanted]
+                    if not picked:
+                        raise TableNotFoundError(f"没有名为 {item.expr.table} 的表")
+                else:
+                    picked = list(out_schema.columns)
+                for col in picked:
+                    index = out_schema.resolve(col.qualifier, col.name)
+                    proj_fns.append(lambda ctx, i=index: ctx.row[i])
+                    proj_cols.append(OutputColumn(col.name, col.type))
+                continue
+
+            fn, type_spec = self.compile(item.expr, out_schema, allow_agg=has_agg)
+            proj_fns.append(fn)
+            name = item.alias
+            if name is None:
+                if isinstance(item.expr, ColumnRef):
+                    name = item.expr.name
+                else:
+                    from ..sql.ast import render_expr
+
+                    name = render_expr(item.expr)
+            proj_cols.append(OutputColumn(name.lower() if item.alias else name, type_spec))
+
+        # ORDER BY：先尝试按输出别名解析，否则编译成隐藏列
+        extra_fns: list[Callable[[EvalContext], Any]] = []
+        sort_keys: list[tuple[Callable[[EvalContext], Any], bool]] = []
+        out_names = [c.name.lower() for c in proj_cols]
+        for item in select.order_by:
+            index: Optional[int] = None
+            if isinstance(item.expr, ColumnRef) and item.expr.table is None:
+                lowered = item.expr.name.lower()
+                if lowered in out_names:
+                    index = out_names.index(lowered)
+            if index is None:
+                fn, _ = self.compile(item.expr, out_schema, allow_agg=has_agg)
+                extra_fns.append(fn)
+                index = len(proj_fns) + len(extra_fns) - 1
+            sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))
+
+        project = Project(
+            child=node,
+            exprs=proj_fns + extra_fns,
+            columns=proj_cols
+            + [OutputColumn(f"$sort{i}", TypeSpec(DataType.TEXT)) for i in range(len(extra_fns))],
+        )
+        node = project
+
+        if select.distinct:
+            node = Distinct(child=node, columns=proj_cols, limit_columns=len(proj_cols))
+
+        if sort_keys:
+            node = Sort(child=node, keys=sort_keys, columns=node.columns)
+
+        if select.limit is not None or select.offset:
+            node = Limit(
+                child=node,
+                limit=select.limit,
+                offset=select.offset or 0,
+                columns=node.columns,
+            )
+
+        return node, proj_cols
+
+    def _try_index_lookup(
+        self, where, schema: Schema, scan: PlanNode
+    ) -> Optional[PlanNode]:
+        """识别 ``col = 常量`` 这种能走索引的等值条件。
+
+        只处理单列等值，且要求该列上确实有索引。更复杂的条件留给全表扫描 +
+        Filter —— 与其做一个半吊子的索引匹配，不如明确只支持一种模式。
+        """
+        if not isinstance(scan, Scan):
+            return None
+        if not isinstance(where, BinaryOp) or where.op != "=":
+            return None
+
+        left, right = where.left, where.right
+        if isinstance(right, ColumnRef) and isinstance(left, Literal):
+            left, right = right, left
+        if not isinstance(left, ColumnRef) or not isinstance(right, Literal):
+            return None
+        if right.value is None:
+            return None
+
+        table = self.catalog.get_table(scan.table)
+        index = table.index_for_columns((left.name.lower(),))
+        if index is None:
+            return None
+
+        column = table.column(left.name.lower())
+        try:
+            value = column.type.coerce(right.value)
+        except ValueError:
+            return None
+
+        return IndexLookup(
+            columns=scan.columns,
+            table=scan.table,
+            alias=scan.alias,
+            index_name=index.name,
+            index_columns=index.columns,
+            key=(value,),
+        )
+
+    def _bind_from(self, refs) -> tuple[PlanNode, Schema]:
+        if not refs:
+            return Values(rows=[()], columns=[]), Schema([])
+
+        node: Optional[PlanNode] = None
+        schema = Schema([])
+        for ref in refs:
+            sub_node, sub_schema = self._bind_table_ref(ref)
+            if node is None:
+                node, schema = sub_node, sub_schema
+            else:
+                merged = schema.concat(sub_schema)
+                node = Join(
+                    left=node,
+                    right=sub_node,
+                    kind="INNER",
+                    on=None,
+                    columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+                )
+                schema = merged
+        assert node is not None
+        return node, schema
+
+    def _bind_table_ref(self, ref) -> tuple[PlanNode, Schema]:
+        table = self.catalog.get_table(ref.name)
+        alias = (ref.alias or table.name).lower()
+        columns = [OutputColumn(col.name, col.type) for col in table.columns]
+        node: PlanNode = Scan(columns=columns, table=table.name, alias=alias)
+        schema = Schema([SchemaColumn(alias, col.name, col.type) for col in table.columns])
+
+        for join in ref.joins:
+            right_table = self.catalog.get_table(join.table.name)
+            right_alias = (join.table.alias or right_table.name).lower()
+            right_cols = [OutputColumn(col.name, col.type) for col in right_table.columns]
+            right_node = Scan(columns=right_cols, table=right_table.name, alias=right_alias)
+            right_schema = Schema(
+                [SchemaColumn(right_alias, col.name, col.type) for col in right_table.columns]
+            )
+            merged = schema.concat(right_schema)
+            on_fn = None
+            if join.on is not None:
+                on_fn, _ = self.compile(join.on, merged, allow_agg=False)
+            node = Join(
+                left=node,
+                right=right_node,
+                kind=join.kind,
+                on=on_fn,
+                columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+            )
+            schema = merged
+        return node, schema
+
+    def _bind_aggregate(self, child: PlanNode, schema: Schema, select) -> tuple[PlanNode, Schema]:
+        group_fns: list[Callable[[EvalContext], Any]] = []
+        group_cols: list[SchemaColumn] = []
+        for gexpr in select.group_by:
+            if not isinstance(gexpr, ColumnRef):
+                raise NotSupportedError(
+                    "GROUP BY 目前只支持列引用",
+                    hint="可以先把表达式放进子查询，再对结果分组",
+                )
+            index = schema.resolve(gexpr.table, gexpr.name)
+            col = schema.columns[index]
+            group_cols.append(col)
+            group_fns.append(lambda ctx, i=index: ctx.row[i])
+
+        # 第一遍：用原 schema 编译，触发聚合函数注册（结果丢弃）
+        for item in select.items:
+            if not isinstance(item.expr, Star):
+                self.compile(item.expr, schema, allow_agg=True)
+        if select.having is not None:
+            self.compile(select.having, schema, allow_agg=True)
+        for item in select.order_by:
+            self.compile(item.expr, schema, allow_agg=True)
+
+        agg_schema = Schema(
+            group_cols
+            + [
+                SchemaColumn("$agg", f"$agg{i}", spec.result_type)
+                for i, spec in enumerate(self.agg_specs)
+            ]
+        )
+        self._agg_base = len(group_cols)
+        agg_node = Aggregate(
+            child=child,
+            group_exprs=group_fns,
+            group_labels=[c.name for c in group_cols],
+            aggs=list(self.agg_specs),
+            columns=[OutputColumn(c.name, c.type) for c in group_cols]
+            + [OutputColumn(f"$agg{i}", s.result_type) for i, s in enumerate(self.agg_specs)],
+        )
+        return agg_node, agg_schema
+
+
+# ---------------------------------------------------------------------------
+# 辅助
+# ---------------------------------------------------------------------------
+
+
+def _contains_aggregate(expr: Expr) -> bool:
+    if isinstance(expr, FunctionCall) and expr.name.upper() in AGGREGATE_FUNCTIONS:
+        return True
+    return any(_contains_aggregate(c) for c in _children(expr))
+
+
+def _children(expr: Expr) -> list[Expr]:
+    if isinstance(expr, UnaryOp):
+        return [expr.operand]
+    if isinstance(expr, BinaryOp):
+        return [expr.left, expr.right]
+    if isinstance(expr, IsNull):
+        return [expr.operand]
+    if isinstance(expr, InList):
+        return [expr.operand, *expr.items]
+    if isinstance(expr, Between):
+        return [expr.operand, expr.low, expr.high]
+    if isinstance(expr, Like):
+        return [expr.operand, expr.pattern]
+    if isinstance(expr, FunctionCall):
+        return list(expr.args)
+    if isinstance(expr, Cast):
+        return [expr.operand]
+    return []
+
+
+def _like_to_regex(pattern: str) -> str:
+    out = []
+    for ch in pattern:
+        if ch == "%":
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re_escape(ch))
+    return "".join(out)
+
+
+def re_escape(ch: str) -> str:
+    import re
+
+    return re.escape(ch)
+
+
+def _make_comparison(op: str, left_fn, right_fn, lt: TypeSpec, rt: TypeSpec):
+    def _cmp(a, b):
+        if op == "=":
+            return a == b
+        if op == "<>":
+            return a != b
+        if op == "<":
+            return a < b
+        if op == "<=":
+            return a <= b
+        if op == ">":
+            return a > b
+        return a >= b
+
+    def _compare(ctx):
+        a, b = left_fn(ctx), right_fn(ctx)
+        if a is None or b is None:
+            return None
+        try:
+            return _cmp(a, b)
+        except TypeError as exc:
+            raise TypeMismatchError(
+                f"无法比较 {lt.sql} 与 {rt.sql}",
+                detail=str(exc),
+                hint="用 CAST 显式转换后再比较",
+            ) from exc
+
+    return _compare
+
+
+def _one_arg(name: str, fn, result_type: TypeSpec, *, require_str: bool = False, require_num: bool = False):
+    def build(args):
+        if len(args) != 1:
+            raise TypeMismatchError(f"{name} 需要 1 个参数")
+        arg_fn, arg_type = args[0]
+        if require_str and arg_type.kind not in (DataType.TEXT, DataType.VARCHAR):
+            raise TypeMismatchError(f"{name} 需要字符串参数", detail=f"实际 {arg_type.sql}")
+        if require_num and not arg_type.is_numeric:
+            raise TypeMismatchError(f"{name} 需要数值参数", detail=f"实际 {arg_type.sql}")
+
+        def _call(ctx):
+            value = arg_fn(ctx)
+            if value is None:
+                return None
+            return fn(value)
+
+        return _call, result_type
+
+    return build
+
+
+_SCALAR_FUNCTIONS = {
+    "LENGTH": _one_arg("LENGTH", lambda v: len(str(v)), TypeSpec(DataType.INT), require_str=True),
+    "UPPER": _one_arg("UPPER", lambda v: str(v).upper(), TypeSpec(DataType.TEXT), require_str=True),
+    "LOWER": _one_arg("LOWER", lambda v: str(v).lower(), TypeSpec(DataType.TEXT), require_str=True),
+    "ABS": _one_arg("ABS", abs, TypeSpec(DataType.INT), require_num=True),
+}
+
+
+def _coalesce(args):
+    if not args:
+        raise TypeMismatchError("COALESCE 至少需要 1 个参数")
+    fns = [a[0] for a in args]
+    result_type = args[0][1]
+
+    def _call(ctx):
+        for fn in fns:
+            value = fn(ctx)
+            if value is not None:
+                return value
+        return None
+
+    return _call, result_type
+
+
+_SCALAR_FUNCTIONS["COALESCE"] = _coalesce
+
+
+_DISPATCH = {
+    Literal: Binder._literal,
+    ColumnRef: Binder._column,
+    Star: Binder._star,
+    UnaryOp: Binder._unary,
+    BinaryOp: Binder._binary,
+    IsNull: Binder._is_null,
+    InList: Binder._in_list,
+    InSubquery: Binder._in_subquery,
+    Between: Binder._between,
+    Like: Binder._like,
+    FunctionCall: Binder._function,
+    Cast: Binder._cast,
+    ScalarSubquery: Binder._scalar_subquery,
+    Exists: Binder._exists,
+}
+
+
+__all__ = [
+    "Binder",
+    "Schema",
+    "SchemaColumn",
+    "AggSpec",
+    "AggregateAccumulatorGroup",
+    "AGGREGATE_FUNCTIONS",
+]
