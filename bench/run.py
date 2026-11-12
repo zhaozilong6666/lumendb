@@ -132,10 +132,12 @@ def bench_point_lookup_index(root: Path, rows: int) -> dict:
 
     def run() -> None:
         db = Database(path, pool_size=1024)
+        db.execute_one("BEGIN")
         random.seed(7)
         keys = [random.randrange(rows) for _ in range(probes)]
         for key in keys:
             db.execute_one(f"SELECT name FROM t WHERE id = {key}")
+        db.execute_one("COMMIT")
         db.close()
 
     best, median = timed(run, repeat=1)
@@ -153,10 +155,12 @@ def bench_point_lookup_scan(root: Path, rows: int) -> dict:
 
     def run() -> None:
         db = Database(path, pool_size=1024)
+        db.execute_one("BEGIN")
         random.seed(7)
         keys = [random.randrange(rows) for _ in range(probes)]
         for key in keys:
             db.execute_one(f"SELECT name FROM t WHERE id = {key}")
+        db.execute_one("COMMIT")
         db.close()
 
     best, median = timed(run, repeat=1)
