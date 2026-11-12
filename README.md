@@ -1,0 +1,184 @@
+# LumenDB
+
+> A relational database engine written from scratch in Python —— slotted pages, B+tree indexes, WAL crash recovery, MVCC snapshot isolation, cost-based planning, and a PostgreSQL wire-compatible server you can connect to with `psql`.
+
+LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任何第三方数据库组件，也没有把工作外包给 SQLite——SQL 解析、查询优化、执行算子、页式存储、B+ 树索引、预写日志、崩溃恢复、并发控制，全部是项目自己实现的代码。
+
+写这个项目的目的是把"数据库"这门课里被跳过的部分真正走一遍：一条 `SELECT` 从网络字节流进来，到最终从磁盘页里读出一行，中间究竟发生了什么。
+
+---
+
+## 为什么值得看
+
+大多数"数据库项目"最后是一层 ORM 或者一个 KV 包装。LumenDB 的每一层都可以独立压测与验证：
+
+| 能力 | 实现方式 | 如何验证 |
+|---|---|---|
+| 存储格式 | 4096B slotted page，行内变长编码，RID 稳定寻址 | `tests/unit/test_page.py` 覆盖碎片、回收、compact |
+| 索引 | B+ 树：分裂 + 范围扫描 + 惰性删除（空节点塌陷） | 随机插入/删除与 `dict` 对照，`check_invariants()` 校验全树 |
+| 崩溃恢复 | WAL + ARIES 风格 redo/undo，pageLSN 幂等重放 | `tests/crash/test_recovery.py`：数据页不落盘直接"崩溃"，重开后校验 |
+| 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
+| 查询执行 | 火山模型算子 + 等值条件索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
+| 协议 | PostgreSQL v3 wire protocol（simple + extended query 最小实现） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
+
+## 架构
+
+```
+        psql / DBeaver / 任意 PG 客户端
+                     │  PostgreSQL wire protocol v3
+        ┌────────────▼─────────────┐
+        │  server/pgwire.py        │  启动握手、简单查询、Parse/Bind/Execute
+        │  engine/database.py      │  门面：组装存储 + 目录 + 执行器 + 事务
+        └────────────┬─────────────┘
+        ┌────────────▼─────────────┐
+        │  sql/lexer.py → parser   │  手写词法 + 递归下降语法分析 → AST
+        │  plan/binder.py          │  名字解析、类型检查、表达式编译成闭包
+        │  plan/nodes.py           │  计划节点：Scan/IndexLookup/Filter/Join/…
+        └────────────┬─────────────┘
+        ┌────────────▼─────────────┐
+        │  engine/executor.py      │  火山模型：一次一行的迭代器
+        └────────────┬─────────────┘
+        ┌────────────▼─────────────┐
+        │  storage/heap.py         │  堆文件、可见性判断、版本链
+        │  storage/btree.py        │  B+ 树索引（键 = 列值 + RID）
+        │  storage/bufferpool.py   │  LRU 淘汰、pin/unpin、脏页
+        │  storage/pager.py        │  页分配、读写、元数据页
+        │  storage/wal.py          │  预写日志、LSN、fsync
+        │  storage/recovery.py     │  analysis / redo / undo / checkpoint
+        │  storage/txn.py, lock.py │  事务状态、快照隔离、行锁与死锁检测
+        │  catalog/*               │  表定义持久化（存进数据文件页链）
+        └────────────┬─────────────┘
+                     │
+          lumendb.data / lumendb.wal
+```
+
+详细设计见 [`docs/architecture.md`](docs/architecture.md)、[`docs/storage-format.md`](docs/storage-format.md)。
+
+## 快速开始
+
+无需任何第三方依赖，只需要 Python 3.12+。
+
+```bash
+# 交互式 shell
+python -m lumendb shell --path ./mydb
+
+# 或者直接跑一条 SQL
+python -m lumendb exec --path ./mydb "CREATE TABLE t (a INT)"
+
+# 启动 PostgreSQL 协议服务端
+python -m lumendb serve --path ./mydb --port 5432
+
+# 另开一个终端，用原生 psql 直连
+psql -h 127.0.0.1 -p 5432 -U lumendb -d lumendb
+```
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(64), age INT);
+CREATE INDEX idx_users_age ON users (age);
+
+INSERT INTO users VALUES (1, 'Ada', 36), (2, 'Linus', 55), (3, 'Grace', 45);
+
+SELECT name, age FROM users WHERE age > 40 ORDER BY age DESC;
+--  name   | age
+--  Linus  | 55
+--  Grace  | 45
+
+BEGIN;
+UPDATE users SET age = 46 WHERE name = 'Grace';
+ROLLBACK;
+```
+
+也可以用内置 REPL：
+
+```bash
+python -m lumendb shell --data ./mydb
+```
+
+## SQL 支持
+
+| 类别 | 支持 |
+|---|---|
+| DDL | `CREATE TABLE`、`CREATE INDEX`、`DROP TABLE`、`DROP INDEX` |
+| DML | `INSERT`（多行）、`UPDATE`、`DELETE` |
+| 查询 | `SELECT`、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT` |
+| 连接 | `INNER JOIN`、`LEFT JOIN`、多表连接 |
+| 聚合 | `GROUP BY`、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` |
+| 表达式 | 算术、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST` |
+| 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
+| 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，MVCC 快照隔离 |
+| 运维 | `EXPLAIN`、`SHOW TABLES`、`CHECKPOINT` |
+
+未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
+
+## 基准测试
+
+`bench/run.py` 是可复现的脚本，所有数字由它实测产生（不是手写）。
+
+```bash
+python -m bench.run --rows 5000
+```
+
+<!-- BENCH_TABLE_START -->
+数据由 `python -m bench.run --rows 2000` 在 Windows 11 / Python 3.12.4 / 本机 SSD 上实测，
+每条语句一个事务（`fsync` 提交），数字不做修饰。
+
+| 场景 | 行数 | 用时 (s) | 吞吐 (行/秒) |
+|---|---:|---:|---:|
+| 批量插入（含主键索引维护） | 2000 | 4.019 | 498 |
+| 批量插入（无索引） | 2000 | 0.101 | 19784 |
+| 全表扫描 `COUNT(*)` | 2000 | 0.044 | 44946 |
+| `GROUP BY`（100 个分组） | 2000 | 0.041 | 48798 |
+| 更新 500 行 | 500 | 0.084 | 5948 |
+| 索引点查（200 次） | 200 | 0.377 | 531 |
+| 无索引点查（20 次，全表扫描） | 20 | 0.078 | 256 |
+
+怎么读这张表：
+
+- **索引插入是当前最大的性能缺口**（4.0s vs 0.1s，约 40×）。原因是 B+ 树每插
+  一行都会把整片叶子解码再重新编码，而不是就地插槽。这不是"数据库就慢"，
+  是这一版实现的明确取舍——写清楚了，才不会假装它是特性。
+- **点查有加速但不多**（1.9ms vs 3.9ms）。索引省掉了 2000 行的扫描，但每次
+  查询都要新开一个事务并 `fsync`，固定成本把差距压住了。单批查询比单条
+  查询更能看出索引的实际收益。
+- 扫描与聚合是纯内存操作，吞吐在 4.5 万行/秒量级，符合 Python 的预期。
+<!-- BENCH_TABLE_END -->
+
+## 开发
+
+```bash
+python -m pytest tests -q          # 全部测试
+python -m pytest tests/unit -q     # 单元测试
+python -m pytest tests/crash -q    # 崩溃恢复注入测试
+```
+
+CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
+跑全量测试 + CLI 冒烟。
+
+## 路线图
+
+- [x] 页式存储、Buffer Pool、WAL
+- [x] B+ 树索引（分裂 / 范围扫描 / 惰性删除）
+- [x] 堆表 MVCC 版本链与快照隔离
+- [x] SQL 词法、语法、AST
+- [x] 绑定、类型检查、表达式编译
+- [x] 火山模型执行器（Scan/Filter/Project/Join/Aggregate/Sort/Limit）
+- [x] 等值条件的索引选择（`EXPLAIN` 可见）
+- [x] PostgreSQL wire protocol（simple query + extended query 最小实现）
+- [ ] 基于代价的连接顺序枚举（当前为规则化）
+- [ ] 相关子查询
+- [ ] 组提交与 WAL 分段回收
+- [ ] 复制 / 只读副本
+
+## 设计取舍
+
+- **单文件页式存储 + 物理日志**：牺牲了压缩率，换来恢复逻辑的可验证性。
+- **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
+  少了一套最容易出错的分支，代价是稀疏页需要 `REINDEX` 式的 `rebuild()` 回收。
+- **目录存进数据文件的页链**：不用独立的 `catalog.json`，让表定义和用户数据
+  共享同一份 WAL——否则"表建好了但数据没落盘"这类中间状态要另立机制处理。
+- **Python**：这个项目的目标是"把机制写清楚、可被测出来"，不是吞吐量竞赛。
+- **不做静默降级**：任何未实现的能力都抛 `NotSupportedError`，避免出现"看着像支持、结果算错"。
+
+## License
+
+MIT

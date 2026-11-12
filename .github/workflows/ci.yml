@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+
+      - name: Run unit and crash tests
+        run: python -m pytest tests -q
+
+      - name: Smoke test the CLI
+        run: |
+          python -m lumendb exec --path ./ci_data "CREATE TABLE t (a INT)"
+          python -m lumendb exec --path ./ci_data "INSERT INTO t VALUES (1), (2)"
+          python -m lumendb exec --path ./ci_data "SELECT COUNT(*) FROM t"
+          python -m lumendb exec --path ./ci_data "SELECT * FROM t ORDER BY a"
