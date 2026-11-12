@@ -212,6 +212,28 @@ class TestUpdateAndSnapshot:
         assert heap.get(reader2, rid) == [1, "Ada", 36]
         txns.commit(reader2)
 
+    def test_update_after_aborted_update_keeps_single_row(self, env):
+        """abort 后 newest 指针仍指向中止版本，下一次 update 不能从它继续。"""
+        heap, txns, bp, table = env
+        t = txns.begin()
+        rid = heap.insert(t, [1, "v0", 0])
+        txns.commit(t)
+
+        first = txns.begin()
+        heap.update(first, rid, [1, "aborted", 1])
+        txns.abort(first)
+
+        second = txns.begin()
+        heap.update(second, rid, [1, "v2", 2])
+        txns.commit(second)
+
+        reader = txns.begin()
+        rows = list(heap.scan(reader))
+        assert len(rows) == 1
+        assert rows[0][1] == [1, "v2", 2]
+        assert heap.get(reader, rid) == [1, "v2", 2]
+        txns.commit(reader)
+
     def test_multiple_updates_chain(self, env):
         heap, txns, bp, table = env
         t = txns.begin()

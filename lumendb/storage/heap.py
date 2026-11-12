@@ -318,15 +318,15 @@ class HeapFile:
         """写一条新版本，返回新版本的 RID。"""
         txn.require_active()
         newest = self._latest_version_rid(root_rid)
-        got = self._read_rid(newest)
-        if got is None:
+        # 必须从"当前快照可见"的版本出发，而不是从 newest 出发：
+        # abort 只写 ABORT 记录、不做进程内 undo，newest 可能仍指向一个
+        # 已中止的版本。若直接从那版继续，根记录的 xmax 永远不会被设置，
+        # 根和最新版本会同时可见，扫描出两行。
+        found = self.find_version(txn, newest)
+        if found is None:
             raise StorageError(f"要更新的行 {root_rid} 不存在")
-        page, rec = got
-        try:
-            old_rid = newest
-            old_header = rec.header
-        finally:
-            self._release(page)
+        old_rid, old_rec = found
+        old_header = old_rec.header
 
         payload = encode_record(
             self.table.columns,

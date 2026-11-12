@@ -158,10 +158,12 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **468 个自动化测试**（`python -m pytest tests -q`，约 11 秒），覆盖页格式、WAL 与恢复、
+- **489 个自动化测试**（`python -m pytest tests -q`，约 17 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
+- **随机崩溃一致性测试**：20 个固定种子，随机执行插入/更新/删除并随机提交、回滚或
+  直接崩溃，每次重开后与测试侧维护的"已提交模型"逐行比对；失败信息带 seed，可复现；
 - **基准数字由脚本产出**，README 里没有手写性能；
 - CI 在 Ubuntu / Windows × Python 3.12 / 3.13 上跑全量测试 + CLI 冒烟。
 
@@ -171,6 +173,7 @@ python -m bench.run --rows 2000
 python -m pytest tests -q          # 全部测试
 python -m pytest tests/unit -q     # 单元测试
 python -m pytest tests/crash -q    # 崩溃恢复注入测试
+python -m pytest tests/stress -q   # 随机崩溃一致性测试（20 seeds）
 ```
 
 CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，

@@ -50,8 +50,8 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 468 automated tests including crash-injection; CI matrix covers
->   Ubuntu/Windows × Python 3.12/3.13.
+> - 489 automated tests including crash-injection and a 20-seed randomized
+>   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 六个可深挖的点（面试主力）
 
@@ -132,6 +132,11 @@ PostgreSQL 有 tuple 的 `xmin/xmax`、clog（commit log）、快照 xip 列表�
 "根元组 + 版本链"重排成每行一条记录，再重建索引。差的是 autovacuum、
 oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级别的，
 不是 PostgreSQL 那种可以在线跑的。这个边界写在 `docs/architecture.md` 里。
+还差一件：`ROLLBACK` 只写中止记录，不做进程内 undo（重启恢复时才真正回滚）。
+所以 `UPDATE` 必须从"快照可见的版本"出发，不能盲信 newest 指针——否则会
+从已中止的版本继续，根记录的 `xmax` 永远不会被设置，同一行会同时可见两次。
+这个 bug 是 20 个种子的随机崩溃测试抓出来的：固定用例恰好没有覆盖
+"abort 之后又 update 同一行"。
 
 **"为什么不做代价模型？"**
 因为没有统计信息（没有 `ANALYZE`），估算基数只能靠猜，做一个假的代价模型
