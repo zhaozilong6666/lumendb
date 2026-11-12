@@ -665,6 +665,73 @@ class TestJoin:
         with pytest.raises(Exception):
             db.execute_one("SELECT id FROM a JOIN b ON a.id = b.id")
 
+    def test_explain_uses_hash_join(self, db):
+        self.setup(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id")
+        )
+        assert "HashJoin (INNER)" in plan
+        assert "a.id = b.id" in plan
+
+    def test_comma_join_stays_nested_loop(self, db):
+        self.setup(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT a.id FROM a, b")
+        )
+        assert "HashJoin" not in plan
+
+    def test_hash_join_composite_key(self, db):
+        db.execute_one("CREATE TABLE a (id INT, x INT)")
+        db.execute_one("CREATE TABLE b (id INT, y INT)")
+        db.execute_one("INSERT INTO a VALUES (1, 10), (2, 20), (2, 21)")
+        db.execute_one("INSERT INTO b VALUES (1, 10), (2, 20), (2, 99), (2, 21)")
+        assert rows(
+            db,
+            "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id AND a.x = b.y",
+        ) == [(3,)]
+
+    def test_hash_join_null_keys_never_match(self, db):
+        db.execute_one("CREATE TABLE a (id INT, x TEXT)")
+        db.execute_one("CREATE TABLE b (id INT, y TEXT)")
+        db.execute_one("INSERT INTO a VALUES (1, 'a'), (NULL, 'n'), (2, 'b')")
+        db.execute_one("INSERT INTO b VALUES (1, 'x'), (NULL, 'y'), (2, 'z')")
+        assert rows(
+            db,
+            "SELECT a.x, b.y FROM a LEFT JOIN b ON a.id = b.id WHERE a.id IS NULL",
+        ) == [("n", None)]
+        assert rows(
+            db,
+            "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id",
+        ) == [(2,)]
+
+    def test_hash_join_duplicate_keys(self, db):
+        self.setup(db)
+        db.execute_one("INSERT INTO b VALUES (1, 'b1-again'), (1, 'b1-third')")
+        assert rows(
+            db,
+            "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id",
+        ) == [(4,)]
+
+    def test_hash_join_residual_predicate(self, db):
+        db.execute_one("CREATE TABLE a (id INT, x INT)")
+        db.execute_one("CREATE TABLE b (id INT, y INT)")
+        db.execute_one("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute_one("INSERT INTO b VALUES (1, 15), (2, 10), (3, 30)")
+        assert rows(
+            db,
+            "SELECT a.id FROM a JOIN b ON a.id = b.id AND a.x < b.y ORDER BY a.id",
+        ) == [(1,)]
+
+    def test_three_way_hash_join(self, db):
+        self.setup(db)
+        db.execute_one("CREATE TABLE c (id INT, z TEXT)")
+        db.execute_one("INSERT INTO c VALUES (1, 'c1'), (3, 'c3')")
+        assert rows(
+            db,
+            "SELECT a.id, b.y, c.z FROM a JOIN b ON a.id = b.id "
+            "JOIN c ON b.id = c.id ORDER BY a.id",
+        ) == [(1, "b1", "c1"), (3, "b3", "c3")]
+
 
 class TestExpressions:
     def test_like(self, db):

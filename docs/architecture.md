@@ -112,9 +112,10 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 范围扫描按"索引列前缀"比较，忽略 `KeyCodec` 追加的 RID；否则
 `col > 10` 会把 RID 更大的 `(10, ...)` 当成大于边界，结果里混进 10 本身。
 
-`LEFT JOIN`/`INNER JOIN` 走 nested loop。谓词下推、常量折叠、连接顺序枚举、
-hash join 都在路线图里但**没有实现**——`EXPLAIN` 输出的是真实执行的计划，
-不是理想中的计划。
+`INNER JOIN` / `LEFT JOIN` 的顶层 `AND` 等值条件走 **hash join**：右侧建哈希表，
+左侧流式探测；没有等值键（逗号连接、`OR` 条件）时退回 nested loop。`NULL` 键
+按 SQL 语义不参与匹配，重复键会展开成多行，剩余谓词仍由完整的 `ON` 复核。
+连接顺序枚举与代价模型仍未实现——`EXPLAIN` 输出的是真实执行的计划，不是理想计划。
 
 ## 4. 执行
 
@@ -123,7 +124,8 @@ hash join 都在路线图里但**没有实现**——`EXPLAIN` 输出的是真�
 - `Values`：常量行（`SELECT 1`、`INSERT ... VALUES` 的表达式求值）；
 - `Scan` / `IndexLookup`：堆表顺序扫描 / 索引点查；
 - `Filter`：谓词为真才放行（`NULL` 视为假）；
-- `Join`：右侧物化，左侧流式；`LEFT JOIN` 无匹配时补 NULL；
+- `Join`：有等值键时 `HashJoin`（右侧物化建哈希表，左侧流式探测）；否则
+  nested loop（右侧物化，左侧流式）。`LEFT JOIN` 无匹配时补 NULL；
 - `Aggregate`：无 `GROUP BY` 时输出一行（空表也输出 `COUNT=0`）；
 - `Project`：求值输出列，可附加 ORDER BY 需要的隐藏列；
 - `Distinct`：按前 N 列去重（隐藏列不参与）；

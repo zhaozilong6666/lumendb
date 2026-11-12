@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Column, TableDef
@@ -914,6 +914,35 @@ class Binder:
             high_inclusive=high_inclusive,
         )
 
+    def _equi_keys(
+        self, on, merged: Schema, left_width: int
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[str, ...]]:
+        """从 ``ON`` 里提取左右两侧的等值列对，供哈希连接使用。
+
+        只提取顶层 ``AND`` 的连接项；``OR`` 里的等值不能单独当哈希键，
+        否则会把本应匹配的行漏掉。剩余谓词仍由完整 ``on`` 复核。
+        """
+        if on is None:
+            return (), ()
+        keys: list[tuple[int, int]] = []
+        labels: list[str] = []
+        for expr in _conjuncts(on):
+            if not isinstance(expr, BinaryOp) or expr.op != "=":
+                continue
+            left, right = expr.left, expr.right
+            if not isinstance(left, ColumnRef) or not isinstance(right, ColumnRef):
+                continue
+            li = merged.resolve(left.table, left.name)
+            ri = merged.resolve(right.table, right.name)
+            if li >= left_width > ri:
+                li, ri = ri, li
+            if not (li < left_width <= ri):
+                continue
+            lcol, rcol = merged.columns[li], merged.columns[ri]
+            keys.append((li, ri - left_width))
+            labels.append(f"{lcol.qualifier}.{lcol.name} = {rcol.qualifier}.{rcol.name}")
+        return tuple(keys), tuple(labels)
+
     def _bind_from(self, refs) -> tuple[PlanNode, Schema]:
         if not refs:
             return Values(rows=[()], columns=[]), Schema([])
@@ -956,12 +985,15 @@ class Binder:
             on_fn = None
             if join.on is not None:
                 on_fn, _ = self.compile(join.on, merged, allow_agg=False)
+            hash_keys, hash_labels = self._equi_keys(join.on, merged, len(schema))
             node = Join(
                 left=node,
                 right=right_node,
                 kind=join.kind,
                 on=on_fn,
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+                hash_keys=hash_keys,
+                hash_labels=hash_labels,
             )
             schema = merged
         return node, schema
@@ -1128,6 +1160,15 @@ def _merge_branch_types(current, candidate):
         detail=f"{current.sql} 与 {candidate.sql}",
         hint="用 CAST 把各分支统一到同一个类型",
     )
+
+
+def _conjuncts(expr: Expr) -> Iterator[Expr]:
+    """展开顶层 ``AND``；不进入 ``OR`` / ``NOT`` 内部。"""
+    if isinstance(expr, BinaryOp) and expr.op == "AND":
+        yield from _conjuncts(expr.left)
+        yield from _conjuncts(expr.right)
+    else:
+        yield expr
 
 
 def _contains_aggregate(expr: Expr) -> bool:

@@ -24,11 +24,12 @@
 >   用"绕过缓冲池直接写数据页"的方式模拟断电，验证已提交数据存活、
 >   未提交数据回滚；
 > - 手写 SQL 词法分析器与递归下降解析器，把表达式编译成闭包以消除执行期的
->   名字解析开销；等值和范围条件命中索引时生成索引计划，`EXPLAIN` 输出真实执行路径，
->   `EXPLAIN ANALYZE` 给每个算子标注实际耗时、行数与循环次数；
+>   名字解析开销；等值和范围条件命中索引时生成索引计划，
+>   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
+>   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 501 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 508 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -47,12 +48,14 @@
 > - Wrote the SQL lexer and recursive-descent parser by hand, and compile
 >   expressions into closures so name resolution is paid once at bind time.
 >   Equality and range predicates on indexed columns become index scans;
->   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
->   annotates each operator with actual time, rows and loop count.
+>   equi-joins use a hash join (NULL keys never match, duplicate keys expand,
+>   residual predicates are rechecked); `EXPLAIN` reports the plan that actually
+>   runs, and `EXPLAIN ANALYZE` annotates each operator with actual time, rows
+>   and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 501 automated tests including crash-injection and a 20-seed randomized
+> - 508 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -160,11 +163,20 @@ oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级�
 范围扫描按索引列前缀比较，忽略键尾自动追加的 RID——否则
 `age > 30` 会把 `(30, rid)` 当成大于边界，把 30 本身也扫出来。
 
+**"哈希连接怎么处理 NULL 和重复键？"**
+哈希键里有 `NULL` 的右侧行不进哈希表，左侧探测键含 `NULL` 时直接视为无匹配——
+这不是优化，是 SQL 语义：`NULL = NULL` 的结果是 `NULL`，不是真。重复键在哈希桶里
+存一个列表，探测时全部展开，所以一对多连接不会丢行。连接条件里的非等值部分
+（`ON a.id = b.id AND a.x < b.y`）不进哈希键，但在候选行上仍用完整 `ON` 复核，
+避免"哈希只保证候选、不保证谓词"的漏判。没有等值键（逗号连接、`OR`）时退回
+嵌套循环，`EXPLAIN` 会显示实际用的是哪一种。
+
 **"性能怎么样？"**
 `bench/results/benchmark.md` 是实测：扫描/聚合 4.6 万行/秒；带索引插入
-4053 行/秒，不带索引 19234 行/秒；索引点查 1.5ms/次，全表扫描 10ms/次；
-范围查询（`score >= 99`）走索引 4.6ms/次，全表 46ms/次，约 10 倍；
-`TRUNCATE` 2000 行 5ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.49s。
+5184 行/秒，不带索引 19914 行/秒；索引点查 1.3ms/次，全表扫描 8.1ms/次；
+范围查询（`score >= 99`）走索引 5.4ms/次，全表 54ms/次，约 10 倍；
+等值连接 2000 订单 × 1000 客户，哈希连接 0.22s 出 2000 行；
+`TRUNCATE` 2000 行 5ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.23s。
 
 这里有一个我主动做的优化，也是最能讲的一段：最初带索引插入只有 498 行/秒，
 cProfile 显示每次插入都调用 `codec.decode` 十几万次——因为叶子页是按

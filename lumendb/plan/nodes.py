@@ -128,11 +128,18 @@ class Join(PlanNode):
     right: Optional[PlanNode] = None
     kind: str = "INNER"
     on: Optional[EvalFn] = None
+    #: (left 列下标, right 列下标) 的等值键；非空时执行器走哈希连接
+    hash_keys: tuple[tuple[int, int], ...] = ()
+    #: EXPLAIN 用的可读键名，如 ``a.id = b.id``
+    hash_labels: tuple[str, ...] = ()
 
     def children(self):
         return [c for c in (self.left, self.right) if c is not None]
 
     def describe(self) -> str:
+        if self.hash_keys:
+            keys = ", ".join(self.hash_labels) or "?"
+            return f"HashJoin ({self.kind}) on {keys}"
         return f"{self.kind} Join"
 
 

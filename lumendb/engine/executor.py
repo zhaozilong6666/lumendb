@@ -315,12 +315,42 @@ class Executor:
 
     def _join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
+        if node.hash_keys and node.kind in ("INNER", "LEFT"):
+            yield from self._hash_join(node, txn)
+            return
         right_rows = list(self._execute(node.right, txn))
         right_width = len(node.right.columns)
         for left in self._execute(node.left, txn):
             matched = False
             for right in right_rows:
                 combined = tuple(left) + tuple(right)
+                if node.on is None or _truthy(node.on(EvalContext(combined))):
+                    matched = True
+                    yield combined
+            if node.kind == "LEFT" and not matched:
+                yield tuple(left) + (None,) * right_width
+
+    def _hash_join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
+        assert node.left is not None and node.right is not None
+        right_rows = list(self._execute(node.right, txn))
+        right_width = len(node.right.columns)
+        left_keys = [pair[0] for pair in node.hash_keys]
+        right_keys = [pair[1] for pair in node.hash_keys]
+
+        buckets: dict[tuple, list[tuple]] = {}
+        for right in right_rows:
+            key = tuple(right[i] for i in right_keys)
+            if any(value is None for value in key):
+                # SQL 语义：NULL 不参与等值匹配
+                continue
+            buckets.setdefault(key, []).append(tuple(right))
+
+        for left in self._execute(node.left, txn):
+            key = tuple(left[i] for i in left_keys)
+            matches = () if any(v is None for v in key) else buckets.get(key, ())
+            matched = False
+            for right in matches:
+                combined = tuple(left) + right
                 if node.on is None or _truthy(node.on(EvalContext(combined))):
                     matched = True
                     yield combined

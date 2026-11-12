@@ -293,6 +293,50 @@ def bench_range_scan(root: Path, rows: int) -> dict:
     }
 
 
+def bench_join(root: Path, rows: int) -> dict:
+    customers = max(100, rows // 2)
+    path = root / "join"
+    if path.exists():
+        shutil.rmtree(path)
+    db = Database(path, pool_size=1024)
+    db.execute_one("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(32))")
+    db.execute_one("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount INT)")
+    batch = []
+    for i in range(customers):
+        batch.append(f"({i}, 'c{i}')")
+        if len(batch) == 200:
+            db.execute_one("INSERT INTO customers VALUES " + ", ".join(batch))
+            batch = []
+    if batch:
+        db.execute_one("INSERT INTO customers VALUES " + ", ".join(batch))
+    batch = []
+    for i in range(rows):
+        batch.append(f"({i}, {i % customers}, {i % 1000})")
+        if len(batch) == 200:
+            db.execute_one("INSERT INTO orders VALUES " + ", ".join(batch))
+            batch = []
+    if batch:
+        db.execute_one("INSERT INTO orders VALUES " + ", ".join(batch))
+    db.close()
+
+    def run() -> None:
+        conn = Database(path, pool_size=1024)
+        conn.execute_one("BEGIN")
+        conn.execute_one(
+            "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id"
+        )
+        conn.execute_one("COMMIT")
+        conn.close()
+
+    best, median = timed(run, repeat=3)
+    return {
+        "name": f"等值连接（{rows} 订单 × {customers} 客户，哈希）",
+        "rows": rows,
+        "seconds": best,
+        "per_sec": rows / best,
+    }
+
+
 BENCHMARKS = [
     bench_insert,
     bench_insert_no_index,
@@ -305,6 +349,7 @@ BENCHMARKS = [
     bench_point_lookup_scan,
     bench_range_index,
     bench_range_scan,
+    bench_join,
 ]
 
 
