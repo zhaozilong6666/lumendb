@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumendb"
+version = "0.1.0"
+description = "A relational database engine written from scratch: B+tree indexes, WAL crash recovery, MVCC, PostgreSQL wire protocol."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "LumenDB contributors" }]
+keywords = ["database", "storage-engine", "btree", "wal", "mvcc", "postgresql-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+lumendb = "lumendb.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lumendb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -p no:cacheprovider"
+markers = [
+    "slow: 耗时较长的压力测试",
+]
