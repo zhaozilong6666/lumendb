@@ -50,6 +50,7 @@ from .ast import (
     TableRef,
     UnaryOp,
     Update,
+    Vacuum,
 )
 from .lexer import RESERVED, Token, tokenize
 
@@ -225,10 +226,16 @@ class Parser:
             self._advance()
             table = self._parse_ident("表名")
             return Reindex(table)
+        if kw == "VACUUM":
+            self._advance()
+            table = None
+            if self._cur.kind == "ident":
+                table = self._parse_ident("表名")
+            return Vacuum(table)
         raise self._error(
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "
-            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / REINDEX",
+            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / REINDEX / VACUUM",
         )
 
     def _parse_create(self) -> Statement:

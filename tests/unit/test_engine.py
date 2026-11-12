@@ -93,6 +93,43 @@ class TestParameters:
         ) == [(3,), (2,)]
 
 
+class TestVacuum:
+    def test_vacuum_rebuilds_index_and_keeps_data(self, db):
+        setup_users(db)
+        db.execute_one("UPDATE users SET age = age + 1")
+        db.execute_one("DELETE FROM users WHERE id = 2")
+        result = db.execute_one("VACUUM users")
+        assert "2 rows kept" in result.tag
+        assert "4 versions reclaimed" in result.tag
+        assert rows(db, "SELECT id, age FROM users ORDER BY id") == [(1, 31), (3, 36)]
+
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT name FROM users WHERE id = 3")
+        )
+        assert "IndexScan" in plan
+        assert rows(db, "SELECT name FROM users WHERE id = 3") == [("carol",)]
+
+    def test_vacuum_all_tables(self, db):
+        db.execute_one("CREATE TABLE a (x INT)")
+        db.execute_one("CREATE TABLE b (y INT)")
+        db.execute_one("INSERT INTO a VALUES (1)")
+        db.execute_one("INSERT INTO b VALUES (2)")
+        result = db.execute_one("VACUUM")
+        assert result.tag.startswith("VACUUM 2 tables")
+        assert rows(db, "SELECT x FROM a") == [(1,)]
+        assert rows(db, "SELECT y FROM b") == [(2,)]
+
+    def test_unique_constraint_survives_vacuum(self, db):
+        setup_users(db)
+        db.execute_one("VACUUM users")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO users VALUES (1, 'dup', 1)")
+
+    def test_vacuum_unknown_table(self, db):
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("VACUUM nope")
+
+
 class TestDdl:
     def test_create_and_show(self, db):
         db.execute_one("CREATE TABLE t (a INT)")

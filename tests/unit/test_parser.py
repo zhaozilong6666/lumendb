@@ -19,6 +19,7 @@ from lumendb.sql.ast import (
     ScalarSubquery,
     Star,
     UnaryOp,
+    Vacuum,
     ColumnRef,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
@@ -296,6 +297,17 @@ class TestExpressions:
     def test_case_requires_a_branch(self):
         with pytest.raises(SQLSyntaxError):
             parse_statement("SELECT CASE END")
+
+
+class TestMaintenance:
+    def test_vacuum_table(self):
+        stmt = parse_statement("VACUUM users")
+        assert isinstance(stmt, Vacuum)
+        assert stmt.table == "users"
+
+    def test_vacuum_all_tables(self):
+        assert isinstance(parse_statement("VACUUM"), Vacuum)
+        assert parse_statement("VACUUM").table is None
 
 
 class TestParameters:

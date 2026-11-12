@@ -63,6 +63,47 @@ def columns():
     ]
 
 
+class TestVacuumRecovery:
+    def test_vacuum_page_images_replay(self, db_path):
+        h = open_db(db_path)
+        txn = h.txns.begin()
+        h.cat.create_table(txn, "t", columns())
+        h.txns.commit(txn)
+
+        txn = h.txns.begin()
+        heap = h.heap("t")
+        rids = [heap.insert(txn, [i, f"v{i}"]) for i in range(30)]
+        h.cat.mark_dirty()
+        h.cat.persist(txn)  # 让 root_page 也进目录
+        h.txns.commit(txn)
+
+        txn = h.txns.begin()
+        for rid in rids[:8]:
+            heap.update(txn, rid, [rid[1], "updated"])
+        h.txns.commit(txn)
+
+        txn = h.txns.begin()
+        kept, dead, _ = heap.vacuum(txn)
+        h.txns.commit(txn)
+        assert (kept, dead) == (30, 8)
+
+        # 数据页全部留在内存里没落盘，只保留 WAL —— 然后崩溃
+        crash(h)
+
+        h2 = open_db(db_path)
+        txn = h2.txns.begin()
+        seen = sorted(values[0] for _, values in h2.heap("t").scan(txn))
+        assert seen == list(range(30))
+        updated = [
+            values[1] for _, values in h2.heap("t").scan(txn) if values[0] < 8
+        ]
+        assert updated == ["updated"] * 8
+        h2.txns.commit(txn)
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+
 class TestCommittedSurvives:
     def test_committed_rows_survive_crash(self, db_path):
         h = open_db(db_path)

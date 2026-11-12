@@ -83,6 +83,7 @@ EXPLAIN <query>;
 SHOW TABLES;
 CHECKPOINT;
 REINDEX table;   -- 按堆表当前内容重建该表所有索引
+VACUUM [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
 ```
 
 ## 明确不支持（会报 `NotSupportedError`）
@@ -102,6 +103,8 @@ REINDEX table;   -- 按堆表当前内容重建该表所有索引
 | **`GROUP BY <表达式>`** | 只接受列引用；表达式分组未实现 |
 | **`COUNT(DISTINCT x)` 等聚合去重** | 未实现；可用 `SELECT DISTINCT` 先降维 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
+| autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
+| `VACUUM FULL` / 缩小数据文件 | 回收页内空间，但文件大小不缩，空页留在链上 |
 | `NULLS FIRST/LAST` | `NULL` 固定排在最后 |
 
 ## 已知的行为细节

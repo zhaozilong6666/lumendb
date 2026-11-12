@@ -12,7 +12,7 @@ import pytest
 
 from lumendb.catalog.schema import Column, TableDef
 from lumendb.datatypes import DataType, TypeSpec
-from lumendb.errors import RowTooLargeError, TransactionAbortedError
+from lumendb.errors import RowTooLargeError, StorageError, TransactionAbortedError
 from lumendb.storage.bufferpool import BufferPoolManager
 from lumendb.storage.heap import HeapFile
 from lumendb.storage.pager import DiskManager
@@ -299,6 +299,71 @@ class TestDelete:
         t = txns.begin()
         assert heap.delete(t, (999, 999)) == 0
         txns.abort(t)
+
+
+class TestVacuum:
+    def test_reclaims_dead_versions_and_keeps_rows(self, env):
+        heap, txns, bp, table = env
+        txn = txns.begin()
+        rids = [heap.insert(txn, [i, f"u{i}", i]) for i in range(40)]
+        txns.commit(txn)
+
+        txn = txns.begin()
+        for rid in rids[:10]:
+            heap.update(txn, rid, [rid[1], f"u{rid[1]}", 99])
+        for rid in rids[10:15]:
+            heap.delete(txn, rid)
+        txns.commit(txn)
+
+        txn = txns.begin()
+        kept, dead, pages = heap.vacuum(txn)
+        assert kept == 35
+        assert dead == 15  # 10 个旧版本 + 5 个被删行
+        txns.commit(txn)
+
+        txn = txns.begin()
+        rows = list(heap.scan(txn))
+        assert len(rows) == 35
+        ages = sorted(values[2] for _, values in rows)
+        assert ages.count(99) == 10
+        # 每行现在都只有一条根元组：prev 为空、newest 指向自己
+        for root_rid, values in rows[:5]:
+            page, rec = heap._read_rid(root_rid)
+            assert rec.header.is_root
+            assert rec.header.prev_rid is None
+            assert rec.header.newest_rid == root_rid
+            assert rec.header.xmin != 0
+            bp.unpin(page.page_id)
+        txns.commit(txn)
+
+        # 再跑一次应该是空操作：没有死版本可回收
+        txn = txns.begin()
+        assert heap.vacuum(txn)[1] == 0
+        txns.commit(txn)
+
+    def test_vacuum_leaves_empty_table_consistent(self, env):
+        heap, txns, bp, table = env
+        txn = txns.begin()
+        rids = [heap.insert(txn, [i, f"u{i}", i]) for i in range(12)]
+        for rid in rids:
+            heap.delete(txn, rid)
+        txns.commit(txn)
+
+        txn = txns.begin()
+        kept, dead, _ = heap.vacuum(txn)
+        assert (kept, dead) == (0, 12)
+        assert list(heap.scan(txn)) == []
+        txns.commit(txn)
+
+    def test_vacuum_rejects_concurrent_transaction(self, env):
+        heap, txns, bp, table = env
+        txn1 = txns.begin()
+        heap.insert(txn1, [1, "a", 1])
+        txn2 = txns.begin()
+        with pytest.raises(StorageError):
+            heap.vacuum(txn2)
+        txns.abort(txn2)
+        txns.commit(txn1)
 
 
 class TestTxnGuard:

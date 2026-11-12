@@ -33,6 +33,7 @@ from ..sql.ast import (
     Insert,
     Query,
     Reindex,
+    Vacuum,
     ShowTables,
     Statement,
     Update,
@@ -128,6 +129,8 @@ class Executor:
                 return self._drop_index(stmt, txn)
             if isinstance(stmt, Reindex):
                 return self._reindex(stmt, txn)
+            if isinstance(stmt, Vacuum):
+                return self._vacuum(stmt, txn)
             if isinstance(stmt, ShowTables):
                 return self._show_tables()
             if isinstance(stmt, Explain):
@@ -393,9 +396,20 @@ class Executor:
     def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
         """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
         table = self._catalog.get_table(stmt.table)
+        rebuilt, entries_total = self._rebuild_indexes(table, txn)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        if rebuilt == 0:
+            return Result(tag="REINDEX 0 indexes", notice="该表没有索引")
+        return Result(
+            affected=entries_total,
+            tag=f"REINDEX {rebuilt} indexes ({entries_total} entries)",
+        )
+
+    def _rebuild_indexes(self, table, txn: Transaction) -> tuple[int, int]:
+        """从堆表当前可见行重建该表的所有索引，返回 (索引数, 条目数)。"""
         heap = HeapFile(self._bp, table, self._txns)
         snapshot = list(heap.scan(txn))
-
         rebuilt = 0
         entries_total = 0
         for idx in table.indexes.values():
@@ -409,14 +423,31 @@ class Executor:
             idx.root_page = tree.root_page
             rebuilt += 1
             entries_total += len(entries)
+        return rebuilt, entries_total
 
+    def _vacuum(self, stmt: Vacuum, txn: Transaction) -> Result:
+        """回收死版本。堆页重排会改变 RID，所以随后必须重建索引。"""
+        tables = (
+            [self._catalog.get_table(stmt.table)]
+            if stmt.table
+            else self._catalog.list_tables()
+        )
+        kept = dead = pages = 0
+        for table in tables:
+            heap = HeapFile(self._bp, table, self._txns)
+            k, d, p = heap.vacuum(txn)
+            kept += k
+            dead += d
+            pages += p
+            self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        if rebuilt == 0:
-            return Result(tag="REINDEX 0 indexes", notice="该表没有索引")
         return Result(
-            affected=entries_total,
-            tag=f"REINDEX {rebuilt} indexes ({entries_total} entries)",
+            affected=dead,
+            tag=(
+                f"VACUUM {len(tables)} tables ({kept} rows kept, "
+                f"{dead} versions reclaimed, {pages} pages rewritten)"
+            ),
         )
 
     def _show_tables(self) -> Result:

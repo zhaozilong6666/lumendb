@@ -60,6 +60,23 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - 隔离级别固定为**快照隔离**，不提供 `SET TRANSACTION ISOLATION LEVEL`
   切换（会明确报 `NotSupportedError`）。既然只有一种语义，就不假装有多种。
 
+### 2.6 回收（VACUUM）
+
+`UPDATE` 写新版本、`DELETE` 只打 `xmax`，所以表会持续膨胀。`VACUUM [table]`
+负责回收：
+
+1. 在**没有并发事务**的前提下（本引擎同一时刻只允许一个活跃事务，这条
+   前提在进程内天然成立）扫描整表，保留当前快照可见的那一版；
+2. 把存活行重排成"每行只有一条根元组"：`root/newest` 指向自己、`prev` 为空；
+   页内顺序紧凑，死版本的空间被真正收回；
+3. 重排会改变所有 RID，所以紧接着**重建该表的所有索引**；
+4. 每一页的改写都写一条**整页 before/after image**，崩溃后恢复能重放，
+   不会出现"VACUUM 之后行凭空消失/复活"。
+
+文件本身不会缩小（和 PostgreSQL 的普通 `VACUUM` 一样）；空页留在页链上，
+扫描会跳过。没有 autovacuum、没有增量回收、没有 oldest-xmin 水位——
+一旦放开并发事务，这些就是下一件必须做的事，写在 `docs/sql-support.md` 里。
+
 ## 3. SQL 与计划
 
 ### 3.1 解析

@@ -381,6 +381,111 @@ class HeapFile:
         self.table.row_count_hint = max(0, self.table.row_count_hint - 1)
         return 1
 
+    def vacuum(self, txn: Transaction) -> tuple[int, int, int]:
+        """回收死版本，并把存活行重排成"每行只剩一条根元组"。
+
+        返回 ``(保留行数, 回收版本数, 重写页数)``。
+
+        前提：**没有其它活跃事务**。本引擎的 ``TransactionManager`` 同一时刻
+        只允许一个活跃事务，所以这条前提在进程内天然成立；如果以后放开并发，
+        就必须引入 oldest-active-xmin 水位，否则会删掉旧快照仍然需要的版本。
+
+        注意：重排会改变所有行的 RID，调用方必须随后重建该表的所有索引
+        （执行器里的 ``VACUUM`` 就是这么做的）。
+        """
+        txn.require_active()
+        active = self._txns.active_xids
+        if len(active) > 1:
+            raise StorageError(
+                "VACUUM 需要表上没有并发事务",
+                detail=f"当前活跃事务：{active}",
+                hint="等其它事务结束后再重试",
+            )
+
+        keep: list[tuple[list[Any], int]] = []
+        dead = 0
+        page_id = self.table.root_page
+        while page_id != INVALID_PAGE_ID:
+            page = self._fetch(page_id)
+            next_id = page.next_page
+            try:
+                for slot in range(page.nslots):
+                    rec = self._decode(page, slot)
+                    if rec is None:
+                        continue
+                    if self._visible(txn, rec):
+                        keep.append((rec.values, rec.header.xmin))
+                    else:
+                        dead += 1
+            finally:
+                self._release(page)
+            page_id = next_id
+
+        index = 0
+        rewritten = 0
+        page_id = self.table.root_page
+        while page_id != INVALID_PAGE_ID:
+            page = self._fetch(page_id)
+            next_id, prev_id = page.next_page, page.prev_page
+            try:
+                old = bytes(page.buf)
+                page.init_heap(page_id)
+                page.next_page = next_id
+                page.prev_page = prev_id
+                index = self._pack_rows(page, keep, index, txn)
+                self._log_page_image(txn, page, old)
+                rewritten += 1
+            finally:
+                self._release(page, dirty=True)
+            page_id = next_id
+
+        # 存活行比原来多（理论上不该发生，但页头可以有碎片）：补新页
+        while index < len(keep):
+            page = self._append_page(txn)
+            try:
+                old = bytes(page.buf)
+                index = self._pack_rows(page, keep, index, txn)
+                if page.nslots == 0:
+                    raise RowTooLargeError(
+                        "有一行放不进空页，VACUUM 中止",
+                        hint="检查行大小是否接近页容量上限",
+                    )
+                self._log_page_image(txn, page, old)
+                rewritten += 1
+            finally:
+                self._release(page, dirty=True)
+
+        self.table.row_count_hint = len(keep)
+        return len(keep), dead, rewritten
+
+    def _pack_rows(
+        self, page: HeapPage, rows: list[tuple[list[Any], int]], index: int, txn: Transaction
+    ) -> int:
+        """把 ``rows[index:]`` 尽量塞进已清空的页，返回下一个待放行的下标。"""
+        while index < len(rows):
+            values, xmin = rows[index]
+            slot = page.nslots
+            payload = encode_record(
+                self.table.columns,
+                values,
+                xmin=xmin,
+                flags=FLAG_ROOT,
+                root=(page.page_id, slot),
+                newest=(page.page_id, slot),
+            )
+            if page.insert_record(payload) is None:
+                return index
+            index += 1
+        return index
+
+    def _log_page_image(self, txn: Transaction, page: HeapPage, old: bytes) -> None:
+        """整页重写也要进 WAL：否则恢复后看到的是旧内容，行就凭空复活了。"""
+        new = bytes(page.buf)
+        if new == old:
+            return
+        self._bp.log_page_update(txn.xid, page, 0, old, new)
+        self._bp.mark_dirty(page)
+
 
 def _record_u64(page: HeapPage, slot: int, rel: int) -> int:
     entry_off = 32 + 4 * slot

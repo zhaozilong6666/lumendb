@@ -113,9 +113,11 @@ WAL 与事务机制，原子性由已有的基础设施保证。
 
 **"你的 MVCC 和 PostgreSQL 差在哪？"**
 PostgreSQL 有 tuple 的 `xmin/xmax`、clog（commit log）、快照 xip 列表；
-我这里用同样的可见性规则，但没有 clog（用事务表在内存里维护状态），
-也没有 `VACUUM`（旧版本只标记不回收）。所以我的表在大量更新后会持续膨胀，
-这是已知取舍，写在 `docs/architecture.md` 里。
+我这里用同样的可见性规则，但没有 clog（用事务表在内存里维护状态）。
+`VACUUM` 是有的：它要求没有并发事务，扫描出当前快照可见的每一版，把
+"根元组 + 版本链"重排成每行一条记录，再重建索引。差的是 autovacuum、
+oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级别的，
+不是 PostgreSQL 那种可以在线跑的。这个边界写在 `docs/architecture.md` 里。
 
 **"为什么不做代价模型？"**
 因为没有统计信息（没有 `ANALYZE`），估算基数只能靠猜，做一个假的代价模型

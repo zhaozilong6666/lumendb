@@ -387,6 +387,13 @@ class Reindex(Statement):
     table: str
 
 
+@dataclass
+class Vacuum(Statement):
+    """``VACUUM [table]``：回收死版本并重排堆页；不带表名则处理所有表。"""
+
+    table: Optional[str] = None
+
+
 __all__ = [
     "Expr",
     "Literal",
@@ -424,5 +431,7 @@ __all__ = [
     "Explain",
     "ShowTables",
     "Checkpoint",
+    "Reindex",
+    "Vacuum",
     "render_expr",
 ]
