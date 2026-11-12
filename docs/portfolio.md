@@ -26,10 +26,11 @@
 > - 手写 SQL 词法分析器与递归下降解析器，把表达式编译成闭包以消除执行期的
 >   名字解析开销；等值和范围条件命中索引时生成索引计划，
 >   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
+>   支持 `UNION` / `UNION ALL` 集合算子与整体排序/限量，
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 508 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 521 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -49,13 +50,14 @@
 >   expressions into closures so name resolution is paid once at bind time.
 >   Equality and range predicates on indexed columns become index scans;
 >   equi-joins use a hash join (NULL keys never match, duplicate keys expand,
->   residual predicates are rechecked); `EXPLAIN` reports the plan that actually
->   runs, and `EXPLAIN ANALYZE` annotates each operator with actual time, rows
->   and loop count.
+>   residual predicates are rechecked); `UNION` / `UNION ALL` are supported
+>   with compound-level ORDER BY and LIMIT; `EXPLAIN` reports the plan that
+>   actually runs, and `EXPLAIN ANALYZE` annotates each operator with actual
+>   time, rows and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 508 automated tests including crash-injection and a 20-seed randomized
+> - 521 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

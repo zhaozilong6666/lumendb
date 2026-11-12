@@ -41,6 +41,17 @@ ORDER BY expr [ASC|DESC], ...
 LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
 ```
 
+集合运算：
+
+```sql
+SELECT ... UNION [ALL] SELECT ...
+SELECT ... UNION ALL SELECT ... ORDER BY 1 LIMIT 5
+```
+
+`UNION` 去重（`NULL` 视为同一行），`UNION ALL` 保留重复；列数必须一致、类型要兼容，
+输出列名取第一个 `SELECT`。`ORDER BY` / `LIMIT` / `OFFSET` 作用于整个集合结果，
+排序键只支持输出列名或从 1 开始的列序号。`EXCEPT` / `INTERSECT` 仍未实现。
+
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
 表达式：`+ - * / %`、`||`（字符串拼接，`NULL` 传染）、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
@@ -98,7 +109,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 视图 / 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 递归 CTE / 普通 CTE（`WITH`） | 未实现 |
-| `UNION` / `EXCEPT` / `INTERSECT` | 未实现集合运算 |
+| `EXCEPT` / `INTERSECT` | 只实现了 `UNION` / `UNION ALL`，其余集合运算未实现 |
 | `RIGHT JOIN` / `FULL JOIN` / `CROSS JOIN` | 可用 `LEFT JOIN` 或逗号连接等价改写 |
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |

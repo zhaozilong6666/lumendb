@@ -61,6 +61,7 @@ from ..plan.nodes import (
     PlanNode,
     Project,
     Scan,
+    SetOp,
     Sort,
     Values,
 )
@@ -224,6 +225,9 @@ class Executor:
         if isinstance(node, IndexRange):
             yield from self._index_range(node, txn)
             return
+        if isinstance(node, SetOp):
+            yield from self._set_op(node, txn)
+            return
         if isinstance(node, Filter):
             assert node.child is not None and node.predicate is not None
             for row in self._execute(node.child, txn):
@@ -312,6 +316,21 @@ class Executor:
         heap = HeapFile(self._bp, table, self._txns)
         for _rid, values in heap.scan(txn):
             yield tuple(values)
+
+    def _set_op(self, node: SetOp, txn: Transaction) -> Iterator[tuple]:
+        assert node.left is not None and node.right is not None
+        if node.all:
+            yield from self._execute(node.left, txn)
+            yield from self._execute(node.right, txn)
+            return
+        seen: set[tuple] = set()
+        for child in (node.left, node.right):
+            for row in self._execute(child, txn):
+                row = tuple(row)
+                if row in seen:
+                    continue
+                seen.add(row)
+                yield row
 
     def _join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None

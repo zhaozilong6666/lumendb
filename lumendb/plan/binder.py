@@ -33,6 +33,7 @@ from ..sql.ast import (
     Cast,
     CaseWhen,
     ColumnRef,
+    CompoundSelect,
     Exists,
     Expr,
     FunctionCall,
@@ -60,6 +61,7 @@ from .nodes import (
     PlanNode,
     Project,
     Scan,
+    SetOp,
     Sort,
 )
 from .nodes import Values
@@ -642,6 +644,8 @@ class Binder:
     # -- SELECT 绑定 -----------------------------------------------------
 
     def bind_select(self, select) -> tuple[PlanNode, list[OutputColumn]]:
+        if isinstance(select, CompoundSelect):
+            return self._bind_compound(select)
         self.reset_aggregates()
 
         node, schema = self._bind_from(select.from_)
@@ -772,6 +776,64 @@ class Binder:
             )
 
         return node, proj_cols
+
+    def _bind_compound(self, select: CompoundSelect) -> tuple[PlanNode, list[OutputColumn]]:
+        parts = select.parts
+        node, out_cols = self.bind_select(parts[0])
+        for i, part in enumerate(parts[1:]):
+            right_node, right_cols = self.bind_select(part)
+            if len(right_cols) != len(out_cols):
+                raise TypeMismatchError(
+                    "UNION 两侧的列数不同",
+                    detail=f"左侧 {len(out_cols)} 列，右侧 {len(right_cols)} 列",
+                )
+            for left_col, right_col in zip(out_cols, right_cols):
+                if not _comparable_types(left_col.type, right_col.type):
+                    raise TypeMismatchError(
+                        "UNION 两侧的列类型不兼容",
+                        detail=(
+                            f"{left_col.name}: {left_col.type.name} 与 "
+                            f"{right_col.type.name}"
+                        ),
+                    )
+            node = SetOp(
+                left=node,
+                right=right_node,
+                all=select.all_flags[i],
+                columns=list(out_cols),
+            )
+
+        if select.order_by:
+            sort_keys = []
+            names = [c.name.lower() for c in out_cols]
+            for item in select.order_by:
+                index: Optional[int] = None
+                if isinstance(item.expr, ColumnRef) and item.expr.table is None:
+                    lowered = item.expr.name.lower()
+                    if lowered in names:
+                        index = names.index(lowered)
+                elif isinstance(item.expr, Literal) and isinstance(item.expr.value, int):
+                    ordinal = item.expr.value
+                    if 1 <= ordinal <= len(out_cols):
+                        index = ordinal - 1
+                if index is None:
+                    raise NotSupportedError(
+                        "UNION 的 ORDER BY 只支持输出列名或列序号",
+                        hint="先给 SELECT 的输出列起别名，再按别名排序",
+                    )
+                sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))
+            node = Sort(child=node, keys=sort_keys, columns=node.columns)
+
+        limit_value = self._limit_value(select.limit, "LIMIT")
+        offset_value = self._limit_value(select.offset, "OFFSET")
+        if limit_value is not None or offset_value:
+            node = Limit(
+                child=node,
+                limit=limit_value,
+                offset=offset_value or 0,
+                columns=node.columns,
+            )
+        return node, out_cols
 
     def _limit_value(self, value, clause: str) -> Optional[int]:
         """把 ``LIMIT`` / ``OFFSET`` 的整数或 ``$n`` 统一成 int（None 表示不限）。"""

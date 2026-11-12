@@ -21,6 +21,7 @@ from .ast import (
     ColumnDef,
     ColumnRef,
     Commit,
+    CompoundSelect,
     CreateIndex,
     CreateTable,
     Delete,
@@ -143,10 +144,10 @@ class Parser:
             if self._match_punct("semicolon"):
                 continue
             result.append(self._parse_statement())
-            if self._cur.is_keyword("UNION", "EXCEPT", "INTERSECT"):
+            if self._cur.is_keyword("EXCEPT", "INTERSECT"):
                 raise NotSupportedError(
-                    "集合运算（UNION / EXCEPT / INTERSECT）尚未实现",
-                    hint="可以拆成多条查询，在客户端合并结果",
+                    "集合运算仅支持 UNION / UNION ALL",
+                    hint="EXCEPT / INTERSECT 尚未实现",
                 )
             if not self._at_end() and not self._cur.is_punct("semicolon"):
                 raise self._error(f"语句后出现多余的内容 {self._cur.value!r}")
@@ -170,7 +171,7 @@ class Parser:
 
         kw = tok.keyword
         if kw == "SELECT":
-            return Query(self._parse_select())
+            return Query(self._parse_query_expression())
         if kw == "CREATE":
             return self._parse_create()
         if kw == "DROP":
@@ -448,6 +449,39 @@ class Parser:
     # ------------------------------------------------------------------
 
     def _parse_select(self) -> Select:
+        """子查询用：单个 SELECT 块，允许自己的 ORDER BY / LIMIT。"""
+        select = self._parse_select_core()
+        select.order_by, select.limit, select.offset = self._parse_select_tail()
+        return select
+
+    def _parse_query_expression(self) -> Select | CompoundSelect:
+        """顶层查询：``SELECT ... UNION [ALL] SELECT ...``，尾部子句作用于整体。"""
+        parts = [self._parse_select_core()]
+        all_flags: list[bool] = []
+        while self._match_kw("UNION") is not None:
+            if self._match_kw("ALL") is not None:
+                all_flags.append(True)
+            else:
+                self._match_kw("DISTINCT")
+                all_flags.append(False)
+            parts.append(self._parse_select_core())
+
+        order_by, limit, offset = self._parse_select_tail()
+        if len(parts) == 1:
+            first = parts[0]
+            first.order_by = order_by
+            first.limit = limit
+            first.offset = offset
+            return first
+        return CompoundSelect(
+            parts=parts,
+            all_flags=all_flags,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+        )
+
+    def _parse_select_core(self) -> Select:
         self._expect_kw("SELECT")
         distinct = self._match_kw("DISTINCT") is not None
 
@@ -474,6 +508,16 @@ class Parser:
         if self._match_kw("HAVING"):
             having = self._parse_expr()
 
+        return Select(
+            items=items,
+            from_=from_,
+            where=where,
+            group_by=group_by,
+            having=having,
+            distinct=distinct,
+        )
+
+    def _parse_select_tail(self):
         order_by: list[OrderItem] = []
         if self._match_kw("ORDER"):
             self._expect_kw("BY")
@@ -487,18 +531,7 @@ class Parser:
             limit = self._parse_limit_value("LIMIT")
             if self._match_kw("OFFSET"):
                 offset = self._parse_limit_value("OFFSET")
-
-        return Select(
-            items=items,
-            from_=from_,
-            where=where,
-            group_by=group_by,
-            having=having,
-            order_by=order_by,
-            limit=limit,
-            offset=offset,
-            distinct=distinct,
-        )
+        return order_by, limit, offset
 
     def _parse_select_item(self) -> SelectItem:
         expr = self._parse_expr()

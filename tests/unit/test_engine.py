@@ -733,6 +733,54 @@ class TestJoin:
         ) == [(1, "b1", "c1"), (3, "b3", "c3")]
 
 
+class TestUnion:
+    def test_union_all_keeps_duplicates(self, db):
+        assert rows(db, "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 2") == [
+            (1,), (2,), (2,)
+        ]
+
+    def test_union_dedupes(self, db):
+        assert rows(db, "SELECT 1 AS x UNION SELECT 1 UNION SELECT 2") == [(1,), (2,)]
+
+    def test_union_null_is_one_row(self, db):
+        assert rows(db, "SELECT NULL AS x UNION SELECT NULL") == [(None,)]
+
+    def test_union_order_by_output_alias_and_limit(self, db):
+        assert rows(
+            db,
+            "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3 "
+            "ORDER BY x DESC LIMIT 2",
+        ) == [(3,), (2,)]
+
+    def test_union_order_by_ordinal(self, db):
+        assert rows(
+            db,
+            "SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1",
+        ) == [(1,), (2,), (3,)]
+
+    def test_union_different_sources(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT id FROM users WHERE id < 3 "
+            "UNION ALL SELECT id FROM users WHERE id = 2",
+        ) == [(1,), (2,), (2,)]
+
+    def test_union_column_count_mismatch(self, db):
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT 1, 2 UNION ALL SELECT 1")
+
+    def test_union_type_mismatch(self, db):
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT 1 AS x UNION ALL SELECT 'a'")
+
+    def test_union_explain_plan(self, db):
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT 1 UNION ALL SELECT 2")
+        )
+        assert "UnionAll" in plan
+
+
 class TestExpressions:
     def test_like(self, db):
         setup_users(db)

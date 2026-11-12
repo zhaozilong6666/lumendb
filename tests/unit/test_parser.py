@@ -23,6 +23,7 @@ from lumendb.sql.ast import (
     Truncate,
     Insert,
     ColumnRef,
+    CompoundSelect,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
 
@@ -389,6 +390,29 @@ class TestTransactions:
 
     def test_checkpoint(self):
         assert parse_statement("CHECKPOINT") is not None
+
+
+class TestCompoundSelect:
+    def test_union_defaults_to_distinct(self):
+        stmt = parse_statement("SELECT 1 UNION SELECT 2")
+        assert isinstance(stmt.select, CompoundSelect)
+        assert stmt.select.parts and len(stmt.select.parts) == 2
+        assert stmt.select.all_flags == [False]
+
+    def test_union_all(self):
+        stmt = parse_statement("SELECT 1 UNION ALL SELECT 2")
+        assert stmt.select.all_flags == [True]
+
+    def test_union_tail_applies_to_the_whole_query(self):
+        stmt = parse_statement("SELECT 1 UNION ALL SELECT 2 ORDER BY 1 LIMIT 1")
+        assert isinstance(stmt.select, CompoundSelect)
+        assert len(stmt.select.order_by) == 1
+        assert stmt.select.limit == 1
+        assert stmt.select.parts[1].order_by == []
+
+    def test_except_still_rejected(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement("SELECT 1 EXCEPT SELECT 2")
 
 
 class TestMultipleStatements:

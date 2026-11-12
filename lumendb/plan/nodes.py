@@ -103,6 +103,19 @@ class IndexRange(PlanNode):
 
 
 @dataclass
+class SetOp(PlanNode):
+    left: Optional[PlanNode] = None
+    right: Optional[PlanNode] = None
+    all: bool = False
+
+    def children(self):
+        return [c for c in (self.left, self.right) if c is not None]
+
+    def describe(self) -> str:
+        return "UnionAll" if self.all else "Union"
+
+
+@dataclass
 class Values(PlanNode):
     rows: list[tuple] = field(default_factory=list)
 

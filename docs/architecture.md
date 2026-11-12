@@ -129,6 +129,8 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - `Aggregate`：无 `GROUP BY` 时输出一行（空表也输出 `COUNT=0`）；
 - `Project`：求值输出列，可附加 ORDER BY 需要的隐藏列；
 - `Distinct`：按前 N 列去重（隐藏列不参与）；
+- `SetOp`：`UNION` / `UNION ALL`，逐行拼接；`UNION` 用集合去重，
+  `UNION ALL` 保留重复，`ORDER BY` / `LIMIT` 由外层节点处理；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；
 - `Limit`：跳 `offset`，取 `limit`。
 

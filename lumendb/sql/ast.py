@@ -278,6 +278,17 @@ class Select:
     distinct: bool = False
 
 
+@dataclass
+class CompoundSelect:
+    """``UNION [ALL]`` 连接的选择块；ORDER/LIMIT 作用于整个结果。"""
+
+    parts: list[Select]
+    all_flags: list[bool]
+    order_by: list[OrderItem] = field(default_factory=list)
+    limit: Optional[Union[int, ParamRef]] = None
+    offset: Optional[Union[int, ParamRef]] = None
+
+
 # ---------------------------------------------------------------------------
 # 语句
 # ---------------------------------------------------------------------------
@@ -425,6 +436,7 @@ __all__ = [
     "Join",
     "TableRef",
     "Select",
+    "CompoundSelect",
     "ColumnDef",
     "Statement",
     "CreateTable",
