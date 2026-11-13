@@ -342,11 +342,18 @@ class Parser:
         ctes: list[Cte] = []
         while True:
             name = self._parse_ident("CTE 名")
+            columns: list[str] = []
+            if self._match_punct("lparen"):
+                while True:
+                    columns.append(self._parse_ident("CTE 列名"))
+                    if not self._match_punct("comma"):
+                        break
+                self._expect_punct("rparen", ")")
             self._expect_kw("AS")
             self._expect_punct("lparen", "(")
             query = self._parse_query_expression()
             self._expect_punct("rparen", ")")
-            ctes.append(Cte(name=name, query=query))
+            ctes.append(Cte(name=name, query=query, columns=columns))
             if not self._match_punct("comma"):
                 break
         if self._cur.is_keyword("SELECT"):

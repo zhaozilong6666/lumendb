@@ -455,6 +455,8 @@ class Query(Statement):
 class Cte:
     name: str
     query: Union[Select, CompoundSelect]
+    #: 可选显式输出列名；空列表表示不覆盖查询自身的列名。
+    columns: list[str] = field(default_factory=list)
 
 
 @dataclass

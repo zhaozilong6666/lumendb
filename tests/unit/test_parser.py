@@ -287,6 +287,12 @@ class TestSelect:
         assert stmt.ctes[0].name == "x"
         assert stmt.select.from_[0].name == "x"
 
+    def test_cte_column_list(self):
+        stmt = parse_statement(
+            "WITH x(a, b) AS (SELECT 1, 2) SELECT a, b FROM x"
+        )
+        assert stmt.ctes[0].columns == ["a", "b"]
+
     def test_with_update(self):
         stmt = parse_statement(
             "WITH x AS (SELECT 2 AS id) UPDATE t SET a = 1 "

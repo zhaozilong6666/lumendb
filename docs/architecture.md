@@ -206,6 +206,7 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
   `UNION ALL` 保留重复，`ORDER BY` / `LIMIT` 由外层节点处理；
 - `CteScan`：普通 `WITH` 的命名子查询。绑定阶段先按书写顺序把每个 CTE
   绑成独立计划并放进作用域，主查询里的 `FROM cte_name` 直接引用它；
+  `WITH c(a, b) AS (...)` 的显式列名会覆盖输出列名并校验列数/重名；
   `WITH ... INSERT ... SELECT` 也走同一套作用域；同一个 CTE 被引用两次会
   执行两次（没有做物化缓存）；
 - `RecursiveCte`：`seed UNION [ALL] recursive` 的递归 CTE。`CteScan(recursive=True)`

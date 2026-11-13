@@ -734,12 +734,38 @@ class Binder:
                     node, cols = self._bind_recursive_cte(cte, name)
                 else:
                     node, cols = self.bind_select(cte.query)
+                    cols = self._cte_output_columns(cte, cols)
                 self.ctes[name] = (node, cols)
         except Exception:
             self.ctes = saved
             raise
 
-    def _bind_recursive_cte(self, cte, name: str) -> tuple[PlanNode, list[OutputColumn]]:
+    def _cte_output_columns(self, cte, cols):
+        """应用 ``WITH c(x, y) AS ...`` 的显式输出列名，并校验列数/重名。"""
+        if not cte.columns:
+            return cols
+        if len(cte.columns) != len(cols):
+            raise BinderError(
+                f"CTE {cte.name!r} 的列名清单与查询列数不一致",
+                hint=f"{len(cte.columns)} vs {len(cols)}",
+            )
+        seen: set[str] = set()
+        for column in cte.columns:
+            lowered = column.lower()
+            if lowered in seen:
+                raise BinderError(
+                    f"CTE {cte.name!r} 的输出列名重复：{column!r}",
+                    hint="显式列名必须唯一",
+                )
+            seen.add(lowered)
+        return [
+            OutputColumn(column, column_type.type)
+            for column, column_type in zip(cte.columns, cols)
+        ]
+
+    def _bind_recursive_cte(self, cte, name: str) -> tuple[
+        PlanNode, list[OutputColumn]
+    ]:
         query = cte.query
         if (
             len(query.parts) != 2
@@ -751,6 +777,7 @@ class Binder:
                 hint="当前只支持两部分的 UNION / UNION ALL 递归定义",
             )
         seed_node, seed_cols = self.bind_select(query.parts[0])
+        seed_cols = self._cte_output_columns(cte, seed_cols)
         placeholder = CteScan(
             columns=list(seed_cols),
             recursive=True,

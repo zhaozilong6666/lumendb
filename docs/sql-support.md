@@ -135,8 +135,13 @@ WITH adults AS (
 )
 SELECT * FROM names;
 
-WITH RECURSIVE c AS (
-  SELECT 1 AS n
+WITH c (user_id, user_name) AS (
+  SELECT id, name FROM users
+)
+SELECT user_id, user_name FROM c;
+
+WITH RECURSIVE c (n) AS (
+  SELECT 1
   UNION ALL
   SELECT n + 1 FROM c WHERE n < 5
 )
@@ -144,11 +149,11 @@ SELECT n FROM c;
 ```
 
 CTE 按书写顺序绑定：后面的 CTE 和主查询都可以引用前面的 CTE；同名的 CTE 会遮蔽
-真实表。`WITH ... INSERT ... SELECT` 同样可用。`WITH RECURSIVE` 支持
-`seed UNION [ALL] recursive` 两部分定义：`UNION ALL` 保留重复，`UNION` 去重；
-递归项引用自身时读取上一轮工作表中的行，直到没有新行；超过 10000 轮会明确报错。
-不支持 `WITH x(a, b) AS (...)` 这种列别名清单，也不支持把递归 CTE 放在
-`WITH ... INSERT/UPDATE/DELETE` 之后。
+真实表。`WITH ... INSERT ... SELECT` 同样可用。CTE 支持显式输出列名清单
+`WITH c(a, b) AS (...)`，列数必须与查询一致、列名不能重复；递归 CTE 也支持该清单。
+`WITH RECURSIVE` 支持 `seed UNION [ALL] recursive` 两部分定义：`UNION ALL` 保留重复，
+`UNION` 去重；递归项引用自身时读取上一轮工作表中的行，直到没有新行；超过 10000 轮
+会明确报错。不支持把递归 CTE 放在 `WITH ... INSERT/UPDATE/DELETE` 之后。
 
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
@@ -208,11 +213,10 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（DROP/RENAME/改类型） | 只实现了 `ADD COLUMN` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型、改默认值） | 只实现了 `ADD COLUMN` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
 | 外键约束 | 需要跨表级联与延迟检查 |
-| 视图 / 触发器 / 存储过程 | 未实现 |
+| 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
-| 递归 CTE | 只实现了非递归 `WITH` |
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |

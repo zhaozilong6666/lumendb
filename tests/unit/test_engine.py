@@ -525,6 +525,12 @@ class TestInsert:
         with pytest.raises(BinderError):
             db.execute_one("CREATE VIEW bad (x) AS SELECT a, b FROM t")
 
+    def test_view_with_cte_column_names(self, db):
+        db.execute_one(
+            "CREATE VIEW v AS WITH c(n) AS (SELECT 1) SELECT n FROM c"
+        )
+        assert rows(db, "SELECT * FROM v") == [(1,)]
+
     def test_create_view_rollback(self, db):
         db.execute_one("BEGIN")
         db.execute_one("CREATE VIEW v AS SELECT 1")
@@ -567,6 +573,18 @@ class TestInsert:
         )
         assert rows(db, "SELECT * FROM v") == [(2,)]
 
+    def test_cte_explicit_column_names(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        assert rows(
+            db,
+            "WITH c(x, y) AS (SELECT a, b FROM t) SELECT x, y FROM c",
+        ) == [(1, "x")]
+        with pytest.raises(BinderError):
+            db.execute_one("WITH c(x) AS (SELECT a, b FROM t) SELECT * FROM c")
+        with pytest.raises(BinderError):
+            db.execute_one("WITH c(x, x) AS (SELECT a, b FROM t) SELECT * FROM c")
+
     def test_recursive_cte_generates_sequence(self, db):
         result = rows(
             db,
@@ -576,6 +594,14 @@ class TestInsert:
             ") SELECT n FROM c",
         )
         assert result == [(1,), (2,), (3,), (4,), (5,)]
+
+    def test_recursive_cte_column_list(self, db):
+        assert rows(
+            db,
+            "WITH RECURSIVE c(n) AS ("
+            "SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3"
+            ") SELECT n FROM c",
+        ) == [(1,), (2,), (3,)]
 
     def test_recursive_cte_union_deduplicates(self, db):
         result = rows(

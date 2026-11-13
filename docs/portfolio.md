@@ -50,7 +50,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 698 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 702 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -104,7 +104,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 698 automated tests including crash-injection and a 20-seed randomized
+> - 702 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -232,8 +232,9 @@ oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级�
 **"CTE 在计划里长什么样？"**
 `WITH` 不是语法糖：解析器把每个 CTE 存成独立的 `SELECT` 树，绑定阶段按书写
 顺序把它们绑成独立计划放进当前作用域；`FROM cte_name` 生成 `CteScan`，它的
-child 就是那份计划。后面的 CTE 能引用前面的 CTE，同名的 CTE 遮蔽真实表。
-没有实现递归 `WITH RECURSIVE`，也没有做“同一个 CTE 被引用多次只算一次”的
+child 就是那份计划。后面的 CTE 能引用前面的 CTE，同名的 CTE 遮蔽真实表；
+`WITH c(a, b) AS (...)` 可以覆盖输出列名并校验列数与重名。递归 `WITH RECURSIVE`
+由 `RecursiveCte` 逐轮执行 seed + 递归项。没有做“同一个 CTE 被引用多次只算一次”的
 物化缓存——现在每次引用都会重新执行一次，这是明确的取舍。
 
 **"`INSERT ... SELECT` 为什么要先物化？"**
