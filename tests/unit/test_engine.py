@@ -1466,6 +1466,34 @@ class TestUpdateDelete:
         with pytest.raises(NotNullViolationError):
             db.execute_one("UPDATE t SET n = DEFAULT")
 
+    def test_update_from(self, db):
+        db.execute_one("CREATE TABLE t (id INT, v INT)")
+        db.execute_one("CREATE TABLE s (id INT, delta INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute_one("INSERT INTO s VALUES (1, 5), (2, -2)")
+        db.execute_one("CREATE INDEX idx_t_v ON t (v)")
+        result = db.execute_one(
+            "UPDATE t SET v = t.v + s.delta FROM s "
+            "WHERE t.id = s.id RETURNING t.id, t.v"
+        )
+        assert result.affected == 2
+        assert sorted(result.rows) == [(1, 15), (2, 18)]
+        assert rows(db, "SELECT id, v FROM t ORDER BY id") == [
+            (1, 15),
+            (2, 18),
+            (3, 30),
+        ]
+        assert rows(db, "SELECT id FROM t WHERE v = 15") == [(1,)]
+
+    def test_update_from_empty_source(self, db):
+        db.execute_one("CREATE TABLE t (id INT, v INT)")
+        db.execute_one("CREATE TABLE s (id INT, delta INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        result = db.execute_one(
+            "UPDATE t SET v = s.delta FROM s WHERE t.id = s.id"
+        )
+        assert result.affected == 0
+
     def test_delete_where(self, db):
         setup_users(db)
         assert db.execute_one("DELETE FROM users WHERE age < 30").affected == 1

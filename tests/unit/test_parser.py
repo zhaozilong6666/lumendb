@@ -295,6 +295,14 @@ class TestDml:
         assert len(stmt.assignments) == 2
         assert stmt.where is not None
 
+    def test_update_from(self):
+        stmt = parse_statement(
+            "UPDATE t SET b = s.delta FROM s WHERE t.id = s.id RETURNING t.id"
+        )
+        assert isinstance(stmt, Update)
+        assert stmt.from_table == "s"
+        assert stmt.where is not None
+
     def test_update_set_default(self):
         from lumendb.sql.ast import DefaultValue
 

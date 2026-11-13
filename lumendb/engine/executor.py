@@ -2312,9 +2312,31 @@ class Executor:
             self._active_ctes = {}
 
         assignment_fns: list[tuple[int, Any]] = []
-        schema = Schema(
-            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        target_schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns],
+            default_qualifier=table.name,
         )
+        schema_columns = list(target_schema.columns)
+        source_table = None
+        source_rows: list[list[Any]] = []
+        if stmt.from_table is not None:
+            if stmt.from_table.lower() == table.name:
+                raise BinderError(
+                    "UPDATE ... FROM 的源表不能与目标表同名",
+                    hint="给源表使用不同的表名或先物化到临时表",
+                )
+            source_table = self._catalog.get_table(stmt.from_table)
+            schema_columns.extend(
+                SchemaColumn(source_table.name, c.name, c.type)
+                for c in source_table.columns
+            )
+            source_rows = [
+                list(values)
+                for _rid, values in HeapFile(
+                    self._bp, source_table, self._txns
+                ).scan(txn)
+            ]
+        schema = Schema(schema_columns, default_qualifier=table.name)
         for name, expr in stmt.assignments:
             index = table.column_index(name)
             assignment_fns.append(
@@ -2325,7 +2347,9 @@ class Executor:
         if stmt.where is not None:
             where_fn, _ = self.binder.compile(stmt.where, schema, allow_agg=False)
 
-        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        ret_fns, ret_cols = self.binder.bind_returning(
+            stmt.returning, target_schema
+        )
         returned: list[tuple] = []
         updated = 0
         # 必须先物化目标行：更新会向堆里追加新版本，边扫边写会让扫描器
@@ -2333,9 +2357,19 @@ class Executor:
         targets = list(heap.scan(txn))
         for rid, old_values in targets:
             old_tuple = tuple(old_values)
-            ctx = EvalContext(old_tuple)
-            if where_fn is not None and not _truthy(where_fn(ctx)):
-                continue
+            if source_table is None:
+                ctx = EvalContext(old_tuple)
+                if where_fn is not None and not _truthy(where_fn(ctx)):
+                    continue
+            else:
+                ctx = None
+                for source_values in source_rows:
+                    candidate = EvalContext(old_tuple + tuple(source_values))
+                    if where_fn is None or _truthy(where_fn(candidate)):
+                        ctx = candidate
+                        break
+                if ctx is None:
+                    continue
             new_values = list(old_tuple)
             for index, fn in assignment_fns:
                 new_values[index] = fn(ctx)

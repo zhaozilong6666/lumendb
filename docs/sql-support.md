@@ -148,6 +148,8 @@ INSERT INTO t VALUES (1, 'a') ON CONFLICT (id)
   DO UPDATE SET name = 'updated';                      -- 冲突时更新已有行
 INSERT INTO t (id, name) SELECT id, name FROM src WHERE age >= 18;
 UPDATE t SET age = age + 1 WHERE id = 1 RETURNING id, age;
+UPDATE t SET total = t.amount + s.tax FROM s
+  WHERE t.id = s.id RETURNING t.id, t.total;  -- 单源表 UPDATE ... FROM
 UPDATE t SET age = DEFAULT WHERE id = 1;                  -- 取列当前默认值
 DELETE FROM t WHERE age < 0 RETURNING id, name;
 WITH old AS (SELECT id FROM t WHERE age < 0) DELETE FROM t
@@ -174,6 +176,13 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 `UPDATE ... SET col = DEFAULT` 与 `ON CONFLICT DO UPDATE SET col = DEFAULT` 在执行时
 读取目录里该列的当前默认值，没有默认值时写入 `NULL`；随后仍会经过 `NOT NULL`、唯一
 索引等约束检查。它只影响被赋值的列，不会重写其它列。
+
+`UPDATE ... FROM` 支持把目标表和**一个**基表源表连接起来更新；目标表列可用表名
+限定，源表列必须用源表名限定（未限定列名优先解析到目标表）。源表在更新前完整
+物化，目标行按 `WHERE` 匹配第一条源行；没有匹配的目标行不更新，同一目标行最多
+更新一次。`SET` 表达式和 `WHERE` 可以同时引用两侧列；`RETURNING` 只能在目标表
+上求值，并返回更新后的新行。源表不能与目标表同名，也暂不支持源表别名、JOIN、
+视图或 CTE 作为源表；这些情况会明确报错。索引与约束维护复用普通 `UPDATE` 的路径。
 
 ### 查询
 

@@ -515,6 +515,8 @@ class Update(Statement):
     where: Optional[Expr] = None
     returning: Optional[list["SelectItem"]] = None
     ctes: list["Cte"] = field(default_factory=list)
+    #: PostgreSQL 的 UPDATE ... FROM；目前只支持单个源表，不支持 JOIN/别名。
+    from_table: Optional[str] = None
 
 
 @dataclass

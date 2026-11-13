@@ -798,6 +798,9 @@ class Parser:
             assignments.append((col, self._parse_assignment_expr()))
             if not self._match_punct("comma"):
                 break
+        from_table = None
+        if self._match_kw("FROM"):
+            from_table = self._parse_ident("源表名")
         where = None
         if self._match_kw("WHERE"):
             where = self._parse_expr()
@@ -806,6 +809,7 @@ class Parser:
             assignments=assignments,
             where=where,
             returning=self._parse_returning(),
+            from_table=from_table,
         )
 
     def _parse_delete(self) -> Delete:
