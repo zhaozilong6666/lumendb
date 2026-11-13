@@ -492,6 +492,7 @@ class Parser:
         on_conflict_nothing = False
         conflict_columns = None
         on_conflict_update = None
+        on_conflict_where = None
         if self._match_kw("ON"):
             self._expect_kw("CONFLICT")
             if self._match_punct("lparen"):
@@ -515,6 +516,8 @@ class Parser:
                     on_conflict_update.append((col, self._parse_expr()))
                     if not self._match_punct("comma"):
                         break
+                if self._match_kw("WHERE"):
+                    on_conflict_where = self._parse_expr()
         returning = self._parse_returning()
         return Insert(
             table=table,
@@ -524,6 +527,7 @@ class Parser:
             on_conflict_nothing=on_conflict_nothing,
             conflict_columns=conflict_columns,
             on_conflict_update=on_conflict_update,
+            on_conflict_where=on_conflict_where,
             returning=returning,
         )
 

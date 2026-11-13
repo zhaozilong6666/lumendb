@@ -937,6 +937,11 @@ class Executor:
             if stmt.on_conflict_update
             else []
         )
+        conflict_where_fn = None
+        if stmt.on_conflict_where is not None:
+            conflict_where_fn, _ = self.binder.compile(
+                stmt.on_conflict_where, schema, allow_agg=False
+            )
         returned: list[tuple] = []
         count = 0
 
@@ -956,6 +961,7 @@ class Executor:
                 on_conflict_update=stmt.on_conflict_update,
                 conflict_index=conflict_index,
                 assignment_fns=assignment_fns,
+                conflict_where_fn=conflict_where_fn,
                 ret_fns=ret_fns,
             )
             count += delta
@@ -1101,6 +1107,11 @@ class Executor:
             if stmt.on_conflict_update
             else []
         )
+        conflict_where_fn = None
+        if stmt.on_conflict_where is not None:
+            conflict_where_fn, _ = self.binder.compile(
+                stmt.on_conflict_where, schema, allow_agg=False
+            )
         returned: list[tuple] = []
         count = 0
         for values in source_rows:
@@ -1114,6 +1125,7 @@ class Executor:
                 on_conflict_update=stmt.on_conflict_update,
                 conflict_index=conflict_index,
                 assignment_fns=assignment_fns,
+                conflict_where_fn=conflict_where_fn,
                 ret_fns=ret_fns,
             )
             count += delta
@@ -1141,6 +1153,7 @@ class Executor:
         on_conflict_update: bool,
         conflict_index: Optional[IndexDef],
         assignment_fns: list[tuple[int, Any]],
+        conflict_where_fn: Optional[Any],
         ret_fns: list[Any],
     ) -> tuple[int, Optional[tuple]]:
         """统一写入一条 INSERT 候选行。
@@ -1168,6 +1181,10 @@ class Executor:
             rid = self._find_conflict_rid(table, prepared, txn, conflict_index)
             old_values = heap.get(txn, rid) if rid is not None else None
             if old_values is not None:
+                if conflict_where_fn is not None and not _truthy(
+                    conflict_where_fn(EvalContext(tuple(old_values)))
+                ):
+                    return 0, None
                 prepared = self._apply_conflict_update(
                     table, heap, txn, rid, old_values, assignment_fns
                 )

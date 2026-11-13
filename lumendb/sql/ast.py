@@ -382,6 +382,8 @@ class Insert(Statement):
     conflict_columns: Optional[list[str]] = None
     #: ``ON CONFLICT DO UPDATE SET ...`` 的赋值；为 None 时不是 DO UPDATE
     on_conflict_update: Optional[list[tuple[str, Expr]]] = None
+    #: ``ON CONFLICT DO UPDATE ... WHERE condition``；在旧行上求值
+    on_conflict_where: Optional[Expr] = None
     #: ``RETURNING`` 表达式及其可选别名；为 None 时不返回行
     returning: Optional[list["SelectItem"]] = None
 

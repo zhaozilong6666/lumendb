@@ -371,6 +371,37 @@ class TestInsert:
             (2, "b"),
         ]
 
+    def test_on_conflict_do_update_where_condition(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 20) "
+            "ON CONFLICT DO UPDATE SET n = 20 WHERE n < 10"
+        )
+        assert result.affected == 0
+        assert rows(db, "SELECT id, n FROM t") == [(1, 10)]
+
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 20) "
+            "ON CONFLICT DO UPDATE SET n = 20 WHERE n = 10 RETURNING id, n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 20)]
+        assert rows(db, "SELECT id, n FROM t") == [(1, 20)]
+
+    def test_on_conflict_do_update_where_condition_insert_select(self, db):
+        db.execute_one("CREATE TABLE src (id INT)")
+        db.execute_one("INSERT INTO src VALUES (1)")
+        db.execute_one("CREATE TABLE dst (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO dst VALUES (1, 10)")
+        result = db.execute_one(
+            "INSERT INTO dst SELECT id, 20 FROM src "
+            "ON CONFLICT DO UPDATE SET n = 20 WHERE n = 10"
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT id, n FROM dst") == [(1, 20)]
+
     def test_on_conflict_do_nothing_with_target_only_skips_target(self, db):
         db.execute_one(
             "CREATE TABLE t (id INT PRIMARY KEY, a INT UNIQUE, b INT UNIQUE)"
