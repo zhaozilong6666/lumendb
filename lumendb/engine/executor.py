@@ -37,6 +37,7 @@ from ..sql.ast import (
     CreateTable,
     CreateTableAs,
     CreateView,
+    DefaultValue,
     Delete,
     DropIndex,
     DropTable,
@@ -1522,6 +1523,16 @@ class Executor:
         ]
         return Schema(old_cols + excluded_cols, default_qualifier=table.name)
 
+    def _compile_assignment(
+        self, table: TableDef, index: int, expr: Expr, schema: Schema
+    ) -> Any:
+        """编译 UPDATE / ON CONFLICT 的赋值；DEFAULT 直接取目录中的列默认值。"""
+        if isinstance(expr, DefaultValue):
+            value = table.columns[index].default
+            return lambda _ctx, captured=value: captured
+        fn, _ = self.binder.compile(expr, schema, allow_agg=False)
+        return fn
+
     def _compile_conflict_assignments(
         self,
         table: TableDef,
@@ -1533,8 +1544,9 @@ class Executor:
         compiled: list[tuple[int, Any]] = []
         for name, expr in assignments:
             index = table.column_index(name)
-            fn, _ = self.binder.compile(expr, schema, allow_agg=False)
-            compiled.append((index, fn))
+            compiled.append(
+                (index, self._compile_assignment(table, index, expr, schema))
+            )
         return compiled
 
     def _apply_conflict_update(
@@ -1754,8 +1766,9 @@ class Executor:
         )
         for name, expr in stmt.assignments:
             index = table.column_index(name)
-            fn, _ = self.binder.compile(expr, schema, allow_agg=False)
-            assignment_fns.append((index, fn))
+            assignment_fns.append(
+                (index, self._compile_assignment(table, index, expr, schema))
+            )
 
         where_fn = None
         if stmt.where is not None:

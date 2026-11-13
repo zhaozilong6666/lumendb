@@ -93,6 +93,7 @@ INSERT INTO t VALUES (1, 'a') ON CONFLICT (id)
   DO UPDATE SET name = 'updated';                      -- 冲突时更新已有行
 INSERT INTO t (id, name) SELECT id, name FROM src WHERE age >= 18;
 UPDATE t SET age = age + 1 WHERE id = 1 RETURNING id, age;
+UPDATE t SET age = DEFAULT WHERE id = 1;                  -- 取列当前默认值
 DELETE FROM t WHERE age < 0 RETURNING id, name;
 WITH old AS (SELECT id FROM t WHERE age < 0) DELETE FROM t
   WHERE id IN (SELECT id FROM old) RETURNING id;
@@ -114,6 +115,10 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 `INSERT ... DEFAULT VALUES` 不接受列清单，按目录里的列默认值组装一行；没有默认值的
 可空列为 `NULL`，`NOT NULL` 列缺少默认值时按约束报错。它同样支持 `RETURNING` 和
 `ON CONFLICT`。
+
+`UPDATE ... SET col = DEFAULT` 与 `ON CONFLICT DO UPDATE SET col = DEFAULT` 在执行时
+读取目录里该列的当前默认值，没有默认值时写入 `NULL`；随后仍会经过 `NOT NULL`、唯一
+索引等约束检查。它只影响被赋值的列，不会重写其它列。
 
 ### 查询
 

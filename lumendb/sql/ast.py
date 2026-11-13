@@ -39,6 +39,14 @@ class Literal(Expr):
 
 
 @dataclass(frozen=True)
+class DefaultValue(Expr):
+    """``SET col = DEFAULT``：执行时取目录里的列默认值，仅用于 DML 赋值。"""
+
+    def render(self) -> str:
+        return "DEFAULT"
+
+
+@dataclass(frozen=True)
 class ParamRef(Expr):
     """参数占位符 ``$n``（n 从 1 开始）。
 

@@ -28,6 +28,7 @@ from .ast import (
     CreateView,
     Cte,
     Delete,
+    DefaultValue,
     DropIndex,
     DropTable,
     DropView,
@@ -670,7 +671,7 @@ class Parser:
                         self._advance()
                     else:
                         raise self._error("赋值处期望 =")
-                    on_conflict_update.append((col, self._parse_expr()))
+                    on_conflict_update.append((col, self._parse_assignment_expr()))
                     if not self._match_punct("comma"):
                         break
                 if self._match_kw("WHERE"):
@@ -690,6 +691,12 @@ class Parser:
             returning=returning,
         )
 
+    def _parse_assignment_expr(self) -> Expr:
+        """UPDATE / ON CONFLICT 的赋值右侧：DEFAULT 是独立语义，不是普通表达式。"""
+        if self._match_kw("DEFAULT"):
+            return DefaultValue()
+        return self._parse_expr()
+
     def _parse_update(self) -> Update:
         self._expect_kw("UPDATE")
         table = self._parse_ident("表名")
@@ -701,7 +708,7 @@ class Parser:
                 self._advance()
             else:
                 raise self._error("赋值处期望 =")
-            assignments.append((col, self._parse_expr()))
+            assignments.append((col, self._parse_assignment_expr()))
             if not self._match_punct("comma"):
                 break
         where = None

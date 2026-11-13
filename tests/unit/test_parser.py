@@ -221,6 +221,16 @@ class TestDml:
         assert len(stmt.assignments) == 2
         assert stmt.where is not None
 
+    def test_update_set_default(self):
+        from lumendb.sql.ast import DefaultValue
+
+        stmt = parse_statement("UPDATE t SET a = DEFAULT, b = 2")
+        assert isinstance(stmt.assignments[0][1], DefaultValue)
+        conflict = parse_statement(
+            "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = DEFAULT"
+        )
+        assert isinstance(conflict.on_conflict_update[0][1], DefaultValue)
+
     def test_delete(self):
         stmt = parse_statement("DELETE FROM t WHERE id = 1")
         assert stmt.table == "t" and stmt.where is not None

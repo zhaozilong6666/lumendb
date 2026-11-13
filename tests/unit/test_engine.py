@@ -143,6 +143,15 @@ class TestOnConflict:
         assert result.affected == 0
         assert rows(db, "SELECT name FROM users WHERE id = 1") == [("alice",)]
 
+    def test_conflict_update_set_default(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT DEFAULT 5)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 99) "
+            "ON CONFLICT DO UPDATE SET n = DEFAULT RETURNING id, n"
+        )
+        assert result.rows == [(1, 5)]
+
     def test_do_nothing_mixed_rows(self, db):
         setup_users(db)
         result = db.execute_one(
@@ -1396,6 +1405,26 @@ class TestUpdateDelete:
         setup_users(db)
         db.execute_one("UPDATE users SET age = age + 1 WHERE id = 1")
         assert rows(db, "SELECT age FROM users WHERE id = 1") == [(31,)]
+
+    def test_update_set_default(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT, a INT DEFAULT 5, b TEXT DEFAULT 'x', c INT)"
+        )
+        db.execute_one("INSERT INTO t (id) VALUES (1)")
+        result = db.execute_one(
+            "UPDATE t SET a = DEFAULT, b = DEFAULT, c = DEFAULT "
+            "WHERE id = 1 RETURNING id, a, b, c"
+        )
+        assert result.rows == [(1, 5, "x", None)]
+        db.execute_one("ALTER TABLE t ALTER COLUMN a SET DEFAULT 9")
+        db.execute_one("UPDATE t SET a = DEFAULT WHERE id = 1")
+        assert rows(db, "SELECT a FROM t WHERE id = 1") == [(9,)]
+
+    def test_update_default_missing_not_null_rejected(self, db):
+        db.execute_one("CREATE TABLE t (id INT, n INT NOT NULL)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("UPDATE t SET n = DEFAULT")
 
     def test_delete_where(self, db):
         setup_users(db)
