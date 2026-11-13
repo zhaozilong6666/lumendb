@@ -627,6 +627,20 @@ class TestAlterTable:
         stmt = parse_statement("ALTER TABLE users ADD age INT")
         assert stmt.column.name == "age"
 
+    def test_alter_column_default(self):
+        from lumendb.sql.ast import AlterTableAlterDefault
+
+        stmt = parse_statement(
+            "ALTER TABLE users ALTER COLUMN age SET DEFAULT 18"
+        )
+        assert isinstance(stmt, AlterTableAlterDefault)
+        assert stmt.column == "age"
+        assert stmt.default.value == 18
+        dropped = parse_statement(
+            "ALTER TABLE users ALTER COLUMN age DROP DEFAULT"
+        )
+        assert dropped.default is None
+
     def test_primary_key_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement("ALTER TABLE users ADD COLUMN id INT PRIMARY KEY")

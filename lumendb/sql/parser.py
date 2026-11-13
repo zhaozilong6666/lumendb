@@ -64,6 +64,7 @@ from .ast import (
     Truncate,
     AlterTableAddColumn,
     AlterTableAddConstraint,
+    AlterTableAlterDefault,
     AlterTableRenameColumn,
     AlterTableRenameTable,
 )
@@ -308,6 +309,22 @@ class Parser:
                     hint="先加普通列，再 CREATE UNIQUE INDEX",
                 )
             return AlterTableAddColumn(table=table, column=column)
+
+        if self._match_kw("ALTER"):
+            self._match_kw("COLUMN")
+            column = self._parse_ident("列名")
+            if self._match_kw("SET"):
+                self._expect_kw("DEFAULT")
+                default = self._parse_expr()
+                return AlterTableAlterDefault(
+                    table=table, column=column, default=default
+                )
+            if self._match_kw("DROP"):
+                self._expect_kw("DEFAULT")
+                return AlterTableAlterDefault(
+                    table=table, column=column, default=None
+                )
+            raise self._error("ALTER COLUMN 之后期望 SET DEFAULT 或 DROP DEFAULT")
 
         if self._match_kw("RENAME"):
             if self._match_kw("TABLE"):

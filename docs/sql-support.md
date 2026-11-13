@@ -21,6 +21,8 @@ DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
 ALTER TABLE t ADD [COLUMN] note TEXT;
 ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
+ALTER TABLE t ALTER [COLUMN] age SET DEFAULT 21;
+ALTER TABLE t ALTER [COLUMN] age DROP DEFAULT;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
@@ -47,6 +49,10 @@ DROP TABLE t [CASCADE];
 带非空 `DEFAULT`；主键/唯一约束请先加普通列，再 `ALTER TABLE ... ADD [CONSTRAINT name]
 UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TABLE ... ADD UNIQUE` 会回填已有数据，
 已有重复值时直接报错，不会留下半成品索引。
+
+`ALTER [COLUMN] ... SET DEFAULT` / `DROP DEFAULT` 只修改目录里的默认值，不重写已有行；
+后续 `INSERT` 省略该列时读取新默认值，已有行只有在 `UPDATE`/`VACUUM` 重写时才会
+重新编码。默认值目前只支持字面常量，且会按列类型做一次转换校验。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
 同步更新所有索引的列引用，不重写堆记录。重命名后旧名字立即失效；客户端需要重新
@@ -215,7 +221,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型、改默认值） | 只实现了 `ADD COLUMN` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |

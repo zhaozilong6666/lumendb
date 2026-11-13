@@ -716,6 +716,16 @@ class TestInsert:
         with pytest.raises(BinderError):
             db.execute_one("DROP TABLE new")
 
+    def test_replace_view_rejected_when_dependent_breaks(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        db.execute_one("CREATE VIEW top AS SELECT a FROM v")
+        with pytest.raises(BinderError):
+            db.execute_one("CREATE OR REPLACE VIEW v AS SELECT b FROM t")
+        # 自动提交语句失败时整体回滚，旧视图仍可用。
+        assert rows(db, "SELECT * FROM top") == [(1,)]
+
     def test_replace_view_dependency_rollback(self, db):
         db.execute_one("CREATE TABLE old (a INT)")
         db.execute_one("CREATE TABLE new (a INT)")
@@ -1588,6 +1598,24 @@ class TestAlterTable:
         ]
         db.execute_one("INSERT INTO t (id, name) VALUES (3, 'c')")
         assert rows(db, "SELECT age FROM t WHERE id = 3") == [(18,)]
+
+    def test_alter_column_default_and_drop(self, db):
+        db.execute_one("CREATE TABLE t (a INT DEFAULT 5, b INT)")
+        db.execute_one("INSERT INTO t (b) VALUES (1)")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a SET DEFAULT 7")
+        db.execute_one("INSERT INTO t (b) VALUES (2)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a SET DEFAULT 9")
+        db.execute_one("ROLLBACK")
+        db.execute_one("INSERT INTO t (b) VALUES (3)")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a DROP DEFAULT")
+        db.execute_one("INSERT INTO t (b) VALUES (4)")
+        assert rows(db, "SELECT a, b FROM t ORDER BY b") == [
+            (5, 1),
+            (7, 2),
+            (7, 3),
+            (None, 4),
+        ]
 
     def test_add_nullable_column_pads_null(self, db):
         db.execute_one("CREATE TABLE t (id INT)")

@@ -29,6 +29,7 @@ from ..errors import (
 from ..sql.ast import (
     AlterTableAddColumn,
     AlterTableAddConstraint,
+    AlterTableAlterDefault,
     AlterTableRenameColumn,
     AlterTableRenameTable,
     CreateIndex,
@@ -161,6 +162,8 @@ class Executor:
                 return self._alter_add_column(stmt, txn)
             if isinstance(stmt, AlterTableAddConstraint):
                 return self._alter_add_constraint(stmt, txn)
+            if isinstance(stmt, AlterTableAlterDefault):
+                return self._alter_default(stmt, txn)
             if isinstance(stmt, AlterTableRenameTable):
                 self._catalog.rename_table(txn, stmt.table, stmt.new_name)
                 return Result(
@@ -950,6 +953,46 @@ class Executor:
                 f"已添加列 {name}；旧记录在读取时按默认值补齐，"
                 "不重写堆页"
             ),
+        )
+
+    def _alter_default(
+        self, stmt: AlterTableAlterDefault, txn: Transaction
+    ) -> Result:
+        from ..sql.ast import Literal
+
+        table = self._catalog.get_table(stmt.table)
+        index = table.column_index(stmt.column)
+        column = table.columns[index]
+        if stmt.default is not None:
+            if not isinstance(stmt.default, Literal):
+                raise NotSupportedError(
+                    "ALTER COLUMN SET DEFAULT 目前只支持字面常量",
+                    hint="默认值不能引用列或函数",
+                )
+            value = stmt.default.value
+            if value is not None:
+                try:
+                    value = column.type.coerce(value)
+                except ValueError as exc:
+                    raise TypeMismatchError(
+                        f"列 {column.name} 的默认值类型不匹配",
+                        detail=str(exc),
+                    ) from exc
+        else:
+            value = None
+        old = column
+        table.columns[index] = replace(column, default=value)
+
+        def undo() -> None:
+            table.columns[index] = old
+
+        txn.undo_log.append(undo)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        action = "设置" if stmt.default is not None else "删除"
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"已{action}列 {column.name} 的默认值",
         )
 
     def _alter_add_constraint(

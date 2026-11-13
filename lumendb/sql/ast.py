@@ -399,6 +399,14 @@ class AlterTableRenameColumn(Statement):
 
 
 @dataclass
+class AlterTableAlterDefault(Statement):
+    table: str
+    column: str
+    #: None 表示 DROP DEFAULT；否则为 SET DEFAULT 的字面表达式
+    default: Optional[Expr] = None
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
