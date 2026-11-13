@@ -24,6 +24,7 @@ from .ast import (
     CompoundSelect,
     CreateIndex,
     CreateTable,
+    CreateTableAs,
     Cte,
     Delete,
     DropIndex,
@@ -293,13 +294,19 @@ class Parser:
             return stmt
         raise self._error("WITH 之后期望 SELECT 或 INSERT")
 
-    def _parse_create_table(self) -> CreateTable:
+    def _parse_create_table(self) -> Statement:
         if_not_exists = False
         if self._match_kw("IF"):
             self._expect_kw("NOT")
             self._expect_kw("EXISTS")
             if_not_exists = True
         name = self._parse_ident("表名")
+        if self._match_kw("AS"):
+            return CreateTableAs(
+                name=name,
+                query=self._parse_query_expression(),
+                if_not_exists=if_not_exists,
+            )
         self._expect_punct("lparen", "(")
         columns: list[ColumnDef] = []
         while True:

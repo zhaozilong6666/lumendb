@@ -323,6 +323,13 @@ class DropTable(Statement):
 
 
 @dataclass
+class CreateTableAs(Statement):
+    name: str
+    query: Union[Select, CompoundSelect]
+    if_not_exists: bool = False
+
+
+@dataclass
 class CreateIndex(Statement):
     name: str
     table: str
@@ -457,6 +464,7 @@ __all__ = [
     "ColumnDef",
     "Statement",
     "CreateTable",
+    "CreateTableAs",
     "DropTable",
     "CreateIndex",
     "AlterTableAddColumn",

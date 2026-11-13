@@ -334,6 +334,61 @@ class TestInsert:
         assert rows(db, "SELECT id FROM dst") == [(2,)]
 
 
+class TestCreateTableAs:
+    def test_basic(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "CREATE TABLE adults AS "
+            "SELECT id, name FROM users WHERE age >= 30"
+        )
+        assert result.affected == 2
+        assert rows(db, "SELECT id, name FROM adults ORDER BY id") == [
+            (1, "alice"), (3, "carol")
+        ]
+
+    def test_expression_alias(self, db):
+        setup_users(db)
+        db.execute_one(
+            "CREATE TABLE stats AS SELECT COUNT(*) AS n FROM users"
+        )
+        assert rows(db, "SELECT n FROM stats") == [(3,)]
+
+    def test_zero_rows_still_creates_table(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "CREATE TABLE empty AS SELECT id FROM users WHERE id > 100"
+        )
+        assert result.affected == 0
+        assert rows(db, "SELECT COUNT(*) FROM empty") == [(0,)]
+
+    def test_union_source(self, db):
+        db.execute_one("CREATE TABLE a (id INT)")
+        db.execute_one("CREATE TABLE b (id INT)")
+        db.execute_one("INSERT INTO a VALUES (1), (2)")
+        db.execute_one("INSERT INTO b VALUES (2), (3)")
+        db.execute_one(
+            "CREATE TABLE merged AS SELECT id FROM a UNION SELECT id FROM b"
+        )
+        assert rows(db, "SELECT id FROM merged ORDER BY id") == [(1,), (2,), (3,)]
+
+    def test_requires_alias_for_expression_name(self, db):
+        with pytest.raises(BinderError):
+            db.execute_one("CREATE TABLE t AS SELECT 1")
+
+    def test_duplicate_output_names_rejected(self, db):
+        with pytest.raises(BinderError):
+            db.execute_one("CREATE TABLE t AS SELECT 1 AS x, 2 AS x")
+
+    def test_if_not_exists_keeps_existing_table(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        result = db.execute_one(
+            "CREATE TABLE IF NOT EXISTS t AS SELECT 2 AS id"
+        )
+        assert "已跳过" in (result.notice or "")
+        assert rows(db, "SELECT id FROM t") == [(1,)]
+
+
 class TestSelectBasics:
     def test_star(self, db):
         setup_users(db)

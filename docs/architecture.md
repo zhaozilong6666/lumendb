@@ -155,6 +155,10 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 再逐行写堆和索引。物化不只是为了简单——`INSERT INTO t SELECT * FROM t` 如果边读
 边写，扫描器会不断看到刚插入的新版本，表会无限增长。
 
+`CREATE TABLE AS SELECT` 复用同一条链路：先绑定查询拿到输出列名和类型，建一张
+全是可空列的空表，再物化结果并逐行插入。它不复制来源表的索引、主键或约束——
+这些需要显式 `CREATE INDEX`。
+
 ## 5. 协议
 
 实现 PostgreSQL v3：

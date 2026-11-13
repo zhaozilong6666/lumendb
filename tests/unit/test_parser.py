@@ -24,6 +24,7 @@ from lumendb.sql.ast import (
     Insert,
     ColumnRef,
     CompoundSelect,
+    CreateTableAs,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
 
@@ -34,6 +35,19 @@ class TestCreateTable:
         assert stmt.name == "t"
         assert len(stmt.columns) == 2
         assert stmt.columns[0].type.kind == DataType.INT
+
+    def test_create_table_as_select(self):
+        stmt = parse_statement("CREATE TABLE t AS SELECT id, name FROM src")
+        assert isinstance(stmt, CreateTableAs)
+        assert stmt.name == "t"
+        assert stmt.query is not None
+
+    def test_create_table_as_if_not_exists(self):
+        stmt = parse_statement(
+            "CREATE TABLE IF NOT EXISTS t AS SELECT id FROM src"
+        )
+        assert isinstance(stmt, CreateTableAs)
+        assert stmt.if_not_exists is True
 
     def test_all_column_options(self):
         stmt = parse_statement(

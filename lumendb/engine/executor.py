@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 import time
 from typing import Any, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
-from ..catalog.schema import IndexDef, TableDef
+from ..catalog.schema import Column, IndexDef, TableDef
 from ..datatypes import DataType, TypeSpec
 from ..errors import (
     BinderError,
@@ -28,6 +29,7 @@ from ..sql.ast import (
     AlterTableAddColumn,
     CreateIndex,
     CreateTable,
+    CreateTableAs,
     Delete,
     DropIndex,
     DropTable,
@@ -49,6 +51,8 @@ from ..storage.page import INVALID_PAGE_ID
 from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 from ..plan.binder import AggregateAccumulatorGroup, Binder, Schema, SchemaColumn
 from ..plan.nodes import (
     Aggregate,
@@ -131,6 +135,8 @@ class Executor:
                 return self._delete(stmt, txn)
             if isinstance(stmt, CreateTable):
                 return self._create_table(stmt, txn)
+            if isinstance(stmt, CreateTableAs):
+                return self._create_table_as(stmt, txn)
             if isinstance(stmt, AlterTableAddColumn):
                 return self._alter_add_column(stmt, txn)
             if isinstance(stmt, DropTable):
@@ -457,6 +463,47 @@ class Executor:
             )
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
+
+    def _create_table_as(
+        self, stmt: CreateTableAs, txn: Transaction
+    ) -> Result:
+        if self._catalog.has_table(stmt.name):
+            if stmt.if_not_exists:
+                return Result(tag="CREATE TABLE", notice="表已存在，已跳过")
+            raise TableAlreadyExistsError(
+                f"表 {stmt.name!r} 已存在",
+                hint="使用 DROP TABLE 后再建",
+            )
+
+        plan, out_cols = self.binder.bind_select(stmt.query)
+        columns: list[Column] = []
+        seen: set[str] = set()
+        for i, out in enumerate(out_cols, start=1):
+            name = out.name.lower()
+            if not _IDENT_RE.match(name) or name in seen:
+                raise BinderError(
+                    "CREATE TABLE AS 的列名必须是合法且唯一的标识符",
+                    detail=f"第 {i} 列是 {out.name!r}",
+                    hint="给表达式加一个 AS 别名，例如 COUNT(*) AS n",
+                )
+            seen.add(name)
+            columns.append(Column(name=name, type=out.type, nullable=True))
+
+        self._catalog.create_table(txn, stmt.name, columns, [])
+        table = self._catalog.get_table(stmt.name)
+        heap = HeapFile(self._bp, table, self._txns)
+        # 先物化查询结果：如果来源恰好读了同名的旧表（IF NOT EXISTS 不适用），
+        # 建表之后再读会改变语义。这里统一在写入前固定结果集。
+        source_rows = [tuple(row) for row in self._execute(plan, txn)]
+        for row in source_rows:
+            heap.insert(txn, list(row))
+
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            affected=len(source_rows),
+            tag=f"CREATE TABLE AS SELECT ({len(source_rows)} rows)",
+        )
 
     def _alter_add_column(self, stmt: AlterTableAddColumn, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
