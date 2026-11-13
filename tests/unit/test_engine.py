@@ -1157,6 +1157,20 @@ class TestUnion:
     def test_union_null_is_one_row(self, db):
         assert rows(db, "SELECT NULL AS x UNION SELECT NULL") == [(None,)]
 
+    def test_union_null_absorbs_other_type(self, db):
+        result = db.execute_one(
+            "SELECT NULL AS x UNION SELECT 1 ORDER BY x"
+        )
+        assert result.rows == [(1,), (None,)]
+        assert result.columns[0].type.name == "INT"
+
+    def test_union_null_and_text_becomes_text(self, db):
+        result = db.execute_one(
+            "SELECT NULL AS x UNION SELECT 'a' ORDER BY x"
+        )
+        assert result.rows == [("a",), (None,)]
+        assert result.columns[0].type.name == "TEXT"
+
     def test_union_order_by_output_alias_and_limit(self, db):
         assert rows(
             db,
@@ -1313,6 +1327,37 @@ class TestSubquery:
     def test_exists(self, db):
         setup_users(db)
         assert rows(db, "SELECT EXISTS (SELECT 1 FROM users)") == [(True,)]
+
+    def test_scalar_null_is_type_compatible(self, db):
+        setup_users(db)
+        assert rows(db, "SELECT id FROM users WHERE id = (SELECT NULL)") == []
+
+    def test_case_null_branch_uses_other_branch_type(self, db):
+        result = db.execute_one(
+            "SELECT CASE WHEN 1 = 1 THEN NULL ELSE 2 END AS v"
+        )
+        assert result.rows == [(None,)]
+        assert result.columns[0].type.name == "INT"
+
+    def test_ctas_null_column_becomes_text(self, db):
+        db.execute_one("CREATE TABLE snap AS SELECT NULL AS v")
+        result = db.execute_one("SELECT * FROM snap")
+        assert result.rows == [(None,)]
+        assert result.columns[0].type.name == "TEXT"
+
+    def test_null_arithmetic_propagates_type(self, db):
+        result = db.execute_one("SELECT NULL + 1 AS v")
+        assert result.rows == [(None,)]
+        assert result.columns[0].type.name == "INT"
+
+    def test_coalesce_absorbs_null_type(self, db):
+        result = db.execute_one("SELECT COALESCE(NULL, 1) AS v")
+        assert result.rows == [(1,)]
+        assert result.columns[0].type.name == "INT"
+
+    def test_coalesce_rejects_incompatible_types(self, db):
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("SELECT COALESCE(1, 'a')")
 
 
 class TestTransactions:

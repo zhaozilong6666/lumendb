@@ -51,12 +51,25 @@ _NUMERIC_RANK = {DataType.INT: 0, DataType.BIGINT: 1, DataType.FLOAT: 2}
 
 @dataclass(frozen=True)
 class TypeSpec:
-    """一个列的具体类型，包含 VARCHAR 的长度上限。"""
+    """一个列的具体类型，包含 VARCHAR 的长度上限。
+
+    ``unknown`` 是 SQL 的 NULL 字面量类型：它只在绑定阶段存在，表示
+    “还不知道具体类型”，需要在集合运算、CASE 分支等位置被另一侧的类型
+    吸收。它不会进入表定义，也不会参与存储编码。
+    """
 
     kind: DataType
     length: int | None = None
+    unknown: bool = False
 
     def __post_init__(self) -> None:
+        if self.unknown:
+            if self.kind is not DataType.TEXT or self.length is not None:
+                raise NotSupportedError(
+                    "NULL 未知类型必须是 TEXT 且不接受长度",
+                    detail=f"收到 {self.kind.value} / length={self.length}",
+                )
+            return
         if self.kind is DataType.VARCHAR:
             if self.length is None:
                 raise NotSupportedError(
@@ -77,6 +90,8 @@ class TypeSpec:
 
     @property
     def name(self) -> str:
+        if self.unknown:
+            return "NULL"
         if self.kind is DataType.VARCHAR:
             return f"VARCHAR({self.length})"
         return self.kind.value
@@ -148,6 +163,11 @@ class TypeSpec:
             return None
 
         kind = self.kind
+        if self.unknown:
+            raise TypeMismatchError(
+                "NULL 未知类型只能表示 SQL NULL",
+                detail=f"收到非 NULL 值 {value!r}",
+            )
 
         if kind is DataType.INT:
             if isinstance(value, bool):
@@ -232,14 +252,30 @@ def common_type(a: TypeSpec, b: TypeSpec) -> TypeSpec:
     """二元运算的类型提升规则。
 
     只允许无损提升：INT -> BIGINT -> FLOAT。字符串与数值之间必须显式 CAST。
+    ``unknown``（SQL NULL 字面量）会被另一侧吸收；两侧都是 unknown 时保持
+    unknown，交给更外层的表达式继续推断。
     """
+    if a.unknown:
+        return b
+    if b.unknown:
+        return a
     if a.kind is b.kind and a.kind is not DataType.VARCHAR:
         return a
     if a.kind is DataType.VARCHAR and b.kind is DataType.VARCHAR:
         # 取更宽的一侧
         la, lb = a.length or 0, b.length or 0
         return TypeSpec(DataType.VARCHAR, max(la, lb))
-    if a.kind is DataType.VARCHAR or b.kind is DataType.VARCHAR:
+    if a.kind in (DataType.TEXT, DataType.VARCHAR) and b.kind in (
+        DataType.TEXT,
+        DataType.VARCHAR,
+    ):
+        # VARCHAR 与 TEXT 可以互转；结果取不限长度的 TEXT，避免集合运算
+        # 因一侧是 TEXT 就直接报不兼容。
+        return TypeSpec(DataType.TEXT)
+    if a.kind in (DataType.TEXT, DataType.VARCHAR) or b.kind in (
+        DataType.TEXT,
+        DataType.VARCHAR,
+    ):
         raise TypeMismatchError(
             f"无法在 {a.name} 与 {b.name} 之间做隐式类型提升",
             hint="使用 CAST 显式转换",

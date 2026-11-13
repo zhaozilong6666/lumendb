@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Column, TableDef
-from ..datatypes import DataType, TypeSpec
+from ..datatypes import DataType, TypeSpec, common_type
 from ..errors import (
     AmbiguousColumnError,
     BinderError,
@@ -256,7 +256,9 @@ class Binder:
     def _literal(self, expr: Literal, schema, allow_agg):
         value = expr.value
         if value is None:
-            return (lambda ctx: None), TypeSpec(DataType.TEXT)
+            # SQL NULL 在 PostgreSQL 里是 unknown 类型，而不是 TEXT；
+            # 让它在 UNION / CASE / 比较里被另一侧的真实类型吸收。
+            return (lambda ctx: None), TypeSpec(DataType.TEXT, unknown=True)
         if isinstance(value, bool):
             return (lambda ctx: value), TypeSpec(DataType.BOOLEAN)
         if isinstance(value, int):
@@ -358,6 +360,17 @@ class Binder:
             return _concat, TypeSpec(DataType.TEXT)
 
         if op in ("+", "-", "*", "/", "%"):
+            if lt.unknown or rt.unknown:
+                other = rt if lt.unknown else lt
+                if other.unknown:
+                    return (lambda ctx: None), TypeSpec(DataType.TEXT, unknown=True)
+                if not other.is_numeric:
+                    raise TypeMismatchError(
+                        f"运算符 {op} 需要数值操作数",
+                        detail=f"未知类型 NULL 与 {other.sql}",
+                    )
+                # NULL + 1 的结果类型由另一侧决定，运行时直接传播 NULL。
+                return (lambda ctx: None), other
             if not lt.is_numeric or not rt.is_numeric:
                 raise TypeMismatchError(
                     f"运算符 {op} 需要数值操作数",
@@ -891,15 +904,20 @@ class Binder:
                     f"{op} 两侧的列数不同",
                     detail=f"左侧 {len(out_cols)} 列，右侧 {len(right_cols)} 列",
                 )
+            merged_cols: list[OutputColumn] = []
             for left_col, right_col in zip(out_cols, right_cols):
-                if not _comparable_types(left_col.type, right_col.type):
+                try:
+                    merged_type = common_type(left_col.type, right_col.type)
+                except TypeMismatchError as exc:
                     raise TypeMismatchError(
                         f"{op} 两侧的列类型不兼容",
                         detail=(
                             f"{left_col.name}: {left_col.type.name} 与 "
                             f"{right_col.type.name}"
                         ),
-                    )
+                    ) from exc
+                merged_cols.append(OutputColumn(left_col.name, merged_type))
+            out_cols = merged_cols
             node = SetOp(
                 left=node,
                 right=right_node,
@@ -1337,6 +1355,10 @@ def _equality_test(left_fn, right_fn):
 def _merge_branch_types(current, candidate):
     if current is None:
         return candidate
+    if current.unknown:
+        return candidate
+    if candidate.unknown:
+        return current
     if current.kind == candidate.kind:
         return current
     if current.is_numeric and candidate.is_numeric:
@@ -1419,9 +1441,12 @@ def _comparable_types(left: TypeSpec, right: TypeSpec) -> bool:
     """比较运算两侧的类型是否兼容。
 
     数值之间可以互比（INT/BIGINT/FLOAT）；TEXT 与 VARCHAR 可以互比；
-    其它情况要求类型完全相同。``WHERE id = 'oops'`` 这类错误应该在绑定阶段
-    报出来，而不是等执行到某一行才抛异常或者悄悄返回 False。
+    ``unknown``（SQL NULL）与任何类型兼容。其它情况要求类型完全相同。
+    ``WHERE id = 'oops'`` 这类错误应该在绑定阶段报出来，而不是等执行到某一行
+    才抛异常或者悄悄返回 False。
     """
+    if left.unknown or right.unknown:
+        return True
     if left.kind is right.kind:
         return True
     if left.kind in _NUMERIC_KINDS and right.kind in _NUMERIC_KINDS:
@@ -1495,6 +1520,15 @@ def _coalesce(args):
         raise TypeMismatchError("COALESCE 至少需要 1 个参数")
     fns = [a[0] for a in args]
     result_type = args[0][1]
+    for _, candidate_type in args[1:]:
+        try:
+            result_type = common_type(result_type, candidate_type)
+        except TypeMismatchError as exc:
+            raise TypeMismatchError(
+                "COALESCE 各参数的类型必须兼容",
+                detail=f"{result_type.sql} 与 {candidate_type.sql}",
+                hint="用 CAST 把参数统一到同一个类型",
+            ) from exc
 
     def _call(ctx):
         for fn in fns:

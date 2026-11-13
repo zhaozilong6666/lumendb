@@ -615,7 +615,10 @@ class Executor:
                     hint="给表达式加一个 AS 别名，例如 COUNT(*) AS n",
                 )
             seen.add(name)
-            columns.append(Column(name=name, type=out.type, nullable=True))
+            # CTAS 必须把 unknown（SELECT NULL）落成具体可存储类型；
+            # PostgreSQL 也把这种列推成 text。
+            col_type = TypeSpec(DataType.TEXT) if out.type.unknown else out.type
+            columns.append(Column(name=name, type=col_type, nullable=True))
 
         self._catalog.create_table(txn, stmt.name, columns, [])
         table = self._catalog.get_table(stmt.name)

@@ -107,7 +107,8 @@ CASE expr WHEN value THEN result [...] [ELSE result] END
 ```
 
 分支的返回类型必须一致（数值之间会自动提升为 `FLOAT`），否则绑定阶段报
-`TypeMismatchError`；`CASE` 可以出现在聚合参数里，`SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+`TypeMismatchError`；`NULL` 字面量作为 `unknown` 类型会被其它分支吸收，
+所以 `CASE WHEN ... THEN NULL ELSE 1 END` 的类型是 `INT`。`CASE` 可以出现在聚合参数里，`SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
 就是常见的条件计数写法。
 
 子查询：标量子查询、`IN (SELECT ...)`、`EXISTS (SELECT ...)`。
@@ -193,3 +194,6 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | `FLOAT` | IEEE754 double |
 
 隐式转换只允许 `INT → BIGINT`、`INT → FLOAT`。其余需要显式 `CAST`，否则报类型错误。
+`NULL` 字面量是 `unknown` 类型：它可以被 `UNION` / `CASE` / `COALESCE` 的另一侧
+吸收，`SELECT NULL + 1` 也会返回 `NULL` 而不是报类型错误；单独 `SELECT NULL`
+或 `CREATE TABLE AS SELECT NULL` 时，输出/落表类型会归一成 `TEXT`。
