@@ -211,7 +211,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 - `RecursiveCte`：`seed UNION [ALL] recursive` 的递归 CTE。`CteScan(recursive=True)`
   在递归项里读取执行器保存的“上一轮工作表”，每一轮把新行加入结果并作为下一轮输入，
   直到没有新行；`UNION` 用哈希集合去重，`UNION ALL` 保留重复，超过 10000 轮报错；
-- `Sort`：从最后一个键往前依次稳定排序，支持多键；
+- `Sort`：从最后一个键往前依次稳定排序，支持多键；每键独立处理
+  `ASC/DESC` 与 `NULLS FIRST/LAST`（默认 ASC 时 NULL 最后、DESC 时 NULL 最前）；
 - `Limit`：跳 `offset`，取 `limit`。
 
 `NULL` 的排序位置固定为"最后"（ASC 与 DESC 都是），不做 `NULLS FIRST/LAST` 语法。

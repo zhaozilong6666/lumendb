@@ -239,6 +239,8 @@ def render_expr(expr: Expr) -> str:
 class OrderItem:
     expr: Expr
     descending: bool = False
+    #: None 表示按 PostgreSQL 默认：ASC 时 NULL 最后，DESC 时 NULL 最前。
+    nulls_first: Optional[bool] = None
 
 
 @dataclass(frozen=True)

@@ -104,7 +104,7 @@ FROM t [alias] [, t2 ...]
 WHERE cond
 GROUP BY expr [, expr...]        -- 列引用或任意标量表达式，同形表达式可直接用于 SELECT
 HAVING cond
-ORDER BY expr [ASC|DESC], ...
+ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...
 LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
 ```
 
@@ -219,7 +219,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
 | `VACUUM FULL` / 缩小数据文件 | 回收页内空间，但文件大小不缩，空页留在链上 |
-| `NULLS FIRST/LAST` | `NULL` 固定排在最后 |
+| `NULLS FIRST/LAST` | 已实现；默认 ASC 时 NULL 最后、DESC 时 NULL 最前，可使用 `NULLS FIRST` / `NULLS LAST` 显式覆盖 |
 
 ## 已知的行为细节
 

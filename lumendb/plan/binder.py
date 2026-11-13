@@ -912,7 +912,9 @@ class Binder:
 
         # ORDER BY：先尝试按输出别名解析，否则编译成隐藏列
         extra_fns: list[Callable[[EvalContext], Any]] = []
-        sort_keys: list[tuple[Callable[[EvalContext], Any], bool]] = []
+        sort_keys: list[
+            tuple[Callable[[EvalContext], Any], bool, Optional[bool]]
+        ] = []
         out_names = [c.name.lower() for c in proj_cols]
         for item in select.order_by:
             index: Optional[int] = None
@@ -931,7 +933,13 @@ class Binder:
                 fn, _ = self.compile(sort_expr, out_schema, allow_agg=has_agg)
                 extra_fns.append(fn)
                 index = len(proj_fns) + len(extra_fns) - 1
-            sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))
+            sort_keys.append(
+                (
+                    lambda ctx, i=index: ctx.row[i],
+                    item.descending,
+                    item.nulls_first,
+                )
+            )
 
         project = Project(
             child=node,
@@ -1010,7 +1018,13 @@ class Binder:
                         "集合查询的 ORDER BY 只支持输出列名或列序号",
                         hint="先给 SELECT 的输出列起别名，再按别名排序",
                     )
-                sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))
+                sort_keys.append(
+                    (
+                        lambda ctx, i=index: ctx.row[i],
+                        item.descending,
+                        item.nulls_first,
+                    )
+                )
             node = Sort(child=node, keys=sort_keys, columns=node.columns)
 
         limit_value = self._limit_value(select.limit, "LIMIT")

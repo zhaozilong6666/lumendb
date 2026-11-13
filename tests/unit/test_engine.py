@@ -611,6 +611,30 @@ class TestInsert:
         )
         assert result == [(1,), (2,), (3,), (4,)]
 
+    def test_order_by_nulls_first_last(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (NULL), (1), (2)")
+        assert rows(db, "SELECT a FROM t ORDER BY a ASC NULLS FIRST") == [
+            (None,),
+            (1,),
+            (2,),
+        ]
+        assert rows(db, "SELECT a FROM t ORDER BY a ASC NULLS LAST") == [
+            (1,),
+            (2,),
+            (None,),
+        ]
+        assert rows(db, "SELECT a FROM t ORDER BY a DESC NULLS FIRST") == [
+            (None,),
+            (2,),
+            (1,),
+        ]
+        assert rows(db, "SELECT a FROM t ORDER BY a DESC NULLS LAST") == [
+            (2,),
+            (1,),
+            (None,),
+        ]
+
     def test_drop_table_blocked_by_view_dependency(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("CREATE VIEW v AS SELECT a FROM t")

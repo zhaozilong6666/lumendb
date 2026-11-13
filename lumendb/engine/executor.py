@@ -669,9 +669,11 @@ class Executor:
         rows = list(self._execute(node.child, txn))
 
         # 稳定排序：从最后一列往前排，天然支持多键
-        for fn, descending in reversed(node.keys):
+        for fn, descending, nulls_first in reversed(node.keys):
             rows.sort(
-                key=lambda r, f=fn: _sort_key(f(EvalContext(r))),
+                key=lambda r, f=fn, d=descending, n=nulls_first: _sort_key(
+                    f(EvalContext(r)), d, n
+                ),
                 reverse=descending,
             )
         yield from rows
@@ -1870,9 +1872,14 @@ def _truthy(value: Any) -> bool:
     return bool(value) if value is not None else False
 
 
-def _sort_key(value: Any):
-    # NULL 排在最后：先按"是否为空"，再按值本身
-    return (1, None) if value is None else (0, value)
+def _sort_key(value: Any, descending: bool, nulls_first: Optional[bool]):
+    # None 使用 PostgreSQL 默认：ASC 时 NULL 最后，DESC 时 NULL 最前。
+    if nulls_first is None:
+        nulls_first = descending
+    null_rank = 1 if nulls_first == descending else 0
+    if value is None:
+        return (null_rank, None)
+    return (1 - null_rank, value)
 
 
 def _describe_plan(

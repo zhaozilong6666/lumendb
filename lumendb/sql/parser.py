@@ -807,7 +807,17 @@ class Parser:
             descending = False
         elif self._match_kw("DESC"):
             descending = True
-        return OrderItem(expr=expr, descending=descending)
+        nulls_first: Optional[bool] = None
+        if self._match_kw("NULLS"):
+            if self._match_kw("FIRST"):
+                nulls_first = True
+            elif self._match_kw("LAST"):
+                nulls_first = False
+            else:
+                raise self._error("NULLS 之后期望 FIRST 或 LAST")
+        return OrderItem(
+            expr=expr, descending=descending, nulls_first=nulls_first
+        )
 
     def _parse_table_ref(self) -> TableRef:
         name = self._parse_ident("表名")

@@ -311,6 +311,13 @@ class TestSelect:
         assert len(stmt.ctes) == 1
 
 
+    def test_order_by_nulls(self):
+        stmt = parse_statement("SELECT 1 ORDER BY 1 ASC NULLS FIRST")
+        assert stmt.select.order_by[0].nulls_first is True
+        stmt = parse_statement("SELECT 1 ORDER BY 1 DESC NULLS LAST")
+        assert stmt.select.order_by[0].nulls_first is False
+
+
 class TestExpressions:
     def test_arithmetic_precedence(self):
         expr = parse_statement("SELECT 1 + 2 * 3").select.items[0].expr

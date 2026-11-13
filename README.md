@@ -143,7 +143,7 @@ psycopg2 都不会正常返回结果。
 |---|---|
 | DDL | `CREATE TABLE`（列级/表级 `PRIMARY KEY` / `UNIQUE`，支持复合主键与复合唯一约束）、`CREATE TABLE AS SELECT`、`CREATE [OR REPLACE] VIEW [ (col...) ] AS SELECT`、`CREATE INDEX`、`ALTER TABLE ... ADD COLUMN` / `ADD [CONSTRAINT name] UNIQUE (col...)` / `ADD [CONSTRAINT name] PRIMARY KEY (col...)` / `RENAME TO` / `RENAME COLUMN`、`DROP TABLE`、`DROP INDEX`、`DROP VIEW`、`SHOW VIEWS` |
 | DML | `INSERT`（多行、`INSERT ... SELECT`、`ON CONFLICT DO NOTHING` / `DO UPDATE` / `DO UPDATE ... WHERE` / `excluded.col` / `ON CONSTRAINT`）、`UPDATE`、`DELETE`、`RETURNING` |
-| 查询 | `SELECT`、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT`、`UNION`/`UNION ALL`/`EXCEPT`/`EXCEPT ALL`/`INTERSECT`/`INTERSECT ALL`、`WITH`（非递归 CTE，含 `WITH ... UPDATE/DELETE`）、`WITH RECURSIVE`（`seed UNION [ALL] recursive`） |
+| 查询 | `SELECT`、`WHERE`、`ORDER BY [NULLS FIRST/LAST]`、`LIMIT`/`OFFSET`、`DISTINCT`、`UNION`/`UNION ALL`/`EXCEPT`/`EXCEPT ALL`/`INTERSECT`/`INTERSECT ALL`、`WITH`（非递归 CTE，含 `WITH ... UPDATE/DELETE`）、`WITH RECURSIVE`（`seed UNION [ALL] recursive`） |
 | 连接 | `INNER JOIN`、`LEFT JOIN`、`RIGHT JOIN`、`FULL JOIN`、`CROSS JOIN`、多表连接；等值 INNER/LEFT 走哈希，外连接补 NULL |
 | 聚合 | `GROUP BY`（列或表达式）、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、`COUNT(DISTINCT x)` |
 | 表达式 | 算术、`\|\|` 拼接、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN` |
@@ -201,7 +201,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **692 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **694 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
