@@ -165,12 +165,13 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 `UNIQUE` / `PRIMARY` B+ 树索引做点查，索引项不可见或缺失时再回落到被引用表扫描；
 两步都找不到完整匹配行时抛 `ForeignKeyViolationError`。因此每次写入不必扫描整张
 父表，同时保留索引异常时的正确性兜底。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
-`UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 扫描所有
-引用表（自引用时跳过当前 RID）：`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
+`UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 收集所有
+引用表（自引用时跳过当前 RID）：子表外键列有精确索引时走 B+ 树点查，否则扫描整张
+子表。`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
 `SET NULL` 收集并将匹配外键列置空，`SET DEFAULT` 收集并写入列默认值，在父行写堆后
 通过同一 `_rewrite_row` 递归更新子行，并维护其索引和下游外键。
 `ON DELETE CASCADE` / `SET NULL` / `SET DEFAULT` 则由 `_cascade_delete_children`
-处理：先收集匹配子行，`RESTRICT` 子行立即报错，`CASCADE` 子行递归删除其子行后再
+处理：先按子表外键索引（如有）或全表扫描收集匹配子行，`RESTRICT` 子行立即报错，`CASCADE` 子行递归删除其子行后再
 删索引项和堆版本，`SET NULL` 子行通过 `_rewrite_row` 将外键列置空，`SET DEFAULT`
 子行延后到父行删除完成后再写入默认值（避免默认值恰好等于旧父键时留下悬空引用）；
 临时 `processing` / `deleted` 集合用于打断自引用环，事务 abort 会恢复所有页和目录。

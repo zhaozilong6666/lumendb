@@ -153,9 +153,10 @@ CI：
 1. **动作子集仍有限**：未实现 `DEFERRABLE` / `MATCH PARTIAL`；当前支持
    `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
    `MATCH SIMPLE` / `MATCH FULL`。
-2. **级联收集仍是全表扫描**：写入侧 `_check_foreign_keys` 已优先走被引用唯一索引，
-   但 `_plan_referenced_updates` 和 `_cascade_delete_children` 仍逐表扫描子行，
-   复杂度与子表行数线性相关；数据量大时可为子表外键列建索引优化。
+2. **级联收集不自动建子表索引**：写入侧 `_check_foreign_keys` 已优先走被引用唯一索引，
+   `_plan_referenced_updates` / `_cascade_delete_children` 在子表外键列存在精确索引时
+   也走点查，但外键不会自动创建子表索引；没有索引时仍逐表扫描，复杂度与子表行数
+   线性相关，数据量大时应显式 `CREATE INDEX`。
 3. **复杂循环图**：`_updating` / `processing` 能打断常见自引用环，但菱形依赖、
    同一子行被多条级联路径同时命中的精确 SQL 顺序语义没有单独建模；
    并发事务下也没有等锁/延迟约束，当前更接近单写者语义。

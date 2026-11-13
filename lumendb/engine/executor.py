@@ -2608,17 +2608,11 @@ class Executor:
                 if any(value is None for value in old_key):
                     continue
                 child_heap = HeapFile(self._bp, child, self._txns)
-                for child_rid, child_values in child_heap.scan(txn):
+                for child_rid, child_values in self._fk_child_rows(
+                    child, fk, old_key, txn, child_heap
+                ):
                     child_ident = (child.name, child_rid)
                     if child_ident in updating:
-                        continue
-                    child_key = tuple(
-                        child_values[child.column_index(name)]
-                        for name in fk.columns
-                    )
-                    if any(value is None for value in child_key):
-                        continue
-                    if child_key != old_key:
                         continue
                     if fk.on_update not in ("CASCADE", "SET NULL", "SET DEFAULT"):
                         raise ForeignKeyViolationError(
@@ -3177,6 +3171,44 @@ class Executor:
             if key is not None:
                 self._tree_for(table, idx).delete(txn, key, rid)
 
+    def _fk_child_rows(
+        self,
+        child: TableDef,
+        fk: ForeignKeyDef,
+        key: tuple[Any, ...],
+        txn: Transaction,
+        child_heap: HeapFile,
+    ) -> Iterator[tuple[RID, list[Any]]]:
+        """按本地外键列查找子行；有精确匹配索引时走点查，否则全表扫描。"""
+        child_index = next(
+            (
+                idx
+                for idx in child.indexes.values()
+                if tuple(idx.columns) == tuple(fk.columns)
+            ),
+            None,
+        )
+        if child_index is not None:
+            tree = self._tree_for(child, child_index)
+            for rid in tree.lookup(txn, list(key)):
+                child_values = child_heap.get(txn, rid)
+                if child_values is None:
+                    continue
+                if all(
+                    child_values[child.column_index(name)] == value
+                    for name, value in zip(fk.columns, key)
+                ):
+                    yield rid, child_values
+            return
+        for rid, child_values in child_heap.scan(txn):
+            child_key = tuple(
+                child_values[child.column_index(name)] for name in fk.columns
+            )
+            if any(value is None for value in child_key):
+                continue
+            if child_key == key:
+                yield rid, child_values
+
     def _cascade_delete_children(
         self,
         table: TableDef,
@@ -3198,18 +3230,13 @@ class Executor:
                     continue
                 child_heap = HeapFile(self._bp, child, self._txns)
                 matches: list[tuple[RID, list[Any]]] = []
-                for rid, child_values in child_heap.scan(txn):
+                for rid, child_values in self._fk_child_rows(
+                    child, fk, key, txn, child_heap
+                ):
                     ident = (child.name, rid)
                     if ident in deleted or ident in processing:
                         continue
-                    child_key = tuple(
-                        child_values[child.column_index(name)]
-                        for name in fk.columns
-                    )
-                    if any(value is None for value in child_key):
-                        continue
-                    if child_key == key:
-                        matches.append((rid, child_values))
+                    matches.append((rid, child_values))
                 if not matches:
                     continue
                 if fk.on_delete == "SET NULL":
