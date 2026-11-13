@@ -11,7 +11,8 @@ CREATE TABLE t (
   id     INT PRIMARY KEY,
   name   VARCHAR(64) NOT NULL,
   age    INT DEFAULT 0,
-  active BOOLEAN
+  active BOOLEAN,
+  email  TEXT UNIQUE
 );
 CREATE [UNIQUE] INDEX idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
@@ -26,7 +27,9 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 `CREATE TABLE AS SELECT` 从查询输出推断列名和类型，只建普通可空列，不自动建
 主键或索引；表达式需要显式 `AS` 别名，否则列名可能不是合法标识符（会明确报错）。
 来源查询先物化再写入，因此 `CREATE TABLE t AS SELECT * FROM t` 的语义也是确定的。
-`IF NOT EXISTS` 遇到同名表会跳过，不会覆盖原表。
+`IF NOT EXISTS` 遇到同名表会跳过，不会覆盖原表。列级 `UNIQUE` 会为每个非主键
+的唯一列建一个唯一索引（`NULL` 不参与唯一性比较）；复合唯一约束请用
+`CREATE UNIQUE INDEX`。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须

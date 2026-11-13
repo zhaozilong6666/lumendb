@@ -325,6 +325,12 @@ class TestInsert:
         assert result.rows == [(1, 15)]
         assert rows(db, "SELECT id, n FROM t") == [(1, 15)]
 
+    def test_column_unique_constraint_is_enforced(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT UNIQUE)")
+        db.execute_one("INSERT INTO t VALUES (1, 'same')")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (2, 'same')")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

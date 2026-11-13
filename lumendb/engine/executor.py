@@ -610,6 +610,19 @@ class Executor:
                     unique=True,
                 )
             )
+        # 列级 UNIQUE 不能只解析不落地：否则表看起来有约束，插入重复值
+        # 却会静默成功。这里为每个非主键的 UNIQUE 列建一个唯一索引。
+        for col_def, col in zip(stmt.columns, columns):
+            if not col_def.unique or col_def.primary_key:
+                continue
+            indexes.append(
+                IndexDef(
+                    name=f"{stmt.name.lower()}_{col.name}_key",
+                    table=stmt.name.lower(),
+                    columns=(col.name,),
+                    unique=True,
+                )
+            )
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
 
