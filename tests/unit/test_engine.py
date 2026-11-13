@@ -445,6 +445,48 @@ class TestInsert:
         # 回滚后不应残留主键索引/列标志，重复行仍可插入。
         db.execute_one("INSERT INTO t VALUES (1, 2)")
 
+    def test_view_select_and_reflects_writes(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+        db.execute_one(
+            "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 0"
+        )
+        assert rows(db, "SELECT * FROM v ORDER BY a") == [(1, "x"), (2, "y")]
+        db.execute_one("INSERT INTO t VALUES (3, 'z')")
+        assert rows(db, "SELECT b FROM v WHERE a = 3") == [("z",)]
+        db.execute_one("DROP VIEW v")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM v")
+
+    def test_view_can_reference_view(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("CREATE VIEW v1 AS SELECT a FROM t")
+        db.execute_one("CREATE VIEW v2 AS SELECT a FROM v1")
+        assert rows(db, "SELECT * FROM v2") == [(1,)]
+
+    def test_view_in_join_with_alias(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("CREATE TABLE u (a INT, c TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("INSERT INTO u VALUES (1, 'y')")
+        db.execute_one("CREATE VIEW v AS SELECT a, b FROM t")
+        assert rows(
+            db,
+            "SELECT x.a, x.b, u.c FROM v AS x JOIN u ON x.a = u.a",
+        ) == [(1, "x", "y")]
+
+    def test_view_survives_reopen(self, tmp_path):
+        path = tmp_path / "viewdb"
+        first = Database(path)
+        first.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        first.execute_one("INSERT INTO t VALUES (1, 'x')")
+        first.execute_one("CREATE VIEW v AS SELECT a, b FROM t")
+        first.close()
+        second = Database(path)
+        assert second.execute_one("SELECT * FROM v").rows == [(1, "x")]
+        second.close()
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
@@ -1981,7 +2023,7 @@ class TestErrorQuality:
 
     def test_unsupported_syntax(self, db):
         with pytest.raises(NotSupportedError):
-            db.execute_one("CREATE VIEW v AS SELECT 1")
+            db.execute_one("CREATE TRIGGER trg")
 
     def test_keyword_as_name_rejected(self, db):
         with pytest.raises(Exception):

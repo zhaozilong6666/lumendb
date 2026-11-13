@@ -118,6 +118,21 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 主键列的 `NOT NULL` 由写路径先行拒绝。多个主键、列级与表级主键混用、以及
 自动索引名与显式约束名碰撞都会在 DDL 阶段报错，避免 `Catalog` 静默覆盖索引。
 
+### 2.9 视图
+
+`CREATE VIEW` 只保存视图定义，不复制基表数据：目录里存的是 `AS` 之后的
+**词法 token 切片**，而不是 AST 或某次查询的物化结果。这样做的好处是视图定义
+能直接随目录 JSON 持久化，不依赖 AST 的序列化格式；代价是每次使用视图都要重新
+解析一次（只在绑定阶段发生，不重复执行基表扫描）。
+
+Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先解析 token，
+再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。`view_stack` 记录
+正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
+`VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
+
+当前限制：没有 `CREATE OR REPLACE VIEW`、没有显式视图列名列表、没有物化视图，
+视图也不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表。
+
 ## 3. SQL 与计划
 
 ### 3.1 解析

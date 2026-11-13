@@ -27,6 +27,8 @@ class Catalog:
     def __init__(self, store: CatalogStore) -> None:
         self._store = store
         self.tables: dict[str, TableDef] = {}
+        #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
+        self.views: dict[str, list[tuple[str, str]]] = {}
         self._loaded = False
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
@@ -41,6 +43,7 @@ class Catalog:
     def load(self) -> None:
         raw = self._store.load()
         self.tables.clear()
+        self.views.clear()
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -59,6 +62,12 @@ class Catalog:
             for tdata in data.get("tables", []):
                 table = TableDef.from_json(tdata)
                 self.tables[table.name] = table
+            self.views = {
+                vdata["name"].lower(): [
+                    (kind, value) for kind, value in vdata.get("tokens", [])
+                ]
+                for vdata in data.get("views", [])
+            }
         self._loaded = True
 
     def persist(self, txn: Transaction) -> None:
@@ -66,6 +75,13 @@ class Catalog:
             {
                 "version": CATALOG_VERSION,
                 "tables": [t.to_json() for t in self.tables.values()],
+                "views": [
+                    {
+                        "name": name,
+                        "tokens": [[kind, value] for kind, value in tokens],
+                    }
+                    for name, tokens in self.views.items()
+                ],
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -95,6 +111,22 @@ class Catalog:
     def table_names(self) -> list[str]:
         return sorted(self.tables)
 
+    def view_names(self) -> list[str]:
+        return sorted(self.views)
+
+    def has_view(self, name: str) -> bool:
+        return name.lower() in self.views
+
+    def get_view(self, name: str) -> list[tuple[str, str]]:
+        key = name.lower()
+        tokens = self.views.get(key)
+        if tokens is None:
+            raise TableNotFoundError(
+                f"视图 {name!r} 不存在",
+                hint="可用视图：" + (", ".join(self.view_names()) or "（空）"),
+            )
+        return tokens
+
     # ------------------------------------------------------------------
     # DDL
     # ------------------------------------------------------------------
@@ -107,7 +139,7 @@ class Catalog:
         indexes: Optional[list[IndexDef]] = None,
     ) -> TableDef:
         key = name.lower()
-        if key in self.tables:
+        if key in self.tables or key in self.views:
             raise TableAlreadyExistsError(
                 f"表 {name!r} 已存在",
                 hint="使用 DROP TABLE 后再建，或换一个名字",
@@ -126,6 +158,38 @@ class Catalog:
         txn.undo_log.append(lambda: self.tables.pop(key, None))
         self.persist(txn)
         return table
+
+    def create_view(
+        self,
+        txn: Transaction,
+        name: str,
+        tokens: list[tuple[str, str]],
+    ) -> None:
+        key = name.lower()
+        if key in self.tables or key in self.views:
+            raise TableAlreadyExistsError(
+                f"对象 {name!r} 已存在",
+                hint="表名和视图名共享同一个命名空间",
+            )
+        self.views[key] = list(tokens)
+
+        def undo() -> None:
+            self.views.pop(key, None)
+
+        txn.undo_log.append(undo)
+        self.persist(txn)
+
+    def drop_view(self, txn: Transaction, name: str) -> None:
+        key = name.lower()
+        if key not in self.views:
+            raise TableNotFoundError(f"视图 {name!r} 不存在")
+        tokens = self.views.pop(key)
+
+        def undo() -> None:
+            self.views[key] = tokens
+
+        txn.undo_log.append(undo)
+        self.persist(txn)
 
     def drop_table(self, txn: Transaction, name: str) -> None:
         key = name.lower()

@@ -50,6 +50,8 @@ from ..sql.ast import (
     render_expr,
     UnaryOp,
 )
+from ..sql.lexer import Token
+from ..sql.parser import Parser
 from .nodes import (
     Aggregate,
     CteScan,
@@ -228,6 +230,8 @@ class AggregateAccumulatorGroup:
 class Binder:
     def __init__(self, catalog: Catalog, params: Optional[list[Any]] = None) -> None:
         self.catalog = catalog
+        #: 正在展开的视图名，用于检测 A -> B -> A 这类循环定义。
+        self.view_stack: frozenset[str] = frozenset()
         #: ``$n`` 的绑定值。绑定阶段直接折成字面量，执行计划里不存在参数数组。
         self.params: list[Any] = list(params) if params else []
         #: 聚合节点 id -> 在聚合输出行里的下标
@@ -1176,6 +1180,29 @@ class Binder:
         entry = self.ctes.get(name.lower())
         if entry is not None:
             child, cols = entry
+            effective = (alias or name).lower()
+            node = CteScan(child=child, columns=list(cols))
+            schema = Schema(
+                [SchemaColumn(effective, col.name, col.type) for col in cols]
+            )
+            return node, schema, list(cols)
+
+        view_key = name.lower()
+        if self.catalog.has_view(name):
+            if view_key in self.view_stack:
+                raise BinderError(
+                    f"视图 {name!r} 存在循环引用",
+                    hint="视图定义不能直接或间接引用自身",
+                )
+            tokens = self.catalog.get_view(name)
+            view_query = Parser(
+                [Token(kind, value, 0, 0) for kind, value in tokens]
+                + [Token("eof", "", 0, 0)]
+            ).parse_query_expression()
+            view_binder = Binder(self.catalog, self.params)
+            view_binder.subquery_runner = self.subquery_runner
+            view_binder.view_stack = self.view_stack | {view_key}
+            child, cols = view_binder.bind_select(view_query)
             effective = (alias or name).lower()
             node = CteScan(child=child, columns=list(cols))
             schema = Schema(

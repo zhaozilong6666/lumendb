@@ -24,6 +24,8 @@ ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
+CREATE VIEW v AS SELECT id, name FROM t WHERE age >= 18;
+DROP VIEW [IF EXISTS] v;
 ```
 
 `CREATE TABLE AS SELECT` 从查询输出推断列名和类型，只建普通可空列，不自动建
@@ -44,6 +46,12 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
 同步更新所有索引的列引用，不重写堆记录。重命名后旧名字立即失效；客户端需要重新
 解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
+
+`CREATE VIEW` 创建只读视图，视图不物化数据，也不占数据页；每次查询时按目录里保存的
+定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
+普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
+视图不能直接 `INSERT`/`UPDATE`/`DELETE`；对视图执行 DML 会得到“表不存在”类错误。
+`DROP VIEW` 只删除目录定义，不影响基表数据。
 
 ### DML
 

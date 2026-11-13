@@ -25,10 +25,12 @@ from .ast import (
     CreateIndex,
     CreateTable,
     CreateTableAs,
+    CreateView,
     Cte,
     Delete,
     DropIndex,
     DropTable,
+    DropView,
     Exists,
     Explain,
     FunctionCall,
@@ -268,9 +270,13 @@ class Parser:
             return self._parse_create_index(unique=unique)
         if unique:
             raise self._error("UNIQUE 只能用于 CREATE INDEX")
-        if self._match_kw("VIEW", "TRIGGER", "PROCEDURE"):
-            raise NotSupportedError("视图 / 触发器 / 存储过程尚未实现")
-        raise self._error("CREATE 之后期望 TABLE 或 INDEX")
+        if self._match_kw("VIEW"):
+            if unique:
+                raise self._error("UNIQUE 不能用于 CREATE VIEW")
+            return self._parse_create_view()
+        if self._match_kw("TRIGGER", "PROCEDURE"):
+            raise NotSupportedError("触发器 / 存储过程尚未实现")
+        raise self._error("CREATE 之后期望 TABLE、INDEX 或 VIEW")
 
     def _parse_alter_table(self) -> Statement:
         self._expect_kw("ALTER")
@@ -350,6 +356,14 @@ class Parser:
             stmt.ctes = ctes
             return stmt
         raise self._error("WITH 之后期望 SELECT、INSERT、UPDATE 或 DELETE")
+
+    def _parse_create_view(self) -> CreateView:
+        name = self._parse_ident("视图名")
+        self._expect_kw("AS")
+        start = self._i
+        query = self._parse_query_expression()
+        tokens = [(tok.kind, tok.value) for tok in self._tokens[start:self._i]]
+        return CreateView(name=name, query=query, tokens=tokens)
 
     def _parse_create_table(self) -> Statement:
         if_not_exists = False
@@ -492,7 +506,13 @@ class Parser:
                 self._expect_kw("EXISTS")
                 if_exists = True
             return DropIndex(name=self._parse_ident("索引名"), if_exists=if_exists)
-        raise self._error("DROP 之后期望 TABLE 或 INDEX")
+        if self._match_kw("VIEW"):
+            if_exists = False
+            if self._match_kw("IF"):
+                self._expect_kw("EXISTS")
+                if_exists = True
+            return DropView(name=self._parse_ident("视图名"), if_exists=if_exists)
+        raise self._error("DROP 之后期望 TABLE、INDEX 或 VIEW")
 
     def _parse_insert(self) -> Insert:
         self._expect_kw("INSERT")
@@ -623,6 +643,10 @@ class Parser:
         select = self._parse_select_core()
         select.order_by, select.limit, select.offset = self._parse_select_tail()
         return select
+
+    def parse_query_expression(self) -> Select | CompoundSelect:
+        """公开入口：把 token 流解析为一条 SELECT / 集合查询。"""
+        return self._parse_query_expression()
 
     def _parse_query_expression(self) -> Select | CompoundSelect:
         """顶层查询：``SELECT ... UNION / EXCEPT / INTERSECT ...``。

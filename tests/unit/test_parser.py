@@ -94,9 +94,22 @@ class TestCreateTable:
             parse_statement("CREATE TABLE t (a INT REFERENCES other(id))")
         assert "外键" in str(exc.value)
 
-    def test_create_view_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("CREATE VIEW v AS SELECT 1")
+    def test_create_view(self):
+        from lumendb.sql.ast import CreateView
+
+        stmt = parse_statement("CREATE VIEW v AS SELECT a FROM t WHERE a > 0")
+        assert isinstance(stmt, CreateView)
+        assert stmt.name == "v"
+        assert stmt.tokens[0] == ("keyword", "SELECT")
+        assert stmt.tokens[-1] == ("int", "0")
+
+    def test_drop_view(self):
+        from lumendb.sql.ast import DropView
+
+        stmt = parse_statement("DROP VIEW IF EXISTS v")
+        assert isinstance(stmt, DropView)
+        assert stmt.name == "v"
+        assert stmt.if_exists
 
 
 class TestCreateIndex:

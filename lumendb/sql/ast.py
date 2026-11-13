@@ -332,6 +332,21 @@ class CreateTable(Statement):
 
 
 @dataclass
+class CreateView(Statement):
+    """只读视图。``tokens`` 是 ``AS`` 之后查询的词法切片，用于持久化。"""
+
+    name: str
+    query: Any
+    tokens: list[tuple[str, str]]
+
+
+@dataclass
+class DropView(Statement):
+    name: str
+    if_exists: bool = False
+
+
+@dataclass
 class DropTable(Statement):
     names: list[str]
     if_exists: bool = False

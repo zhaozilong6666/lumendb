@@ -34,9 +34,11 @@ from ..sql.ast import (
     CreateIndex,
     CreateTable,
     CreateTableAs,
+    CreateView,
     Delete,
     DropIndex,
     DropTable,
+    DropView,
     Expr,
     Explain,
     Insert,
@@ -146,6 +148,10 @@ class Executor:
                 return self._create_table(stmt, txn)
             if isinstance(stmt, CreateTableAs):
                 return self._create_table_as(stmt, txn)
+            if isinstance(stmt, CreateView):
+                return self._create_view(stmt, txn)
+            if isinstance(stmt, DropView):
+                return self._drop_view(stmt, txn)
             if isinstance(stmt, AlterTableAddColumn):
                 return self._alter_add_column(stmt, txn)
             if isinstance(stmt, AlterTableAddConstraint):
@@ -738,6 +744,31 @@ class Executor:
 
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
+
+    def _create_view(self, stmt: CreateView, txn: Transaction) -> Result:
+        if self._catalog.has_table(stmt.name) or self._catalog.has_view(stmt.name):
+            raise TableAlreadyExistsError(
+                f"对象 {stmt.name!r} 已存在",
+                hint="表名和视图名共享同一个命名空间",
+            )
+        # 建视图时先完整绑定一次，提前暴露未知表/列和类型错误；
+        # 视图不物化数据，SELECT 时再按保存的 token 重新绑定。
+        binder = self._new_binder()
+        binder.bind_select(stmt.query)
+        self._catalog.create_view(txn, stmt.name, stmt.tokens)
+        return Result(
+            tag="CREATE VIEW",
+            notice=f"已创建视图 {stmt.name.lower()}",
+        )
+
+    def _drop_view(self, stmt: DropView, txn: Transaction) -> Result:
+        try:
+            self._catalog.drop_view(txn, stmt.name)
+        except Exception:
+            if stmt.if_exists:
+                return Result(tag="DROP VIEW", notice="视图不存在，已跳过")
+            raise
+        return Result(tag="DROP VIEW")
 
     def _create_table_as(
         self, stmt: CreateTableAs, txn: Transaction
