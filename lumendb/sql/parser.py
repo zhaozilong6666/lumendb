@@ -249,10 +249,12 @@ class Parser:
             return Checkpoint()
         if kw == "REINDEX":
             self._advance()
+            self._match_kw("TABLE")
             table = self._parse_ident("表名")
             return Reindex(table)
         if kw == "VACUUM":
             self._advance()
+            self._match_kw("FULL")
             table = None
             if self._cur.kind == "ident":
                 table = self._parse_ident("表名")

@@ -509,6 +509,19 @@ class TestMaintenance:
         assert isinstance(parse_statement("VACUUM"), Vacuum)
         assert parse_statement("VACUUM").table is None
 
+    def test_vacuum_full(self):
+        stmt = parse_statement("VACUUM FULL users")
+        assert isinstance(stmt, Vacuum)
+        assert stmt.table == "users"
+        assert parse_statement("VACUUM FULL").table is None
+
+    def test_reindex_table_keyword(self):
+        from lumendb.sql.ast import Reindex
+
+        stmt = parse_statement("REINDEX TABLE users")
+        assert isinstance(stmt, Reindex)
+        assert stmt.table == "users"
+
     def test_truncate_with_table_keyword(self):
         stmt = parse_statement("TRUNCATE TABLE users")
         assert isinstance(stmt, Truncate)

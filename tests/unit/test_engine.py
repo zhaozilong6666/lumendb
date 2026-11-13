@@ -123,6 +123,14 @@ class TestVacuum:
         assert rows(db, "SELECT x FROM a") == [(1,)]
         assert rows(db, "SELECT y FROM b") == [(2,)]
 
+    def test_vacuum_full_and_reindex_table_syntax(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a')")
+        db.execute_one("CREATE INDEX idx_name ON t (name)")
+        assert "1 rows kept" in db.execute_one("VACUUM FULL t").tag
+        assert db.execute_one("REINDEX TABLE t").tag.startswith("REINDEX")
+        assert rows(db, "SELECT id FROM t WHERE name = 'a'") == [(1,)]
+
     def test_unique_constraint_survives_vacuum(self, db):
         setup_users(db)
         db.execute_one("VACUUM users")

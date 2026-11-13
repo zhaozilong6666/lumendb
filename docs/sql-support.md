@@ -241,8 +241,8 @@ EXPLAIN <query>;
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
 CHECKPOINT;
-REINDEX table;   -- 按堆表当前内容重建该表所有索引
-VACUUM [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
+REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
+VACUUM [FULL] [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
 TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索引重建为空
 ```
 
