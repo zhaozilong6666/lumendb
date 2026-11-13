@@ -562,6 +562,13 @@ class TestAlterTable:
         assert stmt.constraint.name == "uq_ab"
         assert stmt.constraint.columns == ["name", "age"]
 
+    def test_add_primary_key_constraint(self):
+        stmt = parse_statement(
+            "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (name, age)"
+        )
+        assert stmt.constraint.kind == "PRIMARY KEY"
+        assert stmt.constraint.name == "pk_users"
+
     def test_rename_table(self):
         stmt = parse_statement("ALTER TABLE users RENAME TO accounts")
         assert isinstance(stmt, AlterTableRenameTable)

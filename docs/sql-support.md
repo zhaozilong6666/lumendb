@@ -38,7 +38,7 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
 带非空 `DEFAULT`；主键/唯一约束请先加普通列，再 `ALTER TABLE ... ADD [CONSTRAINT name]
-UNIQUE (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TABLE ... ADD UNIQUE` 会回填已有数据，
+UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TABLE ... ADD UNIQUE` 会回填已有数据，
 已有重复值时直接报错，不会留下半成品索引。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，

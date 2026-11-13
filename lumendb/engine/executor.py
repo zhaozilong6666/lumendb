@@ -819,30 +819,86 @@ class Executor:
     ) -> Result:
         table = self._catalog.get_table(stmt.table)
         constraint = stmt.constraint
-        if constraint.kind != "UNIQUE":
-            raise NotSupportedError("ALTER TABLE 暂不支持添加主键")
         names = tuple(name.lower() for name in constraint.columns)
         for name in names:
             table.column(name)
-        index_name = (
-            constraint.name.lower()
-            if constraint.name is not None
-            else f"{table.name}_{'_'.join(names)}_key"
-        )
-        # 复用 CREATE UNIQUE INDEX 的回填逻辑：先建目录索引，再扫描堆表
-        # 填入键；已有重复值会直接报 DuplicateKeyError，并随事务回滚。
-        self._create_index(
-            CreateIndex(
-                name=index_name,
-                table=table.name,
-                columns=list(names),
-                unique=True,
-            ),
-            txn,
-        )
-        return Result(
-            tag="ALTER TABLE",
-            notice=f"已添加唯一约束 {index_name}",
+        if constraint.kind == "UNIQUE":
+            index_name = (
+                constraint.name.lower()
+                if constraint.name is not None
+                else f"{table.name}_{'_'.join(names)}_key"
+            )
+            # 复用 CREATE UNIQUE INDEX 的回填逻辑：先建目录索引，再扫描堆表
+            # 填入键；已有重复值会直接报 DuplicateKeyError，并随事务回滚。
+            self._create_index(
+                CreateIndex(
+                    name=index_name,
+                    table=table.name,
+                    columns=list(names),
+                    unique=True,
+                ),
+                txn,
+            )
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已添加唯一约束 {index_name}",
+            )
+
+        if constraint.kind == "PRIMARY KEY":
+            if any(col.primary_key for col in table.columns):
+                raise NotSupportedError(
+                    "表已有主键",
+                    hint="先删除旧主键，再添加新主键",
+                )
+            # 主键隐含 NOT NULL；已有数据里的 NULL 必须在建索引前拒绝，
+            # 否则唯一索引会跳过 NULL，看起来成功却不符合主键语义。
+            heap = HeapFile(self._bp, table, self._txns)
+            positions = [table.column_index(name) for name in names]
+            for _rid, values in heap.scan(txn):
+                for pos in positions:
+                    if values[pos] is None:
+                        raise NotNullViolationError(
+                            f"主键列 {table.columns[pos].name} 存在 NULL",
+                            hint="先 UPDATE 填充 NULL，再添加主键",
+                        )
+            index_name = (
+                constraint.name.lower()
+                if constraint.name is not None
+                else f"{table.name}_pkey"
+            )
+            self._create_index(
+                CreateIndex(
+                    name=index_name,
+                    table=table.name,
+                    columns=list(names),
+                    unique=True,
+                ),
+                txn,
+            )
+            old_columns = list(table.columns)
+            table.columns = [
+                replace(
+                    col,
+                    primary_key=col.name in names,
+                    nullable=False if col.name in names else col.nullable,
+                )
+                if col.name in names
+                else col
+                for col in table.columns
+            ]
+
+            def undo_columns() -> None:
+                table.columns = old_columns
+
+            txn.undo_log.append(undo_columns)
+            self._catalog.persist(txn)
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已添加主键 {index_name}",
+            )
+
+        raise NotSupportedError(
+            f"不支持的表级约束：{constraint.kind}"
         )
 
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:

@@ -410,6 +410,32 @@ class TestInsert:
         with pytest.raises(DuplicateKeyError):
             db.execute_one("ALTER TABLE t ADD UNIQUE (a, b)")
 
+    def test_alter_add_primary_key(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 2), (3, 4)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT pk_ab PRIMARY KEY (a, b)"
+        )
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 2)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t VALUES (NULL, 5)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 2) "
+            "ON CONFLICT ON CONSTRAINT pk_ab DO NOTHING"
+        )
+        assert result.affected == 0
+
+    def test_alter_add_primary_key_rejects_nulls_and_duplicates(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, NULL)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("ALTER TABLE t ADD PRIMARY KEY (a, b)")
+        db.execute_one("CREATE TABLE u (a INT, b INT)")
+        db.execute_one("INSERT INTO u VALUES (1, 2), (1, 2)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("ALTER TABLE u ADD PRIMARY KEY (a, b)")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
