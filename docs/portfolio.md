@@ -42,6 +42,8 @@
 >   `EXCEPT` / `INTERSECT` 支持集合差与交集（`INTERSECT` 优先级更高），
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` 只改目录并同步索引列引用；
+>   `CREATE VIEW` 保存 `AS` 之后的词法切片，不物化数据，查询时展开为 `CteScan`，
+>   支持 `OR REPLACE`、显式列名和 `SHOW VIEWS`，建视图时即校验绑定；
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
@@ -87,6 +89,9 @@
 >   the catalog and pads old records at read time instead of rewriting the heap;
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` update catalog metadata and
 >   index column references without rewriting heap records;
+>   `CREATE VIEW` persists the token slice after `AS` instead of materializing
+>   data, expands to a `CteScan` at bind time, and supports `OR REPLACE`,
+>   explicit column names and `SHOW VIEWS` with bind-time validation;
 >   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
 >   annotates each operator with actual time, rows and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
