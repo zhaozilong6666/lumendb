@@ -411,17 +411,23 @@ class Parser:
             while self._match_punct("comma"):
                 columns.append(self._parse_ident("列名"))
             self._expect_punct("rparen", ")")
-        self._expect_kw("VALUES")
+        query = None
         rows: list[list] = []
-        while True:
-            self._expect_punct("lparen", "(")
-            row = [self._parse_expr()]
-            while self._match_punct("comma"):
-                row.append(self._parse_expr())
-            self._expect_punct("rparen", ")")
-            rows.append(row)
-            if not self._match_punct("comma"):
-                break
+        if self._cur.is_keyword("VALUES"):
+            self._advance()
+            while True:
+                self._expect_punct("lparen", "(")
+                row = [self._parse_expr()]
+                while self._match_punct("comma"):
+                    row.append(self._parse_expr())
+                self._expect_punct("rparen", ")")
+                rows.append(row)
+                if not self._match_punct("comma"):
+                    break
+        elif self._cur.is_keyword("SELECT"):
+            query = self._parse_query_expression()
+        else:
+            raise self._error("INSERT 之后期望 VALUES 或 SELECT")
 
         on_conflict_nothing = False
         if self._match_kw("ON"):
@@ -443,6 +449,7 @@ class Parser:
             table=table,
             columns=columns,
             rows=rows,
+            query=query,
             on_conflict_nothing=on_conflict_nothing,
         )
 

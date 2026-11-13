@@ -131,7 +131,7 @@ psycopg2 都不会正常返回结果。
 | 类别 | 支持 |
 |---|---|
 | DDL | `CREATE TABLE`、`CREATE INDEX`、`DROP TABLE`、`DROP INDEX`、`ALTER TABLE ... ADD COLUMN` |
-| DML | `INSERT`（多行、`ON CONFLICT DO NOTHING`）、`UPDATE`、`DELETE` |
+| DML | `INSERT`（多行、`INSERT ... SELECT`、`ON CONFLICT DO NOTHING`）、`UPDATE`、`DELETE` |
 | 查询 | `SELECT`、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT`、`UNION`/`UNION ALL`、`WITH`（非递归 CTE） |
 | 连接 | `INNER JOIN`、`LEFT JOIN`、多表连接；等值连接走哈希，其余走嵌套循环 |
 | 聚合 | `GROUP BY`（列或表达式）、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、`COUNT(DISTINCT x)` |
@@ -192,7 +192,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **541 个自动化测试**（`python -m pytest tests -q`，约 17 秒），覆盖页格式、WAL 与恢复、
+- **549 个自动化测试**（`python -m pytest tests -q`，约 17 秒），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

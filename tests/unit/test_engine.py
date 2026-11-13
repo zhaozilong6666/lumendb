@@ -4,6 +4,7 @@ import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import (
+    BinderError,
     ColumnNotFoundError,
     DuplicateKeyError,
     NotNullViolationError,
@@ -269,6 +270,57 @@ class TestInsert:
         db.execute_one("CREATE TABLE t (a INT)")
         with pytest.raises(Exception):
             db.execute_one("INSERT INTO t VALUES (99999999999)")
+
+    def test_insert_select(self, db):
+        db.execute_one("CREATE TABLE src (id INT, name TEXT)")
+        db.execute_one("INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        db.execute_one("CREATE TABLE dst (id INT, name TEXT)")
+        result = db.execute_one(
+            "INSERT INTO dst SELECT id, name FROM src WHERE id >= 2"
+        )
+        assert result.affected == 2
+        assert rows(db, "SELECT id, name FROM dst ORDER BY id") == [
+            (2, "b"), (3, "c")
+        ]
+
+    def test_insert_select_into_column_list(self, db):
+        db.execute_one("CREATE TABLE src (id INT, name TEXT)")
+        db.execute_one("INSERT INTO src VALUES (1, 'a')")
+        db.execute_one("CREATE TABLE dst (id INT, name TEXT, age INT)")
+        db.execute_one("INSERT INTO dst (id, name) SELECT id, name FROM src")
+        assert rows(db, "SELECT id, name, age FROM dst") == [(1, "a", None)]
+
+    def test_insert_select_from_self_is_materialized(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (2)")
+        db.execute_one("INSERT INTO t SELECT * FROM t")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(4,)]
+
+    def test_insert_select_column_count_mismatch(self, db):
+        db.execute_one("CREATE TABLE src (a INT, b INT)")
+        db.execute_one("CREATE TABLE dst (a INT)")
+        with pytest.raises(BinderError):
+            db.execute_one("INSERT INTO dst SELECT a, b FROM src")
+
+    def test_insert_select_on_conflict(self, db):
+        db.execute_one("CREATE TABLE src (id INT)")
+        db.execute_one("INSERT INTO src VALUES (1), (1), (2)")
+        db.execute_one("CREATE TABLE dst (id INT PRIMARY KEY)")
+        result = db.execute_one(
+            "INSERT INTO dst SELECT id FROM src ON CONFLICT DO NOTHING"
+        )
+        assert result.affected == 2
+        assert rows(db, "SELECT COUNT(*) FROM dst") == [(2,)]
+
+    def test_insert_select_with_param(self, db):
+        db.execute_one("CREATE TABLE src (id INT)")
+        db.execute_one("INSERT INTO src VALUES (1), (2)")
+        db.execute_one("CREATE TABLE dst (id INT)")
+        result = db.execute_one(
+            "INSERT INTO dst SELECT id FROM src WHERE id = $1", [2]
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT id FROM dst") == [(2,)]
 
 
 class TestSelectBasics:

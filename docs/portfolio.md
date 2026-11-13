@@ -27,12 +27,13 @@
 >   名字解析开销；等值和范围条件命中索引时生成索引计划，
 >   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
 >   支持 `UNION` / `UNION ALL` 集合算子与整体排序/限量，非递归 `WITH`（CTE）
->   按书写顺序绑定并可在 `FROM` 中当作表引用，
+>   按书写顺序绑定并可在 `FROM` 中当作表引用，`INSERT ... SELECT` 先物化来源
+>   再批量写入（避免自插入无限增长），
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 541 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 549 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -55,6 +56,7 @@
 >   residual predicates are rechecked); `UNION` / `UNION ALL` are supported
 >   with compound-level ORDER BY and LIMIT; non-recursive `WITH` (CTEs) are
 >   bound in declaration order and can be referenced as tables in FROM;
+>   `INSERT ... SELECT` materializes its source before writing;
 >   `ALTER TABLE ADD COLUMN` upgrades
 >   the catalog and pads old records at read time instead of rewriting the heap;
 >   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
@@ -62,7 +64,7 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 541 automated tests including crash-injection and a 20-seed randomized
+> - 549 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -193,6 +195,11 @@ oldest-xmin 水位和 `VACUUM FULL`——所以我的回收是"停机维护"级�
 child 就是那份计划。后面的 CTE 能引用前面的 CTE，同名的 CTE 遮蔽真实表。
 没有实现递归 `WITH RECURSIVE`，也没有做“同一个 CTE 被引用多次只算一次”的
 物化缓存——现在每次引用都会重新执行一次，这是明确的取舍。
+
+**"`INSERT ... SELECT` 为什么要先物化？"**
+如果边扫来源边写目标，而来源就是目标表本身，扫描器会读到刚插入的新版本，
+表会无限增长。实现里先把来源查询完整物化成元组列表，再逐行写堆和索引；
+列数在绑定阶段就与目标列核对，所以空结果也不会绕过 schema 检查。
 
 **"性能怎么样？"**
 `bench/results/benchmark.md` 是实测：扫描/聚合 4.6 万行/秒；带索引插入

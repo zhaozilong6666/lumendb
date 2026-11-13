@@ -663,6 +663,9 @@ class Executor:
     def _insert(self, stmt: Insert, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         heap = HeapFile(self._bp, table, self._txns)
+        if stmt.query is not None:
+            return self._insert_select(stmt, table, heap, txn)
+
         empty_schema = Schema([])
         count = 0
 
@@ -681,6 +684,45 @@ class Executor:
                 table, prepared, txn
             ):
                 # 先查再写：这样跳过冲突行不会在堆里留下一条死版本
+                continue
+
+            rid = heap.insert(txn, prepared)
+            for idx in table.indexes.values():
+                tree = self._tree_for(table, idx)
+                key = self._key_for(table, idx, prepared)
+                if key is None:
+                    continue
+                tree.insert(txn, key, rid)
+                idx.root_page = tree.root_page
+            count += 1
+
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(affected=count, tag=f"INSERT {count}")
+
+    def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
+        plan, out_cols = self.binder.bind_select(stmt.query)
+        target_width = (
+            len(stmt.columns) if stmt.columns is not None else len(table.columns)
+        )
+        if len(out_cols) != target_width:
+            raise BinderError(
+                "INSERT ... SELECT 的列数与目标列不一致",
+                detail=f"SELECT 返回 {len(out_cols)} 列，目标需要 {target_width} 列",
+            )
+
+        # 先物化来源：INSERT INTO t SELECT * FROM t 不能边读边写，
+        # 否则扫描器会把刚插入的新行也读出来，形成无限增长。
+        source_rows = [tuple(row) for row in self._execute(plan, txn)]
+        count = 0
+        for values in source_rows:
+            prepared = self._prepare_values(table, stmt.columns, list(values))
+            self._check_constraints(
+                table, prepared, txn, skip_unique=stmt.on_conflict_nothing
+            )
+            if stmt.on_conflict_nothing and self._has_unique_conflict(
+                table, prepared, txn
+            ):
                 continue
 
             rid = heap.insert(txn, prepared)

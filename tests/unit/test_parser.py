@@ -97,6 +97,16 @@ class TestDml:
         stmt = parse_statement("INSERT INTO t (id) VALUES (1)")
         assert stmt.columns == ["id"]
 
+    def test_insert_select(self):
+        stmt = parse_statement("INSERT INTO t SELECT id, name FROM src")
+        assert stmt.query is not None
+        assert stmt.rows == []
+
+    def test_insert_select_with_columns(self):
+        stmt = parse_statement("INSERT INTO t (a, b) SELECT x, y FROM src")
+        assert stmt.columns == ["a", "b"]
+        assert stmt.query is not None
+
     def test_update(self):
         stmt = parse_statement("UPDATE t SET a = a + 1, b = 2 WHERE id = 1")
         assert len(stmt.assignments) == 2

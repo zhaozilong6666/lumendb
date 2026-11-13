@@ -150,6 +150,10 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 
 `NULL` 的排序位置固定为"最后"（ASC 与 DESC 都是），不做 `NULLS FIRST/LAST` 语法。
 
+`INSERT ... SELECT` 不经过 `Values`：绑定来源查询并核对列数后，先把结果完整物化，
+再逐行写堆和索引。物化不只是为了简单——`INSERT INTO t SELECT * FROM t` 如果边读
+边写，扫描器会不断看到刚插入的新版本，表会无限增长。
+
 ## 5. 协议
 
 实现 PostgreSQL v3：

@@ -30,9 +30,14 @@ ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
 INSERT INTO t VALUES (1, 'a', 3), (2, 'b', 4);
 INSERT INTO t (id, name) VALUES (1, 'a');
 INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING;  -- 唯一键冲突时跳过该行
+INSERT INTO t (id, name) SELECT id, name FROM src WHERE age >= 18;
 UPDATE t SET age = age + 1 WHERE id = 1;
 DELETE FROM t WHERE age < 0;
 ```
+
+`INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
+检查；来源查询先完整物化再写入，所以 `INSERT INTO t SELECT * FROM t` 不会边读边写
+导致无限增长。暂不支持在 `INSERT` 前面直接写 `WITH`。
 
 ### 查询
 

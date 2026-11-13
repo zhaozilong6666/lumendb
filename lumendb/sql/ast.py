@@ -347,6 +347,8 @@ class Insert(Statement):
     table: str
     columns: Optional[list[str]]
     rows: list[list[Expr]]
+    #: ``INSERT ... SELECT`` 的来源；为 None 时使用 ``rows``
+    query: Optional[Union[Select, CompoundSelect]] = None
     #: ``ON CONFLICT DO NOTHING``：唯一键冲突时跳过该行而不是报错
     on_conflict_nothing: bool = False
 
