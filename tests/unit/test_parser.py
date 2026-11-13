@@ -135,10 +135,29 @@ class TestCreateTable:
         assert spec is not None
         assert spec.on_update == "CASCADE"
 
-    def test_foreign_key_on_update_set_null_rejected(self):
+    def test_foreign_key_set_null(self):
+        delete_stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET NULL)"
+        )
+        delete_ref = delete_stmt.columns[0].references
+        assert delete_ref is not None
+        assert delete_ref.on_delete == "SET NULL"
+
+        update_stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET NULL)"
+        )
+        update_ref = update_stmt.columns[0].references
+        assert update_ref is not None
+        assert update_ref.on_update == "SET NULL"
+
+    def test_foreign_key_set_default_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement(
-                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET NULL)"
+                "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET DEFAULT)"
+            )
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET DEFAULT)"
             )
 
     def test_foreign_key_alter_add_constraint(self):

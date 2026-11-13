@@ -2616,14 +2616,14 @@ class Executor:
                         continue
                     if child_key != old_key:
                         continue
-                    if fk.on_update != "CASCADE":
+                    if fk.on_update not in ("CASCADE", "SET NULL"):
                         raise ForeignKeyViolationError(
                             f"外键约束 {fk.name!r} 阻止更新被引用行",
                             detail=(
                                 f"表 {child.name} 中仍有行引用 "
                                 f"{table.name}.{fk.ref_columns} = {old_key}"
                             ),
-                            hint="先 DELETE/UPDATE 引用行，或使用 ON UPDATE CASCADE",
+                            hint="先 DELETE/UPDATE 引用行，或使用 ON UPDATE CASCADE/SET NULL",
                         )
                     entry = pending.get(child_ident)
                     if entry is None:
@@ -2633,9 +2633,11 @@ class Executor:
                     else:
                         child_new = entry[3]
                     for local_name, ref_name in zip(fk.columns, fk.ref_columns):
-                        child_new[child.column_index(local_name)] = new_values[
-                            table.column_index(ref_name)
-                        ]
+                        child_new[child.column_index(local_name)] = (
+                            None
+                            if fk.on_update == "SET NULL"
+                            else new_values[table.column_index(ref_name)]
+                        )
         return list(pending.values())
 
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
@@ -3148,6 +3150,25 @@ class Executor:
                         matches.append((rid, child_values))
                 if not matches:
                     continue
+                if fk.on_delete == "SET NULL":
+                    self._snapshot_table_state(child, txn)
+                    for child_rid, child_values in matches:
+                        ident = (child.name, child_rid)
+                        if ident in deleted or ident in processing:
+                            continue
+                        child_new = list(child_values)
+                        for name in fk.columns:
+                            child_new[child.column_index(name)] = None
+                        self._rewrite_row(
+                            child,
+                            child_heap,
+                            txn,
+                            child_rid,
+                            child_values,
+                            child_new,
+                            _updating=set(processing),
+                        )
+                    continue
                 if fk.on_delete != "CASCADE":
                     raise ForeignKeyViolationError(
                         f"外键约束 {fk.name!r} 阻止删除被引用行",
@@ -3155,7 +3176,7 @@ class Executor:
                             f"表 {child.name} 中仍有行引用 "
                             f"{table.name}.{fk.ref_columns} = {key}"
                         ),
-                        hint="先 DELETE/UPDATE 引用行，或使用 ON DELETE CASCADE",
+                        hint="先 DELETE/UPDATE 引用行，或使用 ON DELETE CASCADE/SET NULL",
                     )
                 for child_rid, child_values in matches:
                     ident = (child.name, child_rid)

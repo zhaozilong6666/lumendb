@@ -689,7 +689,7 @@ class Parser:
         )
 
     def _parse_fk_actions(self) -> tuple[str, str]:
-        """解析外键 ON DELETE/UPDATE 动作；当前支持 RESTRICT 与 CASCADE。"""
+        """解析外键 ON DELETE/UPDATE 动作；当前支持 RESTRICT / CASCADE / SET NULL。"""
         on_delete = "RESTRICT"
         on_update = "RESTRICT"
         while self._match_kw("ON"):
@@ -698,20 +698,36 @@ class Parser:
                     on_delete = "CASCADE"
                 elif self._match_kw("RESTRICT"):
                     on_delete = "RESTRICT"
+                elif self._match_kw("SET"):
+                    if self._match_kw("NULL"):
+                        on_delete = "SET NULL"
+                    else:
+                        raise NotSupportedError(
+                            "外键 ON DELETE 暂不支持 SET DEFAULT",
+                            hint="只支持 SET NULL",
+                        )
                 else:
                     raise NotSupportedError(
-                        "外键 ON DELETE 仅支持 CASCADE 或 RESTRICT",
-                        hint="暂不支持 SET NULL / SET DEFAULT / NO ACTION",
+                        "外键 ON DELETE 仅支持 CASCADE、RESTRICT 或 SET NULL",
+                        hint="暂不支持 SET DEFAULT / NO ACTION",
                     )
             elif self._match_kw("UPDATE"):
                 if self._match_kw("CASCADE"):
                     on_update = "CASCADE"
                 elif self._match_kw("RESTRICT"):
                     on_update = "RESTRICT"
+                elif self._match_kw("SET"):
+                    if self._match_kw("NULL"):
+                        on_update = "SET NULL"
+                    else:
+                        raise NotSupportedError(
+                            "外键 ON UPDATE 暂不支持 SET DEFAULT",
+                            hint="只支持 SET NULL",
+                        )
                 else:
                     raise NotSupportedError(
-                        "外键 ON UPDATE 仅支持 CASCADE 或 RESTRICT",
-                        hint="暂不支持 SET NULL / SET DEFAULT / NO ACTION",
+                        "外键 ON UPDATE 仅支持 CASCADE、RESTRICT 或 SET NULL",
+                        hint="暂不支持 SET DEFAULT / NO ACTION",
                     )
             else:
                 raise self._error("ON 之后期望 DELETE 或 UPDATE")

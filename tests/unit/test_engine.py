@@ -3354,6 +3354,78 @@ class TestForeignKey:
             (7, 1),
         ]
 
+    def test_on_delete_set_null(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON DELETE SET NULL)"
+        )
+        db.execute_one("CREATE INDEX idx_c_pid ON c(pid)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (10, 1)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT id, pid FROM c") == [(10, None)]
+
+    def test_on_delete_set_null_not_null_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT NOT NULL REFERENCES p(id) ON DELETE SET NULL)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+
+    def test_on_update_set_null(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON UPDATE SET NULL)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(None,)]
+
+    def test_on_update_set_null_not_null_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT NOT NULL REFERENCES p(id) ON UPDATE SET NULL)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+
+    def test_on_delete_set_null_rollback(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE SET NULL)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(None,)]
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+
+    def test_alter_add_set_null(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON DELETE SET NULL"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(None,)]
+
     def test_on_delete_cascade_rollback(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

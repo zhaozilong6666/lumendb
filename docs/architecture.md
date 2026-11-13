@@ -164,10 +164,12 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 （SQLSTATE `23503`）。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
 `UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 扫描所有
 引用表（自引用时跳过当前 RID）：`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
-在父行写堆后通过同一 `_rewrite_row` 递归更新子行，并维护其索引和下游外键。
-`ON DELETE CASCADE` 则由 `_cascade_delete_children` 递归处理：先收集匹配子行，
-`RESTRICT` 子行立即报错，`CASCADE` 子行递归删除其子行后再删索引项和堆版本；
-临时 `processing` / `deleted` 集合用于打断自引用环，事务 abort 会恢复所有页和目录。
+`SET NULL` 收集并将匹配外键列置空，在父行写堆后通过同一 `_rewrite_row` 递归更新
+子行，并维护其索引和下游外键。
+`ON DELETE CASCADE` / `SET NULL` 则由 `_cascade_delete_children` 处理：先收集匹配
+子行，`RESTRICT` 子行立即报错，`CASCADE` 子行递归删除其子行后再删索引项和堆版本，
+`SET NULL` 子行通过 `_rewrite_row` 将外键列置空；临时 `processing` / `deleted`
+集合用于打断自引用环，事务 abort 会恢复所有页和目录。
 实现是逐表扫描而非依赖索引定位，正确性优先，规模上仍是 O(子表行数)。
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
@@ -175,8 +177,8 @@ DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / 
 `DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 拒绝被引用的表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
 `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前
-`ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE`，不支持 `SET NULL`、
-`SET DEFAULT`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；`ADD COLUMN ... REFERENCES`
+`ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL`，不支持
+`SET DEFAULT`、`NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；`ADD COLUMN ... REFERENCES`
 复用 `ADD CONSTRAINT FOREIGN KEY` 的存量行校验路径，先加列再原子建立外键，失败时
 整条语句回滚。
 

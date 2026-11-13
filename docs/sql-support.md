@@ -134,19 +134,21 @@ CREATE TABLE child (
   CONSTRAINT fk_child_parent FOREIGN KEY (pcode) REFERENCES parent(code)
 );
 ALTER TABLE child ADD CONSTRAINT fk_child_parent2
-  FOREIGN KEY (pid) REFERENCES parent(id);
+  FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE;
 ```
 
 列级 `REFERENCES` 可省略被引用列（`pid INT REFERENCES parent`），此时取被引用表的
 主键；表级约束也遵循同样规则。被引用列必须存在，并且上有 `UNIQUE` 或 `PRIMARY KEY`
 索引；引用列与被引用列数量、顺序一致，类型必须完全相同。外键按 SQL 的 `MATCH
 SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查。删除动作默认
-`RESTRICT`，支持 `ON DELETE CASCADE` 递归删除子行；更新被引用键默认 `RESTRICT`，
-支持 `ON UPDATE CASCADE` 递归同步子行（多级链和自引用链都会经过同一写路径）。
-`RESTRICT` 下删除或更新被引用键时只要还有子行引用旧键就拒绝；`CASCADE` 会按依赖
-顺序递归处理并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键仍抛
-`ForeignKeyViolationError`（SQLSTATE `23503`）。当前没有 `SET NULL`、`SET DEFAULT`、
-`NO ACTION` 或 `DEFERRABLE` 延迟检查。外键定义（含删除/更新动作）随目录 JSON 持久化，
+`RESTRICT`，支持 `ON DELETE CASCADE` 递归删除子行，以及 `ON DELETE SET NULL`
+将匹配子行的外键列置为 `NULL`；更新被引用键默认 `RESTRICT`，支持
+`ON UPDATE CASCADE` 递归同步子行，以及 `ON UPDATE SET NULL` 将匹配子行的外键列
+置为 `NULL`（多级链和自引用链都会经过同一写路径）。`RESTRICT` 下删除或更新被
+引用键时只要还有子行引用旧键就拒绝；`CASCADE` / `SET NULL` 会按依赖顺序递归处理，
+并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键仍抛
+`ForeignKeyViolationError`（SQLSTATE `23503`）。当前没有 `SET DEFAULT`、`NO ACTION`
+或 `DEFERRABLE` 延迟检查。外键定义（含删除/更新动作）随目录 JSON 持久化，
 事务 undo 会恢复外键字典；支持自引用（同一张表内 `REFERENCES` 自身），自引用未显式
 给列时同样取当前表主键，并允许新行直接引用自身。
 
@@ -363,7 +365,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE`；不支持 `SET NULL`、`SET DEFAULT`、`NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL` |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL`；不支持 `SET DEFAULT`、`NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL` |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |
