@@ -152,6 +152,8 @@ psycopg2 都不会正常返回结果。
 | 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX [TABLE]`、`VACUUM [FULL]`、`TRUNCATE` |
 
 未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
+外键与级联动作的实现、测试矩阵和遗留风险见
+[`docs/foreign-key-milestone.md`](docs/foreign-key-milestone.md)。
 
 ## 基准测试
 
