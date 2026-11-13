@@ -1504,6 +1504,34 @@ class TestUpdateDelete:
         assert db.execute_one("DELETE FROM users").affected == 3
         assert rows(db, "SELECT COUNT(*) FROM users") == [(0,)]
 
+    def test_delete_using(self, db):
+        db.execute_one("CREATE TABLE t (id INT, v INT)")
+        db.execute_one("CREATE TABLE s (id INT, flag INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute_one("INSERT INTO s VALUES (1, 1), (2, 0)")
+        db.execute_one("CREATE INDEX idx_t_id ON t (id)")
+        result = db.execute_one(
+            "DELETE FROM t USING s WHERE t.id = s.id AND s.flag = 1 "
+            "RETURNING t.id, t.v"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 10)]
+        assert rows(db, "SELECT id, v FROM t ORDER BY id") == [
+            (2, 20),
+            (3, 30),
+        ]
+        assert rows(db, "SELECT id FROM t WHERE id = 2") == [(2,)]
+
+    def test_delete_using_empty_source(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("CREATE TABLE s (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        result = db.execute_one(
+            "DELETE FROM t USING s WHERE t.id = s.id"
+        )
+        assert result.affected == 0
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(1,)]
+
     def test_delete_updates_unique_index(self, db):
         setup_users(db)
         db.execute_one("DELETE FROM users WHERE id = 1")

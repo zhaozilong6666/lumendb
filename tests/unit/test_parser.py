@@ -317,6 +317,14 @@ class TestDml:
         stmt = parse_statement("DELETE FROM t WHERE id = 1")
         assert stmt.table == "t" and stmt.where is not None
 
+    def test_delete_using(self):
+        stmt = parse_statement(
+            "DELETE FROM t USING s WHERE t.id = s.id RETURNING t.id"
+        )
+        assert isinstance(stmt, Delete)
+        assert stmt.using_table == "s"
+        assert stmt.returning is not None
+
     def test_delete_all(self):
         assert parse_statement("DELETE FROM t").where is None
 

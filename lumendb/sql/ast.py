@@ -525,6 +525,8 @@ class Delete(Statement):
     where: Optional[Expr] = None
     returning: Optional[list["SelectItem"]] = None
     ctes: list["Cte"] = field(default_factory=list)
+    #: PostgreSQL 的 DELETE ... USING；目前只支持单个源表，不支持 JOIN/别名。
+    using_table: Optional[str] = None
 
 
 @dataclass

@@ -816,6 +816,9 @@ class Parser:
         self._expect_kw("DELETE")
         self._expect_kw("FROM")
         table = self._parse_ident("表名")
+        using_table = None
+        if self._match_word("USING"):
+            using_table = self._parse_ident("源表名")
         where = None
         if self._match_kw("WHERE"):
             where = self._parse_expr()
@@ -823,6 +826,7 @@ class Parser:
             table=table,
             where=where,
             returning=self._parse_returning(),
+            using_table=using_table,
         )
 
     def _parse_returning(self) -> Optional[list[SelectItem]]:

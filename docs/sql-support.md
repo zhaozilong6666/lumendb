@@ -152,6 +152,7 @@ UPDATE t SET total = t.amount + s.tax FROM s
   WHERE t.id = s.id RETURNING t.id, t.total;  -- 单源表 UPDATE ... FROM
 UPDATE t SET age = DEFAULT WHERE id = 1;                  -- 取列当前默认值
 DELETE FROM t WHERE age < 0 RETURNING id, name;
+DELETE FROM t USING s WHERE t.id = s.id;          -- 单源表 DELETE ... USING
 WITH old AS (SELECT id FROM t WHERE age < 0) DELETE FROM t
   WHERE id IN (SELECT id FROM old) RETURNING id;
 ```
@@ -183,6 +184,11 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 更新一次。`SET` 表达式和 `WHERE` 可以同时引用两侧列；`RETURNING` 只能在目标表
 上求值，并返回更新后的新行。源表不能与目标表同名，也暂不支持源表别名、JOIN、
 视图或 CTE 作为源表；这些情况会明确报错。索引与约束维护复用普通 `UPDATE` 的路径。
+
+`DELETE ... USING` 采用同样的单源表连接模型：源表先完整物化，目标行按 `WHERE`
+匹配第一条源行，没有匹配则不删除，同一目标行最多删除一次；目标表索引按删除行
+逐个维护。`RETURNING` 在目标旧行上求值。源表不能与目标表同名，源表别名、JOIN、
+视图/CTE 源表暂不支持。
 
 ### 查询
 

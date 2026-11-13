@@ -2403,26 +2403,61 @@ class Executor:
             self._active_ctes = {}
 
         where_fn = None
-        schema = Schema(
-            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        target_schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns],
+            default_qualifier=table.name,
         )
+        schema_columns = list(target_schema.columns)
+        source_table = None
+        source_rows: list[list[Any]] = []
+        if stmt.using_table is not None:
+            if stmt.using_table.lower() == table.name:
+                raise BinderError(
+                    "DELETE ... USING 的源表不能与目标表同名",
+                    hint="给源表使用不同的表名或先物化到临时表",
+                )
+            source_table = self._catalog.get_table(stmt.using_table)
+            schema_columns.extend(
+                SchemaColumn(source_table.name, c.name, c.type)
+                for c in source_table.columns
+            )
+            source_rows = [
+                list(values)
+                for _rid, values in HeapFile(
+                    self._bp, source_table, self._txns
+                ).scan(txn)
+            ]
+        schema = Schema(schema_columns, default_qualifier=table.name)
         if stmt.where is not None:
             where_fn, _ = self.binder.compile(stmt.where, schema, allow_agg=False)
 
-        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        ret_fns, ret_cols = self.binder.bind_returning(
+            stmt.returning, target_schema
+        )
         returned: list[tuple] = []
         deleted = 0
         for rid, values in heap.scan(txn):
-            ctx = EvalContext(tuple(values))
-            if where_fn is not None and not _truthy(where_fn(ctx)):
-                continue
+            old_tuple = tuple(values)
+            if source_table is None:
+                ctx = EvalContext(old_tuple)
+                if where_fn is not None and not _truthy(where_fn(ctx)):
+                    continue
+            else:
+                matched = False
+                for source_values in source_rows:
+                    candidate = EvalContext(old_tuple + tuple(source_values))
+                    if where_fn is None or _truthy(where_fn(candidate)):
+                        matched = True
+                        break
+                if not matched:
+                    continue
             for idx in table.indexes.values():
                 key = self._key_for(table, idx, values)
                 if key is not None:
                     self._tree_for(table, idx).delete(txn, key, rid)
             if ret_fns:
                 returned.append(
-                    tuple(fn(EvalContext(tuple(values))) for fn in ret_fns)
+                    tuple(fn(EvalContext(old_tuple)) for fn in ret_fns)
                 )
             heap.delete(txn, rid)
             deleted += 1
