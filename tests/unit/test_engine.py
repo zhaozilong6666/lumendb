@@ -1137,6 +1137,28 @@ class TestSelectBasics:
         setup_users(db)
         assert rows(db, "SELECT id FROM users ORDER BY id LIMIT 1 OFFSET 1") == [(2,)]
 
+    def test_limit_all_and_sql_standard_pagination(self, db):
+        setup_users(db)
+        assert rows(db, "SELECT id FROM users ORDER BY id LIMIT ALL") == [
+            (1,), (2,), (3,)
+        ]
+        assert rows(
+            db,
+            "SELECT id FROM users ORDER BY id OFFSET 1 ROW "
+            "FETCH NEXT 2 ROWS ONLY",
+        ) == [(2,), (3,)]
+        assert rows(
+            db, "SELECT id FROM users ORDER BY id FETCH FIRST ROW ONLY"
+        ) == [(1,)]
+        assert rows(
+            db,
+            "SELECT id FROM users ORDER BY id FETCH NEXT $1 ROWS ONLY",
+            params=[2],
+        ) == [(1,), (2,)]
+        assert rows(
+            db, "SELECT id FROM users ORDER BY id OFFSET 2 ROWS"
+        ) == [(3,)]
+
     def test_distinct(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("INSERT INTO t VALUES (1), (1), (2)")

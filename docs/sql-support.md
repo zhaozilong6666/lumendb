@@ -125,8 +125,15 @@ WHERE cond
 GROUP BY expr [, expr...]        -- 列引用或任意标量表达式，同形表达式可直接用于 SELECT
 HAVING cond
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...
-LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
+LIMIT {n | ALL} [OFFSET m [ROW|ROWS]]  -- n/m 也可以是 $1 这样的参数
+OFFSET m [ROW|ROWS]                     -- 可以单独使用
+FETCH {FIRST|NEXT} {n | ROW} {ROW|ROWS} ONLY
 ```
+
+`LIMIT ALL` 等价于不限制行数；`OFFSET m ROWS` 可以单独出现，也可以与
+`FETCH FIRST/NEXT ... ROWS ONLY` 组合，语义与 `LIMIT n OFFSET m` 一致。
+`FETCH FIRST ROW ONLY` 是 `FETCH FIRST 1 ROWS ONLY` 的简写。`FETCH ... WITH TIES`
+尚未支持，会明确报错；需要并列行时请在 `ORDER BY` 中加入唯一键后自行取数。
 
 集合运算：
 

@@ -851,10 +851,46 @@ class Parser:
 
         limit = None
         offset = None
+        limit_seen = False
+        offset_seen = False
         if self._match_kw("LIMIT"):
-            limit = self._parse_limit_value("LIMIT")
+            limit_seen = True
+            limit = self._parse_limit_value("LIMIT", allow_all=True)
             if self._match_kw("OFFSET"):
+                offset_seen = True
                 offset = self._parse_limit_value("OFFSET")
+                self._match_kw("ROW") or self._match_kw("ROWS")
+        if self._match_kw("OFFSET"):
+            if offset_seen:
+                raise self._error("OFFSET 重复指定")
+            offset_seen = True
+            offset = self._parse_limit_value("OFFSET")
+            self._match_kw("ROW") or self._match_kw("ROWS")
+        if self._match_kw("FETCH"):
+            if limit_seen:
+                raise self._error("LIMIT 和 FETCH 不能同时使用")
+            if self._match_kw("FIRST"):
+                pass
+            elif self._match_kw("NEXT"):
+                pass
+            else:
+                raise self._error("FETCH 之后期望 FIRST 或 NEXT")
+            if self._cur.is_keyword("ROW", "ROWS"):
+                limit = 1
+            else:
+                limit = self._parse_limit_value("FETCH")
+            if not (self._match_kw("ROW") or self._match_kw("ROWS")):
+                raise self._error("FETCH 之后期望 ROW 或 ROWS")
+            if self._match_kw("ONLY"):
+                pass
+            elif self._match_kw("WITH"):
+                self._expect_kw("TIES")
+                raise NotSupportedError(
+                    "FETCH ... WITH TIES 尚未支持",
+                    hint="改用 ONLY，或在 ORDER BY 中加入唯一键后自行处理并列行",
+                )
+            else:
+                raise self._error("FETCH 之后期望 ONLY 或 WITH TIES")
         return order_by, limit, offset
 
     def _parse_select_item(self) -> SelectItem:
@@ -1179,8 +1215,13 @@ class Parser:
             return int(tok.value)
         raise self._error("期望一个非负整数")
 
-    def _parse_limit_value(self, clause: str):
-        """``LIMIT n`` / ``LIMIT $1``：参数在绑定阶段解析成整数。"""
+    def _parse_limit_value(self, clause: str, *, allow_all: bool = False):
+        """``LIMIT n`` / ``LIMIT $1``：参数在绑定阶段解析成整数。
+
+        ``LIMIT ALL`` 只在 allow_all=True 时接受，返回 None 表示不限制行数。
+        """
+        if allow_all and self._match_kw("ALL"):
+            return None
         tok = self._cur
         if tok.kind == "int":
             self._advance()

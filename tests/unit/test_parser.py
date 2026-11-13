@@ -553,6 +553,30 @@ class TestParameters:
         assert isinstance(stmt.select.limit, ParamRef)
         assert stmt.select.limit.index == 1
 
+    def test_limit_all(self):
+        stmt = parse_statement("SELECT * FROM t ORDER BY id LIMIT ALL")
+        assert stmt.select.limit is None
+
+    def test_offset_rows_without_limit(self):
+        stmt = parse_statement("SELECT * FROM t OFFSET 2 ROWS")
+        assert stmt.select.limit is None
+        assert stmt.select.offset == 2
+
+    def test_fetch_first_rows_only(self):
+        stmt = parse_statement(
+            "SELECT * FROM t ORDER BY id OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY"
+        )
+        assert stmt.select.limit == 2
+        assert stmt.select.offset == 1
+        one = parse_statement("SELECT * FROM t FETCH FIRST ROW ONLY")
+        assert one.select.limit == 1
+
+    def test_fetch_with_ties_rejected(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "SELECT * FROM t ORDER BY id FETCH FIRST 2 ROWS WITH TIES"
+            )
+
     def test_zero_parameter_rejected(self):
         with pytest.raises(SQLSyntaxError):
             parse_statement("SELECT * FROM t WHERE id = $0")
