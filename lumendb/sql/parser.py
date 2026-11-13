@@ -534,7 +534,11 @@ class Parser:
             names = [self._parse_ident("表名")]
             while self._match_punct("comma"):
                 names.append(self._parse_ident("表名"))
-            return DropTable(names=names, if_exists=if_exists)
+            cascade = self._match_kw("CASCADE") is not None
+            self._match_kw("RESTRICT")
+            return DropTable(
+                names=names, if_exists=if_exists, cascade=cascade
+            )
         if self._match_kw("INDEX"):
             if_exists = False
             if self._match_kw("IF"):
@@ -546,7 +550,10 @@ class Parser:
             if self._match_kw("IF"):
                 self._expect_kw("EXISTS")
                 if_exists = True
-            return DropView(name=self._parse_ident("视图名"), if_exists=if_exists)
+            name = self._parse_ident("视图名")
+            cascade = self._match_kw("CASCADE") is not None
+            self._match_kw("RESTRICT")
+            return DropView(name=name, if_exists=if_exists, cascade=cascade)
         raise self._error("DROP 之后期望 TABLE、INDEX 或 VIEW")
 
     def _parse_insert(self) -> Insert:

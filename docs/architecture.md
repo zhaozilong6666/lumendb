@@ -134,7 +134,7 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 `view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用；Binder 同时把
 实际解析到的表/视图记进 `source_dependencies`，目录持久化为每个视图的依赖集合，
 `DROP TABLE` / `DROP VIEW` / `ALTER TABLE ... RENAME` 据此拒绝会留下悬空定义的删除或
-重命名。视图不占堆页，因此不参与
+重命名；显式 `CASCADE` 会先递归删除依赖视图。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
 `CREATE OR REPLACE VIEW` 先绑定新定义，再替换目录里的 token 切片，因此新定义
 非法时旧视图仍然可用；替换本身也在事务 undo 范围内。

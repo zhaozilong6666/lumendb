@@ -147,6 +147,16 @@ class TestCreateTable:
         assert stmt.name == "v"
         assert stmt.if_exists
 
+    def test_drop_cascade(self):
+        from lumendb.sql.ast import DropTable, DropView
+
+        table = parse_statement("DROP TABLE t CASCADE")
+        assert isinstance(table, DropTable)
+        assert table.cascade
+        view = parse_statement("DROP VIEW v CASCADE")
+        assert isinstance(view, DropView)
+        assert view.cascade
+
 
 class TestCreateIndex:
     def test_single_column(self):

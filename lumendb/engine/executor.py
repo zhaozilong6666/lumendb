@@ -860,7 +860,7 @@ class Executor:
 
     def _drop_view(self, stmt: DropView, txn: Transaction) -> Result:
         try:
-            self._catalog.drop_view(txn, stmt.name)
+            self._catalog.drop_view(txn, stmt.name, stmt.cascade)
         except TableNotFoundError:
             if stmt.if_exists:
                 return Result(tag="DROP VIEW", notice="视图不存在，已跳过")
@@ -1035,7 +1035,7 @@ class Executor:
                 if stmt.if_exists:
                     continue
                 raise TableNotFoundError(f"表 {name!r} 不存在")
-            self._catalog.drop_table(txn, name)
+            self._catalog.drop_table(txn, name, stmt.cascade)
         return Result(tag="DROP TABLE")
 
     def _create_index(self, stmt: CreateIndex, txn: Transaction) -> Result:

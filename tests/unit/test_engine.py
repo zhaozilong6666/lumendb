@@ -668,6 +668,31 @@ class TestInsert:
         db.execute_one("ALTER TABLE t RENAME TO u")
         db.execute_one("SELECT * FROM u")
 
+    def test_drop_table_cascade_removes_views(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        db.execute_one("DROP TABLE t CASCADE")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM v")
+        assert rows(db, "SHOW VIEWS") == []
+
+    def test_drop_view_cascade_removes_dependents(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v1 AS SELECT a FROM t")
+        db.execute_one("CREATE VIEW v2 AS SELECT a FROM v1")
+        db.execute_one("DROP VIEW v1 CASCADE")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM v2")
+
+    def test_drop_cascade_rollback_restores_views(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        db.execute_one("BEGIN")
+        db.execute_one("DROP TABLE t CASCADE")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT * FROM v") == [(1,)]
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

@@ -348,12 +348,14 @@ class CreateView(Statement):
 class DropView(Statement):
     name: str
     if_exists: bool = False
+    cascade: bool = False
 
 
 @dataclass
 class DropTable(Statement):
     names: list[str]
     if_exists: bool = False
+    cascade: bool = False
 
 
 @dataclass

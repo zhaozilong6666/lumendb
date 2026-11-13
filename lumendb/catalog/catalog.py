@@ -225,16 +225,22 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
-    def drop_view(self, txn: Transaction, name: str) -> None:
+    def drop_view(
+        self, txn: Transaction, name: str, cascade: bool = False
+    ) -> None:
         key = name.lower()
         if key not in self.views:
             raise TableNotFoundError(f"视图 {name!r} 不存在")
         dependents = self._view_dependents(key)
         if dependents:
-            raise BinderError(
-                f"视图 {name!r} 被其他视图依赖：{', '.join(dependents)}",
-                hint="先删除依赖它的视图，再删除当前视图",
-            )
+            if not cascade:
+                raise BinderError(
+                    f"视图 {name!r} 被其他视图依赖：{', '.join(dependents)}",
+                    hint="使用 DROP VIEW ... CASCADE，或先删除依赖视图",
+                )
+            for dependent in dependents:
+                if dependent in self.views:
+                    self.drop_view(txn, dependent, cascade=True)
         tokens = self.views.pop(key)
         columns = self.view_columns.pop(key, [])
         dependencies = self.view_dependencies.pop(key, set())
@@ -254,16 +260,22 @@ class Catalog:
             if key in deps
         )
 
-    def drop_table(self, txn: Transaction, name: str) -> None:
+    def drop_table(
+        self, txn: Transaction, name: str, cascade: bool = False
+    ) -> None:
         key = name.lower()
         if key not in self.tables:
             raise TableNotFoundError(f"表 {name!r} 不存在")
         dependents = self._view_dependents(key)
         if dependents:
-            raise BinderError(
-                f"表 {name!r} 被视图依赖：{', '.join(dependents)}",
-                hint="先 DROP VIEW 依赖它的视图，再删除表",
-            )
+            if not cascade:
+                raise BinderError(
+                    f"表 {name!r} 被视图依赖：{', '.join(dependents)}",
+                    hint="使用 DROP TABLE ... CASCADE，或先 DROP VIEW 依赖它的视图",
+                )
+            for dependent in dependents:
+                if dependent in self.views:
+                    self.drop_view(txn, dependent, cascade=True)
         table = self.tables.pop(key)
 
         def undo() -> None:
