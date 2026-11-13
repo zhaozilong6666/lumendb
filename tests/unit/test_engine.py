@@ -1579,9 +1579,23 @@ class TestUnion:
             db, "SELECT NULL AS x INTERSECT SELECT NULL"
         ) == [(None,)]
 
-    def test_except_all_rejected(self, db):
-        with pytest.raises(NotSupportedError):
-            db.execute_one("SELECT 1 EXCEPT ALL SELECT 2")
+    def test_except_all_multiset(self, db):
+        db.execute_one("CREATE TABLE a (id INT)")
+        db.execute_one("CREATE TABLE b (id INT)")
+        db.execute_one("INSERT INTO a VALUES (1), (2), (2), (3)")
+        db.execute_one("INSERT INTO b VALUES (2), (3), (4)")
+        assert rows(
+            db, "SELECT id FROM a EXCEPT ALL SELECT id FROM b ORDER BY id"
+        ) == [(1,), (2,)]
+
+    def test_intersect_all_multiset(self, db):
+        db.execute_one("CREATE TABLE c (id INT)")
+        db.execute_one("CREATE TABLE d (id INT)")
+        db.execute_one("INSERT INTO c VALUES (2), (2), (3)")
+        db.execute_one("INSERT INTO d VALUES (2), (2), (3), (4)")
+        assert rows(
+            db, "SELECT id FROM c INTERSECT ALL SELECT id FROM d ORDER BY id"
+        ) == [(2,), (2,), (3,)]
 
     def test_union_explain_plan(self, db):
         plan = "\n".join(

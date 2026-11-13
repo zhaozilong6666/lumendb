@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 import time
+from collections import Counter
 from typing import Any, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
@@ -431,6 +432,18 @@ class Executor:
             return
 
         if node.op == "EXCEPT":
+            if node.all:
+                # EXCEPT ALL 是多重集差：左侧每命中右侧一次，消耗一份右侧重复行。
+                right_counts = Counter(
+                    tuple(row) for row in self._execute(node.right, txn)
+                )
+                for row in self._execute(node.left, txn):
+                    row = tuple(row)
+                    if right_counts.get(row, 0) > 0:
+                        right_counts[row] -= 1
+                        continue
+                    yield row
+                return
             right_rows = {tuple(row) for row in self._execute(node.right, txn)}
             seen: set[tuple] = set()
             for row in self._execute(node.left, txn):
@@ -442,6 +455,18 @@ class Executor:
             return
 
         if node.op == "INTERSECT":
+            if node.all:
+                # INTERSECT ALL 是多重集交：右侧每有一份，左侧就产出一份。
+                right_counts = Counter(
+                    tuple(row) for row in self._execute(node.right, txn)
+                )
+                for row in self._execute(node.left, txn):
+                    row = tuple(row)
+                    if right_counts.get(row, 0) <= 0:
+                        continue
+                    right_counts[row] -= 1
+                    yield row
+                return
             right_rows = {tuple(row) for row in self._execute(node.right, txn)}
             seen: set[tuple] = set()
             for row in self._execute(node.left, txn):
@@ -454,7 +479,7 @@ class Executor:
 
         raise NotSupportedError(
             f"集合运算 {node.op} 尚未实现",
-            hint="支持 UNION / UNION ALL / EXCEPT / INTERSECT",
+            hint="支持 UNION / UNION ALL / EXCEPT / EXCEPT ALL / INTERSECT / INTERSECT ALL",
         )
 
     def _join(self, node: Join, txn: Transaction) -> Iterator[tuple]:

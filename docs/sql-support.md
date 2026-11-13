@@ -85,16 +85,16 @@ LIMIT n [OFFSET m]               -- n/m 也可以是 $1 这样的参数
 
 ```sql
 SELECT ... UNION [ALL] SELECT ...
-SELECT ... EXCEPT SELECT ...
-SELECT ... INTERSECT SELECT ...
+SELECT ... EXCEPT [ALL] SELECT ...
+SELECT ... INTERSECT [ALL] SELECT ...
 SELECT ... UNION ALL SELECT ... ORDER BY 1 LIMIT 5
 ```
 
-`UNION` 去重（`NULL` 视为同一行），`UNION ALL` 保留重复，`EXCEPT` / `INTERSECT`
-按 DISTINCT 语义去重。`INTERSECT` 的优先级高于 `UNION` / `EXCEPT`，同级从左到右
-结合；列数必须一致、类型要兼容，输出列名取第一个 `SELECT`。`ORDER BY` / `LIMIT`
-/ `OFFSET` 作用于整个集合结果，排序键只支持输出列名或从 1 开始的列序号。
-`EXCEPT ALL` / `INTERSECT ALL` 尚未实现。
+`UNION` 去重（`NULL` 视为同一行），`UNION ALL` 保留重复；`EXCEPT` / `INTERSECT`
+按 DISTINCT 语义去重，`EXCEPT ALL` / `INTERSECT ALL` 按多重集计数保留重复。
+`INTERSECT` 的优先级高于 `UNION` / `EXCEPT`，同级从左到右结合；列数必须一致、
+类型要兼容，输出列名取第一个 `SELECT`。`ORDER BY` / `LIMIT` / `OFFSET` 作用于
+整个集合结果，排序键只支持输出列名或从 1 开始的列序号。
 
 公共表表达式（非递归 CTE）：
 

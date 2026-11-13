@@ -519,9 +519,12 @@ class TestCompoundSelect:
         assert stmt.select.ops == ["INTERSECT"]
         assert stmt.select.parts[0].ops == ["INTERSECT"]
 
-    def test_except_all_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("SELECT 1 EXCEPT ALL SELECT 2")
+    def test_except_all_flags(self):
+        stmt = parse_statement("SELECT 1 EXCEPT ALL SELECT 2 INTERSECT ALL SELECT 3")
+        assert stmt.select.all_flags == [True]
+        assert stmt.select.ops == ["EXCEPT"]
+        assert stmt.select.parts[1].all_flags == [True]
+        assert stmt.select.parts[1].ops == ["INTERSECT"]
 
 
 class TestAlterTable:

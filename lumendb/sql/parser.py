@@ -637,11 +637,6 @@ class Parser:
 
     def _set_all_flag(self, op: str) -> bool:
         if self._match_kw("ALL") is not None:
-            if op != "UNION":
-                raise NotSupportedError(
-                    f"{op} ALL 尚未实现",
-                    hint="当前集合运算的 ALL 只支持 UNION ALL",
-                )
             return True
         self._match_kw("DISTINCT")
         return False
