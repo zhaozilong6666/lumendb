@@ -436,6 +436,15 @@ class TestInsert:
         with pytest.raises(DuplicateKeyError):
             db.execute_one("ALTER TABLE u ADD PRIMARY KEY (a, b)")
 
+    def test_alter_add_primary_key_rollback_restores_table(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ADD PRIMARY KEY (a, b)")
+        db.execute_one("ROLLBACK")
+        # 回滚后不应残留主键索引/列标志，重复行仍可插入。
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
