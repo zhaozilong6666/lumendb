@@ -46,7 +46,8 @@
 >   `CHECK` 约束以 token 切片持久化，写入统一校验并支持存量回填；`RENAME` 会同步
 >   重写 token 里的列/表引用；`ALTER COLUMN
 >   SET/DROP NOT NULL` 先校验存量行，再只改目录约束；`DROP CONSTRAINT` 可移除
->   CHECK；`ADD COLUMN ... CHECK` 会先按默认值补齐旧行再验证；`ALTER COLUMN
+>   CHECK、UNIQUE 或 PRIMARY KEY（删除主键保留 NOT NULL），`DROP INDEX`
+>   拒绝约束索引；`ADD COLUMN ... CHECK` 会先按默认值补齐旧行再验证；`ALTER COLUMN
 >   TYPE / SET DATA TYPE` 走全表物化、类型预校验、逐行重写，并在类型变化后
 >   从堆表重建受影响索引；
 >   `CREATE VIEW` 保存 `AS` 之后的词法切片，不物化数据，查询时展开为 `CteScan`，
@@ -56,7 +57,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 767 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 772 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -101,7 +102,9 @@
 >   index column references without rewriting heap records; column- and table-level
 >   `CHECK` constraints persist token slices, enforce on all writes and backfill
 >   existing rows; `RENAME` rewrites table/column references inside the tokens;
->   `DROP CONSTRAINT` removes CHECK constraints; `ADD COLUMN ... CHECK`
+>   `DROP CONSTRAINT` removes CHECK, UNIQUE or PRIMARY KEY constraints (dropping
+>   a primary key keeps `NOT NULL`), while `DROP INDEX` rejects constraint-owned
+>   indexes; `ADD COLUMN ... CHECK`
 >   pads old rows with the default before validating; `ALTER COLUMN
 >   SET/DROP NOT NULL` validates existing rows and updates only the catalog;
 >   `ALTER COLUMN TYPE` / `SET DATA TYPE` materializes rows, pre-validates
@@ -118,7 +121,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 767 automated tests including crash-injection and a 20-seed randomized
+> - 772 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

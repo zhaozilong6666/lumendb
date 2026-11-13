@@ -2098,6 +2098,60 @@ class TestAlterColumnType:
         db.execute_one("INSERT INTO t VALUES ('abcd')")
 
 
+class TestDropConstraintIndexes:
+    def test_drop_unique_constraint_allows_duplicates(self, db):
+        db.execute_one("CREATE TABLE t (a INT UNIQUE, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_a_key")
+        db.execute_one("INSERT INTO t VALUES (1, 20)")
+        assert rows(db, "SELECT b FROM t ORDER BY b") == [(10,), (20,)]
+
+    def test_drop_primary_key_constraint_keeps_not_null(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_pkey")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t VALUES (NULL)")
+        assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,), (1,)]
+
+    def test_drop_constraint_rejects_plain_index(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE INDEX idx_a ON t (a)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t DROP CONSTRAINT idx_a")
+        db.execute_one("DROP INDEX idx_a")
+
+    def test_drop_table_level_and_added_unique_constraints(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, UNIQUE (a, b))"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_a_b_key")
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+
+        db.execute_one("CREATE TABLE u (a INT)")
+        db.execute_one("INSERT INTO u VALUES (1)")
+        db.execute_one(
+            "ALTER TABLE u ADD CONSTRAINT uq_u UNIQUE (a)"
+        )
+        db.execute_one("ALTER TABLE u DROP CONSTRAINT uq_u")
+        db.execute_one("INSERT INTO u VALUES (1)")
+
+    def test_drop_index_rejects_constraint_index_and_rollback(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("DROP INDEX t_pkey")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_pkey")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ROLLBACK")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1)")
+
+
 class TestCheckConstraints:
     def test_column_check_enforced_on_insert_and_update(self, db):
         db.execute_one("CREATE TABLE t (a INT CHECK (a > 0), b INT)")
@@ -2243,7 +2297,8 @@ class TestCheckConstraints:
     def test_drop_index_constraint_rejected(self, db):
         db.execute_one("CREATE TABLE t (a INT UNIQUE)")
         with pytest.raises(NotSupportedError):
-            db.execute_one("ALTER TABLE t DROP CONSTRAINT t_a_key")
+            db.execute_one("DROP INDEX t_a_key")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_a_key")
 
     def test_drop_check_survives_reopen(self, tmp_path):
         path = tmp_path / "check_drop_reopen"

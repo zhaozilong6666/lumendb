@@ -137,8 +137,11 @@ token 切片持久化，重开数据库后重新解析 AST、再经 Binder 绑�
 以及 UPDATE 都会经过同一套校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量的
 `UNKNOWN` 可通过），只有结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 按 SQL 语义视为通过。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
 整个堆表，发现存量违反行就整体失败；重命名表/列会同步重写 CHECK token 里的表限定符
-或列引用，不会留下绑定旧名字的约束。`DROP CONSTRAINT` 只删除 CHECK 目录对象并登记
-undo，不扫描也不重写堆记录；唯一/主键约束仍通过 `DROP INDEX` 管理。
+或列引用，不会留下绑定旧名字的约束。`DROP CONSTRAINT` 支持 CHECK、UNIQUE 和
+PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.constraint_kind`
+区分，删除时同时移除底层索引，主键还会清除 `primary_key` 标记但保留 `NOT NULL`。
+普通索引与约束索引的删除入口分开：`DROP CONSTRAINT` 拒绝普通索引，`DROP INDEX`
+拒绝约束索引，避免删掉索引后目录里留下“主键存在但没有索引”的半状态。
 `ADD COLUMN ... CHECK` 会先用“旧列 + 新列默认值”拼出完整存量行，验证通过后才把
 列和约束一起写入目录，因此不会出现列已加上但约束没落地的半状态。
 

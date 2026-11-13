@@ -68,8 +68,12 @@ SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会�
 器会把旧行补上默认值后扫描完整行，失败时不修改目录，默认值本身违反约束也会被
 拒绝。`RENAME TO` / `RENAME COLUMN` 会同步重写 CHECK token 里的表限定符或列引用，
 因此带 CHECK 的表可以正常重命名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name`
-目前只删除 CHECK 约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层
-是索引，请用 `DROP INDEX` 删除。
+支持删除 CHECK、UNIQUE 和 PRIMARY KEY：唯一/主键约束底层是索引，目录里的
+`IndexDef.constraint_kind` 记录它是 `"UNIQUE"` 还是 `"PRIMARY"`，删除时同时移除
+索引并持久化；删除主键还会清除 `primary_key` 标记，但保留列的 `NOT NULL`（与
+PostgreSQL 一致）。事务 undo 会恢复 CHECK 字典、索引定义和主键标记。普通
+`CREATE INDEX` 的 `constraint_kind` 为 `None`，`DROP CONSTRAINT` 会拒绝并提示改用
+`DROP INDEX`；反过来 `DROP INDEX` 也拒绝约束索引，必须用 `DROP CONSTRAINT`。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须

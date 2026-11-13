@@ -61,6 +61,8 @@ class IndexDef:
     columns: tuple[str, ...]
     unique: bool = False
     root_page: int = INVALID_PAGE_ID
+    #: "PRIMARY" / "UNIQUE" 表示由表约束创建的索引；普通 CREATE INDEX 为 None。
+    constraint_kind: Optional[str] = None
 
     def to_json(self) -> dict:
         return {
@@ -69,6 +71,7 @@ class IndexDef:
             "columns": list(self.columns),
             "unique": self.unique,
             "root_page": self.root_page,
+            "constraint_kind": self.constraint_kind,
         }
 
     @classmethod
@@ -79,6 +82,7 @@ class IndexDef:
             columns=tuple(data["columns"]),
             unique=data.get("unique", False),
             root_page=data.get("root_page", INVALID_PAGE_ID),
+            constraint_kind=data.get("constraint_kind"),
         )
 
 
@@ -217,6 +221,14 @@ def validate_table_def(table: TableDef) -> None:
                 raise ColumnNotFoundError(
                     f"索引 {idx.name} 引用了不存在的列 {cname!r}"
                 )
+        if idx.constraint_kind not in (None, "PRIMARY", "UNIQUE"):
+            raise NotSupportedError(
+                f"索引 {idx.name} 的约束类型非法：{idx.constraint_kind!r}"
+            )
+        if idx.constraint_kind is not None and not idx.unique:
+            raise NotSupportedError(
+                f"约束索引 {idx.name} 必须是唯一索引"
+            )
 
     for name in table.checks:
         if name in table.indexes:

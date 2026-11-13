@@ -786,6 +786,7 @@ class Executor:
                     table=stmt.name.lower(),
                     columns=primary_columns,
                     unique=True,
+                    constraint_kind="PRIMARY",
                 )
             )
 
@@ -800,6 +801,7 @@ class Executor:
                     table=stmt.name.lower(),
                     columns=(col.name,),
                     unique=True,
+                    constraint_kind="UNIQUE",
                 )
             )
 
@@ -828,6 +830,7 @@ class Executor:
                     table=stmt.name.lower(),
                     columns=names,
                     unique=True,
+                    constraint_kind="UNIQUE",
                 )
             )
 
@@ -1421,6 +1424,7 @@ class Executor:
                     unique=True,
                 ),
                 txn,
+                constraint_kind="UNIQUE",
             )
             return Result(
                 tag="ALTER TABLE",
@@ -1457,6 +1461,7 @@ class Executor:
                     unique=True,
                 ),
                 txn,
+                constraint_kind="PRIMARY",
             )
             old_columns = list(table.columns)
             table.columns = [
@@ -1490,19 +1495,53 @@ class Executor:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
         if name not in table.checks:
-            if name in table.indexes:
-                raise NotSupportedError(
-                    f"约束 {name!r} 是索引/唯一约束，暂不支持 DROP CONSTRAINT",
-                    hint="使用 DROP INDEX 删除唯一索引",
+            index = table.indexes.get(name)
+            if index is not None:
+                if index.constraint_kind is None:
+                    raise NotSupportedError(
+                        f"{name!r} 是普通索引，不是约束",
+                        hint="使用 DROP INDEX 删除普通索引",
+                    )
+                if index.constraint_kind not in ("PRIMARY", "UNIQUE"):
+                    raise NotSupportedError(
+                        f"不支持的约束索引类型：{index.constraint_kind!r}"
+                    )
+                old_columns = list(table.columns)
+                self._catalog.drop_index(txn, name)
+                if index.constraint_kind == "PRIMARY":
+                    table.columns = [
+                        replace(col, primary_key=False)
+                        if col.name in index.columns
+                        else col
+                        for col in table.columns
+                    ]
+
+                    def undo_columns() -> None:
+                        table.columns = old_columns
+
+                    txn.undo_log.append(undo_columns)
+                    self._catalog.mark_dirty()
+                    self._catalog.persist(txn)
+                    return Result(
+                        tag="ALTER TABLE",
+                        notice=f"已删除主键约束 {name}",
+                    )
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"已删除唯一约束 {name}",
                 )
             if stmt.if_exists:
                 return Result(
                     tag="ALTER TABLE",
-                    notice=f"CHECK 约束 {name} 不存在，已跳过",
+                    notice=f"约束 {name} 不存在，已跳过",
                 )
             raise BinderError(
-                f"CHECK 约束 {name!r} 不存在",
-                hint=f"可用 CHECK 约束：{', '.join(table.checks) or '无'}",
+                f"约束 {name!r} 不存在",
+                hint=(
+                    f"可用 CHECK 约束：{', '.join(table.checks) or '无'}；"
+                    f"可用唯一/主键索引："
+                    f"{', '.join(n for n, i in table.indexes.items() if i.constraint_kind) or '无'}"
+                ),
             )
         old_checks = dict(table.checks)
         del table.checks[name]
@@ -1527,7 +1566,13 @@ class Executor:
             self._catalog.drop_table(txn, name, stmt.cascade)
         return Result(tag="DROP TABLE")
 
-    def _create_index(self, stmt: CreateIndex, txn: Transaction) -> Result:
+    def _create_index(
+        self,
+        stmt: CreateIndex,
+        txn: Transaction,
+        *,
+        constraint_kind: Optional[str] = None,
+    ) -> Result:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
         if name in table.indexes:
@@ -1545,6 +1590,7 @@ class Executor:
             table=table.name,
             columns=tuple(c.lower() for c in stmt.columns),
             unique=stmt.unique,
+            constraint_kind=constraint_kind,
         )
         self._catalog.create_index(txn, table.name, idx)
 
@@ -1566,8 +1612,16 @@ class Executor:
         return Result(tag="CREATE INDEX")
 
     def _drop_index(self, stmt: DropIndex, txn: Transaction) -> Result:
+        name = stmt.name.lower()
+        for table in self._catalog.list_tables():
+            idx = table.indexes.get(name)
+            if idx is not None and idx.constraint_kind is not None:
+                raise NotSupportedError(
+                    f"索引 {name!r} 由表约束创建，不能直接 DROP INDEX",
+                    hint="使用 ALTER TABLE ... DROP CONSTRAINT 删除约束",
+                )
         try:
-            self._catalog.drop_index(txn, stmt.name.lower())
+            self._catalog.drop_index(txn, name)
         except Exception:
             if stmt.if_exists:
                 return Result(tag="DROP INDEX", notice="索引不存在，已跳过")
