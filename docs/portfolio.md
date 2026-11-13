@@ -35,7 +35,8 @@
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
->   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
+>   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
+>   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
 > - 610 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
@@ -70,8 +71,9 @@
 >   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
 >   annotates each operator with actual time, rows and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
->   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
->   connect directly.
+>   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
+>   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
+>   error responses), so `psql` can connect directly.
 > - 610 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
