@@ -746,20 +746,27 @@ class Executor:
         return Result(tag="CREATE TABLE")
 
     def _create_view(self, stmt: CreateView, txn: Transaction) -> Result:
-        if self._catalog.has_table(stmt.name) or self._catalog.has_view(stmt.name):
+        if self._catalog.has_table(stmt.name):
             raise TableAlreadyExistsError(
                 f"对象 {stmt.name!r} 已存在",
                 hint="表名和视图名共享同一个命名空间",
+            )
+        if self._catalog.has_view(stmt.name) and not stmt.or_replace:
+            raise TableAlreadyExistsError(
+                f"视图 {stmt.name!r} 已存在",
+                hint="使用 CREATE OR REPLACE VIEW 覆盖，或先 DROP VIEW",
             )
         # 建视图时先完整绑定一次，提前暴露未知表/列和类型错误；
         # 视图不物化数据，SELECT 时再按保存的 token 重新绑定。
         binder = self._new_binder()
         binder.bind_select(stmt.query)
-        self._catalog.create_view(txn, stmt.name, stmt.tokens)
-        return Result(
-            tag="CREATE VIEW",
-            notice=f"已创建视图 {stmt.name.lower()}",
-        )
+        if stmt.or_replace and self._catalog.has_view(stmt.name):
+            self._catalog.replace_view(txn, stmt.name, stmt.tokens)
+            notice = f"已替换视图 {stmt.name.lower()}"
+        else:
+            self._catalog.create_view(txn, stmt.name, stmt.tokens)
+            notice = f"已创建视图 {stmt.name.lower()}"
+        return Result(tag="CREATE VIEW", notice=notice)
 
     def _drop_view(self, stmt: DropView, txn: Transaction) -> Result:
         try:

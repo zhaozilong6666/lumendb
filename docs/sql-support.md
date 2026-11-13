@@ -25,6 +25,7 @@ ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 CREATE VIEW v AS SELECT id, name FROM t WHERE age >= 18;
+CREATE OR REPLACE VIEW v AS SELECT id FROM t;
 DROP VIEW [IF EXISTS] v;
 ```
 
@@ -51,7 +52,8 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
 普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
 视图不能直接 `INSERT`/`UPDATE`/`DELETE`；对视图执行 DML 会得到“表不存在”类错误。
-`DROP VIEW` 只删除目录定义，不影响基表数据。
+`CREATE OR REPLACE VIEW` 会先完整绑定新定义，成功后再原子替换旧定义；绑定失败时旧视图
+保持不变。`DROP VIEW` 只删除目录定义，不影响基表数据。
 
 ### DML
 

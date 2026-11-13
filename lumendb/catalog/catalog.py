@@ -179,6 +179,21 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    def replace_view(
+        self, txn: Transaction, name: str, tokens: list[tuple[str, str]]
+    ) -> None:
+        key = name.lower()
+        if key not in self.views:
+            raise TableNotFoundError(f"视图 {name!r} 不存在")
+        old = self.views[key]
+        self.views[key] = list(tokens)
+
+        def undo() -> None:
+            self.views[key] = old
+
+        txn.undo_log.append(undo)
+        self.persist(txn)
+
     def drop_view(self, txn: Transaction, name: str) -> None:
         key = name.lower()
         if key not in self.views:

@@ -103,6 +103,15 @@ class TestCreateTable:
         assert stmt.tokens[0] == ("keyword", "SELECT")
         assert stmt.tokens[-1] == ("int", "0")
 
+    def test_create_or_replace_view(self):
+        from lumendb.sql.ast import CreateView
+
+        stmt = parse_statement("CREATE OR REPLACE VIEW v AS SELECT 1")
+        assert isinstance(stmt, CreateView)
+        assert stmt.or_replace
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("CREATE OR REPLACE TABLE t (a INT)")
+
     def test_drop_view(self):
         from lumendb.sql.ast import DropView
 

@@ -261,19 +261,27 @@ class Parser:
 
     def _parse_create(self) -> Statement:
         self._expect_kw("CREATE")
+        or_replace = False
+        if self._match_kw("OR"):
+            self._expect_kw("REPLACE")
+            or_replace = True
         unique = self._match_kw("UNIQUE") is not None
         if self._match_kw("TABLE"):
+            if or_replace:
+                raise self._error("OR REPLACE 只支持视图")
             if unique:
                 raise self._error("UNIQUE 只能用于 CREATE INDEX")
             return self._parse_create_table()
         if self._match_kw("INDEX"):
+            if or_replace:
+                raise self._error("OR REPLACE 只支持视图")
             return self._parse_create_index(unique=unique)
         if unique:
             raise self._error("UNIQUE 只能用于 CREATE INDEX")
         if self._match_kw("VIEW"):
             if unique:
                 raise self._error("UNIQUE 不能用于 CREATE VIEW")
-            return self._parse_create_view()
+            return self._parse_create_view(or_replace=or_replace)
         if self._match_kw("TRIGGER", "PROCEDURE"):
             raise NotSupportedError("触发器 / 存储过程尚未实现")
         raise self._error("CREATE 之后期望 TABLE、INDEX 或 VIEW")
@@ -357,13 +365,15 @@ class Parser:
             return stmt
         raise self._error("WITH 之后期望 SELECT、INSERT、UPDATE 或 DELETE")
 
-    def _parse_create_view(self) -> CreateView:
+    def _parse_create_view(self, or_replace: bool = False) -> CreateView:
         name = self._parse_ident("视图名")
         self._expect_kw("AS")
         start = self._i
         query = self._parse_query_expression()
         tokens = [(tok.kind, tok.value) for tok in self._tokens[start:self._i]]
-        return CreateView(name=name, query=query, tokens=tokens)
+        return CreateView(
+            name=name, query=query, tokens=tokens, or_replace=or_replace
+        )
 
     def _parse_create_table(self) -> Statement:
         if_not_exists = False

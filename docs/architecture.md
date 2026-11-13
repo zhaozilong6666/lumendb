@@ -129,9 +129,11 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。`view_stack` 记录
 正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
+`CREATE OR REPLACE VIEW` 先绑定新定义，再替换目录里的 token 切片，因此新定义
+非法时旧视图仍然可用；替换本身也在事务 undo 范围内。
 
-当前限制：没有 `CREATE OR REPLACE VIEW`、没有显式视图列名列表、没有物化视图，
-视图也不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表。
+当前限制：没有显式视图列名列表、没有物化视图，视图也不能作为
+`INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表。
 
 ## 3. SQL 与计划
 

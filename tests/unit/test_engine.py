@@ -487,6 +487,16 @@ class TestInsert:
         assert second.execute_one("SELECT * FROM v").rows == [(1, "x")]
         second.close()
 
+    def test_create_or_replace_view_swaps_definition(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        assert rows(db, "SELECT * FROM v") == [(1,)]
+        db.execute_one("CREATE OR REPLACE VIEW v AS SELECT b FROM t")
+        assert rows(db, "SELECT * FROM v") == [("x",)]
+        with pytest.raises(TableAlreadyExistsError):
+            db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

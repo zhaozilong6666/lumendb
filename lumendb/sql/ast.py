@@ -338,6 +338,7 @@ class CreateView(Statement):
     name: str
     query: Any
     tokens: list[tuple[str, str]]
+    or_replace: bool = False
 
 
 @dataclass
