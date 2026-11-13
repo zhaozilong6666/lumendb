@@ -100,7 +100,8 @@ CI：
 - `e1a0552`：success
 - `8da5a63`：success
 - `9cc420f`：success
-- `640f38d`：生成报告时 in progress
+- `640f38d`：success
+- `b0985ae`：success
 
 ## 4. 基准（2000 行）
 
