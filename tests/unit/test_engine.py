@@ -1188,6 +1188,30 @@ class TestAlterTable:
         ]
         assert rows(db, "SELECT id FROM t WHERE name = 'b'") == [(2,)]
 
+    def test_reindex_rollback_restores_index(self, tmp_path):
+        path = tmp_path / "reindex_rollback"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("CREATE INDEX idx_name ON t (name)")
+        db.execute_one("BEGIN")
+        db.execute_one("REINDEX t")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT id FROM t WHERE name = 'b'") == [(2,)]
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT id FROM t WHERE name = 'a'") == [(1,)]
+        db2.close()
+
+    def test_create_unique_index_rollback(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("BEGIN")
+        db.execute_one("CREATE UNIQUE INDEX u_name ON t (name)")
+        db.execute_one("ROLLBACK")
+        db.execute_one("INSERT INTO t VALUES (1, 'same'), (2, 'same')")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(2,)]
+
     def test_failed_dml_transaction_restores_table_roots(self, db):
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         db.execute_one("BEGIN")
