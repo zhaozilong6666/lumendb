@@ -107,6 +107,7 @@ class CatalogStore:
             meta = self._bp.fetch_page(0)
             try:
                 old = bytes(meta.buf[META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4])
+                old_root = struct.unpack("<I", old)[0]
                 new = struct.pack("<I", pages[0].page_id)
                 self._bp.log_page_update(
                     txn.xid, meta, META_OFF_CATALOG_ROOT, old, new
@@ -118,6 +119,31 @@ class CatalogStore:
         finally:
             for page in pages:
                 self._bp.unpin(page.page_id, dirty=True)
+
+        def undo_root() -> None:
+            # 显式 ROLLBACK 不会经过恢复流程，所以目录根页号必须在这里
+            # 主动指回旧链；否则关闭/重启后目录加载到未提交的新链。
+            meta_page = self._bp.fetch_page(0)
+            try:
+                current = meta_page.get_u32(META_OFF_CATALOG_ROOT)
+                if current != pages[0].page_id:
+                    return
+                old_bytes = struct.pack("<I", old_root)
+                self._bp.log_page_update(
+                    txn.xid,
+                    meta_page,
+                    META_OFF_CATALOG_ROOT,
+                    struct.pack("<I", current),
+                    old_bytes,
+                )
+                meta_page.buf[
+                    META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4
+                ] = old_bytes
+                self._bp.mark_dirty(meta_page)
+            finally:
+                self._bp.unpin(0, dirty=True)
+
+        txn.undo_log.append(undo_root)
 
 
 __all__ = ["CatalogStore", "CHUNK_SIZE"]

@@ -41,7 +41,7 @@ class Transaction:
     state: TxnState = TxnState.ACTIVE
     first_lsn: int = 0
     last_lsn: int = 0
-    #: 事务内已写入的页与原像，供语句级回滚使用（当前用于整体回滚的补充）
+    #: DDL 的内存逆操作；abort 时逆序执行，页级 undo 由 WAL 负责。
     undo_log: list = field(default_factory=list)
 
     def require_active(self) -> None:

@@ -1058,6 +1058,22 @@ class TestAlterTable:
         db.execute_one("ROLLBACK")
         assert rows(db, "SELECT * FROM t") == [(1,)]
 
+    def test_ddl_rollback_survives_reopen(self, tmp_path):
+        path = tmp_path / "rollback_reopen"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t RENAME TO t2")
+        db.execute_one("ROLLBACK")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT * FROM t") == [(1,)]
+        with pytest.raises(TableNotFoundError):
+            db2.execute_one("SELECT * FROM t2")
+        db2.close()
+
     def test_duplicate_column_rejected(self, db):
         db.execute_one("CREATE TABLE t (id INT)")
         with pytest.raises(Exception):
