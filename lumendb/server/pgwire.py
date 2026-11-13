@@ -436,17 +436,24 @@ class PGWireServer:
         if portal is None:
             self._send_error(writer, ProtocolError(f"未找到门户 {name!r}"))
             return
-        # 执行一次拿到列信息（结果集很小，代价可接受）
+        # 只绑定、不执行：Describe 不能产生 DML 副作用。以前这里执行一次
+        # 拿列信息，导致同一条 INSERT 在 Describe + Execute 中执行两次。
         async with self._lock:
             try:
-                result = self._run_one(
-                    session, portal.statement.sql, portal.params
+                statements = parse_sql(portal.statement.sql)
+                if len(statements) != 1:
+                    raise ProtocolError(
+                        "扩展协议一次只能描述一条语句",
+                        detail=f"实际有 {len(statements)} 条",
+                    )
+                columns = session.database.executor.describe(
+                    statements[0], portal.params
                 )
             except LumenError as exc:
                 self._send_error(writer, exc)
                 return
-        if result.columns:
-            self._send_row_description(writer, result.columns, include_header=True)
+        if columns:
+            self._send_row_description(writer, columns, include_header=True)
         else:
             self._send(writer, b"n", b"")  # NoData
 

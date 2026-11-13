@@ -241,6 +241,9 @@ class TestExtendedQuery:
     def _execute(self, portal="") -> bytes:
         return self._msg(b"E", portal.encode() + b"\x00" + struct.pack("!i", 0))
 
+    def _describe_portal(self, portal="") -> bytes:
+        return self._msg(b"D", b"P" + portal.encode() + b"\x00")
+
     async def _ready(self, reader, writer):
         payload = (
             struct.pack("!i", 196608)
@@ -273,6 +276,72 @@ class TestExtendedQuery:
             await writer.wait_closed()
 
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_describe_portal_does_not_execute_dml(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            sql = "INSERT INTO t (id, name) VALUES ($1, $2) RETURNING id"
+            writer.write(self._parse(sql, [23, 25]))
+            writer.write(self._bind([b"1", b"a"]))
+            writer.write(self._describe_portal())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            described = await _read_until_ready(reader)
+            desc = next(p for k, p in described if k == b"T")
+            assert _parse_row_description(desc) == ["id"]
+
+            # Describe 只给 RowDescription；真正执行必须等到 Execute。
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            executed = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in executed if k == b"D"]
+            assert rows == [["1"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        db.close()
+
+    def test_describe_portal_accepts_cte_insert_select(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            sql = (
+                "WITH x AS (SELECT 5 AS id) "
+                "INSERT INTO t (id, name) SELECT id, 'a' FROM x RETURNING id"
+            )
+            writer.write(self._parse(sql, []))
+            writer.write(self._bind([]))
+            writer.write(self._describe_portal())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            described = await _read_until_ready(reader)
+            desc = next(p for k, p in described if k == b"T")
+            assert _parse_row_description(desc) == ["id"]
+
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            executed = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in executed if k == b"D"]
+            assert rows == [["5"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
         db.close()
 
     def test_binary_int8_param(self, tmp_path):

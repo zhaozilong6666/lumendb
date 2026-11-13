@@ -190,7 +190,9 @@ Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，
   OID 0（客户端未声明）时按字面量推断。参数个数与 `Bind` 不一致报 `08P01`，
   `$n` 没有值报 `42P02`；
 - `Describe` 语句返回 `ParameterDescription`（真实 OID 列表）；结果列要等 `Bind`
-  之后 `Describe` 门户才能确定，此时回 `RowDescription`；
+  之后 `Describe` 门户才能确定，此时回 `RowDescription`。门户的 `Describe`
+  **只做静态绑定**，绝不执行语句——否则同一条 `INSERT/UPDATE/DELETE` 会在
+  `Describe` 和 `Execute` 中各执行一次；
 - 错误：`ErrorResponse` 带 `SQLSTATE`、`MESSAGE`、`DETAIL`、`HINT`，
   客户端（psql / JDBC）能按标准字段展示；
 - **会话事务**：`BEGIN` 创建的事务挂在 `Session` 上，而不是共用 `Database`

@@ -174,6 +174,59 @@ class Executor:
     # 查询
     # ------------------------------------------------------------------
 
+    def describe(self, stmt: Statement, params: Optional[list[Any]] = None) -> list[ColumnMeta]:
+        """只绑定、不执行，返回语句的结果列。
+
+        扩展协议的 Describe(Portal) 需要 RowDescription，但绝不能为了拿列
+        信息去执行一条 INSERT/UPDATE/DELETE——那会让同一条 DML 在
+        Describe + Execute 中被执行两次。这里复用 Binder，只做静态绑定。
+        """
+        self._txn = None
+        self._params = list(params) if params else []
+        self.binder = self._new_binder()
+        try:
+            if isinstance(stmt, Query):
+                _, cols = self.binder.bind_query(stmt)
+                return [ColumnMeta(c.name, c.type) for c in cols]
+            if isinstance(stmt, Insert):
+                table = self._catalog.get_table(stmt.table)
+                if stmt.query is not None:
+                    # bind_query 自己会绑定 CTE；这里不能再先 bind_ctes，
+                    # 否则同一个 CTE 会被注册两次并报重名。
+                    if stmt.ctes:
+                        self.binder.bind_query(
+                            Query(select=stmt.query, ctes=stmt.ctes)
+                        )
+                    else:
+                        self.binder.bind_select(stmt.query)
+                elif stmt.ctes:
+                    self.binder.bind_ctes(stmt.ctes)
+                schema = Schema(
+                    [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+                )
+                _, cols = self.binder.bind_returning(stmt.returning, schema)
+                return [ColumnMeta(c.name, c.type) for c in cols]
+            if isinstance(stmt, (Update, Delete)):
+                table = self._catalog.get_table(stmt.table)
+                if stmt.ctes:
+                    self.binder.bind_ctes(stmt.ctes)
+                schema = Schema(
+                    [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+                )
+                _, cols = self.binder.bind_returning(stmt.returning, schema)
+                return [ColumnMeta(c.name, c.type) for c in cols]
+            if isinstance(stmt, Explain):
+                return [ColumnMeta("plan", TypeSpec(DataType.TEXT))]
+            if isinstance(stmt, ShowTables):
+                return [
+                    ColumnMeta("table", TypeSpec(DataType.TEXT)),
+                    ColumnMeta("columns", TypeSpec(DataType.INT)),
+                    ColumnMeta("rows", TypeSpec(DataType.BIGINT)),
+                ]
+            return []
+        finally:
+            self._txn = None
+
     def _select(self, stmt: Query, txn: Transaction) -> Result:
         plan, out_cols = self.binder.bind_query(stmt)
         width = len(out_cols)
