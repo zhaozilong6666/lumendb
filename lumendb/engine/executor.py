@@ -47,6 +47,7 @@ from ..sql.ast import (
     Vacuum,
     Truncate,
     ShowTables,
+    ShowViews,
     Statement,
     Update,
     render_expr,
@@ -187,6 +188,8 @@ class Executor:
                 return self._truncate(stmt, txn)
             if isinstance(stmt, ShowTables):
                 return self._show_tables()
+            if isinstance(stmt, ShowViews):
+                return self._show_views()
             if isinstance(stmt, Explain):
                 return self._explain(stmt)
             if isinstance(stmt, Statement) and type(stmt).__name__ == "Checkpoint":
@@ -248,6 +251,11 @@ class Executor:
                 return [ColumnMeta(c.name, c.type) for c in cols]
             if isinstance(stmt, Explain):
                 return [ColumnMeta("plan", TypeSpec(DataType.TEXT))]
+            if isinstance(stmt, ShowViews):
+                return [
+                    ColumnMeta("view", TypeSpec(DataType.TEXT)),
+                    ColumnMeta("definition", TypeSpec(DataType.TEXT)),
+                ]
             if isinstance(stmt, ShowTables):
                 return [
                     ColumnMeta("table", TypeSpec(DataType.TEXT)),
@@ -1098,6 +1106,21 @@ class Executor:
                 ColumnMeta("table", TypeSpec(DataType.TEXT)),
                 ColumnMeta("columns", TypeSpec(DataType.INT)),
                 ColumnMeta("rows", TypeSpec(DataType.BIGINT)),
+            ],
+            rows=rows,
+            tag=f"SHOW {len(rows)}",
+        )
+
+    def _show_views(self) -> Result:
+        rows = [
+            (name, " ".join(value for _kind, value in tokens))
+            for name in self._catalog.view_names()
+            for tokens in [self._catalog.get_view(name)]
+        ]
+        return Result(
+            columns=[
+                ColumnMeta("view", TypeSpec(DataType.TEXT)),
+                ColumnMeta("definition", TypeSpec(DataType.TEXT)),
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",

@@ -133,7 +133,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 非法时旧视图仍然可用；替换本身也在事务 undo 范围内。
 
 当前限制：没有显式视图列名列表、没有物化视图，视图也不能作为
-`INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表。
+`INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表，`SHOW VIEWS`
+单独列出视图。
 
 ## 3. SQL 与计划
 

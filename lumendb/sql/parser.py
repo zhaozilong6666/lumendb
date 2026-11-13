@@ -53,6 +53,7 @@ from .ast import (
     Select,
     SelectItem,
     ShowTables,
+    ShowViews,
     TableConstraint,
     Star,
     Statement,
@@ -234,8 +235,11 @@ class Parser:
             return Explain(inner, analyze=analyze)
         if kw == "SHOW":
             self._advance()
-            self._expect_kw("TABLES")
-            return ShowTables()
+            if self._match_kw("TABLES"):
+                return ShowTables()
+            if self._match_kw("VIEWS"):
+                return ShowViews()
+            raise self._error("SHOW 之后期望 TABLES 或 VIEWS")
         if kw == "CHECKPOINT":
             self._advance()
             return Checkpoint()

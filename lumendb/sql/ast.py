@@ -493,6 +493,11 @@ class ShowTables(Statement):
 
 
 @dataclass
+class ShowViews(Statement):
+    pass
+
+
+@dataclass
 class Checkpoint(Statement):
     pass
 

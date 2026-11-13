@@ -112,9 +112,15 @@ class TestCreateTable:
         with pytest.raises(SQLSyntaxError):
             parse_statement("CREATE OR REPLACE TABLE t (a INT)")
 
+    def test_show_views(self):
+        from lumendb.sql.ast import ShowViews
+
+        assert isinstance(parse_statement("SHOW VIEWS"), ShowViews)
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("SHOW SOMETHING")
+
     def test_drop_view(self):
         from lumendb.sql.ast import DropView
-
         stmt = parse_statement("DROP VIEW IF EXISTS v")
         assert isinstance(stmt, DropView)
         assert stmt.name == "v"

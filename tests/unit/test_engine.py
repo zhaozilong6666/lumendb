@@ -497,6 +497,13 @@ class TestInsert:
         with pytest.raises(TableAlreadyExistsError):
             db.execute_one("CREATE VIEW v AS SELECT a FROM t")
 
+    def test_show_views(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        result = db.execute_one("SHOW VIEWS")
+        assert result.rows[0][0] == "v"
+        assert "SELECT" in result.rows[0][1]
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

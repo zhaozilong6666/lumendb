@@ -27,6 +27,7 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 CREATE VIEW v AS SELECT id, name FROM t WHERE age >= 18;
 CREATE OR REPLACE VIEW v AS SELECT id FROM t;
 DROP VIEW [IF EXISTS] v;
+SHOW VIEWS;
 ```
 
 `CREATE TABLE AS SELECT` 从查询输出推断列名和类型，只建普通可空列，不自动建
@@ -53,7 +54,8 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
 视图不能直接 `INSERT`/`UPDATE`/`DELETE`；对视图执行 DML 会得到“表不存在”类错误。
 `CREATE OR REPLACE VIEW` 会先完整绑定新定义，成功后再原子替换旧定义；绑定失败时旧视图
-保持不变。`DROP VIEW` 只删除目录定义，不影响基表数据。
+保持不变。`DROP VIEW` 只删除目录定义，不影响基表数据。`SHOW VIEWS` 列出视图名和
+保存的定义文本。
 
 ### DML
 
