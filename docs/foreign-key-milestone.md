@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 范围：LumenDB 外键约束、删除/更新动作、`ALTER TABLE` 外键 DDL、测试与文档
 - 基线：`8da5a63`（`ON DELETE CASCADE`）
-- 本轮提交：`9cc420f`、`640f38d`
+- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`
 
 ## 1. 成果清单
 
@@ -114,6 +114,8 @@ CI：
 - `9cc420f`：success
 - `640f38d`：success
 - `b0985ae`：success
+- `d27fea0`：success
+- `42627d8`：success
 
 ## 4. 基准（2000 行）
 
