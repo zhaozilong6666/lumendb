@@ -101,7 +101,9 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 1. **名字解析**：把 `ColumnRef`（可能带表前缀）解析成"这一行元组里的第几列"。
    重复列名报 `AmbiguousColumnError`，未知列报 `ColumnNotFoundError` 并列出可用列；
 2. **类型推导**：每个表达式都有一个 `TypeSpec`。算术要求数值、比较要求可比的
-   类型、聚合参数要求数值——错在编译期报出来，而不是执行到一半才炸；
+   类型、聚合参数要求数值——错在编译期报出来，而不是执行到一半才炸。`NULL`
+   字面量是 `unknown` 类型，会被 `UNION` / `CASE` / `COALESCE` 的另一侧吸收，
+   不会因为固定推断成 `TEXT` 而误报类型不兼容；
 3. **编译成闭包**：`compile(expr, schema)` 返回 `f(ctx) -> value`。名字解析的
    结果被固化成下标，执行时不再走语法树、不再查字典。
 
@@ -183,9 +185,10 @@ Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，
   `SSLRequest` 时回 `N`（不做 TLS），让它退回明文；
 - 简单查询：`Query` → `RowDescription` / `DataRow*` / `CommandComplete` / `ReadyForQuery`；
 - 扩展查询：`Parse` / `Bind` / `Describe` / `Execute` / `Sync`。`Parse` 记录客户端
-  声明的参数类型 OID 并**在这里就做语法检查**；`Bind` 按格式码（文本 0 / 二进制 1）
-  把参数解码成 Python 值；绑定阶段把 `$n` **折成字面量**，所以执行计划里没有
-  "参数数组"，代价是没有计划缓存；
+  声明的参数类型 OID、**在这里做语法检查并缓存 AST**；`Execute` 直接复用该 AST，
+  不再重新 parse；`Bind` 按格式码（文本 0 / 二进制 1）把参数解码成 Python 值；
+  绑定阶段把 `$n` **折成字面量**，所以执行计划里没有"参数数组"，代价是没有
+  计划缓存；
 - 参数：支持 `INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR` 的文本与二进制格式；
   OID 0（客户端未声明）时按字面量推断。参数个数与 `Bind` 不一致报 `08P01`，
   `$n` 没有值报 `42P02`；

@@ -344,6 +344,37 @@ class TestExtendedQuery:
         assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
         db.close()
 
+    def test_execute_reuses_parsed_ast(self, tmp_path, monkeypatch):
+        import lumendb.server.pgwire as pgwire_module
+
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT)")
+        server = PGWireServer(db)
+        calls = []
+        original = pgwire_module.parse_sql
+
+        def counting(sql):
+            calls.append(sql)
+            return original(sql)
+
+        monkeypatch.setattr(pgwire_module, "parse_sql", counting)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT id FROM t", []))
+            writer.write(self._bind([]))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            await _read_until_ready(reader)
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        assert calls == ["SELECT id FROM t"]
+        db.close()
+
     def test_binary_int8_param(self, tmp_path):
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
