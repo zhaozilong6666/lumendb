@@ -466,6 +466,8 @@ class AlterTableAlterType(Statement):
     table: str
     column: str
     type: TypeSpec
+    #: 可选的 USING 表达式；为 None 时按目标类型做隐式 coerce。
+    using: Optional[Expr] = None
 
 
 @dataclass

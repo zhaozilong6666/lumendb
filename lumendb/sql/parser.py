@@ -358,26 +358,22 @@ class Parser:
             column = self._parse_ident("列名")
             if self._match_word("TYPE"):
                 type_spec = self._parse_type()
+                using = None
                 if self._match_word("USING"):
-                    raise NotSupportedError(
-                        "ALTER COLUMN TYPE 暂不支持 USING 表达式",
-                        hint="只支持可隐式转换的类型，或先 UPDATE 数据",
-                    )
+                    using = self._parse_expr()
                 return AlterTableAlterType(
-                    table=table, column=column, type=type_spec
+                    table=table, column=column, type=type_spec, using=using
                 )
             if self._match_kw("SET"):
                 if self._match_word("DATA"):
                     if not self._match_word("TYPE"):
                         raise self._error("SET DATA 之后期望 TYPE")
                     type_spec = self._parse_type()
+                    using = None
                     if self._match_word("USING"):
-                        raise NotSupportedError(
-                            "ALTER COLUMN TYPE 暂不支持 USING 表达式",
-                            hint="只支持可隐式转换的类型，或先 UPDATE 数据",
-                        )
+                        using = self._parse_expr()
                     return AlterTableAlterType(
-                        table=table, column=column, type=type_spec
+                        table=table, column=column, type=type_spec, using=using
                     )
                 if self._match_kw("NOT"):
                     self._expect_kw("NULL")

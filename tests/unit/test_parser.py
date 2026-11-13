@@ -144,12 +144,15 @@ class TestCreateTable:
         assert stmt.type.kind == DataType.VARCHAR
         assert stmt.type.length == 10
 
-    def test_alter_column_type_using_rejected(self):
-        with pytest.raises(NotSupportedError) as exc:
-            parse_statement(
-                "ALTER TABLE t ALTER COLUMN a TYPE TEXT USING CAST(a AS TEXT)"
-            )
-        assert "USING" in str(exc.value)
+    def test_alter_column_type_using_expression(self):
+        from lumendb.sql.ast import AlterTableAlterType, Cast
+
+        stmt = parse_statement(
+            "ALTER TABLE t ALTER COLUMN a TYPE TEXT USING CAST(a AS TEXT)"
+        )
+        assert isinstance(stmt, AlterTableAlterType)
+        assert isinstance(stmt.using, Cast)
+        assert stmt.using.target.kind == DataType.TEXT
 
     def test_create_view(self):
         from lumendb.sql.ast import CreateView

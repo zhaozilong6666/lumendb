@@ -2097,6 +2097,33 @@ class TestAlterColumnType:
         assert rows(db, "SELECT a FROM t") == [("abc",)]
         db.execute_one("INSERT INTO t VALUES ('abcd')")
 
+    def test_type_change_using_expression(self, db):
+        db.execute_one("CREATE TABLE t (a TEXT)")
+        db.execute_one("INSERT INTO t VALUES ('123')")
+        db.execute_one(
+            "ALTER TABLE t ALTER COLUMN a TYPE INT USING CAST(a AS INT)"
+        )
+        db.execute_one("INSERT INTO t VALUES (4)")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [(4,), (123,)]
+
+        db.execute_one("CREATE TABLE u (a INT)")
+        db.execute_one("INSERT INTO u VALUES (5)")
+        db.execute_one(
+            "ALTER TABLE u ALTER COLUMN a TYPE TEXT USING a || ''"
+        )
+        db.execute_one("INSERT INTO u VALUES ('x')")
+        assert rows(db, "SELECT a FROM u ORDER BY a") == [("5",), ("x",)]
+
+    def test_using_expression_failure_rolls_back(self, db):
+        db.execute_one("CREATE TABLE t (a TEXT)")
+        db.execute_one("INSERT INTO t VALUES ('not-a-number')")
+        with pytest.raises(TypeMismatchError):
+            db.execute_one(
+                "ALTER TABLE t ALTER COLUMN a TYPE INT USING CAST(a AS INT)"
+            )
+        assert rows(db, "SELECT a FROM t") == [("not-a-number",)]
+        db.execute_one("INSERT INTO t VALUES ('still-text')")
+
 
 class TestDropConstraintIndexes:
     def test_drop_unique_constraint_allows_duplicates(self, db):

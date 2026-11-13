@@ -1268,11 +1268,25 @@ class Executor:
         source_rows = [
             (rid, list(values)) for rid, values in heap.scan(txn)
         ]
+        using_fn = None
+        if stmt.using is not None:
+            schema = Schema(
+                [
+                    SchemaColumn(table.name, col.name, col.type)
+                    for col in table.columns
+                ]
+            )
+            using_fn, _result_type = self.binder.compile(
+                stmt.using, schema, allow_agg=False
+            )
         converted: list[tuple[Any, list[Any], list[Any]]] = []
         for rid, values in source_rows:
             new_values = list(values)
+            source_value = values[index]
+            if using_fn is not None:
+                source_value = using_fn(EvalContext(tuple(values)))
             try:
-                new_values[index] = new_type.coerce(values[index])
+                new_values[index] = new_type.coerce(source_value)
             except TypeMismatchError as exc:
                 raise TypeMismatchError(
                     f"列 {old_column.name} 无法从 {old_column.type.name} "
@@ -1280,6 +1294,12 @@ class Executor:
                     detail=f"行 {rid}：{exc}",
                     hint="先 UPDATE 修正不兼容的值，或改用可转换的目标类型",
                 ) from exc
+            if new_values[index] is None and not old_column.nullable:
+                raise NotNullViolationError(
+                    f"列 {old_column.name} 的 USING 表达式产生了 NULL",
+                    detail=f"行 {rid}",
+                    hint="保证转换表达式对每一行都返回非 NULL，或先 DROP NOT NULL",
+                )
             converted.append((rid, values, new_values))
 
         new_default = old_column.default
@@ -1312,38 +1332,26 @@ class Executor:
         old_indexes = dict(table.indexes)
         self._snapshot_table_state(table, txn)
 
-        def undo_indexes() -> None:
-            table.indexes = old_indexes
+        # 旧版本仍按旧列类型编码；不能在原堆页上 UPDATE，否则后续扫描
+        # 会用新 schema 解码旧版本。这里把可见行写入一棵新的堆页链，
+        # 然后一次性切换目录里的 root/last_page，旧页链不再被引用。
+        shadow = TableDef(name=table.name, columns=new_columns)
+        shadow_heap = HeapFile(self._bp, shadow, self._txns)
+        for _rid, _old_values, new_values in converted:
+            shadow_heap.insert(txn, new_values)
 
-        txn.undo_log.append(undo_indexes)
-        affected_names = {
-            name
-            for name, idx in old_indexes.items()
-            if old_column.name in idx.columns
-        }
-        # 索引键的编码依赖列类型。先移除受影响索引，避免用新类型 codec
-        # 去删除旧 key 造成悬挂条目；行重写完成后再从堆表整体重建。
-        for name in affected_names:
-            table.indexes.pop(name, None)
         table.columns = new_columns
+        table.root_page = shadow.root_page
+        table.last_page = shadow.last_page
+        table.row_count_hint = shadow.row_count_hint
 
         def undo() -> None:
             table.columns = old_columns
 
         txn.undo_log.append(undo)
-        for rid, old_values, new_values in converted:
-            self._rewrite_row(
-                table,
-                heap,
-                txn,
-                rid,
-                old_values,
-                new_values,
-            )
 
-        table.indexes = old_indexes
         rebuilt = 0
-        if affected_names:
+        if old_indexes:
             rebuilt, _entries = self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
