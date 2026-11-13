@@ -191,6 +191,8 @@ DML 求值期间把同一作用域放进 `_active_ctes`，语句结束即丢弃�
 
 所有 `INSERT`（`VALUES` 与 `INSERT ... SELECT`）共用 `_insert_row`：
 NOT NULL、唯一索引检查、`ON CONFLICT` 分派和索引维护都在写堆之前完成。
+唯一性查询本身收敛在 `_find_unique_conflict`，INSERT、UPDATE、upsert 和
+`DO NOTHING` 共用同一个"NULL 不进索引 / 忽略当前行 / 目标索引"语义。
 新增插入路径必须复用这个入口，不能绕过去直接写 `HeapFile`，否则会重现
 "先写行、后建索引"或静默重复唯一键的问题。
 

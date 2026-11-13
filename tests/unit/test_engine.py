@@ -371,6 +371,25 @@ class TestInsert:
             (2, "b"),
         ]
 
+    def test_on_conflict_do_nothing_with_target_only_skips_target(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT UNIQUE, b INT UNIQUE)"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 1, 1)")
+
+        # a 冲突：按目标索引跳过。
+        result = db.execute_one(
+            "INSERT INTO t VALUES (2, 1, 9) ON CONFLICT (a) DO NOTHING"
+        )
+        assert result.affected == 0
+
+        # a 不冲突、b 冲突：目标索引以外的唯一约束必须报错。
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one(
+                "INSERT INTO t VALUES (3, 3, 1) ON CONFLICT (a) DO NOTHING"
+            )
+        assert rows(db, "SELECT id, a, b FROM t ORDER BY id") == [(1, 1, 1)]
+
     def test_insert_select_on_conflict_do_update(self, db):
         db.execute_one("CREATE TABLE src (id INT)")
         db.execute_one("INSERT INTO src VALUES (1), (2)")

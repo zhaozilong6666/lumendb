@@ -191,9 +191,10 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 - `SAVEPOINT` 是事务内保存点：`ROLLBACK TO` 会撤销保存点之后的页写入
   和 DDL/目录对象变更，事务继续保持活动；`RELEASE` 连同它之后建立的
   保存点一起释放。保存点不写 WAL、不跨连接持久化。
-- `ON CONFLICT DO NOTHING` 目前会把任意唯一索引冲突都当作"跳过"，
-  `(col, ...)` 目标只对 `DO UPDATE` 做精确匹配；`excluded.col` 和
-  `DO UPDATE ... WHERE` 尚未实现。
+- `ON CONFLICT DO NOTHING` 在没有冲突目标时会把任意唯一索引冲突都当作
+  "跳过"；写了 `(col, ...)` 目标时只跳过该唯一索引上的冲突，其它唯一索引
+  冲突仍会报错。`DO UPDATE` 的目标列必须精确匹配一个唯一索引；
+  `excluded.col` 和 `DO UPDATE ... WHERE` 尚未实现。
 - 单列等值条件与单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）在列上有索引时
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。

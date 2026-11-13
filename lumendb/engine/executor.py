@@ -926,7 +926,10 @@ class Executor:
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
         conflict_index = (
             self._conflict_index_for(table, stmt.conflict_columns)
-            if stmt.on_conflict_update
+            if (
+                stmt.on_conflict_update
+                or (stmt.on_conflict_nothing and stmt.conflict_columns)
+            )
             else None
         )
         assignment_fns = (
@@ -1000,16 +1003,10 @@ class Executor:
             if conflict_index is not None
             else list(table.indexes.values())
         )
-        for idx in indexes:
-            if not idx.unique:
-                continue
-            key = self._key_for(table, idx, values)
-            if key is None:
-                continue
-            rid = self._tree_for(table, idx).lookup_one(txn, key)
-            if rid is not None:
-                return rid
-        return None
+        conflict = self._find_unique_conflict(
+            table, values, txn, indexes=indexes
+        )
+        return conflict[1] if conflict is not None else None
 
     def _compile_conflict_assignments(
         self,
@@ -1093,7 +1090,10 @@ class Executor:
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
         conflict_index = (
             self._conflict_index_for(table, stmt.conflict_columns)
-            if stmt.on_conflict_update
+            if (
+                stmt.on_conflict_update
+                or (stmt.on_conflict_nothing and stmt.conflict_columns)
+            )
             else None
         )
         assignment_fns = (
@@ -1150,10 +1150,20 @@ class Executor:
         返回 (affected_delta, returning_row)；DO NOTHING 跳过时返回 (0, None)。
         """
         if do_nothing:
-            # 唯一冲突是预期内的跳过，因此先跳过唯一检查；NOT NULL 仍要检查。
-            self._check_constraints(table, prepared, txn, skip_unique=True)
-            if self._has_unique_conflict(table, prepared, txn):
-                return 0, None
+            # 有冲突目标时只跳过该索引上的冲突；其它唯一索引仍必须报错。
+            # 没有目标时保持 PostgreSQL 的"任意唯一冲突都跳过"语义。
+            if conflict_index is not None:
+                conflict = self._find_unique_conflict(
+                    table, prepared, txn, indexes=(conflict_index,)
+                )
+                if conflict is not None:
+                    return 0, None
+                self._check_constraints(table, prepared, txn)
+            else:
+                # 唯一冲突是预期内的跳过，因此先跳过唯一检查；NOT NULL 仍要检查。
+                self._check_constraints(table, prepared, txn, skip_unique=True)
+                if self._has_unique_conflict(table, prepared, txn):
+                    return 0, None
         elif on_conflict_update:
             rid = self._find_conflict_rid(table, prepared, txn, conflict_index)
             old_values = heap.get(txn, rid) if rid is not None else None
@@ -1190,15 +1200,7 @@ class Executor:
 
     def _has_unique_conflict(self, table, values, txn: Transaction) -> bool:
         """ON CONFLICT DO NOTHING 的前置检查：任一唯一索引上已有同样的键。"""
-        for idx in table.indexes.values():
-            if not idx.unique:
-                continue
-            key = self._key_for(table, idx, values)
-            if key is None:
-                continue
-            if self._tree_for(table, idx).lookup_one(txn, key) is not None:
-                return True
-        return False
+        return self._find_unique_conflict(table, values, txn) is not None
 
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
@@ -1368,6 +1370,38 @@ class Executor:
             prepared.append(coerced)
         return prepared
 
+    def _find_unique_conflict(
+        self,
+        table: TableDef,
+        values: Iterable[Any],
+        txn: Transaction,
+        *,
+        indexes: Optional[Iterable[IndexDef]] = None,
+        ignore_rid: Optional[RID] = None,
+    ) -> Optional[tuple[IndexDef, RID]]:
+        """返回第一个违反唯一约束的索引和占用者 RID；没有冲突返回 None。
+
+        INSERT、UPDATE、upsert 和 DO NOTHING 都走这一个查询入口，
+        避免各路径对"NULL 不进索引""忽略当前行"的理解出现分歧。
+        """
+        candidates = indexes if indexes is not None else table.indexes.values()
+        for idx in candidates:
+            if not idx.unique:
+                continue
+            key = self._key_for(table, idx, values)
+            if key is None:
+                continue
+            rid = self._tree_for(table, idx).lookup_one(txn, key)
+            if rid is not None and rid != ignore_rid:
+                return idx, rid
+        return None
+
+    def _duplicate_key_error(self, idx: IndexDef) -> DuplicateKeyError:
+        return DuplicateKeyError(
+            f"唯一约束冲突：索引 {idx.name}",
+            detail=f"列 {', '.join(idx.columns)} 上已存在相同的值",
+        )
+
     def _check_update_unique(
         self,
         table: TableDef,
@@ -1384,12 +1418,15 @@ class Executor:
         new_key = self._key_for(table, idx, new_values)
         if new_key is None or old_key == new_key:
             return
-        existing = self._tree_for(table, idx).lookup_one(txn, new_key)
-        if existing is not None and existing != rid:
-            raise DuplicateKeyError(
-                f"唯一约束冲突：索引 {idx.name}",
-                detail=f"列 {', '.join(idx.columns)} 上已存在相同的值",
-            )
+        conflict = self._find_unique_conflict(
+            table,
+            new_values,
+            txn,
+            indexes=(idx,),
+            ignore_rid=rid,
+        )
+        if conflict is not None:
+            raise self._duplicate_key_error(conflict[0])
 
     def _check_constraints(
         self,
@@ -1403,17 +1440,9 @@ class Executor:
             # ON CONFLICT DO NOTHING：唯一冲突由调用方判断并跳过，
             # 但 NOT NULL 之类的约束仍然必须报错。
             return
-        for idx in table.indexes.values():
-            if not idx.unique:
-                continue
-            key = self._key_for(table, idx, values)
-            if key is None:
-                continue
-            if self._tree_for(table, idx).lookup_one(txn, key) is not None:
-                raise DuplicateKeyError(
-                    f"唯一约束冲突：索引 {idx.name}",
-                    detail=f"列 {', '.join(idx.columns)} 上已存在相同的值",
-                )
+        conflict = self._find_unique_conflict(table, values, txn)
+        if conflict is not None:
+            raise self._duplicate_key_error(conflict[0])
 
     def _tree_for(self, table: TableDef, idx: IndexDef) -> BPlusTree:
         # KeyCodec 会自动在末尾追加 RID 两列，这里只给索引列的类型
