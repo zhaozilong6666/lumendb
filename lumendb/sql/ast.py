@@ -303,6 +303,7 @@ class Select:
     limit: Optional[Union[int, ParamRef]] = None
     offset: Optional[Union[int, ParamRef]] = None
     distinct: bool = False
+    with_ties: bool = False
 
 
 @dataclass
@@ -319,6 +320,7 @@ class CompoundSelect:
     order_by: list[OrderItem] = field(default_factory=list)
     limit: Optional[Union[int, ParamRef]] = None
     offset: Optional[Union[int, ParamRef]] = None
+    with_ties: bool = False
 
 
 # ---------------------------------------------------------------------------

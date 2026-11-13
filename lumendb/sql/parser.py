@@ -758,7 +758,9 @@ class Parser:
     def _parse_select(self) -> Select:
         """子查询用：单个 SELECT 块，允许自己的 ORDER BY / LIMIT。"""
         select = self._parse_select_core()
-        select.order_by, select.limit, select.offset = self._parse_select_tail()
+        select.order_by, select.limit, select.offset, select.with_ties = (
+            self._parse_select_tail()
+        )
         return select
 
     def parse_query_expression(self) -> Select | CompoundSelect:
@@ -791,15 +793,17 @@ class Parser:
                 ops=[op],
             )
 
-        order_by, limit, offset = self._parse_select_tail()
+        order_by, limit, offset, with_ties = self._parse_select_tail()
         if isinstance(node, CompoundSelect):
             node.order_by = order_by
             node.limit = limit
             node.offset = offset
+            node.with_ties = with_ties
             return node
         node.order_by = order_by
         node.limit = limit
         node.offset = offset
+        node.with_ties = with_ties
         return node
 
     def _parse_intersect_chain(self) -> Select | CompoundSelect:
@@ -867,6 +871,7 @@ class Parser:
 
         limit = None
         offset = None
+        with_ties = False
         limit_seen = False
         offset_seen = False
         if self._match_kw("LIMIT"):
@@ -901,13 +906,10 @@ class Parser:
                 pass
             elif self._match_kw("WITH"):
                 self._expect_kw("TIES")
-                raise NotSupportedError(
-                    "FETCH ... WITH TIES 尚未支持",
-                    hint="改用 ONLY，或在 ORDER BY 中加入唯一键后自行处理并列行",
-                )
+                with_ties = True
             else:
                 raise self._error("FETCH 之后期望 ONLY 或 WITH TIES")
-        return order_by, limit, offset
+        return order_by, limit, offset, with_ties
 
     def _parse_select_item(self) -> SelectItem:
         expr = self._parse_expr()

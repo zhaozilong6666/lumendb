@@ -210,8 +210,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 - `Aggregate`：无 `GROUP BY` 时输出一行（空表也输出 `COUNT=0`）；
 - `Project`：求值输出列，可附加 ORDER BY 需要的隐藏列；
 - `Distinct`：按前 N 列去重（隐藏列不参与）；
-- `SetOp`：`UNION` / `UNION ALL`，逐行拼接；`UNION` 用集合去重，
-  `UNION ALL` 保留重复，`ORDER BY` / `LIMIT` 由外层节点处理；
+- `SetOp`：集合运算，逐行拼接 `UNION` / `UNION ALL`，`EXCEPT [ALL]` /
+  `INTERSECT [ALL]` 按行多重集处理；`ORDER BY` / `LIMIT` 由外层节点处理；
 - `CteScan`：普通 `WITH` 的命名子查询。绑定阶段先按书写顺序把每个 CTE
   绑成独立计划并放进作用域，主查询里的 `FROM cte_name` 直接引用它；
   `WITH c(a, b) AS (...)` 的显式列名会覆盖输出列名并校验列数/重名；
@@ -222,9 +222,11 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
   直到没有新行；`UNION` 用哈希集合去重，`UNION ALL` 保留重复，超过 10000 轮报错；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；每键独立处理
   `ASC/DESC` 与 `NULLS FIRST/LAST`（默认 ASC 时 NULL 最后、DESC 时 NULL 最前）；
-- `Limit`：跳 `offset`，取 `limit`。
+- `Limit`：跳 `offset`，取 `limit`；`WITH TIES` 时用排序键比较边界行，
+  继续放行与最后一条同键的行。
 
-`NULL` 的排序位置固定为"最后"（ASC 与 DESC 都是），不做 `NULLS FIRST/LAST` 语法。
+默认排序位置与 PostgreSQL 对齐：`ASC` 时 `NULL` 最后、`DESC` 时 `NULL` 最前；
+`NULLS FIRST/LAST` 可以显式覆盖，每个排序键独立生效。
 
 `INSERT ... SELECT` 不经过 `Values`：绑定来源查询并核对列数后，先把结果完整物化，
 再逐行写堆和索引。物化不只是为了简单——`INSERT INTO t SELECT * FROM t` 如果边读

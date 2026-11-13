@@ -235,12 +235,16 @@ class Limit(PlanNode):
     child: Optional[PlanNode] = None
     limit: Optional[int] = None
     offset: int = 0
+    with_ties: bool = False
+    #: ORDER BY 键求值函数，只用于 WITH TIES 判断并列；空表示所有行互为并列
+    tie_keys: list[EvalFn] = field(default_factory=list)
 
     def children(self):
         return [self.child] if self.child else []
 
     def describe(self) -> str:
-        return f"Limit {self.limit} offset {self.offset}"
+        suffix = " with ties" if self.with_ties else ""
+        return f"Limit {self.limit} offset {self.offset}{suffix}"
 
 
 @dataclass

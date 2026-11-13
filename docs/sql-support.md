@@ -135,13 +135,14 @@ HAVING cond
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...
 LIMIT {n | ALL} [OFFSET m [ROW|ROWS]]  -- n/m 也可以是 $1 这样的参数
 OFFSET m [ROW|ROWS]                     -- 可以单独使用
-FETCH {FIRST|NEXT} {n | ROW} {ROW|ROWS} ONLY
+FETCH {FIRST|NEXT} {n | ROW} {ROW|ROWS} {ONLY | WITH TIES}
 ```
 
 `LIMIT ALL` 等价于不限制行数；`OFFSET m ROWS` 可以单独出现，也可以与
-`FETCH FIRST/NEXT ... ROWS ONLY` 组合，语义与 `LIMIT n OFFSET m` 一致。
-`FETCH FIRST ROW ONLY` 是 `FETCH FIRST 1 ROWS ONLY` 的简写。`FETCH ... WITH TIES`
-尚未支持，会明确报错；需要并列行时请在 `ORDER BY` 中加入唯一键后自行取数。
+`FETCH FIRST/NEXT ... ROWS` 组合，语义与 `LIMIT n OFFSET m` 一致。
+`FETCH FIRST ROW ONLY` 是 `FETCH FIRST 1 ROWS ONLY` 的简写。
+`WITH TIES` 在前 n 行之后继续输出与最后一行排序键相同的行；没有 `ORDER BY`
+时所有行互为并列，因此会返回偏移之后的所有行。计数仍然受 `OFFSET` 影响。
 
 集合运算：
 

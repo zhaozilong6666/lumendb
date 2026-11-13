@@ -1176,6 +1176,37 @@ class TestSelectBasics:
             db, "SELECT id FROM users ORDER BY id OFFSET 2 ROWS"
         ) == [(3,)]
 
+    def test_fetch_with_ties_keeps_peer_rows(self, db):
+        db.execute_one("CREATE TABLE t (id INT, score INT)")
+        db.execute_one(
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)"
+        )
+        assert rows(
+            db,
+            "SELECT id FROM t ORDER BY score FETCH FIRST 2 ROWS WITH TIES",
+        ) == [(1,), (2,), (3,)]
+        assert rows(
+            db,
+            "SELECT id FROM t ORDER BY score OFFSET 1 ROW "
+            "FETCH NEXT 2 ROWS WITH TIES",
+        ) == [(2,), (3,)]
+        assert rows(
+            db,
+            "SELECT id FROM t ORDER BY score FETCH FIRST 2 ROWS ONLY",
+        ) == [(1,), (2,)]
+        assert rows(
+            db,
+            "SELECT id FROM t ORDER BY score DESC FETCH FIRST ROW WITH TIES",
+        ) == [(4,)]
+        assert rows(
+            db, "SELECT id FROM t FETCH FIRST 2 ROWS WITH TIES"
+        ) == [(1,), (2,), (3,), (4,)]
+        assert rows(
+            db,
+            "SELECT 2 AS x UNION ALL SELECT 2 UNION ALL SELECT 3 "
+            "ORDER BY x FETCH FIRST ROW WITH TIES",
+        ) == [(2,), (2,)]
+
     def test_distinct(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("INSERT INTO t VALUES (1), (1), (2)")

@@ -394,17 +394,7 @@ class Executor:
             yield from self._sort(node, txn)
             return
         if isinstance(node, Limit):
-            assert node.child is not None
-            skipped = 0
-            emitted = 0
-            for row in self._execute(node.child, txn):
-                if skipped < node.offset:
-                    skipped += 1
-                    continue
-                if node.limit is not None and emitted >= node.limit:
-                    return
-                emitted += 1
-                yield row
+            yield from self._limit(node, txn)
             return
         raise NotSupportedError(f"计划节点 {type(node).__name__} 无法执行")
 
@@ -684,6 +674,33 @@ class Executor:
                 reverse=descending,
             )
         yield from rows
+
+    def _limit(self, node: Limit, txn: Transaction) -> Iterator[tuple]:
+        """LIMIT/OFFSET；``WITH TIES`` 时继续输出与最后一条排序键相同的行。"""
+        assert node.child is not None
+        if node.limit == 0:
+            return
+        skipped = 0
+        emitted = 0
+        boundary: Optional[tuple] = None
+        for row in self._execute(node.child, txn):
+            if skipped < node.offset:
+                skipped += 1
+                continue
+            if node.limit is not None and emitted >= node.limit:
+                if not node.with_ties:
+                    return
+                # 没有 ORDER BY 时所有行互为并列；有排序键时只放行同键行。
+                if node.tie_keys:
+                    key = tuple(fn(EvalContext(row)) for fn in node.tie_keys)
+                    if key != boundary:
+                        return
+                yield row
+                continue
+            emitted += 1
+            yield row
+            if node.limit is not None and emitted == node.limit and node.with_ties:
+                boundary = tuple(fn(EvalContext(row)) for fn in node.tie_keys)
 
     # ------------------------------------------------------------------
     # DDL

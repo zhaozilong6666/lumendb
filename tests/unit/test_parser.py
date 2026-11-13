@@ -602,11 +602,16 @@ class TestParameters:
         one = parse_statement("SELECT * FROM t FETCH FIRST ROW ONLY")
         assert one.select.limit == 1
 
-    def test_fetch_with_ties_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement(
-                "SELECT * FROM t ORDER BY id FETCH FIRST 2 ROWS WITH TIES"
-            )
+    def test_fetch_with_ties(self):
+        stmt = parse_statement(
+            "SELECT * FROM t ORDER BY id FETCH FIRST 2 ROWS WITH TIES"
+        )
+        assert stmt.select.limit == 2
+        assert stmt.select.with_ties is True
+        only = parse_statement(
+            "SELECT * FROM t ORDER BY id FETCH FIRST 2 ROWS ONLY"
+        )
+        assert only.select.with_ties is False
 
     def test_zero_parameter_rejected(self):
         with pytest.raises(SQLSyntaxError):

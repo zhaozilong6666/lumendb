@@ -1034,6 +1034,8 @@ class Binder:
                 child=node,
                 limit=limit_value,
                 offset=offset_value or 0,
+                with_ties=select.with_ties,
+                tie_keys=[fn for fn, _descending, _nulls_first in sort_keys],
                 columns=node.columns,
             )
 
@@ -1072,8 +1074,8 @@ class Binder:
                 columns=list(out_cols),
             )
 
+        sort_keys = []
         if select.order_by:
-            sort_keys = []
             names = [c.name.lower() for c in out_cols]
             for item in select.order_by:
                 index: Optional[int] = None
@@ -1106,6 +1108,8 @@ class Binder:
                 child=node,
                 limit=limit_value,
                 offset=offset_value or 0,
+                with_ties=select.with_ties,
+                tie_keys=[fn for fn, _descending, _nulls_first in sort_keys],
                 columns=node.columns,
             )
         return node, out_cols
