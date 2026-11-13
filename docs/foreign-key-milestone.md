@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 范围：LumenDB 外键约束、删除/更新动作、`ALTER TABLE` 外键 DDL、测试与文档
 - 基线：`8da5a63`（`ON DELETE CASCADE`）
-- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`
+- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`8a88bad`
 
 ## 1. 成果清单
 
@@ -37,10 +37,13 @@
 ```python
 on_delete: str = "RESTRICT"
 on_update: str = "RESTRICT"
+match_type: str = "SIMPLE"  # SIMPLE / FULL
 ```
 
-`from_json` 对旧目录缺省为 `RESTRICT`；`validate_table_def` 只允许
-`RESTRICT` / `CASCADE`，非法动作直接拒绝。
+`from_json` 对旧目录缺省为 `RESTRICT` / `SIMPLE`；`validate_table_def` 允许
+`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和 `SIMPLE` / `FULL`，非法动作或
+MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`，因此目录里不会
+留下未定义的延迟动作。
 
 ### 2.2 插入与更新校验
 
@@ -122,6 +125,8 @@ CI：
 - `b0985ae`：success
 - `d27fea0`：success
 - `42627d8`：success
+- `9039add`：success
+- `5c3dd00`：success
 
 ## 4. 基准（2000 行）
 
@@ -167,7 +172,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引维护、事务回滚、持久化和文档均已落地；全量 822 个测试通过，最新代码提交
-`9cc420f` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
+索引点查、事务回滚、持久化和文档均已落地；全量 839 个测试通过，已推送代码提交
+`5c3dd00` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 与
 `MATCH SIMPLE` / `MATCH FULL` 子集。

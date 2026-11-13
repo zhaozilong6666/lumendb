@@ -240,6 +240,8 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 等值与范围的索引选择（`EXPLAIN` 可见）
 - [x] PostgreSQL wire protocol（simple + extended query，支持 `$1` 参数绑定）
 - [x] `VACUUM`：回收死版本、压实堆页、重建索引（要求无并发事务）
+- [x] 外键：`MATCH SIMPLE/FULL`、`RESTRICT/CASCADE/SET NULL/SET DEFAULT/NO ACTION`、`ALTER TABLE` 外键 DDL
+- [ ] 外键延迟约束 `DEFERRABLE` 与 `MATCH PARTIAL`
 - [ ] 基于代价的连接顺序枚举（当前为规则化）
 - [ ] 相关子查询
 - [ ] 组提交与 WAL 分段回收
