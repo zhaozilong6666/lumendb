@@ -924,14 +924,7 @@ class Executor:
             [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
         )
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
-        conflict_index = (
-            self._conflict_index_for(table, stmt.conflict_columns)
-            if (
-                stmt.on_conflict_update
-                or (stmt.on_conflict_nothing and stmt.conflict_columns)
-            )
-            else None
-        )
+        conflict_index = self._resolve_conflict_index(table, stmt)
         assignment_fns = (
             self._compile_conflict_assignments(table, stmt.on_conflict_update)
             if stmt.on_conflict_update
@@ -998,6 +991,37 @@ class Executor:
             hint="先在该列组合上建 UNIQUE 索引，或省略冲突目标",
         )
 
+    def _conflict_index_for_constraint(
+        self, table: TableDef, name: str
+    ) -> IndexDef:
+        """把 ``ON CONFLICT ON CONSTRAINT name`` 映射到唯一索引。"""
+        wanted = name.lower()
+        for idx in table.indexes.values():
+            if idx.unique and idx.name.lower() == wanted:
+                return idx
+        available = sorted(idx.name for idx in table.indexes.values() if idx.unique)
+        raise BinderError(
+            "ON CONFLICT ON CONSTRAINT 没找到唯一约束",
+            detail=f"约束名：{name}",
+            hint=(
+                "可用唯一约束：" + ", ".join(available)
+                if available
+                else "该表没有唯一约束"
+            ),
+        )
+
+    def _resolve_conflict_index(
+        self, table: TableDef, stmt: Insert
+    ) -> Optional[IndexDef]:
+        """统一解析三种冲突目标：无目标 / 列组合 / 约束名。"""
+        if stmt.conflict_constraint is not None:
+            return self._conflict_index_for_constraint(
+                table, stmt.conflict_constraint
+            )
+        if stmt.conflict_columns is not None:
+            return self._conflict_index_for(table, stmt.conflict_columns)
+        return None
+
     def _find_conflict_rid(
         self,
         table: TableDef,
@@ -1062,6 +1086,19 @@ class Executor:
         new_values = list(old_tuple)
         for index, fn in assignment_fns:
             new_values[index] = fn(ctx)
+        return self._rewrite_row(table, heap, txn, rid, old_tuple, new_values)
+
+    def _rewrite_row(
+        self,
+        table: TableDef,
+        heap: HeapFile,
+        txn: Transaction,
+        rid: RID,
+        old_values: Iterable[Any],
+        new_values: list[Any],
+    ) -> list[Any]:
+        """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。"""
+        old_tuple = tuple(old_values)
         prepared = self._prepare_values(table, None, new_values)
 
         changed_indexes = [
@@ -1111,14 +1148,7 @@ class Executor:
             [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
         )
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
-        conflict_index = (
-            self._conflict_index_for(table, stmt.conflict_columns)
-            if (
-                stmt.on_conflict_update
-                or (stmt.on_conflict_nothing and stmt.conflict_columns)
-            )
-            else None
-        )
+        conflict_index = self._resolve_conflict_index(table, stmt)
         assignment_fns = (
             self._compile_conflict_assignments(table, stmt.on_conflict_update)
             if stmt.on_conflict_update
@@ -1277,30 +1307,9 @@ class Executor:
             new_values = list(old_tuple)
             for index, fn in assignment_fns:
                 new_values[index] = fn(ctx)
-            prepared = self._prepare_values(table, None, new_values)
-
-            changed_indexes = [
-                idx
-                for idx in table.indexes.values()
-                if self._key_for(table, idx, old_tuple) != self._key_for(table, idx, prepared)
-            ]
-            for idx in changed_indexes:
-                self._check_update_unique(
-                    table, idx, old_tuple, prepared, txn, rid
-                )
-            for idx in changed_indexes:
-                old_key = self._key_for(table, idx, old_tuple)
-                if old_key is not None:
-                    self._tree_for(table, idx).delete(txn, old_key, rid)
-
-            heap.update(txn, rid, prepared)
-
-            for idx in changed_indexes:
-                tree = self._tree_for(table, idx)
-                new_key = self._key_for(table, idx, prepared)
-                if new_key is not None:
-                    tree.insert(txn, new_key, rid)
-                idx.root_page = tree.root_page
+            prepared = self._rewrite_row(
+                table, heap, txn, rid, old_tuple, new_values
+            )
             if ret_fns:
                 returned.append(
                     tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)

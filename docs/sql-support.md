@@ -59,9 +59,9 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 不会先写入再报错。`ON CONFLICT DO NOTHING` 跳过的行不会出现在返回结果里。
 `ON CONFLICT DO UPDATE` 会把冲突行更新为新值，`RETURNING` 返回更新后的行；
 不带冲突目标时取第一个命中的唯一索引，带 `(col, ...)` 时要求存在完全匹配的
-唯一索引。`DO UPDATE ... WHERE` 的条件在旧行上求值，条件不成立时不更新该行。
-赋值表达式可以引用旧行当前列，也可以用 `excluded.col` 读取待插入行，但不支持
-`ON CONFLICT ON CONSTRAINT`。
+唯一索引；`ON CONSTRAINT name` 按唯一索引名匹配。`DO UPDATE ... WHERE`
+的条件在旧行上求值，条件不成立时不更新该行。赋值表达式可以引用旧行当前列，
+也可以用 `excluded.col` 读取待插入行。
 `WITH` 后面除 SELECT/INSERT 外也接受 UPDATE/DELETE；CTE 只在当前语句内可见。
 
 `INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
@@ -177,7 +177,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
-| `ON CONFLICT` 的 `ON CONFLICT ON CONSTRAINT` | 支持 `DO NOTHING` / `DO UPDATE SET` / `DO UPDATE ... WHERE` / `excluded.col`，冲突目标必须是唯一索引的列组合 |
+| `ON CONFLICT` 约束目标 | 支持 `DO NOTHING` / `DO UPDATE SET` / `DO UPDATE ... WHERE` / `excluded.col`；列组合或 `ON CONSTRAINT name` 必须映射到一个唯一索引 |
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
@@ -195,8 +195,8 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 - `ON CONFLICT DO NOTHING` 在没有冲突目标时会把任意唯一索引冲突都当作
   "跳过"；写了 `(col, ...)` 目标时只跳过该唯一索引上的冲突，其它唯一索引
   冲突仍会报错。`DO UPDATE` 的目标列必须精确匹配一个唯一索引；
-  支持在旧行上求值的 `DO UPDATE ... WHERE` 和 `excluded.col`，但不支持
-  `ON CONFLICT ON CONSTRAINT`。
+  支持在旧行上求值的 `DO UPDATE ... WHERE`、`excluded.col`，以及
+  `ON CONFLICT ON CONSTRAINT 索引名`。
 - 单列等值条件与单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）在列上有索引时
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。

@@ -201,6 +201,14 @@ Schema 上绑定：默认 qualifier 是目标表，因此未限定列名访问�
 `excluded.col` 访问待插入行。两者在同一个 `EvalContext` 元组里连续排放；
 执行器只把赋值结果写回堆，excluded 行本身不会被写入。
 
+冲突目标有三种写法：不写目标、`(col, ...)` 列组合、`ON CONSTRAINT name`；
+三者都由 `_resolve_conflict_index` 映射到唯一 `IndexDef`，后续写入路径不再
+关心目标写法。
+
+`UPDATE` 和 upsert 的最终写回共用 `_rewrite_row`：类型/约束校验、唯一键
+冲突检查、旧索引删除、堆更新和新索引插入都在一个入口完成，避免两条
+路径对“先删索引还是先查重”的顺序产生分歧。
+
 Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，不能跨语句复用；
 曾经复用 Binder 导致上一条 `WITH` 的 CTE 在下一句仍然可见，现已修复并加测试。
 

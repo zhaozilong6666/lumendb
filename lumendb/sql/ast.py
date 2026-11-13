@@ -380,6 +380,8 @@ class Insert(Statement):
     on_conflict_nothing: bool = False
     #: ``ON CONFLICT (col, ...)`` 的冲突目标；为 None 时匹配任意唯一索引
     conflict_columns: Optional[list[str]] = None
+    #: ``ON CONFLICT ON CONSTRAINT name`` 的约束名；与 conflict_columns 二选一
+    conflict_constraint: Optional[str] = None
     #: ``ON CONFLICT DO UPDATE SET ...`` 的赋值；为 None 时不是 DO UPDATE
     on_conflict_update: Optional[list[tuple[str, Expr]]] = None
     #: ``ON CONFLICT DO UPDATE ... WHERE condition``；在旧行上求值

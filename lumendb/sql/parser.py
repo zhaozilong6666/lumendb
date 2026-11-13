@@ -491,11 +491,15 @@ class Parser:
 
         on_conflict_nothing = False
         conflict_columns = None
+        conflict_constraint = None
         on_conflict_update = None
         on_conflict_where = None
         if self._match_kw("ON"):
             self._expect_kw("CONFLICT")
-            if self._match_punct("lparen"):
+            if self._match_kw("ON"):
+                self._expect_kw("CONSTRAINT")
+                conflict_constraint = self._parse_ident("约束名")
+            elif self._match_punct("lparen"):
                 conflict_columns = [self._parse_ident("列名")]
                 while self._match_punct("comma"):
                     conflict_columns.append(self._parse_ident("列名"))
@@ -526,6 +530,7 @@ class Parser:
             query=query,
             on_conflict_nothing=on_conflict_nothing,
             conflict_columns=conflict_columns,
+            conflict_constraint=conflict_constraint,
             on_conflict_update=on_conflict_update,
             on_conflict_where=on_conflict_where,
             returning=returning,

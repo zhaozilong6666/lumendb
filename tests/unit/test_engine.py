@@ -423,6 +423,39 @@ class TestInsert:
         assert result.affected == 1
         assert result.rows == [(1, 20)]
 
+    def test_on_conflict_on_constraint_target(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE, n INT)"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 'a', 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 'b', 20) "
+            "ON CONFLICT ON CONSTRAINT t_pkey "
+            "DO UPDATE SET n = excluded.n RETURNING id, name, n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, "a", 20)]
+
+    def test_on_conflict_on_constraint_do_nothing(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE, n INT)"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 'a', 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (2, 'a', 20) "
+            "ON CONFLICT ON CONSTRAINT t_name_key DO NOTHING"
+        )
+        assert result.affected == 0
+        assert rows(db, "SELECT id, name, n FROM t") == [(1, "a", 10)]
+
+    def test_on_conflict_on_constraint_missing(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        with pytest.raises(BinderError):
+            db.execute_one(
+                "INSERT INTO t VALUES (1, 'a') "
+                "ON CONFLICT ON CONSTRAINT no_such_constraint DO NOTHING"
+            )
+
     def test_on_conflict_excluded_unknown_column(self, db):
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
         db.execute_one("INSERT INTO t VALUES (1, 10)")
