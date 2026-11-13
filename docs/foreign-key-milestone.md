@@ -44,7 +44,7 @@ on_update: str = "RESTRICT"
 
 ### 2.2 插入与更新校验
 
-`_check_foreign_keys` 按外键的 `MATCH` 模式扫描被引用表：
+`_check_foreign_keys` 按外键的 `MATCH` 模式检查，并优先使用被引用列上的唯一索引点查：
 
 - `MATCH SIMPLE`：本地键任一列为 `NULL`：跳过；
 - `MATCH FULL`：本地键全为 `NULL`：跳过；部分 `NULL`：直接报错；全非 `NULL`：
@@ -147,8 +147,9 @@ CI：
 1. **动作子集仍有限**：未实现 `DEFERRABLE` / `MATCH PARTIAL`；当前支持
    `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
    `MATCH SIMPLE` / `MATCH FULL`。
-2. **外键检查是全表扫描**：`_check_foreign_keys` 和级联收集都逐表扫描，
-   复杂度与子表行数线性相关，未利用唯一索引点查；数据量大时需要索引定位优化。
+2. **级联收集仍是全表扫描**：写入侧 `_check_foreign_keys` 已优先走被引用唯一索引，
+   但 `_plan_referenced_updates` 和 `_cascade_delete_children` 仍逐表扫描子行，
+   复杂度与子表行数线性相关；数据量大时可为子表外键列建索引优化。
 3. **复杂循环图**：`_updating` / `processing` 能打断常见自引用环，但菱形依赖、
    同一子行被多条级联路径同时命中的精确 SQL 顺序语义没有单独建模；
    并发事务下也没有等锁/延迟约束，当前更接近单写者语义。

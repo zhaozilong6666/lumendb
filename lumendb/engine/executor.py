@@ -3128,13 +3128,37 @@ class Executor:
                 )
                 found = candidate_key == local_key
             ref_heap = HeapFile(self._bp, ref_table, self._txns)
-            for _rid, ref_values in ref_heap.scan(txn):
-                if all(
-                    ref_values[pos] == value
-                    for pos, value in zip(ref_positions, local_key)
-                ):
-                    found = True
-                    break
+            # 被引用列一定有 UNIQUE / PRIMARY 索引；优先用索引点查，
+            # 避免每次写入都扫描整张被引用表。索引项可能指向已不可见的
+            # 旧版本，所以仍以 heap.get 的可见性结果为准；点查未命中时
+            # 再退回全表扫描，保证索引异常时也不会漏判。
+            ref_index = next(
+                (
+                    idx
+                    for idx in ref_table.indexes.values()
+                    if idx.unique
+                    and tuple(idx.columns) == tuple(fk.ref_columns)
+                ),
+                None,
+            )
+            if ref_index is not None:
+                tree = self._tree_for(ref_table, ref_index)
+                for rid in tree.lookup(txn, list(local_key)):
+                    ref_values = ref_heap.get(txn, rid)
+                    if ref_values is not None and all(
+                        ref_values[pos] == value
+                        for pos, value in zip(ref_positions, local_key)
+                    ):
+                        found = True
+                        break
+            if not found:
+                for _rid, ref_values in ref_heap.scan(txn):
+                    if all(
+                        ref_values[pos] == value
+                        for pos, value in zip(ref_positions, local_key)
+                    ):
+                        found = True
+                        break
             if not found:
                 raise ForeignKeyViolationError(
                     f"外键约束 {fk.name!r} 违反",

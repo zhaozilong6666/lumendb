@@ -161,8 +161,10 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 
 写入路径在 `_check_foreign_keys` 中按外键的 `MATCH` 模式检查：`SIMPLE` 下本地键
 任一列为 `NULL` 就跳过；`FULL` 下要么全为 `NULL`，要么全部非 `NULL`，部分 `NULL`
-直接抛 `ForeignKeyViolationError`（SQLSTATE `23503`）；否则扫描被引用表，找不到
-完整匹配行也抛 `ForeignKeyViolationError`。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
+直接抛 `ForeignKeyViolationError`（SQLSTATE `23503`）；否则优先用被引用列上的
+`UNIQUE` / `PRIMARY` B+ 树索引做点查，索引项不可见或缺失时再回落到被引用表扫描；
+两步都找不到完整匹配行时抛 `ForeignKeyViolationError`。因此每次写入不必扫描整张
+父表，同时保留索引异常时的正确性兜底。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
 `UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 扫描所有
 引用表（自引用时跳过当前 RID）：`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
 `SET NULL` 收集并将匹配外键列置空，`SET DEFAULT` 收集并写入列默认值，在父行写堆后
