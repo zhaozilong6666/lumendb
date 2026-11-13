@@ -767,12 +767,29 @@ class Executor:
         # 建视图时先完整绑定一次，提前暴露未知表/列和类型错误；
         # 视图不物化数据，SELECT 时再按保存的 token 重新绑定。
         binder = self._new_binder()
-        binder.bind_select(stmt.query)
+        bound_cols = binder.bind_select(stmt.query)
+        if stmt.columns:
+            if len(stmt.columns) != len(bound_cols):
+                raise BinderError(
+                    f"视图 {stmt.name!r} 的列清单有 {len(stmt.columns)} 列，"
+                    f"但查询输出 {len(bound_cols)} 列",
+                    hint="视图列名数量必须与查询输出的列数一致",
+                )
+            names = [name.lower() for name in stmt.columns]
+            if len(set(names)) != len(names):
+                raise BinderError(
+                    f"视图 {stmt.name!r} 的列名重复",
+                    hint="视图列名必须唯一",
+                )
         if stmt.or_replace and self._catalog.has_view(stmt.name):
-            self._catalog.replace_view(txn, stmt.name, stmt.tokens)
+            self._catalog.replace_view(
+                txn, stmt.name, stmt.tokens, stmt.columns
+            )
             notice = f"已替换视图 {stmt.name.lower()}"
         else:
-            self._catalog.create_view(txn, stmt.name, stmt.tokens)
+            self._catalog.create_view(
+                txn, stmt.name, stmt.tokens, stmt.columns
+            )
             notice = f"已创建视图 {stmt.name.lower()}"
         return Result(tag="CREATE VIEW", notice=notice)
 

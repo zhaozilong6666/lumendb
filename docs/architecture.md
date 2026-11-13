@@ -126,15 +126,15 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 解析一次（只在绑定阶段发生，不重复执行基表扫描）。
 
 Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先解析 token，
-再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。`view_stack` 记录
-正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
+再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。若视图带显式列名清单，
+目录会在 `view_columns` 里保存别名，Binder 用别名覆盖输出列名并校验列数/重复名。
+`view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
 `CREATE OR REPLACE VIEW` 先绑定新定义，再替换目录里的 token 切片，因此新定义
 非法时旧视图仍然可用；替换本身也在事务 undo 范围内。
 
-当前限制：没有显式视图列名列表、没有物化视图，视图也不能作为
-`INSERT`/`UPDATE`/`DELETE` 的目标；`SHOW TABLES` 只列基表，`SHOW VIEWS`
-单独列出视图。
+当前限制：没有物化视图，视图不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；
+`SHOW TABLES` 只列基表，`SHOW VIEWS` 单独列出视图。
 
 ## 3. SQL 与计划
 

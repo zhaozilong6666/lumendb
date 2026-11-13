@@ -481,10 +481,10 @@ class TestInsert:
         first = Database(path)
         first.execute_one("CREATE TABLE t (a INT, b TEXT)")
         first.execute_one("INSERT INTO t VALUES (1, 'x')")
-        first.execute_one("CREATE VIEW v AS SELECT a, b FROM t")
+        first.execute_one("CREATE VIEW v (x, y) AS SELECT a, b FROM t")
         first.close()
         second = Database(path)
-        assert second.execute_one("SELECT * FROM v").rows == [(1, "x")]
+        assert second.execute_one("SELECT x, y FROM v").rows == [(1, "x")]
         second.close()
 
     def test_create_or_replace_view_swaps_definition(self, db):
@@ -503,6 +503,14 @@ class TestInsert:
         result = db.execute_one("SHOW VIEWS")
         assert result.rows[0][0] == "v"
         assert "SELECT" in result.rows[0][1]
+
+    def test_view_column_list_renames_output(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("CREATE VIEW v (x, y) AS SELECT a, b FROM t")
+        assert rows(db, "SELECT x, y FROM v") == [(1, "x")]
+        with pytest.raises(BinderError):
+            db.execute_one("CREATE VIEW bad (x) AS SELECT a, b FROM t")
 
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")

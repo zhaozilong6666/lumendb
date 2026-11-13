@@ -112,6 +112,13 @@ class TestCreateTable:
         with pytest.raises(SQLSyntaxError):
             parse_statement("CREATE OR REPLACE TABLE t (a INT)")
 
+    def test_view_column_list(self):
+        from lumendb.sql.ast import CreateView
+
+        stmt = parse_statement("CREATE VIEW v (x, y) AS SELECT a, b FROM t")
+        assert isinstance(stmt, CreateView)
+        assert stmt.columns == ["x", "y"]
+
     def test_show_views(self):
         from lumendb.sql.ast import ShowViews
 

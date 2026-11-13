@@ -371,12 +371,23 @@ class Parser:
 
     def _parse_create_view(self, or_replace: bool = False) -> CreateView:
         name = self._parse_ident("视图名")
+        columns: list[str] = []
+        if self._match_punct("lparen"):
+            while True:
+                columns.append(self._parse_ident("视图列名"))
+                if not self._match_punct("comma"):
+                    break
+            self._expect_punct("rparen", ")")
         self._expect_kw("AS")
         start = self._i
         query = self._parse_query_expression()
         tokens = [(tok.kind, tok.value) for tok in self._tokens[start:self._i]]
         return CreateView(
-            name=name, query=query, tokens=tokens, or_replace=or_replace
+            name=name,
+            query=query,
+            tokens=tokens,
+            columns=columns,
+            or_replace=or_replace,
         )
 
     def _parse_create_table(self) -> Statement:

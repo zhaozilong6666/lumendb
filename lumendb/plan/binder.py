@@ -1203,6 +1203,24 @@ class Binder:
             view_binder.subquery_runner = self.subquery_runner
             view_binder.view_stack = self.view_stack | {view_key}
             child, cols = view_binder.bind_select(view_query)
+            aliases = self.catalog.get_view_columns(name)
+            if aliases:
+                if len(aliases) != len(cols):
+                    raise BinderError(
+                        f"视图 {name!r} 的列清单有 {len(aliases)} 列，"
+                        f"但查询输出 {len(cols)} 列",
+                        hint="视图列名数量必须与查询输出的列数一致",
+                    )
+                normalized = [alias.lower() for alias in aliases]
+                if len(set(normalized)) != len(normalized):
+                    raise BinderError(
+                        f"视图 {name!r} 的列名重复",
+                        hint="视图列名必须唯一",
+                    )
+                cols = [
+                    OutputColumn(alias, col.type)
+                    for alias, col in zip(normalized, cols)
+                ]
             effective = (alias or name).lower()
             node = CteScan(child=child, columns=list(cols))
             schema = Schema(

@@ -338,6 +338,7 @@ class CreateView(Statement):
     name: str
     query: Any
     tokens: list[tuple[str, str]]
+    columns: list[str] = field(default_factory=list)
     or_replace: bool = False
 
 

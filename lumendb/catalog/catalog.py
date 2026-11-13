@@ -29,6 +29,8 @@ class Catalog:
         self.tables: dict[str, TableDef] = {}
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
         self.views: dict[str, list[tuple[str, str]]] = {}
+        #: 视图名 -> 显式列名（可选）；空列表表示沿用查询输出的列名。
+        self.view_columns: dict[str, list[str]] = {}
         self._loaded = False
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
@@ -44,6 +46,7 @@ class Catalog:
         raw = self._store.load()
         self.tables.clear()
         self.views.clear()
+        self.view_columns.clear()
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -62,12 +65,12 @@ class Catalog:
             for tdata in data.get("tables", []):
                 table = TableDef.from_json(tdata)
                 self.tables[table.name] = table
-            self.views = {
-                vdata["name"].lower(): [
+            for vdata in data.get("views", []):
+                name = vdata["name"].lower()
+                self.views[name] = [
                     (kind, value) for kind, value in vdata.get("tokens", [])
                 ]
-                for vdata in data.get("views", [])
-            }
+                self.view_columns[name] = list(vdata.get("columns", []))
         self._loaded = True
 
     def persist(self, txn: Transaction) -> None:
@@ -79,6 +82,7 @@ class Catalog:
                     {
                         "name": name,
                         "tokens": [[kind, value] for kind, value in tokens],
+                        "columns": self.view_columns.get(name, []),
                     }
                     for name, tokens in self.views.items()
                 ],
@@ -127,6 +131,9 @@ class Catalog:
             )
         return tokens
 
+    def get_view_columns(self, name: str) -> list[str]:
+        return list(self.view_columns.get(name.lower(), []))
+
     # ------------------------------------------------------------------
     # DDL
     # ------------------------------------------------------------------
@@ -164,6 +171,7 @@ class Catalog:
         txn: Transaction,
         name: str,
         tokens: list[tuple[str, str]],
+        columns: Optional[list[str]] = None,
     ) -> None:
         key = name.lower()
         if key in self.tables or key in self.views:
@@ -172,24 +180,33 @@ class Catalog:
                 hint="表名和视图名共享同一个命名空间",
             )
         self.views[key] = list(tokens)
+        self.view_columns[key] = list(columns or [])
 
         def undo() -> None:
             self.views.pop(key, None)
+            self.view_columns.pop(key, None)
 
         txn.undo_log.append(undo)
         self.persist(txn)
 
     def replace_view(
-        self, txn: Transaction, name: str, tokens: list[tuple[str, str]]
+        self,
+        txn: Transaction,
+        name: str,
+        tokens: list[tuple[str, str]],
+        columns: Optional[list[str]] = None,
     ) -> None:
         key = name.lower()
         if key not in self.views:
             raise TableNotFoundError(f"视图 {name!r} 不存在")
         old = self.views[key]
+        old_columns = self.view_columns.get(key, [])
         self.views[key] = list(tokens)
+        self.view_columns[key] = list(columns or [])
 
         def undo() -> None:
             self.views[key] = old
+            self.view_columns[key] = old_columns
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -199,9 +216,11 @@ class Catalog:
         if key not in self.views:
             raise TableNotFoundError(f"视图 {name!r} 不存在")
         tokens = self.views.pop(key)
+        columns = self.view_columns.pop(key, [])
 
         def undo() -> None:
             self.views[key] = tokens
+            self.view_columns[key] = columns
 
         txn.undo_log.append(undo)
         self.persist(txn)
