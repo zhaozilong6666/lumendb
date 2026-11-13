@@ -46,7 +46,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 656 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 657 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -93,7 +93,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 656 automated tests including crash-injection and a 20-seed randomized
+> - 657 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -231,12 +231,11 @@ child 就是那份计划。后面的 CTE 能引用前面的 CTE，同名的 CTE 
 列数在绑定阶段就与目标列核对，所以空结果也不会绕过 schema 检查。
 
 **"性能怎么样？"**
-`bench/results/benchmark.md` 是实测：扫描/聚合约 4 万行/秒；带索引插入
-3.6 千行/秒，不带索引 1.6 万行/秒；索引点查约 1.3ms/次，全表扫描 7.5ms/次；
-范围查询（`score >= 99`）走索引约 4.4ms/次，全表约 47ms/次，约 10 倍；
-等值连接 1.25 万行/秒。
-等值连接 2000 订单 × 1000 客户，哈希连接 0.22s 出 2000 行；
-`TRUNCATE` 2000 行 5ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.23s。
+`bench/results/benchmark.md` 是实测（每场景 3 次，取最好与中位）：扫描/聚合约 3 万行/秒；
+带索引插入 3.4 千行/秒，不带索引 1.2 万行/秒；索引点查约 1.0ms/次，全表扫描 4.6ms/次；
+范围查询（`score >= 99`）走索引约 3.1ms/次，全表约 45ms/次，约 15 倍；
+等值连接 2000 订单 × 1000 客户，哈希连接 0.18s 出 2000 行，约 1.1 万行/秒；
+`TRUNCATE` 2000 行 4ms，`VACUUM` 压实 2000 行（回收 500 个死版本）0.90s。
 
 这里有一个我主动做的优化，也是最能讲的一段：最初带索引插入只有 498 行/秒，
 cProfile 显示每次插入都调用 `codec.decode` 十几万次——因为叶子页是按

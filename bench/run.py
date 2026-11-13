@@ -24,8 +24,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lumendb.engine.database import Database
 
 
-def timed(fn: Callable[[], None], *, repeat: int = 3) -> tuple[float, float]:
+# 默认重复次数；CLI --repeat 可覆盖。多次运行取中位数，避免单次抖动。
+REPEAT = 3
+
+
+def timed(
+    fn: Callable[[], None], *, repeat: int | None = None
+) -> tuple[float, float]:
     """跑 repeat 次，返回 (最好成绩秒数, 中位数秒数)。"""
+    if repeat is None:
+        repeat = REPEAT
     samples = []
     for _ in range(repeat):
         start = time.perf_counter()
@@ -55,11 +63,12 @@ def bench_insert(root: Path, rows: int) -> dict:
             db.execute_one("INSERT INTO t VALUES " + ", ".join(batch))
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": "批量插入（含主键索引维护）",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -78,11 +87,12 @@ def bench_insert_no_index(root: Path, rows: int) -> dict:
             db.execute_one("INSERT INTO t VALUES " + ", ".join(batch))
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": "批量插入（无索引）",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -118,6 +128,7 @@ def bench_scan(root: Path, rows: int) -> dict:
         "name": "全表扫描 COUNT(*)",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -140,11 +151,12 @@ def bench_point_lookup_index(root: Path, rows: int) -> dict:
         db.execute_one("COMMIT")
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"索引点查（{probes} 次）",
         "rows": probes,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": probes / best,
     }
 
@@ -163,11 +175,12 @@ def bench_point_lookup_scan(root: Path, rows: int) -> dict:
         db.execute_one("COMMIT")
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"无索引点查（{probes} 次，全表扫描）",
         "rows": probes,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": probes / best,
     }
 
@@ -181,11 +194,12 @@ def bench_update(root: Path, rows: int) -> dict:
         db.execute_one(f"UPDATE t SET score = score + 1 WHERE id < {updated}")
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"更新 {updated} 行",
         "rows": updated,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": updated / best,
     }
 
@@ -203,6 +217,7 @@ def bench_group_by(root: Path, rows: int) -> dict:
         "name": "GROUP BY（100 个分组）",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -211,7 +226,7 @@ def bench_vacuum(root: Path, rows: int) -> dict:
     """先制造 500 个死版本，再单独计时 VACUUM 的压实成本。"""
     updated = min(500, rows)
     samples = []
-    for _ in range(3):
+    for _ in range(REPEAT):
         path = _prepare_scan_db(root, rows, name="vacuum")
         db = Database(path, pool_size=1024)
         db.execute_one(f"UPDATE t SET score = score + 1 WHERE id < {updated}")
@@ -221,17 +236,19 @@ def bench_vacuum(root: Path, rows: int) -> dict:
         assert "rows kept" in result.tag
         db.close()
     best = min(samples)
+    median = statistics.median(samples)
     return {
         "name": f"VACUUM 压实 {rows} 行（回收 {updated} 个死版本）",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
 
 def bench_truncate(root: Path, rows: int) -> dict:
     samples = []
-    for _ in range(3):
+    for _ in range(REPEAT):
         path = _prepare_scan_db(root, rows, name="truncate")
         db = Database(path, pool_size=1024)
         start = time.perf_counter()
@@ -240,10 +257,12 @@ def bench_truncate(root: Path, rows: int) -> dict:
         assert result.affected == rows
         db.close()
     best = min(samples)
+    median = statistics.median(samples)
     return {
         "name": f"TRUNCATE 清空 {rows} 行",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -263,11 +282,12 @@ def bench_range_index(root: Path, rows: int) -> dict:
         db.execute_one("COMMIT")
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"索引范围查询（score >= 99，{probes} 次）",
         "rows": probes,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": probes / best,
     }
 
@@ -284,11 +304,12 @@ def bench_range_scan(root: Path, rows: int) -> dict:
         db.execute_one("COMMIT")
         db.close()
 
-    best, median = timed(run, repeat=1)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"无索引范围查询（score >= 99，{probes} 次，全表扫描）",
         "rows": probes,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": probes / best,
     }
 
@@ -328,11 +349,12 @@ def bench_join(root: Path, rows: int) -> dict:
         conn.execute_one("COMMIT")
         conn.close()
 
-    best, median = timed(run, repeat=3)
+    best, median = timed(run, repeat=REPEAT)
     return {
         "name": f"等值连接（{rows} 订单 × {customers} 客户，哈希）",
         "rows": rows,
         "seconds": best,
+        "median_seconds": median,
         "per_sec": rows / best,
     }
 
@@ -356,8 +378,19 @@ BENCHMARKS = [
 def main() -> int:
     parser = argparse.ArgumentParser(description="LumenDB 基准测试")
     parser.add_argument("--rows", type=int, default=1000, help="基础数据量")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=3,
+        help="每个场景重复次数（取最好成绩与中位数）",
+    )
     parser.add_argument("--out", type=Path, default=None, help="输出 Markdown 文件")
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat 必须 >= 1")
+
+    global REPEAT
+    REPEAT = args.repeat
 
     with tempfile.TemporaryDirectory(prefix="lumendb-bench-") as tmp:
         root = Path(tmp)
@@ -367,12 +400,13 @@ def main() -> int:
             results.append(bench(root, args.rows))
 
     lines = [
-        "| 场景 | 行数 | 用时 (s) | 吞吐 (行/秒) |",
-        "|---|---:|---:|---:|",
+        "| 场景 | 行数 | 最好 (s) | 中位 (s) | 吞吐 (行/秒) |",
+        "|---|---:|---:|---:|---:|",
     ]
     for r in results:
         lines.append(
-            f"| {r['name']} | {r['rows']} | {r['seconds']:.3f} | {r['per_sec']:.0f} |"
+            f"| {r['name']} | {r['rows']} | {r['seconds']:.3f} | "
+            f"{r['median_seconds']:.3f} | {r['per_sec']:.0f} |"
         )
     table = "\n".join(lines)
     print()

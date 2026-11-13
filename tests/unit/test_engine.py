@@ -362,6 +362,20 @@ class TestInsert:
         assert result.affected == 1
         assert result.rows == [(1, 3)]
 
+    def test_table_constraints_survive_reopen(self, tmp_path):
+        path = tmp_path / "reopen"
+        first = Database(path)
+        first.execute_one(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT uq_ab UNIQUE (a, b))"
+        )
+        first.execute_one("INSERT INTO t VALUES (1, 2)")
+        first.close()
+        second = Database(path)
+        with pytest.raises(DuplicateKeyError):
+            second.execute_one("INSERT INTO t VALUES (1, 2)")
+        second.execute_one("INSERT INTO t VALUES (1, 3)")
+        second.close()
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
