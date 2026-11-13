@@ -512,6 +512,39 @@ class TestInsert:
         with pytest.raises(BinderError):
             db.execute_one("CREATE VIEW bad (x) AS SELECT a, b FROM t")
 
+    def test_create_view_rollback(self, db):
+        db.execute_one("BEGIN")
+        db.execute_one("CREATE VIEW v AS SELECT 1")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM v")
+
+    def test_or_replace_view_failure_keeps_old(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one("CREATE OR REPLACE VIEW v AS SELECT nope FROM t")
+        assert rows(db, "SELECT * FROM v") == [(1,)]
+
+    def test_view_is_read_only(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("INSERT INTO v VALUES (1)")
+
+    def test_view_supports_aggregate_and_setop(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE TABLE u (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (1), (2)")
+        db.execute_one("INSERT INTO u VALUES (2), (3)")
+        db.execute_one(
+            "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u"
+        )
+        assert rows(db, "SELECT * FROM v ORDER BY a") == [(1,), (2,), (3,)]
+        db.execute_one("CREATE VIEW counts AS SELECT count(*) AS n FROM t")
+        assert rows(db, "SELECT n FROM counts") == [(3,)]
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
