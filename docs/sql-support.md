@@ -262,14 +262,15 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
-| `VACUUM FULL` / 缩小数据文件 | 回收页内空间，但文件大小不缩，空页留在链上 |
-| `NULLS FIRST/LAST` | 已实现；默认 ASC 时 NULL 最后、DESC 时 NULL 最前，可使用 `NULLS FIRST` / `NULLS LAST` 显式覆盖 |
+| 缩小数据文件 | `VACUUM` / `VACUUM FULL` 回收页内空间，但文件大小不缩，空页留在链上 |
 
 ## 已知的行为细节
 
 - `SELECT FROM` 这类把关键字当列名的笔误会在解析阶段报错，不会被静默解释成
   "列名叫 FROM"。
 - `ORDER BY` 先按输出别名解析，解析不到再按输入列编译成隐藏列。
+- `ORDER BY ... NULLS FIRST/LAST` 已实现；默认 `ASC` 时 `NULL` 最后、`DESC` 时
+  `NULL` 最前，可使用 `NULLS FIRST` / `NULLS LAST` 逐键显式覆盖。
 - `SAVEPOINT` 是事务内保存点：`ROLLBACK TO` 会撤销保存点之后的页写入
   和 DDL/目录对象变更，事务继续保持活动；`RELEASE` 连同它之后建立的
   保存点一起释放。保存点不写 WAL、不跨连接持久化。
