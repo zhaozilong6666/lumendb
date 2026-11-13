@@ -277,6 +277,12 @@ class Catalog:
         new_key = new_name.lower()
         if old_key not in self.tables:
             raise TableNotFoundError(f"表 {old_name!r} 不存在")
+        dependents = self._view_dependents(old_key)
+        if dependents:
+            raise BinderError(
+                f"表 {old_name!r} 被视图依赖：{', '.join(dependents)}",
+                hint="先 DROP VIEW 依赖它的视图，再重命名表",
+            )
         if new_key in self.tables:
             raise TableAlreadyExistsError(
                 f"表 {new_name!r} 已存在",

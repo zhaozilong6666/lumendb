@@ -591,6 +591,15 @@ class TestInsert:
             db.execute_one("CREATE OR REPLACE VIEW v AS SELECT a FROM v")
         assert rows(db, "SELECT * FROM v") == []
 
+    def test_rename_table_blocked_by_view_dependency(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t RENAME TO u")
+        db.execute_one("DROP VIEW v")
+        db.execute_one("ALTER TABLE t RENAME TO u")
+        db.execute_one("SELECT * FROM u")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

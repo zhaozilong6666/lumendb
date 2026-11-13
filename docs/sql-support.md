@@ -55,7 +55,8 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
 普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
 视图依赖会随目录持久化：`DROP TABLE` 若有视图引用该表会报错，`DROP VIEW` 若有其他
-视图引用该视图也会报错，避免留下悬空定义。视图可以带显式列名清单，例如
+视图引用该视图也会报错，`ALTER TABLE ... RENAME` 同样会拒绝重命名被视图引用的表，
+避免留下悬空定义。视图可以带显式列名清单，例如
 `CREATE VIEW v (x, y) AS SELECT a, b FROM t`；列名数量
 必须与查询输出一致，且列名不能重复，否则在建视图阶段报错。视图定义也支持非递归
 `WITH`（CTE），例如 `CREATE VIEW v AS WITH x AS (SELECT ...) SELECT * FROM x`；
