@@ -2206,6 +2206,25 @@ class TestExpressions:
         setup_users(db)
         assert rows(db, "SELECT id FROM users WHERE name NOT LIKE 'a%' ORDER BY id") == [(2,), (3,)]
 
+    def test_like_escape(self, db):
+        db.execute_one("CREATE TABLE t (name TEXT)")
+        db.execute_one(
+            "INSERT INTO t VALUES ('100%'), ('100x'), ('100_'), ('a%b')"
+        )
+        assert rows(
+            db, "SELECT name FROM t WHERE name LIKE '100!%' ESCAPE '!'"
+        ) == [("100%",)]
+        assert rows(
+            db, "SELECT name FROM t WHERE name LIKE '100!_%' ESCAPE '!'"
+        ) == [("100_",)]
+        assert rows(
+            db, "SELECT name FROM t WHERE name LIKE '100%' ESCAPE '!' ORDER BY name"
+        ) == [("100%",), ("100_",), ("100x",)]
+        with pytest.raises(TypeMismatchError):
+            rows(db, "SELECT name FROM t WHERE name LIKE '100!%' ESCAPE '!!'")
+        with pytest.raises(BinderError):
+            rows(db, "SELECT name FROM t WHERE name LIKE '100!' ESCAPE '!'")
+
     def test_in(self, db):
         setup_users(db)
         assert rows(db, "SELECT id FROM users WHERE id IN (1, 3) ORDER BY id") == [(1,), (3,)]

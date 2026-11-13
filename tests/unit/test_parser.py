@@ -435,6 +435,14 @@ class TestExpressions:
         expr = parse_statement("SELECT 1 WHERE a NOT LIKE 'x'").select.where
         assert isinstance(expr, Like) and expr.negated
 
+    def test_like_escape(self):
+        expr = parse_statement(
+            "SELECT 1 WHERE a LIKE 'x!%' ESCAPE '!'"
+        ).select.where
+        assert isinstance(expr, Like)
+        assert isinstance(expr.escape, Literal)
+        assert expr.escape.value == "!"
+
     def test_scalar_subquery(self):
         expr = parse_statement("SELECT (SELECT 1)").select.items[0].expr
         assert isinstance(expr, ScalarSubquery)

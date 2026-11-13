@@ -158,9 +158,13 @@ class Like(Expr):
     operand: Expr
     pattern: Expr
     negated: bool = False
+    escape: Optional[Expr] = None
 
     def render(self) -> str:
-        return f"{self.operand.render()} {'NOT ' if self.negated else ''}LIKE {self.pattern.render()}"
+        text = f"{self.operand.render()} {'NOT ' if self.negated else ''}LIKE {self.pattern.render()}"
+        if self.escape is not None:
+            text += f" ESCAPE {self.escape.render()}"
+        return text
 
 
 @dataclass(frozen=True)

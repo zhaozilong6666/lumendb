@@ -1064,7 +1064,13 @@ class Parser:
 
             if tok.is_keyword("LIKE"):
                 self._advance()
-                left = Like(left, self._parse_additive(), negated=negated)
+                pattern = self._parse_additive()
+                escape = None
+                if self._match_kw("ESCAPE"):
+                    escape = self._parse_additive()
+                left = Like(
+                    left, pattern, negated=negated, escape=escape
+                )
                 continue
 
             if tok.is_keyword("NOT"):

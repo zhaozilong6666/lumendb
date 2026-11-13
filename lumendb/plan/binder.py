@@ -480,21 +480,36 @@ class Binder:
     def _like(self, expr: Like, schema, allow_agg):
         fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
         pat, _ = self.compile(expr.pattern, schema, allow_agg=allow_agg)
+        esc = (
+            self.compile(expr.escape, schema, allow_agg=allow_agg)[0]
+            if expr.escape is not None
+            else None
+        )
         negated = expr.negated
         import re
 
-        cache: dict[str, Any] = {}
+        cache: dict[tuple[str, str], Any] = {}
 
         def _like(ctx):
             value = fn(ctx)
             pattern = pat(ctx)
+            escape = esc(ctx) if esc is not None else None
             if value is None or pattern is None:
                 return None
-            rx = cache.get(pattern)
+            if escape is not None:
+                if not isinstance(escape, str) or len(escape) != 1:
+                    raise TypeMismatchError(
+                        "LIKE ESCAPE 必须是单个字符",
+                        detail=f"实际值：{escape!r}",
+                    )
+            key = (pattern, escape)
+            rx = cache.get(key)
             if rx is None:
-                rx = re.compile(_like_to_regex(pattern), re.DOTALL)
+                rx = re.compile(
+                    _like_to_regex(pattern, escape), re.DOTALL
+                )
                 if len(cache) < 256:
-                    cache[pattern] = rx
+                    cache[key] = rx
             hit = rx.fullmatch(str(value)) is not None
             return (not hit) if negated else hit
 
@@ -1601,15 +1616,28 @@ def _children(expr: Expr) -> list[Expr]:
     return []
 
 
-def _like_to_regex(pattern: str) -> str:
+def _like_to_regex(pattern: str, escape: Optional[str] = None) -> str:
     out = []
-    for ch in pattern:
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if escape is not None and ch == escape:
+            i += 1
+            if i >= len(pattern):
+                raise BinderError(
+                    "LIKE 模式不能以转义字符结尾",
+                    hint="转义字符后面必须跟一个待转义字符",
+                )
+            out.append(re_escape(pattern[i]))
+            i += 1
+            continue
         if ch == "%":
             out.append(".*")
         elif ch == "_":
             out.append(".")
         else:
             out.append(re_escape(ch))
+        i += 1
     return "".join(out)
 
 

@@ -190,7 +190,11 @@ CTE 按书写顺序绑定：后面的 CTE 和主查询都可以引用前面的 C
 
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
-表达式：`+ - * / %`、`||`（字符串拼接，`NULL` 传染）、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IS [NOT] DISTINCT FROM`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
+表达式：`+ - * / %`、`||`（字符串拼接，`NULL` 传染）、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IS [NOT] DISTINCT FROM`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`，支持 `ESCAPE 'c'` 指定单字符转义）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
+
+`LIKE ... ESCAPE 'c'` 用单个字符作为转义符，可把 `%`、`_` 或转义符本身当作普通
+字符匹配；转义符为空、长度不是 1，或模式以转义符结尾时会明确报错。没有 `ESCAPE`
+时保持原行为，`\` 不是默认转义符。
 
 条件表达式（两种形式都支持）：
 
