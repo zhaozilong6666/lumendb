@@ -538,6 +538,11 @@ class Parser:
         return TypeSpec(data_type, length)
 
     def _parse_create_index(self, unique: bool = False) -> CreateIndex:
+        if_not_exists = False
+        if self._match_kw("IF"):
+            self._expect_kw("NOT")
+            self._expect_kw("EXISTS")
+            if_not_exists = True
         name = self._parse_ident("索引名")
         self._expect_kw("ON")
         table = self._parse_ident("表名")
@@ -546,7 +551,13 @@ class Parser:
         while self._match_punct("comma"):
             columns.append(self._parse_ident("列名"))
         self._expect_punct("rparen", ")")
-        return CreateIndex(name=name, table=table, columns=columns, unique=unique)
+        return CreateIndex(
+            name=name,
+            table=table,
+            columns=columns,
+            unique=unique,
+            if_not_exists=if_not_exists,
+        )
 
     def _parse_drop(self) -> Statement:
         self._expect_kw("DROP")

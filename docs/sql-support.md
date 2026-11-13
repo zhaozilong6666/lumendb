@@ -16,7 +16,7 @@ CREATE TABLE t (
 );
 CREATE TABLE t2 (a INT, b INT, CONSTRAINT uq_ab UNIQUE (a, b));
 CREATE TABLE t3 (a INT, b INT, PRIMARY KEY (a, b));
-CREATE [UNIQUE] INDEX idx_name ON t (col [, col...]);
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
 ALTER TABLE t ADD [COLUMN] note TEXT;

@@ -371,6 +371,7 @@ class CreateIndex(Statement):
     table: str
     columns: list[str]
     unique: bool = False
+    if_not_exists: bool = False
 
 
 @dataclass

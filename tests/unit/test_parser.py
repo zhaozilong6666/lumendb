@@ -167,6 +167,11 @@ class TestCreateIndex:
         stmt = parse_statement("CREATE INDEX i ON t (a, b, c)")
         assert stmt.columns == ["a", "b", "c"]
 
+    def test_create_index_if_not_exists(self):
+        stmt = parse_statement("CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)")
+        assert stmt.if_not_exists and stmt.unique
+        assert stmt.name == "i" and stmt.columns == ["a"]
+
     def test_drop_index(self):
         assert parse_statement("DROP INDEX i").name == "i"
 

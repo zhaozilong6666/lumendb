@@ -1095,6 +1095,11 @@ class Executor:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
         if name in table.indexes:
+            if stmt.if_not_exists:
+                return Result(
+                    tag="CREATE INDEX",
+                    notice=f"索引 {stmt.name.lower()} 已存在，已跳过",
+                )
             raise IndexAlreadyExistsError(f"索引 {stmt.name!r} 已存在")
         for cname in stmt.columns:
             table.column(cname)

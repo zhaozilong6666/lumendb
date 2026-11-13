@@ -7,6 +7,7 @@ from lumendb.errors import (
     BinderError,
     ColumnNotFoundError,
     DuplicateKeyError,
+    IndexAlreadyExistsError,
     NotNullViolationError,
     NotSupportedError,
     SQLSyntaxError,
@@ -218,6 +219,15 @@ class TestDdl:
     def test_create_index(self, db):
         setup_users(db)
         assert db.execute_one("CREATE INDEX idx_age ON users (age)").tag == "CREATE INDEX"
+
+    def test_create_index_if_not_exists(self, db):
+        setup_users(db)
+        db.execute_one("CREATE INDEX idx_age ON users (age)")
+        result = db.execute_one("CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
+        assert result.tag == "CREATE INDEX"
+        assert "已存在" in result.notice
+        with pytest.raises(IndexAlreadyExistsError):
+            db.execute_one("CREATE INDEX idx_age ON users (age)")
 
     def test_create_index_backfills(self, db):
         setup_users(db)
