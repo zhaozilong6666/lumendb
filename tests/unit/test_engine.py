@@ -1359,6 +1359,12 @@ class TestSubquery:
         with pytest.raises(TypeMismatchError):
             db.execute_one("SELECT COALESCE(1, 'a')")
 
+    def test_sum_null_is_null(self, db):
+        db.execute_one("CREATE TABLE nums (v INT)")
+        db.execute_one("INSERT INTO nums VALUES (1), (2)")
+        result = db.execute_one("SELECT SUM(NULL) AS s FROM nums")
+        assert result.rows == [(None,)]
+
 
 class TestTransactions:
     def test_rollback_discards_changes(self, db):

@@ -510,6 +510,14 @@ class Binder:
         if len(expr.args) != 1:
             raise TypeMismatchError(f"{kind} 需要且只需要 1 个参数")
         arg_fn, arg_type = self.compile(expr.args[0], schema, allow_agg=False)
+        if kind in ("SUM", "AVG") and arg_type.unknown:
+            # SUM(NULL) / AVG(NULL) 的结果是 NULL；类型由各自聚合语义决定。
+            result = (
+                TypeSpec(DataType.TEXT, unknown=True)
+                if kind == "SUM"
+                else TypeSpec(DataType.FLOAT)
+            )
+            return AggSpec(kind, arg_fn, expr.distinct, result)
         if kind in ("SUM", "AVG") and not arg_type.is_numeric:
             raise TypeMismatchError(
                 f"{kind} 需要数值参数",
