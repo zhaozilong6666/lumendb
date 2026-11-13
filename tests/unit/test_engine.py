@@ -258,6 +258,26 @@ class TestInsert:
         db.execute_one("INSERT INTO t (a) VALUES (1)")
         assert rows(db, "SELECT a, b FROM t") == [(1, None)]
 
+    def test_default_values(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY DEFAULT 1, "
+            "name TEXT DEFAULT 'anon', age INT)"
+        )
+        result = db.execute_one(
+            "INSERT INTO t DEFAULT VALUES RETURNING id, name, age"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, "anon", None)]
+        db.execute_one(
+            "INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING"
+        )
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(1,)]
+
+    def test_default_values_missing_not_null_rejected(self, db):
+        db.execute_one("CREATE TABLE t (id INT NOT NULL)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t DEFAULT VALUES")
+
     def test_not_null_violation(self, db):
         setup_users(db)
         with pytest.raises(NotNullViolationError):

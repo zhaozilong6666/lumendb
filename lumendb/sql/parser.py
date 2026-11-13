@@ -620,7 +620,13 @@ class Parser:
             self._expect_punct("rparen", ")")
         query = None
         rows: list[list] = []
-        if self._cur.is_keyword("VALUES"):
+        default_values = False
+        if self._match_kw("DEFAULT"):
+            if columns is not None:
+                raise self._error("INSERT ... DEFAULT VALUES 不能指定列名")
+            self._expect_kw("VALUES")
+            default_values = True
+        elif self._cur.is_keyword("VALUES"):
             self._advance()
             while True:
                 self._expect_punct("lparen", "(")
@@ -634,7 +640,7 @@ class Parser:
         elif self._cur.is_keyword("SELECT"):
             query = self._parse_query_expression()
         else:
-            raise self._error("INSERT 之后期望 VALUES 或 SELECT")
+            raise self._error("INSERT 之后期望 VALUES、DEFAULT VALUES 或 SELECT")
 
         on_conflict_nothing = False
         conflict_columns = None
@@ -675,6 +681,7 @@ class Parser:
             columns=columns,
             rows=rows,
             query=query,
+            default_values=default_values,
             on_conflict_nothing=on_conflict_nothing,
             conflict_columns=conflict_columns,
             conflict_constraint=conflict_constraint,

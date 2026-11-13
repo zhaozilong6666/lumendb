@@ -441,6 +441,8 @@ class Insert(Statement):
     rows: list[list[Expr]]
     #: ``INSERT ... SELECT`` 的来源；为 None 时使用 ``rows``
     query: Optional[Union[Select, CompoundSelect]] = None
+    #: ``INSERT ... DEFAULT VALUES``：按每列默认值写入一行
+    default_values: bool = False
     #: ``WITH ... INSERT`` 的作用域
     ctes: list["Cte"] = field(default_factory=list)
     #: ``ON CONFLICT DO NOTHING``：唯一键冲突时跳过该行而不是报错

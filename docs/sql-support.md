@@ -87,6 +87,7 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 ```sql
 INSERT INTO t VALUES (1, 'a', 3), (2, 'b', 4);
 INSERT INTO t (id, name) VALUES (1, 'a');
+INSERT INTO t DEFAULT VALUES;                              -- 按每列默认值写入一行
 INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING;  -- 唯一键冲突时跳过该行
 INSERT INTO t VALUES (1, 'a') ON CONFLICT (id)
   DO UPDATE SET name = 'updated';                      -- 冲突时更新已有行
@@ -110,6 +111,9 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 `INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
 检查；来源查询先完整物化再写入，所以 `INSERT INTO t SELECT * FROM t` 不会边读边写
 导致无限增长。`WITH ... INSERT ... SELECT` 也支持，CTE 只在这次插入的源查询里可见。
+`INSERT ... DEFAULT VALUES` 不接受列清单，按目录里的列默认值组装一行；没有默认值的
+可空列为 `NULL`，`NOT NULL` 列缺少默认值时按约束报错。它同样支持 `RETURNING` 和
+`ON CONFLICT`。
 
 ### 查询
 

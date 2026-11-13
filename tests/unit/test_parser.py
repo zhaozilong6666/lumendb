@@ -195,6 +195,14 @@ class TestDml:
         assert stmt.query is not None
         assert stmt.rows == []
 
+    def test_insert_default_values(self):
+        stmt = parse_statement("INSERT INTO t DEFAULT VALUES")
+        assert stmt.default_values is True
+        assert stmt.rows == []
+        assert stmt.query is None
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("INSERT INTO t (id) DEFAULT VALUES")
+
     def test_insert_select_with_columns(self):
         stmt = parse_statement("INSERT INTO t (a, b) SELECT x, y FROM src")
         assert stmt.columns == ["a", "b"]

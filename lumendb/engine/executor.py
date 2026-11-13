@@ -1388,13 +1388,10 @@ class Executor:
         returned: list[tuple] = []
         count = 0
 
-        for row_exprs in stmt.rows:
-            values: list[Any] = []
-            for expr in row_exprs:
-                fn, _ = self.binder.compile(expr, empty_schema, allow_agg=False)
-                values.append(fn(EvalContext(())))
-
-            prepared = self._prepare_values(table, stmt.columns, values)
+        if stmt.default_values:
+            prepared = self._prepare_values(
+                table, None, [column.default for column in table.columns]
+            )
             delta, returning_row = self._insert_row(
                 table,
                 heap,
@@ -1410,6 +1407,29 @@ class Executor:
             count += delta
             if returning_row is not None:
                 returned.append(returning_row)
+        else:
+            for row_exprs in stmt.rows:
+                values: list[Any] = []
+                for expr in row_exprs:
+                    fn, _ = self.binder.compile(expr, empty_schema, allow_agg=False)
+                    values.append(fn(EvalContext(())))
+
+                prepared = self._prepare_values(table, stmt.columns, values)
+                delta, returning_row = self._insert_row(
+                    table,
+                    heap,
+                    txn,
+                    prepared,
+                    do_nothing=stmt.on_conflict_nothing,
+                    on_conflict_update=stmt.on_conflict_update,
+                    conflict_index=conflict_index,
+                    assignment_fns=assignment_fns,
+                    conflict_where_fn=conflict_where_fn,
+                    ret_fns=ret_fns,
+                )
+                count += delta
+                if returning_row is not None:
+                    returned.append(returning_row)
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
