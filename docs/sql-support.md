@@ -26,6 +26,7 @@ ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 CREATE VIEW v AS SELECT id, name FROM t WHERE age >= 18;
 CREATE VIEW v2 (user_id, user_name) AS SELECT id, name FROM t;
+CREATE VIEW v3 AS WITH recent AS (SELECT id FROM t WHERE age >= 18) SELECT * FROM recent;
 CREATE OR REPLACE VIEW v AS SELECT id FROM t;
 DROP VIEW [IF EXISTS] v;
 SHOW VIEWS;
@@ -54,7 +55,9 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
 普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
 视图可以带显式列名清单，例如 `CREATE VIEW v (x, y) AS SELECT a, b FROM t`；列名数量
-必须与查询输出一致，且列名不能重复，否则在建视图阶段报错。视图不能直接
+必须与查询输出一致，且列名不能重复，否则在建视图阶段报错。视图定义也支持非递归
+`WITH`（CTE），例如 `CREATE VIEW v AS WITH x AS (SELECT ...) SELECT * FROM x`；
+递归 CTE 和 `WITH ... INSERT/UPDATE/DELETE` 仍不支持。视图不能直接
 `INSERT`/`UPDATE`/`DELETE`；对视图执行 DML 会得到“表不存在”类错误。
 `CREATE OR REPLACE VIEW` 会先完整绑定新定义，成功后再原子替换旧定义；绑定失败时旧视图
 保持不变。`DROP VIEW` 只删除目录定义，不影响基表数据。`SHOW VIEWS` 列出视图名和

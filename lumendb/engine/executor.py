@@ -767,7 +767,10 @@ class Executor:
         # 建视图时先完整绑定一次，提前暴露未知表/列和类型错误；
         # 视图不物化数据，SELECT 时再按保存的 token 重新绑定。
         binder = self._new_binder()
-        bound_cols = binder.bind_select(stmt.query)
+        if isinstance(stmt.query, Query):
+            bound_cols = binder.bind_query(stmt.query)
+        else:
+            bound_cols = binder.bind_select(stmt.query)
         if stmt.columns:
             if len(stmt.columns) != len(bound_cols):
                 raise BinderError(

@@ -126,7 +126,9 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 解析一次（只在绑定阶段发生，不重复执行基表扫描）。
 
 Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先解析 token，
-再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。若视图带显式列名清单，
+再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。视图定义可以带非递归
+`WITH`，此时 token 重新解析为 `Query` 并走 `bind_query`；普通定义仍走 `bind_select`。
+若视图带显式列名清单，
 目录会在 `view_columns` 里保存别名，Binder 用别名覆盖输出列名并校验列数/重复名。
 `view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。

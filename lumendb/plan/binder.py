@@ -45,6 +45,7 @@ from ..sql.ast import (
     Like,
     Literal,
     ParamRef,
+    Query,
     ScalarSubquery,
     Star,
     render_expr,
@@ -1198,11 +1199,14 @@ class Binder:
             view_query = Parser(
                 [Token(kind, value, 0, 0) for kind, value in tokens]
                 + [Token("eof", "", 0, 0)]
-            ).parse_query_expression()
+            ).parse_view_expression()
             view_binder = Binder(self.catalog, self.params)
             view_binder.subquery_runner = self.subquery_runner
             view_binder.view_stack = self.view_stack | {view_key}
-            child, cols = view_binder.bind_select(view_query)
+            if isinstance(view_query, Query):
+                child, cols = view_binder.bind_query(view_query)
+            else:
+                child, cols = view_binder.bind_select(view_query)
             aliases = self.catalog.get_view_columns(name)
             if aliases:
                 if len(aliases) != len(cols):

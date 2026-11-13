@@ -119,6 +119,20 @@ class TestCreateTable:
         assert isinstance(stmt, CreateView)
         assert stmt.columns == ["x", "y"]
 
+    def test_view_with_cte(self):
+        from lumendb.sql.ast import CreateView, Query
+
+        stmt = parse_statement(
+            "CREATE VIEW v AS WITH x AS (SELECT 1) SELECT * FROM x"
+        )
+        assert isinstance(stmt, CreateView)
+        assert isinstance(stmt.query, Query)
+        assert stmt.query.ctes[0].name == "x"
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "CREATE VIEW v AS WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"
+            )
+
     def test_show_views(self):
         from lumendb.sql.ast import ShowViews
 

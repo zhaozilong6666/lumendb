@@ -380,7 +380,12 @@ class Parser:
             self._expect_punct("rparen", ")")
         self._expect_kw("AS")
         start = self._i
-        query = self._parse_query_expression()
+        query = self.parse_view_expression()
+        if not isinstance(query, (Query, Select, CompoundSelect)):
+            raise NotSupportedError(
+                "视图定义只能是 SELECT 查询",
+                hint="WITH 之后的 INSERT/UPDATE/DELETE 不能作为视图定义",
+            )
         tokens = [(tok.kind, tok.value) for tok in self._tokens[start:self._i]]
         return CreateView(
             name=name,
@@ -671,6 +676,12 @@ class Parser:
 
     def parse_query_expression(self) -> Select | CompoundSelect:
         """公开入口：把 token 流解析为一条 SELECT / 集合查询。"""
+        return self._parse_query_expression()
+
+    def parse_view_expression(self) -> Query | Select | CompoundSelect:
+        """视图定义：允许 ``WITH ... SELECT``，也允许直接 SELECT / 集合查询。"""
+        if self._cur.is_keyword("WITH"):
+            return self._parse_with()
         return self._parse_query_expression()
 
     def _parse_query_expression(self) -> Select | CompoundSelect:

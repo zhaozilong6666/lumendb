@@ -545,6 +545,15 @@ class TestInsert:
         db.execute_one("CREATE VIEW counts AS SELECT count(*) AS n FROM t")
         assert rows(db, "SELECT n FROM counts") == [(3,)]
 
+    def test_view_definition_can_use_cte(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (2)")
+        db.execute_one(
+            "CREATE VIEW v AS WITH x AS (SELECT a FROM t WHERE a > 1) "
+            "SELECT a FROM x"
+        )
+        assert rows(db, "SELECT * FROM v") == [(2,)]
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
