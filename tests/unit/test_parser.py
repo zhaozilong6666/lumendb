@@ -127,10 +127,18 @@ class TestCreateTable:
         fk = next(c for c in stmt.constraints if c.kind == "FOREIGN KEY")
         assert fk.on_delete == "RESTRICT"
 
-    def test_foreign_key_on_update_cascade_rejected(self):
+    def test_foreign_key_on_update_cascade(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE CASCADE)"
+        )
+        spec = stmt.columns[0].references
+        assert spec is not None
+        assert spec.on_update == "CASCADE"
+
+    def test_foreign_key_on_update_set_null_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement(
-                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE CASCADE)"
+                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET NULL)"
             )
 
     def test_foreign_key_alter_add_constraint(self):

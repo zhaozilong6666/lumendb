@@ -3299,6 +3299,61 @@ class TestForeignKey:
         db.execute_one("DELETE FROM node WHERE id = 1")
         assert rows(db, "SELECT COUNT(*) FROM node") == [(0,)]
 
+    def test_on_update_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON UPDATE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1), (2)")
+        db.execute_one("INSERT INTO c VALUES (10, 1), (20, 2)")
+        db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT id, pid FROM c ORDER BY id") == [
+            (10, 5),
+            (20, 2),
+        ]
+
+    def test_on_update_cascade_multi_level(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT UNIQUE REFERENCES p(id) ON UPDATE CASCADE)"
+        )
+        db.execute_one(
+            "CREATE TABLE g (cpid INT REFERENCES c(pid) ON UPDATE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("INSERT INTO g VALUES (1)")
+        db.execute_one("UPDATE p SET id = 7 WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(7,)]
+        assert rows(db, "SELECT cpid FROM g") == [(7,)]
+
+    def test_on_update_cascade_rollback(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON UPDATE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(5,)]
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+
+    def test_on_update_cascade_self_reference(self, db):
+        db.execute_one(
+            "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT, "
+            "FOREIGN KEY (parent_id) REFERENCES node(id) ON UPDATE CASCADE)"
+        )
+        db.execute_one("INSERT INTO node VALUES (1, NULL), (2, 1), (3, 2)")
+        db.execute_one("UPDATE node SET id = 7 WHERE id = 2")
+        assert rows(db, "SELECT id, parent_id FROM node ORDER BY id") == [
+            (1, None),
+            (3, 7),
+            (7, 1),
+        ]
+
     def test_on_delete_cascade_rollback(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(
@@ -3338,13 +3393,30 @@ class TestForeignKey:
         db.execute_one("ALTER TABLE c DROP CONSTRAINT fk_renamed")
         db.execute_one("INSERT INTO c VALUES (2)")
 
-    def test_alter_add_column_references_rejected(self, db):
+    def test_add_column_references(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one("CREATE TABLE c (id INT)")
-        with pytest.raises(NotSupportedError):
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one(
+            "ALTER TABLE c ADD COLUMN pid INT REFERENCES p(id) DEFAULT 1"
+        )
+        assert rows(db, "SELECT id, pid FROM c") == [(1, 1)]
+        db.execute_one("INSERT INTO c VALUES (2, 1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (3, 99)")
+
+    def test_add_column_references_failure_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (id INT)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
             db.execute_one(
-                "ALTER TABLE c ADD COLUMN pid INT REFERENCES p(id)"
+                "ALTER TABLE c ADD COLUMN pid INT REFERENCES p(id) DEFAULT 9"
             )
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one("SELECT pid FROM c")
+        assert rows(db, "SELECT id FROM c") == [(1,)]
 
     def test_drop_table_cascade_rollback_restores_fk(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")

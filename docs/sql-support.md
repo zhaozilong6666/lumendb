@@ -140,22 +140,24 @@ ALTER TABLE child ADD CONSTRAINT fk_child_parent2
 列级 `REFERENCES` 可省略被引用列（`pid INT REFERENCES parent`），此时取被引用表的
 主键；表级约束也遵循同样规则。被引用列必须存在，并且上有 `UNIQUE` 或 `PRIMARY KEY`
 索引；引用列与被引用列数量、顺序一致，类型必须完全相同。外键按 SQL 的 `MATCH
-SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查。删除动作支持默认的
-`RESTRICT` 与 `ON DELETE CASCADE`：`RESTRICT` 下删除被引用行时只要还有子行引用旧
-键就拒绝；`CASCADE` 会递归删除所有匹配子行（支持多级链和自引用链），并同步维护
-子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键仍抛 `ForeignKeyViolationError`
-（SQLSTATE `23503`）。当前 `ON UPDATE` 只支持 `RESTRICT`，没有 `SET NULL`、
-`SET DEFAULT`、`NO ACTION` 或 `DEFERRABLE` 延迟检查。外键定义（含删除动作）随目录
-JSON 持久化，事务 undo 会恢复外键字典；支持自引用（同一张表内 `REFERENCES` 自身），
-自引用未显式给列时同样取当前表主键，并允许新行直接引用自身。
+SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查。删除动作默认
+`RESTRICT`，支持 `ON DELETE CASCADE` 递归删除子行；更新被引用键默认 `RESTRICT`，
+支持 `ON UPDATE CASCADE` 递归同步子行（多级链和自引用链都会经过同一写路径）。
+`RESTRICT` 下删除或更新被引用键时只要还有子行引用旧键就拒绝；`CASCADE` 会按依赖
+顺序递归处理并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键仍抛
+`ForeignKeyViolationError`（SQLSTATE `23503`）。当前没有 `SET NULL`、`SET DEFAULT`、
+`NO ACTION` 或 `DEFERRABLE` 延迟检查。外键定义（含删除/更新动作）随目录 JSON 持久化，
+事务 undo 会恢复外键字典；支持自引用（同一张表内 `REFERENCES` 自身），自引用未显式
+给列时同样取当前表主键，并允许新行直接引用自身。
 
 外键命名空间与 CHECK、索引共享：显式 `CONSTRAINT name` 重名会报错；省略名字时自动生成
 `<table>_<cols>_fkey`，冲突时追加 `_2`。`ALTER TABLE ... DROP CONSTRAINT` 可删除外键，
 `RENAME CONSTRAINT` 也可重命名外键。已有表添加外键时会扫描存量行，任一可见行违反
 约束则整条 `ALTER TABLE` 失败并回滚，不会留下半成品外键。
 
-为避免悬空引用，DDL 还有以下保护：`ADD COLUMN ... REFERENCES` 暂不支持（先加列，再
-`ADD CONSTRAINT FOREIGN KEY`）；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
+为避免悬空引用，DDL 还有以下保护：`ADD COLUMN ... REFERENCES` 复用
+`ADD CONSTRAINT FOREIGN KEY` 的存量行回填与校验路径，先加列再原子建立外键，任一步
+失败整条语句回滚；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
 `ALTER COLUMN TYPE` 会拒绝；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
 CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 拒绝被外键引用的表；
 删除支撑外键的唯一索引/唯一约束前，必须先删除外键。`RENAME TO` / `RENAME COLUMN`
@@ -361,7 +363,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | 删除支持 `RESTRICT` / `CASCADE`；不支持 `ON UPDATE CASCADE`、`SET NULL`、`SET DEFAULT`、`NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；`ADD COLUMN ... REFERENCES` 暂不支持 |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE`；不支持 `SET NULL`、`SET DEFAULT`、`NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL` |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

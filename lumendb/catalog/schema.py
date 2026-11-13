@@ -113,6 +113,7 @@ class ForeignKeyDef:
     ref_table: str
     ref_columns: tuple[str, ...]
     on_delete: str = "RESTRICT"
+    on_update: str = "RESTRICT"
 
     def to_json(self) -> dict:
         return {
@@ -121,6 +122,7 @@ class ForeignKeyDef:
             "ref_table": self.ref_table,
             "ref_columns": list(self.ref_columns),
             "on_delete": self.on_delete,
+            "on_update": self.on_update,
         }
 
     @classmethod
@@ -131,6 +133,7 @@ class ForeignKeyDef:
             ref_table=data["ref_table"],
             ref_columns=tuple(data["ref_columns"]),
             on_delete=data.get("on_delete", "RESTRICT"),
+            on_update=data.get("on_update", "RESTRICT"),
         )
 
 
@@ -292,6 +295,10 @@ def validate_table_def(table: TableDef) -> None:
         if fk.on_delete not in ("RESTRICT", "CASCADE"):
             raise NotSupportedError(
                 f"外键 {name!r} 的删除动作非法：{fk.on_delete!r}"
+            )
+        if fk.on_update not in ("RESTRICT", "CASCADE"):
+            raise NotSupportedError(
+                f"外键 {name!r} 的更新动作非法：{fk.on_update!r}"
             )
         for cname in fk.columns:
             if not table.has_column(cname):

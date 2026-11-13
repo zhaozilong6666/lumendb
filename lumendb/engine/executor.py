@@ -65,6 +65,7 @@ from ..sql.ast import (
     ShowTables,
     ShowViews,
     Statement,
+    TableConstraint,
     Update,
     render_expr,
 )
@@ -1014,6 +1015,7 @@ class Executor:
                 ref_table=ref_table,
                 ref_columns=ref_columns,
                 on_delete=spec.on_delete,
+                on_update=spec.on_update,
             )
             used.add(name)
 
@@ -1030,6 +1032,7 @@ class Executor:
                     ref_columns=list(constraint.ref_columns),
                     name=constraint.name,
                     on_delete=constraint.on_delete,
+                    on_update=constraint.on_update,
                 ),
                 list(constraint.columns),
             )
@@ -1254,11 +1257,6 @@ class Executor:
                 hint="换一个列名，或先 DROP TABLE 重建",
             )
         column = _to_column(stmt.column)
-        if stmt.column.references is not None:
-            raise NotSupportedError(
-                "ADD COLUMN 暂不支持 REFERENCES",
-                hint="先 ADD COLUMN，再用 ALTER TABLE ADD CONSTRAINT FOREIGN KEY",
-            )
         if not column.nullable and column.default is None:
             raise NotSupportedError(
                 "ADD COLUMN NOT NULL 需要提供 DEFAULT",
@@ -1305,13 +1303,29 @@ class Executor:
         txn.undo_log.append(undo)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(
-            tag="ALTER TABLE",
-            notice=(
-                f"已添加列 {name}；旧记录在读取时按默认值补齐，"
-                "不重写堆页"
-            ),
+        notice = (
+            f"已添加列 {name}；旧记录在读取时按默认值补齐，"
+            "不重写堆页"
         )
+        ref = stmt.column.references
+        if ref is not None:
+            fk_result = self._alter_add_constraint(
+                AlterTableAddConstraint(
+                    table=stmt.table,
+                    constraint=TableConstraint(
+                        kind="FOREIGN KEY",
+                        columns=[name],
+                        name=ref.name,
+                        ref_table=ref.ref_table,
+                        ref_columns=list(ref.ref_columns),
+                        on_delete=ref.on_delete,
+                        on_update=ref.on_update,
+                    ),
+                ),
+                txn,
+            )
+            notice += f"；{fk_result.notice}"
+        return Result(tag="ALTER TABLE", notice=notice)
 
     def _alter_default(
         self, stmt: AlterTableAlterDefault, txn: Transaction
@@ -1834,6 +1848,7 @@ class Executor:
                 ref_table=ref_name,
                 ref_columns=ref_columns,
                 on_delete=constraint.on_delete,
+                on_update=constraint.on_update,
             )
             provisional = TableDef(
                 name=table.name,
@@ -2511,28 +2526,21 @@ class Executor:
         rid: RID,
         old_values: Iterable[Any],
         new_values: list[Any],
+        _updating: Optional[set[tuple[str, RID]]] = None,
     ) -> list[Any]:
         """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。"""
         old_tuple = tuple(old_values)
         prepared = self._prepare_values(table, None, new_values)
         self._check_checks(table, prepared)
         self._check_foreign_keys(table, prepared, txn)
-        for ref_table in self._catalog.list_tables():
-            for fk in ref_table.foreign_keys.values():
-                if fk.ref_table != table.name:
-                    continue
-                if any(
-                    old_tuple[table.column_index(name)]
-                    != prepared[table.column_index(name)]
-                    for name in fk.ref_columns
-                ):
-                    self._check_referenced_by(
-                        table, list(old_tuple), txn, skip_rid=rid
-                    )
-                    break
-            else:
-                continue
-            break
+        updating = _updating if _updating is not None else set()
+        ident = (table.name, rid)
+        if ident in updating:
+            return prepared
+        updating.add(ident)
+        pending = self._plan_referenced_updates(
+            table, old_tuple, prepared, txn, rid, updating
+        )
 
         changed_indexes = [
             idx
@@ -2555,7 +2563,80 @@ class Executor:
             if new_key is not None:
                 tree.insert(txn, new_key, rid)
             idx.root_page = tree.root_page
+        for child, child_rid, child_old, child_new in pending:
+            child_heap = HeapFile(self._bp, child, self._txns)
+            self._rewrite_row(
+                child,
+                child_heap,
+                txn,
+                child_rid,
+                child_old,
+                child_new,
+                _updating=updating,
+            )
         return prepared
+
+    def _plan_referenced_updates(
+        self,
+        table: TableDef,
+        old_values: tuple[Any, ...],
+        new_values: list[Any],
+        txn: Transaction,
+        rid: RID,
+        updating: set[tuple[str, RID]],
+    ) -> list[tuple[TableDef, RID, list[Any], list[Any]]]:
+        """收集被引用键变化影响的行；RESTRICT 立即报错，CASCADE 延后重写。"""
+        pending: dict[tuple[str, RID], tuple[TableDef, RID, list[Any], list[Any]]] = {}
+        for child in self._catalog.list_tables():
+            for fk in child.foreign_keys.values():
+                if fk.ref_table != table.name:
+                    continue
+                if all(
+                    old_values[table.column_index(name)]
+                    == new_values[table.column_index(name)]
+                    for name in fk.ref_columns
+                ):
+                    continue
+                old_key = tuple(
+                    old_values[table.column_index(name)]
+                    for name in fk.ref_columns
+                )
+                if any(value is None for value in old_key):
+                    continue
+                child_heap = HeapFile(self._bp, child, self._txns)
+                for child_rid, child_values in child_heap.scan(txn):
+                    child_ident = (child.name, child_rid)
+                    if child_ident in updating:
+                        continue
+                    child_key = tuple(
+                        child_values[child.column_index(name)]
+                        for name in fk.columns
+                    )
+                    if any(value is None for value in child_key):
+                        continue
+                    if child_key != old_key:
+                        continue
+                    if fk.on_update != "CASCADE":
+                        raise ForeignKeyViolationError(
+                            f"外键约束 {fk.name!r} 阻止更新被引用行",
+                            detail=(
+                                f"表 {child.name} 中仍有行引用 "
+                                f"{table.name}.{fk.ref_columns} = {old_key}"
+                            ),
+                            hint="先 DELETE/UPDATE 引用行，或使用 ON UPDATE CASCADE",
+                        )
+                    entry = pending.get(child_ident)
+                    if entry is None:
+                        child_new = list(child_values)
+                        entry = (child, child_rid, child_values, child_new)
+                        pending[child_ident] = entry
+                    else:
+                        child_new = entry[3]
+                    for local_name, ref_name in zip(fk.columns, fk.ref_columns):
+                        child_new[child.column_index(local_name)] = new_values[
+                            table.column_index(ref_name)
+                        ]
+        return list(pending.values())
 
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
         if stmt.ctes:
