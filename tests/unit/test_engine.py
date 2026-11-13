@@ -13,6 +13,7 @@ from lumendb.errors import (
     TableNotFoundError,
     TypeMismatchError,
     UndefinedParameterError,
+    TableAlreadyExistsError,
 )
 
 
@@ -991,6 +992,71 @@ class TestAlterTable:
         db.execute_one("CREATE INDEX idx_age ON t (age)")
         assert rows(db, "SELECT id FROM t WHERE age = 10 ORDER BY id") == [(1,)]
         assert rows(db, "SELECT id FROM t WHERE age = 20 ORDER BY id") == [(2,)]
+
+    def test_rename_table_and_column(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("CREATE INDEX idx_name ON t (name)")
+        db.execute_one("ALTER TABLE t RENAME TO t2")
+        assert rows(db, "SELECT * FROM t2 ORDER BY id") == [(1, "a"), (2, "b")]
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM t")
+
+        db.execute_one("ALTER TABLE t2 RENAME COLUMN name TO label")
+        assert rows(db, "SELECT id, label FROM t2 WHERE label = 'b'") == [(2, "b")]
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one("SELECT name FROM t2")
+
+    def test_rename_table_conflict_rejected(self, db):
+        db.execute_one("CREATE TABLE a (id INT)")
+        db.execute_one("CREATE TABLE b (id INT)")
+        with pytest.raises(TableAlreadyExistsError):
+            db.execute_one("ALTER TABLE a RENAME TO b")
+
+    def test_rename_survives_reopen(self, tmp_path):
+        path = tmp_path / "rename_db"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("CREATE INDEX idx_name ON t (name)")
+        db.execute_one("ALTER TABLE t RENAME TO t2")
+        db.execute_one("ALTER TABLE t2 RENAME COLUMN name TO label")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT id, label FROM t2 ORDER BY id") == [
+            (1, "a"),
+            (2, "b"),
+        ]
+        db2.close()
+
+    def test_ddl_rollback_restores_catalog_memory(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t RENAME TO t2")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT * FROM t") == [(1,)]
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM t2")
+
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ADD COLUMN note TEXT")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one("SELECT note FROM t")
+
+        db.execute_one("BEGIN")
+        db.execute_one("CREATE TABLE x (id INT)")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM x")
+
+        db.execute_one("BEGIN")
+        db.execute_one("DROP TABLE t")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT * FROM t") == [(1,)]
 
     def test_duplicate_column_rejected(self, db):
         db.execute_one("CREATE TABLE t (id INT)")

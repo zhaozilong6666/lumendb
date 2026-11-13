@@ -349,6 +349,19 @@ class AlterTableAddColumn(Statement):
 
 
 @dataclass
+class AlterTableRenameTable(Statement):
+    table: str
+    new_name: str
+
+
+@dataclass
+class AlterTableRenameColumn(Statement):
+    table: str
+    column: str
+    new_name: str
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False

@@ -109,6 +109,8 @@ class TransactionManager:
             txn.state = TxnState.COMMITTED
             self._states[txn.xid] = TxnState.COMMITTED
             self._active.discard(txn.xid)
+            # DDL 的内存撤销信息在提交后不再需要。
+            txn.undo_log.clear()
             if self._current is txn:
                 self._current = None
 
@@ -116,6 +118,14 @@ class TransactionManager:
         with self._lock:
             if txn.state is not TxnState.ACTIVE:
                 return
+            # DDL 修改的是内存里的 Catalog 对象；WAL 只能恢复页，不能替
+            # 调用方恢复已变异的 Python 对象，所以这里先逆序执行内存 undo。
+            while txn.undo_log:
+                undo = txn.undo_log.pop()
+                try:
+                    undo()
+                except Exception:  # pragma: no cover - 撤销本身不应改变事务结局
+                    pass
             txn.last_lsn = self._wal.abort(txn.xid)
             self._wal.flush()
             txn.state = TxnState.ABORTED

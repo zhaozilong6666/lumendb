@@ -18,6 +18,8 @@ DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
 ALTER TABLE t ADD [COLUMN] note TEXT;
 ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
+ALTER TABLE t RENAME TO t2;
+ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 ```
 
@@ -29,6 +31,10 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
 带非空 `DEFAULT`；主键/唯一约束请先加普通列，再 `CREATE UNIQUE INDEX`。
+
+`RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
+同步更新所有索引的列引用，不重写堆记录。重命名后旧名字立即失效；客户端需要重新
+解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
 
 ### DML
 
@@ -150,7 +156,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（DROP/RENAME/改类型） | 只实现了 `ADD COLUMN` |
+| `ALTER TABLE` 的其它动作（DROP/RENAME/改类型） | 只实现了 `ADD COLUMN` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 视图 / 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |

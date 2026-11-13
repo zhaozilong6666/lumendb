@@ -60,6 +60,12 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - 隔离级别固定为**快照隔离**，不提供 `SET TRANSACTION ISOLATION LEVEL`
   切换（会明确报 `NotSupportedError`）。既然只有一种语义，就不假装有多种。
 
+DDL 不止改磁盘页，还会原地修改内存里的 `Catalog` 对象。因此 `Catalog` 的
+建表/删表/建索引/删索引/重命名/加列都会把一个逆操作登记到 `txn.undo_log`；
+`abort` 时逆序执行这些回调，先把内存目录恢复到事务开始前的样子，再由 WAL
+负责页级 undo。否则 `BEGIN; ALTER ...; ROLLBACK` 之后，页被恢复了，内存
+目录却还停留在未提交的表名/列名上。
+
 ### 2.6 回收（VACUUM）
 
 `UPDATE` 写新版本、`DELETE` 只打 `xmax`，所以表会持续膨胀。`VACUUM [table]`
@@ -85,8 +91,9 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 才会写成包含新列的完整格式。
 
 这样做的好处是 DDL 是 O(1)，不需要停机搬表；代价是"同一张表里新旧两种行格式
-共存"，解码路径必须显式知道缺列是合法的。`ALTER TABLE` 的其它动作（删列、改类型、
-重命名）需要真正的行格式迁移，未实现。
+共存"，解码路径必须显式知道缺列是合法的。`RENAME TO` / `RENAME COLUMN` 只改目录
+里的名字并同步索引列引用，不搬页也不重写记录；真正需要行格式迁移的删列、改类型
+仍未实现。
 
 ## 3. SQL 与计划
 

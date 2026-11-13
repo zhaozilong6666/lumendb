@@ -27,6 +27,8 @@ from lumendb.sql.ast import (
     CreateTableAs,
     Update,
     Delete,
+    AlterTableRenameColumn,
+    AlterTableRenameTable,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
 
@@ -522,6 +524,26 @@ class TestAlterTable:
     def test_primary_key_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement("ALTER TABLE users ADD COLUMN id INT PRIMARY KEY")
+
+    def test_rename_table(self):
+        stmt = parse_statement("ALTER TABLE users RENAME TO accounts")
+        assert isinstance(stmt, AlterTableRenameTable)
+        assert stmt.table == "users"
+        assert stmt.new_name == "accounts"
+
+    def test_rename_table_with_table_keyword(self):
+        stmt = parse_statement("ALTER TABLE users RENAME TABLE TO accounts")
+        assert isinstance(stmt, AlterTableRenameTable)
+
+    def test_rename_column(self):
+        stmt = parse_statement("ALTER TABLE users RENAME COLUMN name TO label")
+        assert isinstance(stmt, AlterTableRenameColumn)
+        assert stmt.column == "name"
+        assert stmt.new_name == "label"
+
+    def test_rename_column_without_column_keyword(self):
+        stmt = parse_statement("ALTER TABLE users RENAME name TO label")
+        assert isinstance(stmt, AlterTableRenameColumn)
 
 
 class TestMultipleStatements:

@@ -1,8 +1,8 @@
 """SQL 解析：递归下降 + 运算符优先级爬升。
 
 原则是"支持的语法必须正确，不支持的语法必须明确报错"。因此这里没有
-"宽容解析"分支：遇到 ``ALTER TABLE``、``RIGHT JOIN``、CTE 这类已知不
-支持的写法，直接抛 ``NotSupportedError``，而不是悄悄当成别的东西。
+"宽容解析"分支：遇到尚未实现的子语法，直接抛 ``NotSupportedError``，
+而不是悄悄当成别的东西。
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ from .ast import (
     Vacuum,
     Truncate,
     AlterTableAddColumn,
+    AlterTableRenameColumn,
+    AlterTableRenameTable,
 )
 from .lexer import RESERVED, Token, tokenize
 
@@ -255,19 +257,46 @@ class Parser:
             raise NotSupportedError("视图 / 触发器 / 存储过程尚未实现")
         raise self._error("CREATE 之后期望 TABLE 或 INDEX")
 
-    def _parse_alter_table(self) -> AlterTableAddColumn:
+    def _parse_alter_table(self) -> Statement:
         self._expect_kw("ALTER")
         self._expect_kw("TABLE")
         table = self._parse_ident("表名")
-        self._expect_kw("ADD")
-        self._match_kw("COLUMN")
-        column = self._parse_column_def()
-        if column.primary_key or column.unique:
-            raise NotSupportedError(
-                "ALTER TABLE ADD COLUMN 暂不支持主键或唯一约束",
-                hint="先加普通列，再 CREATE UNIQUE INDEX",
+        if self._match_kw("ADD"):
+            self._match_kw("COLUMN")
+            column = self._parse_column_def()
+            if column.primary_key or column.unique:
+                raise NotSupportedError(
+                    "ALTER TABLE ADD COLUMN 暂不支持主键或唯一约束",
+                    hint="先加普通列，再 CREATE UNIQUE INDEX",
+                )
+            return AlterTableAddColumn(table=table, column=column)
+
+        if self._match_kw("RENAME"):
+            if self._match_kw("TABLE"):
+                self._expect_kw("TO")
+                new_name = self._parse_ident("新表名")
+                return AlterTableRenameTable(table=table, new_name=new_name)
+            if self._match_kw("COLUMN"):
+                old_name = self._parse_ident("旧列名")
+                self._expect_kw("TO")
+                new_name = self._parse_ident("新列名")
+                return AlterTableRenameColumn(
+                    table=table, column=old_name, new_name=new_name
+                )
+            if self._match_kw("TO"):
+                new_name = self._parse_ident("新表名")
+                return AlterTableRenameTable(table=table, new_name=new_name)
+            old_name = self._parse_ident("旧列名")
+            self._expect_kw("TO")
+            new_name = self._parse_ident("新列名")
+            return AlterTableRenameColumn(
+                table=table, column=old_name, new_name=new_name
             )
-        return AlterTableAddColumn(table=table, column=column)
+
+        raise NotSupportedError(
+            "ALTER TABLE 只支持 ADD COLUMN 和 RENAME",
+            hint="支持 ADD [COLUMN] / RENAME TO / RENAME [COLUMN] old TO new",
+        )
 
     def _parse_with(self) -> Statement:
         self._expect_kw("WITH")

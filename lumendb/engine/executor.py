@@ -27,6 +27,8 @@ from ..errors import (
 )
 from ..sql.ast import (
     AlterTableAddColumn,
+    AlterTableRenameColumn,
+    AlterTableRenameTable,
     CreateIndex,
     CreateTable,
     CreateTableAs,
@@ -142,6 +144,23 @@ class Executor:
                 return self._create_table_as(stmt, txn)
             if isinstance(stmt, AlterTableAddColumn):
                 return self._alter_add_column(stmt, txn)
+            if isinstance(stmt, AlterTableRenameTable):
+                self._catalog.rename_table(txn, stmt.table, stmt.new_name)
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"表已重命名为 {stmt.new_name.lower()}",
+                )
+            if isinstance(stmt, AlterTableRenameColumn):
+                self._catalog.rename_column(
+                    txn, stmt.table, stmt.column, stmt.new_name
+                )
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=(
+                        f"列 {stmt.column.lower()} 已重命名为 "
+                        f"{stmt.new_name.lower()}"
+                    ),
+                )
             if isinstance(stmt, DropTable):
                 return self._drop_table(stmt, txn)
             if isinstance(stmt, CreateIndex):
@@ -650,7 +669,13 @@ class Executor:
                 "ADD COLUMN NOT NULL 需要提供 DEFAULT",
                 hint="已有行没有这个列的值；先加可空列，再 UPDATE 后改约束",
             )
+        old_columns = list(table.columns)
         table.columns.append(column)
+
+        def undo() -> None:
+            table.columns = old_columns
+
+        txn.undo_log.append(undo)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
         return Result(

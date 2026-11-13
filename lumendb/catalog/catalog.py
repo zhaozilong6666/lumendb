@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Optional
 
 from ..errors import (
+    BinderError,
+    ColumnNotFoundError,
     IndexAlreadyExistsError,
     IndexNotFoundError,
     TableAlreadyExistsError,
@@ -115,6 +118,7 @@ class Catalog:
             table.indexes[idx.name] = idx
         validate_table_def(table)
         self.tables[key] = table
+        txn.undo_log.append(lambda: self.tables.pop(key, None))
         self.persist(txn)
         return table
 
@@ -122,8 +126,78 @@ class Catalog:
         key = name.lower()
         if key not in self.tables:
             raise TableNotFoundError(f"表 {name!r} 不存在")
-        del self.tables[key]
+        table = self.tables.pop(key)
+
+        def undo() -> None:
+            self.tables[key] = table
+
+        txn.undo_log.append(undo)
         self.persist(txn)
+
+    def rename_table(self, txn: Transaction, old_name: str, new_name: str) -> TableDef:
+        old_key = old_name.lower()
+        new_key = new_name.lower()
+        if old_key not in self.tables:
+            raise TableNotFoundError(f"表 {old_name!r} 不存在")
+        if new_key in self.tables:
+            raise TableAlreadyExistsError(
+                f"表 {new_name!r} 已存在",
+                hint="换一个表名，或先 DROP TABLE 旧表",
+            )
+        table = self.tables.pop(old_key)
+        table.name = new_key
+        for index in table.indexes.values():
+            index.table = new_key
+        self.tables[new_key] = table
+
+        def undo() -> None:
+            self.tables.pop(new_key, None)
+            table.name = old_key
+            for index in table.indexes.values():
+                index.table = old_key
+            self.tables[old_key] = table
+
+        txn.undo_log.append(undo)
+        validate_table_def(table)
+        self.persist(txn)
+        return table
+
+    def rename_column(
+        self, txn: Transaction, table_name: str, old_name: str, new_name: str
+    ) -> TableDef:
+        table = self.get_table(table_name)
+        old_key = old_name.lower()
+        new_key = new_name.lower()
+        if not table.has_column(old_key):
+            raise ColumnNotFoundError(
+                f"表 {table.name} 没有列 {old_name!r}",
+                hint=f"可用列：{', '.join(table.column_names)}",
+            )
+        if table.has_column(new_key):
+            raise BinderError(
+                f"列 {new_name!r} 已存在",
+                hint="换一个列名",
+            )
+        index = table.column_index(old_key)
+        old_column = table.columns[index]
+        old_index_columns = {
+            idx.name: idx.columns for idx in table.indexes.values()
+        }
+        table.columns[index] = replace(table.columns[index], name=new_key)
+        for idx in table.indexes.values():
+            idx.columns = tuple(
+                new_key if cname == old_key else cname for cname in idx.columns
+            )
+
+        def undo() -> None:
+            table.columns[index] = old_column
+            for idx in table.indexes.values():
+                idx.columns = old_index_columns.get(idx.name, idx.columns)
+
+        txn.undo_log.append(undo)
+        validate_table_def(table)
+        self.persist(txn)
+        return table
 
     def create_index(
         self,
@@ -139,13 +213,23 @@ class Catalog:
         index.table = table.name
         index.root_page = INVALID_PAGE_ID
         table.indexes[index.name] = index
+
+        def undo() -> None:
+            table.indexes.pop(index.name, None)
+
+        txn.undo_log.append(undo)
         self.persist(txn)
         return index
 
     def drop_index(self, txn: Transaction, index_name: str) -> str:
         for table in self.tables.values():
             if index_name in table.indexes:
-                del table.indexes[index_name]
+                index = table.indexes.pop(index_name)
+
+                def undo() -> None:
+                    table.indexes[index_name] = index
+
+                txn.undo_log.append(undo)
                 self.persist(txn)
                 return table.name
         raise IndexNotFoundError(f"索引 {index_name!r} 不存在")
