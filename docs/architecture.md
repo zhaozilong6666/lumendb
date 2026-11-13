@@ -108,8 +108,8 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 
 这样做的好处是 DDL 是 O(1)，不需要停机搬表；代价是"同一张表里新旧两种行格式
 共存"，解码路径必须显式知道缺列是合法的。`RENAME TO` / `RENAME COLUMN` 只改目录
-里的名字并同步索引列引用，不搬页也不重写记录；真正需要行格式迁移的删列、改类型
-仍未实现。
+里的名字并同步索引列引用与 CHECK token，不搬页也不重写记录；真正需要行格式迁移的
+删列、改类型仍未实现。
 
 ### 2.8 表级约束
 
@@ -131,9 +131,9 @@ token 切片持久化，重开数据库后重新解析 AST、再经 Binder 绑�
 `_check_checks`，因此普通 INSERT、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert
 以及 UPDATE 都会经过同一套校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量的
 `UNKNOWN` 可通过），只有结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 按 SQL 语义视为通过。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
-整个堆表，发现存量违反行就整体失败；带 CHECK 的表暂不支持重命名表/列，因为持久化
-token 里仍保留旧名字，重建 AST 时会绑定失败。`DROP CONSTRAINT` 只删除 CHECK 目录
-对象并登记 undo，不扫描也不重写堆记录；唯一/主键约束仍通过 `DROP INDEX` 管理。
+整个堆表，发现存量违反行就整体失败；重命名表/列会同步重写 CHECK token 里的表限定符
+或列引用，不会留下绑定旧名字的约束。`DROP CONSTRAINT` 只删除 CHECK 目录对象并登记
+undo，不扫描也不重写堆记录；唯一/主键约束仍通过 `DROP INDEX` 管理。
 `ADD COLUMN ... CHECK` 会先用“旧列 + 新列默认值”拼出完整存量行，验证通过后才把
 列和约束一起写入目录，因此不会出现列已加上但约束没落地的半状态。
 

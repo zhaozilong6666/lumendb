@@ -2173,19 +2173,23 @@ class TestCheckConstraints:
                 "CONSTRAINT t_a_check CHECK (a < 100))"
             )
 
-    def test_check_blocks_rename_without_corrupting_table(self, db):
-        db.execute_one("CREATE TABLE t (a INT, CHECK (a > 0))")
+    def test_check_rename_updates_persisted_tokens(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, CONSTRAINT ck CHECK (t.a > 0))"
+        )
         db.execute_one("INSERT INTO t VALUES (1)")
-        with pytest.raises(NotSupportedError):
-            db.execute_one("ALTER TABLE t RENAME TO t2")
-        assert rows(db, "SELECT a FROM t") == [(1,)]
+        db.execute_one("ALTER TABLE t RENAME TO u")
         with pytest.raises(CheckViolationError):
-            db.execute_one("INSERT INTO t VALUES (0)")
+            db.execute_one("INSERT INTO u VALUES (0)")
+        db.execute_one("INSERT INTO u VALUES (2)")
 
-        db.execute_one("CREATE TABLE u (a INT, CHECK (a > 0))")
-        with pytest.raises(NotSupportedError):
-            db.execute_one("ALTER TABLE u RENAME COLUMN a TO b")
-        assert rows(db, "SELECT a FROM u") == []
+        db.execute_one(
+            "CREATE TABLE v (a INT, CONSTRAINT ck_v CHECK (v.a > 0))"
+        )
+        db.execute_one("ALTER TABLE v RENAME COLUMN a TO b")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO v VALUES (0)")
+        db.execute_one("INSERT INTO v VALUES (3)")
 
     def test_check_applies_to_insert_select_and_default_values(self, db):
         db.execute_one("CREATE TABLE src (a INT)")

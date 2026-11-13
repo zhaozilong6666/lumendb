@@ -23,6 +23,38 @@ from .store import CatalogStore
 CATALOG_VERSION = 1
 
 
+def _rewrite_check_tokens(
+    checks: dict[str, CheckDef],
+    old_name: str,
+    new_name: str,
+    *,
+    qualifier_only: bool,
+) -> dict[str, CheckDef]:
+    """重命名表/列时同步 CHECK token 里的标识符引用。
+
+    列重命名跳过 ``old.col`` 里的表限定符；表重命名只改 ``old.col`` 里的
+    表限定符。这样不会把同名的列引用误当成表名。
+    """
+    rewritten: dict[str, CheckDef] = {}
+    old_key = old_name.lower()
+    for key, check in checks.items():
+        tokens = list(check.tokens)
+        for i, (kind, value) in enumerate(tokens):
+            if kind != "ident" or value.lower() != old_key:
+                continue
+            next_is_dot = (
+                i + 1 < len(tokens)
+                and tokens[i + 1][0] == "dot"
+            )
+            if qualifier_only and not next_is_dot:
+                continue
+            if not qualifier_only and next_is_dot:
+                continue
+            tokens[i] = (kind, new_name.lower())
+        rewritten[key] = CheckDef(name=check.name, tokens=tuple(tokens))
+    return rewritten
+
+
 class Catalog:
     def __init__(self, store: CatalogStore) -> None:
         self._store = store
@@ -321,13 +353,12 @@ class Catalog:
                 hint="换一个表名，或先 DROP TABLE 旧表",
             )
         table = self.tables[old_key]
-        if table.checks:
-            raise NotSupportedError(
-                f"表 {old_name!r} 有 CHECK 约束，暂不支持重命名",
-                hint="先重建表，或删掉 CHECK 约束后再重命名",
-            )
+        old_checks = dict(table.checks)
         self.tables.pop(old_key)
         table.name = new_key
+        table.checks = _rewrite_check_tokens(
+            old_checks, old_key, new_key, qualifier_only=True
+        )
         for index in table.indexes.values():
             index.table = new_key
         self.tables[new_key] = table
@@ -335,6 +366,7 @@ class Catalog:
         def undo() -> None:
             self.tables.pop(new_key, None)
             table.name = old_key
+            table.checks = old_checks
             for index in table.indexes.values():
                 index.table = old_key
             self.tables[old_key] = table
@@ -360,17 +392,16 @@ class Catalog:
                 f"列 {new_name!r} 已存在",
                 hint="换一个列名",
             )
-        if table.checks:
-            raise NotSupportedError(
-                f"表 {table.name!r} 有 CHECK 约束，暂不支持重命名列",
-                hint="先重建表，或删掉 CHECK 约束后再重命名列",
-            )
         index = table.column_index(old_key)
         old_column = table.columns[index]
+        old_checks = dict(table.checks)
         old_index_columns = {
             idx.name: idx.columns for idx in table.indexes.values()
         }
         table.columns[index] = replace(table.columns[index], name=new_key)
+        table.checks = _rewrite_check_tokens(
+            old_checks, old_key, new_key, qualifier_only=False
+        )
         for idx in table.indexes.values():
             idx.columns = tuple(
                 new_key if cname == old_key else cname for cname in idx.columns
@@ -378,6 +409,7 @@ class Catalog:
 
         def undo() -> None:
             table.columns[index] = old_column
+            table.checks = old_checks
             for idx in table.indexes.values():
                 idx.columns = old_index_columns.get(idx.name, idx.columns)
 

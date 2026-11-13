@@ -43,7 +43,8 @@
 >   `EXCEPT` / `INTERSECT` 支持集合差与交集（`INTERSECT` 优先级更高），
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` 只改目录并同步索引列引用；列级/表级
->   `CHECK` 约束以 token 切片持久化，写入统一校验并支持存量回填；`ALTER COLUMN
+>   `CHECK` 约束以 token 切片持久化，写入统一校验并支持存量回填；`RENAME` 会同步
+>   重写 token 里的列/表引用；`ALTER COLUMN
 >   SET/DROP NOT NULL` 先校验存量行，再只改目录约束；`DROP CONSTRAINT` 可移除
 >   CHECK；`ADD COLUMN ... CHECK` 会先按默认值补齐旧行再验证；
 >   `CREATE VIEW` 保存 `AS` 之后的词法切片，不物化数据，查询时展开为 `CteScan`，
@@ -97,7 +98,8 @@
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` update catalog metadata and
 >   index column references without rewriting heap records; column- and table-level
 >   `CHECK` constraints persist token slices, enforce on all writes and backfill
->   existing rows; `DROP CONSTRAINT` removes CHECK constraints; `ADD COLUMN ... CHECK`
+>   existing rows; `RENAME` rewrites table/column references inside the tokens;
+>   `DROP CONSTRAINT` removes CHECK constraints; `ADD COLUMN ... CHECK`
 >   pads old rows with the default before validating; `ALTER COLUMN
 >   SET/DROP NOT NULL` validates existing rows and updates only the catalog;
 >   `CREATE VIEW` persists the token slice after `AS` instead of materializing

@@ -64,10 +64,10 @@ DROP TABLE t [CASCADE];
 SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
 存量行，发现违反行时整体失败、不留下约束；`ADD COLUMN` 可以同时声明 CHECK，执行
 器会把旧行补上默认值后扫描完整行，失败时不修改目录，默认值本身违反约束也会被
-拒绝。带 `CHECK` 的表暂不支持 `RENAME TO` / `RENAME COLUMN`，避免目录里的 token
-保留旧列名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name` 目前只删除 CHECK
-约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层是索引，请用
-`DROP INDEX` 删除。
+拒绝。`RENAME TO` / `RENAME COLUMN` 会同步重写 CHECK token 里的表限定符或列引用，
+因此带 CHECK 的表可以正常重命名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name`
+目前只删除 CHECK 约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层
+是索引，请用 `DROP INDEX` 删除。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
@@ -86,8 +86,8 @@ EXISTS` 遇到同名列会跳过并返回 notice，不会比较新定义的类�
 天然要求 `NOT NULL`，因此主键列上的 `DROP NOT NULL` 会被拒绝。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
-同步更新所有索引的列引用，不重写堆记录。重命名后旧名字立即失效；客户端需要重新
-解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
+同步更新所有索引的列引用与 CHECK token 里的标识符，不重写堆记录。重命名后旧名字
+立即失效；客户端需要重新解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
 
 `CREATE VIEW` 创建只读视图，视图不物化数据，也不占数据页；每次查询时按目录里保存的
 定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
