@@ -835,6 +835,17 @@ class TestJoin:
         assert "HashJoin (INNER)" in plan
         assert "a.id = b.id" in plan
 
+    def test_outer_join_explain_is_nested_loop(self, db):
+        self.setup(db)
+        plan = "\n".join(
+            r[0]
+            for r in rows(
+                db, "EXPLAIN SELECT a.id FROM a FULL JOIN b ON a.id = b.id"
+            )
+        )
+        assert "HashJoin" not in plan
+        assert "FULL Join" in plan
+
     def test_comma_join_stays_nested_loop(self, db):
         self.setup(db)
         plan = "\n".join(

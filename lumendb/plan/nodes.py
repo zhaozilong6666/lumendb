@@ -163,7 +163,7 @@ class Join(PlanNode):
         return [c for c in (self.left, self.right) if c is not None]
 
     def describe(self) -> str:
-        if self.hash_keys:
+        if self.hash_keys and self.kind in ("INNER", "LEFT"):
             keys = ", ".join(self.hash_labels) or "?"
             return f"HashJoin ({self.kind}) on {keys}"
         return f"{self.kind} Join"

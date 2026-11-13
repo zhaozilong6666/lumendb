@@ -1091,7 +1091,11 @@ class Binder:
             on_fn = None
             if join.on is not None:
                 on_fn, _ = self.compile(join.on, merged, allow_agg=False)
-            hash_keys, hash_labels = self._equi_keys(join.on, merged, len(schema))
+            hash_keys, hash_labels = ((), ())
+            if join.kind in ("INNER", "LEFT"):
+                hash_keys, hash_labels = self._equi_keys(
+                    join.on, merged, len(schema)
+                )
             node = Join(
                 left=node,
                 right=right_node,
