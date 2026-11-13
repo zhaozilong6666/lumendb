@@ -137,7 +137,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 重命名；显式 `CASCADE` 会先递归删除依赖视图。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
 `CREATE OR REPLACE VIEW` 先绑定新定义，再替换目录里的 token 切片，因此新定义
-非法时旧视图仍然可用；替换本身也在事务 undo 范围内。
+非法时旧视图仍然可用；替换本身也在事务 undo 范围内。替换成功后会重新绑定并刷新
+所有视图的依赖快照，避免依赖视图继续引用已经被移除的旧表，或漏掉新表依赖。
 
 当前限制：没有物化视图，视图不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；
 `SHOW TABLES` 只列基表，`SHOW VIEWS` 单独列出视图。

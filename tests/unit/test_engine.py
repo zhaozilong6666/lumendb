@@ -702,6 +702,32 @@ class TestInsert:
             db.execute_one("SELECT * FROM v")
         assert rows(db, "SHOW VIEWS") == []
 
+    def test_replace_view_refreshes_indirect_dependencies(self, db):
+        db.execute_one("CREATE TABLE old (a INT)")
+        db.execute_one("CREATE TABLE new (a INT)")
+        db.execute_one("INSERT INTO old VALUES (1)")
+        db.execute_one("INSERT INTO new VALUES (2)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM old")
+        db.execute_one("CREATE VIEW top AS SELECT a FROM v")
+        db.execute_one("CREATE OR REPLACE VIEW v AS SELECT a FROM new")
+        assert rows(db, "SELECT * FROM top") == [(2,)]
+        # 旧表不再被引用，可以删除；新表仍被间接依赖，必须拒绝。
+        db.execute_one("DROP TABLE old")
+        with pytest.raises(BinderError):
+            db.execute_one("DROP TABLE new")
+
+    def test_replace_view_dependency_rollback(self, db):
+        db.execute_one("CREATE TABLE old (a INT)")
+        db.execute_one("CREATE TABLE new (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM old")
+        db.execute_one("CREATE VIEW top AS SELECT a FROM v")
+        db.execute_one("BEGIN")
+        db.execute_one("CREATE OR REPLACE VIEW v AS SELECT a FROM new")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(BinderError):
+            db.execute_one("DROP TABLE old")
+        db.execute_one("DROP TABLE new")
+
     def test_drop_view_cascade_removes_dependents(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("CREATE VIEW v1 AS SELECT a FROM t")

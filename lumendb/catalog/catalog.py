@@ -225,6 +225,24 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    def update_view_dependencies(
+        self, txn: Transaction, updates: dict[str, set[str]]
+    ) -> None:
+        """刷新多个视图的依赖快照，并登记事务 undo。"""
+        old = {
+            key: set(self.view_dependencies.get(key, set()))
+            for key in updates
+        }
+        for key, deps in updates.items():
+            self.view_dependencies[key] = set(deps)
+
+        def undo() -> None:
+            for key, deps in old.items():
+                self.view_dependencies[key] = deps
+
+        txn.undo_log.append(undo)
+        self.persist(txn)
+
     def drop_view(
         self, txn: Transaction, name: str, cascade: bool = False
     ) -> None:

@@ -812,6 +812,21 @@ class Binder:
         self.bind_ctes(query.ctes, recursive=query.recursive)
         return self.bind_select(query.select)
 
+    def collect_view_dependencies(self, name: str) -> set[str]:
+        """重新绑定一个视图定义，返回它实际引用到的表/视图集合。"""
+        tokens = self.catalog.get_view(name)
+        view_query = Parser(
+            [Token(kind, value, 0, 0) for kind, value in tokens]
+            + [Token("eof", "", 0, 0)]
+        ).parse_view_expression()
+        binder = Binder(self.catalog, self.params)
+        binder.view_stack = frozenset({name.lower()})
+        if isinstance(view_query, Query):
+            binder.bind_query(view_query)
+        else:
+            binder.bind_select(view_query)
+        return set(binder.source_dependencies)
+
     def bind_returning(self, items, schema) -> tuple[list, list[OutputColumn]]:
         """把 ``RETURNING`` 列表编译成 (表达式函数, 输出列)。
 

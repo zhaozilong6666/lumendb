@@ -810,6 +810,13 @@ class Executor:
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
 
+    def _refresh_view_dependencies(self, txn: Transaction) -> None:
+        updates: dict[str, set[str]] = {}
+        for name in self._catalog.view_names():
+            binder = self._new_binder()
+            updates[name.lower()] = binder.collect_view_dependencies(name)
+        self._catalog.update_view_dependencies(txn, updates)
+
     def _create_view(self, stmt: CreateView, txn: Transaction) -> Result:
         if self._catalog.has_table(stmt.name):
             raise TableAlreadyExistsError(
@@ -849,6 +856,9 @@ class Executor:
                 txn, stmt.name, stmt.tokens, stmt.columns,
                 binder.source_dependencies,
             )
+            # 替换可能改变了间接依赖：重算所有视图，避免依赖快照里残留旧表，
+            # 也避免新表没有被依赖视图记录而允许 DROP TABLE。
+            self._refresh_view_dependencies(txn)
             notice = f"已替换视图 {stmt.name.lower()}"
         else:
             self._catalog.create_view(
