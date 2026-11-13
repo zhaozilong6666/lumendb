@@ -95,7 +95,7 @@ on_update: str = "RESTRICT"
 
 ## 3. 测试与验证
 
-- 全量测试：**838 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**839 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
