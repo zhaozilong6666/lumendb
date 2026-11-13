@@ -331,6 +331,37 @@ class TestInsert:
         with pytest.raises(DuplicateKeyError):
             db.execute_one("INSERT INTO t VALUES (2, 'same')")
 
+    def test_table_constraints_composite_unique(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT uq_ab UNIQUE (a, b))"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 2)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 2) "
+            "ON CONFLICT ON CONSTRAINT uq_ab DO UPDATE SET b = 3 "
+            "RETURNING a, b"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 3)]
+
+    def test_table_constraints_composite_primary(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT pk_ab PRIMARY KEY (a, b))"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 2)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t VALUES (NULL, 3)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 2) "
+            "ON CONFLICT ON CONSTRAINT pk_ab DO UPDATE SET b = 3 RETURNING a, b"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 3)]
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

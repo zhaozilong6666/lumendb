@@ -309,6 +309,15 @@ class ColumnDef:
     default: Optional[Expr] = None
 
 
+@dataclass(frozen=True)
+class TableConstraint:
+    """表级约束：复合 PRIMARY KEY 或 UNIQUE (col...)。"""
+
+    kind: str  # "PRIMARY KEY" 或 "UNIQUE"
+    columns: list[str]
+    name: Optional[str] = None
+
+
 @dataclass
 class Statement:
     pass
@@ -319,6 +328,7 @@ class CreateTable(Statement):
     name: str
     columns: list[ColumnDef]
     if_not_exists: bool = False
+    constraints: list[TableConstraint] = field(default_factory=list)
 
 
 @dataclass

@@ -141,7 +141,7 @@ psycopg2 都不会正常返回结果。
 
 | 类别 | 支持 |
 |---|---|
-| DDL | `CREATE TABLE`（列级 `PRIMARY KEY` / `UNIQUE`）、`CREATE TABLE AS SELECT`、`CREATE INDEX`、`DROP TABLE`、`DROP INDEX`、`ALTER TABLE ... ADD COLUMN` / `RENAME TO` / `RENAME COLUMN` |
+| DDL | `CREATE TABLE`（列级/表级 `PRIMARY KEY` / `UNIQUE`，支持复合主键与复合唯一约束）、`CREATE TABLE AS SELECT`、`CREATE INDEX`、`DROP TABLE`、`DROP INDEX`、`ALTER TABLE ... ADD COLUMN` / `RENAME TO` / `RENAME COLUMN` |
 | DML | `INSERT`（多行、`INSERT ... SELECT`、`ON CONFLICT DO NOTHING` / `DO UPDATE` / `DO UPDATE ... WHERE` / `excluded.col` / `ON CONSTRAINT`）、`UPDATE`、`DELETE`、`RETURNING` |
 | 查询 | `SELECT`、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT`、`UNION`/`UNION ALL`/`EXCEPT`/`EXCEPT ALL`/`INTERSECT`/`INTERSECT ALL`、`WITH`（非递归 CTE，含 `WITH ... UPDATE/DELETE`） |
 | 连接 | `INNER JOIN`、`LEFT JOIN`、`RIGHT JOIN`、`FULL JOIN`、`CROSS JOIN`、多表连接；等值 INNER/LEFT 走哈希，外连接补 NULL |
@@ -203,7 +203,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **653 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **656 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

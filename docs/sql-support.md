@@ -14,6 +14,8 @@ CREATE TABLE t (
   active BOOLEAN,
   email  TEXT UNIQUE
 );
+CREATE TABLE t2 (a INT, b INT, CONSTRAINT uq_ab UNIQUE (a, b));
+CREATE TABLE t3 (a INT, b INT, PRIMARY KEY (a, b));
 CREATE [UNIQUE] INDEX idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
@@ -28,8 +30,10 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 主键或索引；表达式需要显式 `AS` 别名，否则列名可能不是合法标识符（会明确报错）。
 来源查询先物化再写入，因此 `CREATE TABLE t AS SELECT * FROM t` 的语义也是确定的。
 `IF NOT EXISTS` 遇到同名表会跳过，不会覆盖原表。列级 `UNIQUE` 会为每个非主键
-的唯一列建一个唯一索引（`NULL` 不参与唯一性比较）；复合唯一约束请用
-`CREATE UNIQUE INDEX`。
+的唯一列建一个唯一索引（`NULL` 不参与唯一性比较）；复合唯一约束请用表级
+`UNIQUE (a, b)` 或 `CREATE UNIQUE INDEX`。表级 `PRIMARY KEY (a, b)` 支持复合
+主键，参与列自动变为 `NOT NULL`，并生成一个名为 `<table>_pkey`（或显式约束名）
+的复合唯一索引。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须

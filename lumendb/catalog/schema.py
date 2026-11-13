@@ -179,18 +179,14 @@ def validate_table_def(table: TableDef) -> None:
         seen.add(col.name)
 
     pk_cols = [c for c in table.columns if c.primary_key]
-    if len(pk_cols) > 1:
-        raise NotSupportedError(
-            "暂不支持复合主键",
-            hint="使用多列唯一索引替代",
-        )
-    if pk_cols and pk_cols[0].nullable:
-        # 主键隐含 NOT NULL。这里直接报错，而不是悄悄改成非空——
-        # 用户应该知道自己的 DDL 与实际语义有差别。
-        raise NotSupportedError(
-            f"主键列 {pk_cols[0].name} 不能声明为可空",
-            hint="去掉 NULL，或删掉 PRIMARY KEY",
-        )
+    for col in pk_cols:
+        if col.nullable:
+            # 主键隐含 NOT NULL。这里直接报错，而不是悄悄改成非空——
+            # 用户应该知道自己的 DDL 与实际语义有差别。
+            raise NotSupportedError(
+                f"主键列 {col.name} 不能声明为可空",
+                hint="去掉 NULL，或删掉 PRIMARY KEY",
+            )
 
     for idx in table.indexes.values():
         for cname in idx.columns:

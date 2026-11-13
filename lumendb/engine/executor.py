@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 import time
 from collections import Counter
@@ -618,27 +618,74 @@ class Executor:
             )
 
         columns = [_to_column(c) for c in stmt.columns]
-        primary = [c for c in columns if c.primary_key]
-        if len(primary) > 1:
-            raise NotSupportedError(
-                "只支持单列主键",
-                hint="复合主键请改用 UNIQUE INDEX",
+        by_name = {c.name: c for c in columns}
+
+        table_primary: list[tuple[tuple[str, ...], Optional[str]]] = []
+        for constraint in stmt.constraints:
+            if constraint.kind != "PRIMARY KEY":
+                continue
+            if table_primary:
+                raise NotSupportedError(
+                    "只支持一个主键",
+                    hint="一个表只能声明一个 PRIMARY KEY",
+                )
+            names = tuple(name.lower() for name in constraint.columns)
+            for name in names:
+                if name not in by_name:
+                    raise BinderError(
+                        f"表级主键引用了不存在的列 {name!r}"
+                    )
+            table_primary.append(
+                (names, constraint.name.lower() if constraint.name else None)
             )
 
+        column_primary = [c for c in columns if c.primary_key]
+        if table_primary and column_primary:
+            raise NotSupportedError(
+                "不能同时声明列级和表级主键",
+                hint="把 PRIMARY KEY 统一写在列上或表级约束里",
+            )
+        if len(column_primary) > 1:
+            raise NotSupportedError(
+                "只支持一个主键",
+                hint="复合主键请用表级 PRIMARY KEY (col, ...)",
+            )
+
+        primary_name: Optional[str] = None
+        if table_primary:
+            primary_columns, primary_name = table_primary[0]
+            # 表级复合主键把参与列标记为 NOT NULL + primary_key，
+            # 列级读取和目录展示仍然看到完整的主键信息。
+            columns = [
+                replace(
+                    c,
+                    primary_key=c.name in primary_columns,
+                    nullable=False if c.name in primary_columns else c.nullable,
+                )
+                if c.name in primary_columns
+                else c
+                for c in columns
+            ]
+        elif column_primary:
+            primary_columns = (column_primary[0].name,)
+        else:
+            primary_columns = ()
+
         indexes: list[IndexDef] = []
-        if primary:
+        if primary_columns:
             indexes.append(
                 IndexDef(
-                    name=f"{stmt.name.lower()}_pkey",
+                    name=primary_name or f"{stmt.name.lower()}_pkey",
                     table=stmt.name.lower(),
-                    columns=(primary[0].name,),
+                    columns=primary_columns,
                     unique=True,
                 )
             )
+
         # 列级 UNIQUE 不能只解析不落地：否则表看起来有约束，插入重复值
         # 却会静默成功。这里为每个非主键的 UNIQUE 列建一个唯一索引。
         for col_def, col in zip(stmt.columns, columns):
-            if not col_def.unique or col_def.primary_key:
+            if not col_def.unique or col.name in primary_columns:
                 continue
             indexes.append(
                 IndexDef(
@@ -648,6 +695,44 @@ class Executor:
                     unique=True,
                 )
             )
+
+        # 表级 UNIQUE (a, b) 生成一个复合唯一索引；ON CONFLICT ON CONSTRAINT
+        # 可以直接引用这个索引名。
+        for constraint in stmt.constraints:
+            if constraint.kind != "UNIQUE":
+                continue
+            names = tuple(name.lower() for name in constraint.columns)
+            for name in names:
+                if name not in by_name:
+                    raise BinderError(
+                        f"表级 UNIQUE 引用了不存在的列 {name!r}"
+                    )
+            if constraint.name is not None:
+                index_name = constraint.name.lower()
+            else:
+                index_name = (
+                    f"{stmt.name.lower()}_"
+                    + "_".join(names)
+                    + "_key"
+                )
+            indexes.append(
+                IndexDef(
+                    name=index_name,
+                    table=stmt.name.lower(),
+                    columns=names,
+                    unique=True,
+                )
+            )
+
+        seen_index_names: set[str] = set()
+        for idx in indexes:
+            if idx.name in seen_index_names:
+                raise BinderError(
+                    f"索引/约束名重复：{idx.name}",
+                    hint="显式命名表级约束时避免与自动生成的索引名冲突",
+                )
+            seen_index_names.add(idx.name)
+
         self._catalog.create_table(txn, stmt.name, columns, indexes)
         return Result(tag="CREATE TABLE")
 

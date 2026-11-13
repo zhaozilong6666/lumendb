@@ -66,6 +66,17 @@ class TestCreateTable:
         assert b_col.nullable is True  # 显式 NULL 表示可空
         assert c_col.unique
 
+    def test_table_constraints(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, b INT, "
+            "CONSTRAINT uq_ab UNIQUE (a, b), PRIMARY KEY (a, b))"
+        )
+        assert len(stmt.constraints) == 2
+        assert stmt.constraints[0].kind == "UNIQUE"
+        assert stmt.constraints[0].name == "uq_ab"
+        assert stmt.constraints[0].columns == ["a", "b"]
+        assert stmt.constraints[1].kind == "PRIMARY KEY"
+
     def test_if_not_exists(self):
         stmt = parse_statement("CREATE TABLE IF NOT EXISTS t (id INT)")
         assert stmt.if_not_exists

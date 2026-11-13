@@ -51,6 +51,7 @@ from .ast import (
     Select,
     SelectItem,
     ShowTables,
+    TableConstraint,
     Star,
     Statement,
     TableRef,
@@ -359,13 +360,39 @@ class Parser:
             )
         self._expect_punct("lparen", "(")
         columns: list[ColumnDef] = []
+        constraints: list[TableConstraint] = []
         while True:
-            columns.append(self._parse_column_def())
+            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE"):
+                constraints.append(self._parse_table_constraint())
+            else:
+                columns.append(self._parse_column_def())
             if not self._match_punct("comma"):
                 break
         self._expect_punct("rparen", ")")
-        # 表级约束：只接受没有约束时的空体；遇到 PRIMARY KEY (...) 之类明确报不支持
-        return CreateTable(name=name, columns=columns, if_not_exists=if_not_exists)
+        return CreateTable(
+            name=name,
+            columns=columns,
+            if_not_exists=if_not_exists,
+            constraints=constraints,
+        )
+
+    def _parse_table_constraint(self) -> TableConstraint:
+        name = None
+        if self._match_kw("CONSTRAINT"):
+            name = self._parse_ident("约束名")
+        if self._match_kw("PRIMARY"):
+            self._expect_kw("KEY")
+            kind = "PRIMARY KEY"
+        elif self._match_kw("UNIQUE"):
+            kind = "UNIQUE"
+        else:
+            raise self._error("表级约束期望 PRIMARY KEY 或 UNIQUE")
+        self._expect_punct("lparen", "(")
+        columns = [self._parse_ident("列名")]
+        while self._match_punct("comma"):
+            columns.append(self._parse_ident("列名"))
+        self._expect_punct("rparen", ")")
+        return TableConstraint(kind=kind, columns=columns, name=name)
 
     def _parse_column_def(self) -> ColumnDef:
         name = self._parse_ident("列名")
