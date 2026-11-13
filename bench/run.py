@@ -314,6 +314,46 @@ def bench_range_scan(root: Path, rows: int) -> dict:
     }
 
 
+def bench_fk_insert(root: Path, rows: int) -> dict:
+    """子表每行都触发一次外键点查，父表已有唯一索引。"""
+    parents = max(10, rows // 2)
+    db = fresh_db(root, "fk_insert")
+    db.execute_one("CREATE TABLE parent (id INT PRIMARY KEY)")
+    db.execute_one(
+        "CREATE TABLE child (id INT PRIMARY KEY, "
+        "parent_id INT NOT NULL REFERENCES parent(id))"
+    )
+    batch = []
+    for i in range(parents):
+        batch.append(f"({i})")
+        if len(batch) == 200:
+            db.execute_one("INSERT INTO parent VALUES " + ", ".join(batch))
+            batch = []
+    if batch:
+        db.execute_one("INSERT INTO parent VALUES " + ", ".join(batch))
+
+    def run() -> None:
+        db.execute_one("DELETE FROM child")
+        batch = []
+        for i in range(rows):
+            batch.append(f"({i}, {i % parents})")
+            if len(batch) == 200:
+                db.execute_one("INSERT INTO child VALUES " + ", ".join(batch))
+                batch = []
+        if batch:
+            db.execute_one("INSERT INTO child VALUES " + ", ".join(batch))
+
+    best, median = timed(run, repeat=REPEAT)
+    db.close()
+    return {
+        "name": "外键子表插入（每行唯一索引点查）",
+        "rows": rows,
+        "seconds": best,
+        "median_seconds": median,
+        "per_sec": rows / best,
+    }
+
+
 def bench_join(root: Path, rows: int) -> dict:
     customers = max(100, rows // 2)
     path = root / "join"
@@ -372,6 +412,7 @@ BENCHMARKS = [
     bench_range_index,
     bench_range_scan,
     bench_join,
+    bench_fk_insert,
 ]
 
 
