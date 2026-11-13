@@ -107,6 +107,14 @@ class TestDml:
         assert stmt.columns == ["a", "b"]
         assert stmt.query is not None
 
+    def test_with_insert_select(self):
+        stmt = parse_statement(
+            "WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM x"
+        )
+        assert isinstance(stmt, Insert)
+        assert stmt.ctes[0].name == "x"
+        assert stmt.query is not None
+
     def test_update(self):
         stmt = parse_statement("UPDATE t SET a = a + 1, b = 2 WHERE id = 1")
         assert len(stmt.assignments) == 2

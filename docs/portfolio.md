@@ -27,13 +27,14 @@
 >   名字解析开销；等值和范围条件命中索引时生成索引计划，
 >   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
 >   支持 `UNION` / `UNION ALL` 集合算子与整体排序/限量，非递归 `WITH`（CTE）
->   按书写顺序绑定并可在 `FROM` 中当作表引用，`INSERT ... SELECT` 先物化来源
+>   按书写顺序绑定并可在 `FROM` 中当作表引用，也支持 `WITH ... INSERT ... SELECT`，
+>   `INSERT ... SELECT` 先物化来源
 >   再批量写入（避免自插入无限增长），
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 549 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 551 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -56,6 +57,7 @@
 >   residual predicates are rechecked); `UNION` / `UNION ALL` are supported
 >   with compound-level ORDER BY and LIMIT; non-recursive `WITH` (CTEs) are
 >   bound in declaration order and can be referenced as tables in FROM;
+>   `WITH ... INSERT ... SELECT` uses the same scope;
 >   `INSERT ... SELECT` materializes its source before writing;
 >   `ALTER TABLE ADD COLUMN` upgrades
 >   the catalog and pads old records at read time instead of rewriting the heap;
@@ -64,7 +66,7 @@
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, SQLSTATE-bearing error responses), so `psql` can
 >   connect directly.
-> - 549 automated tests including crash-injection and a 20-seed randomized
+> - 551 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

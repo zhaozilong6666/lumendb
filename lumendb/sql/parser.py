@@ -268,7 +268,7 @@ class Parser:
             )
         return AlterTableAddColumn(table=table, column=column)
 
-    def _parse_with(self) -> Query:
+    def _parse_with(self) -> Statement:
         self._expect_kw("WITH")
         if self._match_kw("RECURSIVE") is not None:
             raise NotSupportedError(
@@ -285,10 +285,13 @@ class Parser:
             ctes.append(Cte(name=name, query=query))
             if not self._match_punct("comma"):
                 break
-        if not self._cur.is_keyword("SELECT"):
-            raise self._error("WITH 之后期望 SELECT")
-        select = self._parse_query_expression()
-        return Query(select=select, ctes=ctes)
+        if self._cur.is_keyword("SELECT"):
+            return Query(select=self._parse_query_expression(), ctes=ctes)
+        if self._cur.is_keyword("INSERT"):
+            stmt = self._parse_insert()
+            stmt.ctes = ctes
+            return stmt
+        raise self._error("WITH 之后期望 SELECT 或 INSERT")
 
     def _parse_create_table(self) -> CreateTable:
         if_not_exists = False

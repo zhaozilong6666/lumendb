@@ -701,7 +701,12 @@ class Executor:
         return Result(affected=count, tag=f"INSERT {count}")
 
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
-        plan, out_cols = self.binder.bind_select(stmt.query)
+        if stmt.ctes:
+            plan, out_cols = self.binder.bind_query(
+                Query(select=stmt.query, ctes=stmt.ctes)
+            )
+        else:
+            plan, out_cols = self.binder.bind_select(stmt.query)
         target_width = (
             len(stmt.columns) if stmt.columns is not None else len(table.columns)
         )
@@ -713,7 +718,11 @@ class Executor:
 
         # 先物化来源：INSERT INTO t SELECT * FROM t 不能边读边写，
         # 否则扫描器会把刚插入的新行也读出来，形成无限增长。
-        source_rows = [tuple(row) for row in self._execute(plan, txn)]
+        self._active_ctes = dict(self.binder.ctes) if stmt.ctes else {}
+        try:
+            source_rows = [tuple(row) for row in self._execute(plan, txn)]
+        finally:
+            self._active_ctes = {}
         count = 0
         for values in source_rows:
             prepared = self._prepare_values(table, stmt.columns, list(values))

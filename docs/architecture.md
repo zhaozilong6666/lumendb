@@ -144,7 +144,8 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
   `UNION ALL` 保留重复，`ORDER BY` / `LIMIT` 由外层节点处理；
 - `CteScan`：非递归 `WITH` 的命名子查询。绑定阶段先按书写顺序把每个 CTE
   绑成独立计划并放进作用域，主查询里的 `FROM cte_name` 直接引用它；
-  同一个 CTE 被引用两次会执行两次（没有做物化缓存）；
+  `WITH ... INSERT ... SELECT` 也走同一套作用域；同一个 CTE 被引用两次会
+  执行两次（没有做物化缓存）；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；
 - `Limit`：跳 `offset`，取 `limit`。
 

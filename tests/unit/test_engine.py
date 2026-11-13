@@ -322,6 +322,17 @@ class TestInsert:
         assert result.affected == 1
         assert rows(db, "SELECT id FROM dst") == [(2,)]
 
+    def test_with_insert_select(self, db):
+        db.execute_one("CREATE TABLE src (id INT)")
+        db.execute_one("INSERT INTO src VALUES (1), (2), (3)")
+        db.execute_one("CREATE TABLE dst (id INT)")
+        result = db.execute_one(
+            "WITH even AS (SELECT id FROM src WHERE id % 2 = 0) "
+            "INSERT INTO dst SELECT id FROM even"
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT id FROM dst") == [(2,)]
+
 
 class TestSelectBasics:
     def test_star(self, db):

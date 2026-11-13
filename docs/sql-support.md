@@ -37,7 +37,7 @@ DELETE FROM t WHERE age < 0;
 
 `INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
 检查；来源查询先完整物化再写入，所以 `INSERT INTO t SELECT * FROM t` 不会边读边写
-导致无限增长。暂不支持在 `INSERT` 前面直接写 `WITH`。
+导致无限增长。`WITH ... INSERT ... SELECT` 也支持，CTE 只在这次插入的源查询里可见。
 
 ### 查询
 
@@ -75,8 +75,8 @@ SELECT * FROM names;
 ```
 
 CTE 按书写顺序绑定：后面的 CTE 和主查询都可以引用前面的 CTE；同名的 CTE 会遮蔽
-真实表。没有实现递归 `WITH RECURSIVE`，也不支持 `WITH x(a, b) AS (...)` 这种
-列别名清单。
+真实表。`WITH ... INSERT ... SELECT` 同样可用。没有实现递归 `WITH RECURSIVE`，
+也不支持 `WITH x(a, b) AS (...)` 这种列别名清单。
 
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
