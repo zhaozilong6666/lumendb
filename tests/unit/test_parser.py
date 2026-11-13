@@ -193,6 +193,16 @@ class TestCreateTable:
                 "FOREIGN KEY (a, b) REFERENCES other(x, y) MATCH PARTIAL)"
             )
 
+    def test_foreign_key_no_action(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) "
+            "ON DELETE NO ACTION ON UPDATE NO ACTION)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.on_delete == "RESTRICT"
+        assert ref.on_update == "RESTRICT"
+
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
 

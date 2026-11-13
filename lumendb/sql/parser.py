@@ -715,6 +715,9 @@ class Parser:
                     on_delete = "CASCADE"
                 elif self._match_kw("RESTRICT"):
                     on_delete = "RESTRICT"
+                elif self._match_kw("NO"):
+                    self._expect_kw("ACTION")
+                    on_delete = "RESTRICT"
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_delete = "SET NULL"
@@ -727,13 +730,16 @@ class Parser:
                         )
                 else:
                     raise NotSupportedError(
-                        "外键 ON DELETE 仅支持 CASCADE、RESTRICT 或 SET NULL",
-                        hint="暂不支持 SET DEFAULT / NO ACTION",
+                        "外键 ON DELETE 动作非法",
+                        hint="支持 CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION",
                     )
             elif self._match_kw("UPDATE"):
                 if self._match_kw("CASCADE"):
                     on_update = "CASCADE"
                 elif self._match_kw("RESTRICT"):
+                    on_update = "RESTRICT"
+                elif self._match_kw("NO"):
+                    self._expect_kw("ACTION")
                     on_update = "RESTRICT"
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
@@ -747,8 +753,8 @@ class Parser:
                         )
                 else:
                     raise NotSupportedError(
-                        "外键 ON UPDATE 仅支持 CASCADE、RESTRICT 或 SET NULL",
-                        hint="暂不支持 SET DEFAULT / NO ACTION",
+                        "外键 ON UPDATE 动作非法",
+                        hint="支持 CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION",
                     )
             else:
                 raise self._error("ON 之后期望 DELETE 或 UPDATE")

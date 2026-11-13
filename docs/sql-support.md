@@ -147,11 +147,13 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 将匹配子行的外键列置为 `NULL`，以及 `ON DELETE SET DEFAULT` 将匹配子行的外键列
 置为列默认值；更新被引用键默认 `RESTRICT`，支持 `ON UPDATE CASCADE` 递归同步
 子行、`ON UPDATE SET NULL` 置空和 `ON UPDATE SET DEFAULT` 置为列默认值（多级链
-和自引用链都会经过同一写路径）。`RESTRICT` 下删除或更新被引用键时只要还有子行
+和自引用链都会经过同一写路径）。`NO ACTION` 也被接受，但在没有 `DEFERRABLE`
+延迟检查的实现里与 `RESTRICT` 等价，目录中按 `RESTRICT` 落地。`RESTRICT` 下删除或
+更新被引用键时只要还有子行
 引用旧键就拒绝；`CASCADE` / `SET NULL` / `SET DEFAULT` 会按依赖顺序递归处理，
 并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键仍抛
-`ForeignKeyViolationError`（SQLSTATE `23503`）。当前没有 `NO ACTION` 或
-`DEFERRABLE` 延迟检查。外键定义（含删除/更新动作）随目录 JSON 持久化，
+`ForeignKeyViolationError`（SQLSTATE `23503`）。当前没有 `DEFERRABLE` 延迟检查。
+外键定义（含删除/更新动作）随目录 JSON 持久化，
 事务 undo 会恢复外键字典；支持自引用（同一张表内 `REFERENCES` 自身），自引用未显式
 给列时同样取当前表主键，并允许新行直接引用自身。
 
@@ -368,7 +370,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；不支持 `NO ACTION`、`DEFERRABLE` |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`（`NO ACTION` 等价立即 `RESTRICT`）；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；不支持 `DEFERRABLE` |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

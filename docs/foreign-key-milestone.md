@@ -21,6 +21,7 @@
 | `ON UPDATE CASCADE` | 完成 | 父键更新后递归同步子行，支持多级链与自引用链 |
 | `ON UPDATE SET NULL` | 完成 | 父键更新后将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
 | `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值；默认值不存在时回滚 |
+| `NO ACTION` | 完成 | 接受该语法；无 `DEFERRABLE` 时按立即 `RESTRICT` 处理 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT` |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
 | 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护 |
@@ -94,7 +95,7 @@ on_update: str = "RESTRICT"
 
 ## 3. 测试与验证
 
-- 全量测试：**837 passed**（`python -m pytest tests -q`，约 36 秒）
+- 全量测试：**838 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -103,6 +104,7 @@ on_update: str = "RESTRICT"
   - `ON UPDATE CASCADE` 单级/多级/自引用链、事务回滚；
   - `ON DELETE SET NULL` / `ON UPDATE SET NULL`、`NOT NULL` 冲突回滚；
   - `MATCH FULL` 全空/全非空/部分 NULL 拒绝；
+  - `NO ACTION` 解析为立即 `RESTRICT`；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -142,8 +144,8 @@ CI：
 
 ## 5. 遗留风险与未实现项
 
-1. **动作子集仍有限**：未实现 `NO ACTION`、`DEFERRABLE`、`MATCH PARTIAL`；
-   当前已支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和
+1. **动作子集仍有限**：未实现 `DEFERRABLE` / `MATCH PARTIAL`；当前支持
+   `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
    `MATCH SIMPLE` / `MATCH FULL`。
 2. **外键检查是全表扫描**：`_check_foreign_keys` 和级联收集都逐表扫描，
    复杂度与子表行数线性相关，未利用唯一索引点查；数据量大时需要索引定位优化。
@@ -165,5 +167,5 @@ CI：
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
 索引维护、事务回滚、持久化和文档均已落地；全量 822 个测试通过，最新代码提交
 `9cc420f` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
-`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 与
+`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 与
 `MATCH SIMPLE` / `MATCH FULL` 子集。
