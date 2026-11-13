@@ -1627,6 +1627,56 @@ class TestAlterTable:
             (None, 4),
         ]
 
+    def test_alter_column_nullability(self, db):
+        db.execute_one("CREATE TABLE t (id INT, age INT)")
+        db.execute_one("INSERT INTO t VALUES (1, NULL)")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("ALTER TABLE t ALTER COLUMN age SET NOT NULL")
+        # 失败后目录保持原状，NULL 仍可写入
+        db.execute_one("INSERT INTO t VALUES (2, NULL)")
+        db.execute_one("UPDATE t SET age = 30 WHERE id IN (1, 2)")
+        result = db.execute_one("ALTER TABLE t ALTER age SET NOT NULL")
+        assert "已校验 2 行" in result.notice
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t VALUES (3, NULL)")
+        db.execute_one("ALTER TABLE t ALTER COLUMN age DROP NOT NULL")
+        db.execute_one("INSERT INTO t VALUES (4, NULL)")
+        assert rows(db, "SELECT id, age FROM t ORDER BY id") == [
+            (1, 30),
+            (2, 30),
+            (4, None),
+        ]
+
+    def test_alter_column_not_null_rollback(self, db):
+        db.execute_one("CREATE TABLE t (id INT, age INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 20)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ALTER COLUMN age SET NOT NULL")
+        db.execute_one("ROLLBACK")
+        db.execute_one("INSERT INTO t VALUES (2, NULL)")
+        assert rows(db, "SELECT id, age FROM t ORDER BY id") == [
+            (1, 20),
+            (2, None),
+        ]
+
+    def test_drop_not_null_on_primary_key_rejected(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t ALTER COLUMN id DROP NOT NULL")
+
+    def test_alter_column_not_null_survives_reopen(self, tmp_path):
+        path = tmp_path / "not_null_reopen"
+        first = Database(path)
+        first.execute_one("CREATE TABLE t (id INT, age INT)")
+        first.execute_one("INSERT INTO t VALUES (1, 20)")
+        first.execute_one("ALTER TABLE t ALTER COLUMN age SET NOT NULL")
+        first.close()
+
+        second = Database(path)
+        with pytest.raises(NotNullViolationError):
+            second.execute_one("INSERT INTO t VALUES (2, NULL)")
+        second.close()
+
     def test_add_nullable_column_pads_null(self, db):
         db.execute_one("CREATE TABLE t (id INT)")
         db.execute_one("INSERT INTO t VALUES (1)")

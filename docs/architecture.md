@@ -101,7 +101,9 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 
 `ALTER TABLE ... ALTER [COLUMN] ... SET/DROP DEFAULT` 同样只修改目录里的列默认值，
 不扫描或重写已有行；默认值在后续 `INSERT` 省略该列时读取，并沿用与建表相同的
-字面常量/类型转换校验。默认值修改与 `DROP` 都登记事务 undo。
+字面常量/类型转换校验。`SET NOT NULL` 会先扫描堆表验证存量数据，校验通过后只改
+目录约束；`DROP NOT NULL` 直接解除约束，两者都登记事务 undo，不重写堆页。默认值
+修改与 `DROP` 也都登记事务 undo。
 
 这样做的好处是 DDL 是 O(1)，不需要停机搬表；代价是"同一张表里新旧两种行格式
 共存"，解码路径必须显式知道缺列是合法的。`RENAME TO` / `RENAME COLUMN` 只改目录

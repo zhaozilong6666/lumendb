@@ -30,6 +30,7 @@ from ..sql.ast import (
     AlterTableAddColumn,
     AlterTableAddConstraint,
     AlterTableAlterDefault,
+    AlterTableAlterNullability,
     AlterTableRenameColumn,
     AlterTableRenameTable,
     CreateIndex,
@@ -164,6 +165,8 @@ class Executor:
                 return self._alter_add_constraint(stmt, txn)
             if isinstance(stmt, AlterTableAlterDefault):
                 return self._alter_default(stmt, txn)
+            if isinstance(stmt, AlterTableAlterNullability):
+                return self._alter_nullability(stmt, txn)
             if isinstance(stmt, AlterTableRenameTable):
                 self._catalog.rename_table(txn, stmt.table, stmt.new_name)
                 return Result(
@@ -994,6 +997,50 @@ class Executor:
             tag="ALTER TABLE",
             notice=f"已{action}列 {column.name} 的默认值",
         )
+
+    def _alter_nullability(
+        self, stmt: AlterTableAlterNullability, txn: Transaction
+    ) -> Result:
+        """SET/DROP NOT NULL：只改目录约束，不重写任何已有记录。
+
+        SET NOT NULL 必须先扫描堆表确认没有 NULL；校验失败时目录保持原样。
+        主键列天然 NOT NULL，拒绝 DROP NOT NULL，避免破坏主键索引的不变量。
+        """
+        table = self._catalog.get_table(stmt.table)
+        index = table.column_index(stmt.column)
+        column = table.columns[index]
+        if stmt.nullable and column.primary_key:
+            raise BinderError(
+                f"列 {column.name!r} 属于主键，不能 DROP NOT NULL",
+                hint="主键列必须保持 NOT NULL",
+            )
+
+        checked = 0
+        if not stmt.nullable:
+            heap = HeapFile(self._bp, table, self._txns)
+            for _rid, values in heap.scan(txn):
+                checked += 1
+                if values[index] is None:
+                    raise NotNullViolationError(
+                        f"列 {column.name!r} 存在 NULL，无法 SET NOT NULL",
+                        detail=f"已扫描 {checked} 行，首次发现 NULL",
+                        hint="先 UPDATE 或 DELETE 含 NULL 的行",
+                    )
+
+        old = column
+        table.columns[index] = replace(column, nullable=stmt.nullable)
+
+        def undo() -> None:
+            table.columns[index] = old
+
+        txn.undo_log.append(undo)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        action = "删除" if stmt.nullable else "设置"
+        notice = f"已{action}列 {column.name} 的 NOT NULL 约束"
+        if not stmt.nullable:
+            notice += f"；已校验 {checked} 行"
+        return Result(tag="ALTER TABLE", notice=notice)
 
     def _alter_add_constraint(
         self, stmt: AlterTableAddConstraint, txn: Transaction

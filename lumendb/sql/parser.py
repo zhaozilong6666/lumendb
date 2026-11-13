@@ -66,6 +66,7 @@ from .ast import (
     AlterTableAddColumn,
     AlterTableAddConstraint,
     AlterTableAlterDefault,
+    AlterTableAlterNullability,
     AlterTableRenameColumn,
     AlterTableRenameTable,
 )
@@ -315,17 +316,29 @@ class Parser:
             self._match_kw("COLUMN")
             column = self._parse_ident("列名")
             if self._match_kw("SET"):
+                if self._match_kw("NOT"):
+                    self._expect_kw("NULL")
+                    return AlterTableAlterNullability(
+                        table=table, column=column, nullable=False
+                    )
                 self._expect_kw("DEFAULT")
                 default = self._parse_expr()
                 return AlterTableAlterDefault(
                     table=table, column=column, default=default
                 )
             if self._match_kw("DROP"):
+                if self._match_kw("NOT"):
+                    self._expect_kw("NULL")
+                    return AlterTableAlterNullability(
+                        table=table, column=column, nullable=True
+                    )
                 self._expect_kw("DEFAULT")
                 return AlterTableAlterDefault(
                     table=table, column=column, default=None
                 )
-            raise self._error("ALTER COLUMN 之后期望 SET DEFAULT 或 DROP DEFAULT")
+            raise self._error(
+                "ALTER COLUMN 之后期望 SET/DROP DEFAULT 或 SET/DROP NOT NULL"
+            )
 
         if self._match_kw("RENAME"):
             if self._match_kw("TABLE"):
@@ -350,8 +363,11 @@ class Parser:
             )
 
         raise NotSupportedError(
-            "ALTER TABLE 只支持 ADD COLUMN 和 RENAME",
-            hint="支持 ADD [COLUMN] / RENAME TO / RENAME [COLUMN] old TO new",
+            "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN 和 RENAME",
+            hint=(
+                "支持 ADD [COLUMN] / ALTER [COLUMN] SET|DROP DEFAULT|NOT NULL / "
+                "RENAME TO / RENAME [COLUMN] old TO new"
+            ),
         )
 
     def _parse_with(self) -> Statement:

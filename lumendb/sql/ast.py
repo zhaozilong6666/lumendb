@@ -421,6 +421,14 @@ class AlterTableAlterDefault(Statement):
 
 
 @dataclass
+class AlterTableAlterNullability(Statement):
+    table: str
+    column: str
+    #: False 表示 SET NOT NULL，True 表示 DROP NOT NULL
+    nullable: bool
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False

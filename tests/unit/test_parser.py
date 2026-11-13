@@ -658,6 +658,21 @@ class TestAlterTable:
         )
         assert dropped.default is None
 
+    def test_alter_column_not_null(self):
+        from lumendb.sql.ast import AlterTableAlterNullability
+
+        stmt = parse_statement(
+            "ALTER TABLE users ALTER COLUMN age SET NOT NULL"
+        )
+        assert isinstance(stmt, AlterTableAlterNullability)
+        assert stmt.column == "age"
+        assert stmt.nullable is False
+        dropped = parse_statement(
+            "ALTER TABLE users ALTER age DROP NOT NULL"
+        )
+        assert isinstance(dropped, AlterTableAlterNullability)
+        assert dropped.nullable is True
+
     def test_primary_key_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement("ALTER TABLE users ADD COLUMN id INT PRIMARY KEY")

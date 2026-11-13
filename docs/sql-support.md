@@ -23,6 +23,8 @@ ALTER TABLE t ADD [COLUMN] note TEXT;
 ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
 ALTER TABLE t ALTER [COLUMN] age SET DEFAULT 21;
 ALTER TABLE t ALTER [COLUMN] age DROP DEFAULT;
+ALTER TABLE t ALTER [COLUMN] age SET NOT NULL;
+ALTER TABLE t ALTER [COLUMN] age DROP NOT NULL;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
@@ -53,6 +55,10 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 `ALTER [COLUMN] ... SET DEFAULT` / `DROP DEFAULT` 只修改目录里的默认值，不重写已有行；
 后续 `INSERT` 省略该列时读取新默认值，已有行只有在 `UPDATE`/`VACUUM` 重写时才会
 重新编码。默认值目前只支持字面常量，且会按列类型做一次转换校验。
+
+`ALTER [COLUMN] ... SET NOT NULL` 会先扫描堆表确认该列没有 `NULL`，校验通过后只修改
+目录约束并登记事务 undo；`DROP NOT NULL` 直接解除约束。两者都不重写已有行。主键列
+天然要求 `NOT NULL`，因此主键列上的 `DROP NOT NULL` 会被拒绝。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
 同步更新所有索引的列引用，不重写堆记录。重命名后旧名字立即失效；客户端需要重新
@@ -221,7 +227,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
