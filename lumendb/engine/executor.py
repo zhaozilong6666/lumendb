@@ -944,49 +944,20 @@ class Executor:
                 values.append(fn(EvalContext(())))
 
             prepared = self._prepare_values(table, stmt.columns, values)
-            if stmt.on_conflict_nothing:
-                self._check_constraints(
-                    table, prepared, txn, skip_unique=True
-                )
-                if self._has_unique_conflict(table, prepared, txn):
-                    continue
-            elif stmt.on_conflict_update:
-                rid = self._find_conflict_rid(
-                    table, prepared, txn, conflict_index
-                )
-                old_values = heap.get(txn, rid) if rid is not None else None
-                if old_values is not None:
-                    prepared = self._apply_conflict_update(
-                        table, heap, txn, rid, old_values, assignment_fns
-                    )
-                    if ret_fns:
-                        returned.append(
-                            tuple(
-                                fn(EvalContext(tuple(prepared)))
-                                for fn in ret_fns
-                            )
-                        )
-                    count += 1
-                    continue
-                # 冲突目标上没有找到可更新行，按普通插入处理，
-                # 其它唯一索引的冲突会在下面报出来。
-                self._check_constraints(table, prepared, txn)
-            else:
-                self._check_constraints(table, prepared, txn)
-
-            rid = heap.insert(txn, prepared)
-            for idx in table.indexes.values():
-                tree = self._tree_for(table, idx)
-                key = self._key_for(table, idx, prepared)
-                if key is None:
-                    continue
-                tree.insert(txn, key, rid)
-                idx.root_page = tree.root_page
-            if ret_fns:
-                returned.append(
-                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
-                )
-            count += 1
+            delta, returning_row = self._insert_row(
+                table,
+                heap,
+                txn,
+                prepared,
+                do_nothing=stmt.on_conflict_nothing,
+                on_conflict_update=stmt.on_conflict_update,
+                conflict_index=conflict_index,
+                assignment_fns=assignment_fns,
+                ret_fns=ret_fns,
+            )
+            count += delta
+            if returning_row is not None:
+                returned.append(returning_row)
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
@@ -1134,47 +1105,20 @@ class Executor:
         count = 0
         for values in source_rows:
             prepared = self._prepare_values(table, stmt.columns, list(values))
-            if stmt.on_conflict_nothing:
-                self._check_constraints(
-                    table, prepared, txn, skip_unique=True
-                )
-                if self._has_unique_conflict(table, prepared, txn):
-                    continue
-            elif stmt.on_conflict_update:
-                rid = self._find_conflict_rid(
-                    table, prepared, txn, conflict_index
-                )
-                old_values = heap.get(txn, rid) if rid is not None else None
-                if old_values is not None:
-                    prepared = self._apply_conflict_update(
-                        table, heap, txn, rid, old_values, assignment_fns
-                    )
-                    if ret_fns:
-                        returned.append(
-                            tuple(
-                                fn(EvalContext(tuple(prepared)))
-                                for fn in ret_fns
-                            )
-                        )
-                    count += 1
-                    continue
-                self._check_constraints(table, prepared, txn)
-            else:
-                self._check_constraints(table, prepared, txn)
-
-            rid = heap.insert(txn, prepared)
-            for idx in table.indexes.values():
-                tree = self._tree_for(table, idx)
-                key = self._key_for(table, idx, prepared)
-                if key is None:
-                    continue
-                tree.insert(txn, key, rid)
-                idx.root_page = tree.root_page
-            if ret_fns:
-                returned.append(
-                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
-                )
-            count += 1
+            delta, returning_row = self._insert_row(
+                table,
+                heap,
+                txn,
+                prepared,
+                do_nothing=stmt.on_conflict_nothing,
+                on_conflict_update=stmt.on_conflict_update,
+                conflict_index=conflict_index,
+                assignment_fns=assignment_fns,
+                ret_fns=ret_fns,
+            )
+            count += delta
+            if returning_row is not None:
+                returned.append(returning_row)
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
@@ -1185,6 +1129,64 @@ class Executor:
             affected=count,
             tag=f"INSERT {count}",
         )
+
+    def _insert_row(
+        self,
+        table: TableDef,
+        heap: HeapFile,
+        txn: Transaction,
+        prepared: list[Any],
+        *,
+        do_nothing: bool,
+        on_conflict_update: bool,
+        conflict_index: Optional[IndexDef],
+        assignment_fns: list[tuple[int, Any]],
+        ret_fns: list[Any],
+    ) -> tuple[int, Optional[tuple]]:
+        """统一写入一条 INSERT 候选行。
+
+        所有 INSERT（VALUES / SELECT）都必须经过这里，避免两条路径在
+        NOT NULL、唯一索引和 ON CONFLICT 处理上各自漂移。
+        返回 (affected_delta, returning_row)；DO NOTHING 跳过时返回 (0, None)。
+        """
+        if do_nothing:
+            # 唯一冲突是预期内的跳过，因此先跳过唯一检查；NOT NULL 仍要检查。
+            self._check_constraints(table, prepared, txn, skip_unique=True)
+            if self._has_unique_conflict(table, prepared, txn):
+                return 0, None
+        elif on_conflict_update:
+            rid = self._find_conflict_rid(table, prepared, txn, conflict_index)
+            old_values = heap.get(txn, rid) if rid is not None else None
+            if old_values is not None:
+                prepared = self._apply_conflict_update(
+                    table, heap, txn, rid, old_values, assignment_fns
+                )
+                returning_row = (
+                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
+                    if ret_fns
+                    else None
+                )
+                return 1, returning_row
+            # 冲突目标上没有可更新行：按普通插入处理，其它唯一索引冲突
+            # 会在 _check_constraints 中抛出来。
+            self._check_constraints(table, prepared, txn)
+        else:
+            self._check_constraints(table, prepared, txn)
+
+        rid = heap.insert(txn, prepared)
+        for idx in table.indexes.values():
+            tree = self._tree_for(table, idx)
+            key = self._key_for(table, idx, prepared)
+            if key is None:
+                continue
+            tree.insert(txn, key, rid)
+            idx.root_page = tree.root_page
+        returning_row = (
+            tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
+            if ret_fns
+            else None
+        )
+        return 1, returning_row
 
     def _has_unique_conflict(self, table, values, txn: Transaction) -> bool:
         """ON CONFLICT DO NOTHING 的前置检查：任一唯一索引上已有同样的键。"""

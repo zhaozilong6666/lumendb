@@ -189,6 +189,11 @@ DML 的 `RETURNING` 不另建计划：绑定阶段把表达式编译成闭包，
 `WITH ... UPDATE/DELETE` 把 CTE 注册表挂到当前语句的 Binder 上，执行器在
 DML 求值期间把同一作用域放进 `_active_ctes`，语句结束即丢弃。
 
+所有 `INSERT`（`VALUES` 与 `INSERT ... SELECT`）共用 `_insert_row`：
+NOT NULL、唯一索引检查、`ON CONFLICT` 分派和索引维护都在写堆之前完成。
+新增插入路径必须复用这个入口，不能绕过去直接写 `HeapFile`，否则会重现
+"先写行、后建索引"或静默重复唯一键的问题。
+
 Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，不能跨语句复用；
 曾经复用 Binder 导致上一条 `WITH` 的 CTE 在下一句仍然可见，现已修复并加测试。
 

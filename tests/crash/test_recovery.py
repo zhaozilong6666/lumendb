@@ -13,6 +13,7 @@ from lumendb.catalog.catalog import Catalog
 from lumendb.catalog.schema import Column, TableDef
 from lumendb.catalog.store import CatalogStore
 from lumendb.datatypes import DataType, TypeSpec
+from lumendb.engine.database import Database
 from lumendb.storage.bufferpool import BufferPoolManager
 from lumendb.storage.heap import HeapFile
 from lumendb.storage.pager import DiskManager
@@ -203,6 +204,28 @@ class TestCommittedSurvives:
         h2.bp.close()
         h2.wal.close()
         h2.dm.close()
+
+
+class TestSavepointCrashRecovery:
+    def test_savepoint_rollback_then_crash(self, db_path):
+        path = db_path / "savepoint_crash"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (2, 20)")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (3, 30)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+
+        # 崩溃：只保证 WAL 落盘，数据页留在 Buffer Pool，不执行 commit。
+        db.wal.flush()
+        db.disk.close()
+
+        db2 = Database(path)
+        result = db2.execute_one("SELECT id, v FROM t ORDER BY id")
+        assert result.rows == [(1, 10)]
+        db2.close()
 
 
 class TestRecoveryReport:
