@@ -554,6 +554,30 @@ class TestInsert:
         )
         assert rows(db, "SELECT * FROM v") == [(2,)]
 
+    def test_drop_table_blocked_by_view_dependency(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        with pytest.raises(BinderError):
+            db.execute_one("DROP TABLE t")
+        db.execute_one("DROP VIEW v")
+        db.execute_one("DROP TABLE t")
+
+    def test_drop_view_blocked_by_dependent_view(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v1 AS SELECT a FROM t")
+        db.execute_one("CREATE VIEW v2 AS SELECT a FROM v1")
+        with pytest.raises(BinderError):
+            db.execute_one("DROP VIEW v1")
+        db.execute_one("DROP VIEW v2")
+        db.execute_one("DROP VIEW v1")
+
+    def test_or_replace_view_cannot_reference_itself(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        with pytest.raises(BinderError):
+            db.execute_one("CREATE OR REPLACE VIEW v AS SELECT a FROM v")
+        assert rows(db, "SELECT * FROM v") == []
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

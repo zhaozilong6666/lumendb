@@ -31,6 +31,8 @@ class Catalog:
         self.views: dict[str, list[tuple[str, str]]] = {}
         #: 视图名 -> 显式列名（可选）；空列表表示沿用查询输出的列名。
         self.view_columns: dict[str, list[str]] = {}
+        #: 视图名 -> 实际引用到的表/视图名；用于拒绝悬空的 DROP。
+        self.view_dependencies: dict[str, set[str]] = {}
         self._loaded = False
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
@@ -47,6 +49,7 @@ class Catalog:
         self.tables.clear()
         self.views.clear()
         self.view_columns.clear()
+        self.view_dependencies.clear()
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -71,6 +74,7 @@ class Catalog:
                     (kind, value) for kind, value in vdata.get("tokens", [])
                 ]
                 self.view_columns[name] = list(vdata.get("columns", []))
+                self.view_dependencies[name] = set(vdata.get("dependencies", []))
         self._loaded = True
 
     def persist(self, txn: Transaction) -> None:
@@ -83,6 +87,9 @@ class Catalog:
                         "name": name,
                         "tokens": [[kind, value] for kind, value in tokens],
                         "columns": self.view_columns.get(name, []),
+                        "dependencies": sorted(
+                            self.view_dependencies.get(name, set())
+                        ),
                     }
                     for name, tokens in self.views.items()
                 ],
@@ -172,6 +179,7 @@ class Catalog:
         name: str,
         tokens: list[tuple[str, str]],
         columns: Optional[list[str]] = None,
+        dependencies: Optional[set[str]] = None,
     ) -> None:
         key = name.lower()
         if key in self.tables or key in self.views:
@@ -181,10 +189,12 @@ class Catalog:
             )
         self.views[key] = list(tokens)
         self.view_columns[key] = list(columns or [])
+        self.view_dependencies[key] = set(dependencies or ())
 
         def undo() -> None:
             self.views.pop(key, None)
             self.view_columns.pop(key, None)
+            self.view_dependencies.pop(key, None)
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -195,18 +205,22 @@ class Catalog:
         name: str,
         tokens: list[tuple[str, str]],
         columns: Optional[list[str]] = None,
+        dependencies: Optional[set[str]] = None,
     ) -> None:
         key = name.lower()
         if key not in self.views:
             raise TableNotFoundError(f"视图 {name!r} 不存在")
         old = self.views[key]
         old_columns = self.view_columns.get(key, [])
+        old_dependencies = self.view_dependencies.get(key, set())
         self.views[key] = list(tokens)
         self.view_columns[key] = list(columns or [])
+        self.view_dependencies[key] = set(dependencies or ())
 
         def undo() -> None:
             self.views[key] = old
             self.view_columns[key] = old_columns
+            self.view_dependencies[key] = old_dependencies
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -215,20 +229,41 @@ class Catalog:
         key = name.lower()
         if key not in self.views:
             raise TableNotFoundError(f"视图 {name!r} 不存在")
+        dependents = self._view_dependents(key)
+        if dependents:
+            raise BinderError(
+                f"视图 {name!r} 被其他视图依赖：{', '.join(dependents)}",
+                hint="先删除依赖它的视图，再删除当前视图",
+            )
         tokens = self.views.pop(key)
         columns = self.view_columns.pop(key, [])
+        dependencies = self.view_dependencies.pop(key, set())
 
         def undo() -> None:
             self.views[key] = tokens
             self.view_columns[key] = columns
+            self.view_dependencies[key] = dependencies
 
         txn.undo_log.append(undo)
         self.persist(txn)
+
+    def _view_dependents(self, key: str) -> list[str]:
+        return sorted(
+            name
+            for name, deps in self.view_dependencies.items()
+            if key in deps
+        )
 
     def drop_table(self, txn: Transaction, name: str) -> None:
         key = name.lower()
         if key not in self.tables:
             raise TableNotFoundError(f"表 {name!r} 不存在")
+        dependents = self._view_dependents(key)
+        if dependents:
+            raise BinderError(
+                f"表 {name!r} 被视图依赖：{', '.join(dependents)}",
+                hint="先 DROP VIEW 依赖它的视图，再删除表",
+            )
         table = self.tables.pop(key)
 
         def undo() -> None:

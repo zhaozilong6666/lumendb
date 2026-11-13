@@ -767,6 +767,9 @@ class Executor:
         # 建视图时先完整绑定一次，提前暴露未知表/列和类型错误；
         # 视图不物化数据，SELECT 时再按保存的 token 重新绑定。
         binder = self._new_binder()
+        if stmt.or_replace:
+            # 防止 OR REPLACE 把视图替换成依赖自身的递归定义。
+            binder.view_stack = frozenset({stmt.name.lower()})
         if isinstance(stmt.query, Query):
             bound_cols = binder.bind_query(stmt.query)
         else:
@@ -786,12 +789,14 @@ class Executor:
                 )
         if stmt.or_replace and self._catalog.has_view(stmt.name):
             self._catalog.replace_view(
-                txn, stmt.name, stmt.tokens, stmt.columns
+                txn, stmt.name, stmt.tokens, stmt.columns,
+                binder.source_dependencies,
             )
             notice = f"已替换视图 {stmt.name.lower()}"
         else:
             self._catalog.create_view(
-                txn, stmt.name, stmt.tokens, stmt.columns
+                txn, stmt.name, stmt.tokens, stmt.columns,
+                binder.source_dependencies,
             )
             notice = f"已创建视图 {stmt.name.lower()}"
         return Result(tag="CREATE VIEW", notice=notice)
@@ -799,7 +804,7 @@ class Executor:
     def _drop_view(self, stmt: DropView, txn: Transaction) -> Result:
         try:
             self._catalog.drop_view(txn, stmt.name)
-        except Exception:
+        except TableNotFoundError:
             if stmt.if_exists:
                 return Result(tag="DROP VIEW", notice="视图不存在，已跳过")
             raise

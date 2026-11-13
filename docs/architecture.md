@@ -130,7 +130,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 `WITH`，此时 token 重新解析为 `Query` 并走 `bind_query`；普通定义仍走 `bind_select`。
 若视图带显式列名清单，
 目录会在 `view_columns` 里保存别名，Binder 用别名覆盖输出列名并校验列数/重复名。
-`view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用。视图不占堆页，因此不参与
+`view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用；Binder 同时把
+实际解析到的表/视图记进 `source_dependencies`，目录持久化为每个视图的依赖集合，
+`DROP TABLE` / `DROP VIEW` 据此拒绝会留下悬空定义的删除。视图不占堆页，因此不参与
 `VACUUM`/`TRUNCATE`；它读到的始终是基表当前已提交的 MVCC 版本。
 `CREATE OR REPLACE VIEW` 先绑定新定义，再替换目录里的 token 切片，因此新定义
 非法时旧视图仍然可用；替换本身也在事务 undo 范围内。

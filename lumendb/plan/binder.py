@@ -233,6 +233,8 @@ class Binder:
         self.catalog = catalog
         #: 正在展开的视图名，用于检测 A -> B -> A 这类循环定义。
         self.view_stack: frozenset[str] = frozenset()
+        #: 绑定过程中实际引用到的基础表/视图名，用于视图依赖检查。
+        self.source_dependencies: set[str] = set()
         #: ``$n`` 的绑定值。绑定阶段直接折成字面量，执行计划里不存在参数数组。
         self.params: list[Any] = list(params) if params else []
         #: 聚合节点 id -> 在聚合输出行里的下标
@@ -1203,10 +1205,12 @@ class Binder:
             view_binder = Binder(self.catalog, self.params)
             view_binder.subquery_runner = self.subquery_runner
             view_binder.view_stack = self.view_stack | {view_key}
+            self.source_dependencies.add(view_key)
             if isinstance(view_query, Query):
                 child, cols = view_binder.bind_query(view_query)
             else:
                 child, cols = view_binder.bind_select(view_query)
+            self.source_dependencies.update(view_binder.source_dependencies)
             aliases = self.catalog.get_view_columns(name)
             if aliases:
                 if len(aliases) != len(cols):
@@ -1233,6 +1237,7 @@ class Binder:
             return node, schema, list(cols)
 
         table = self.catalog.get_table(name)
+        self.source_dependencies.add(table.name)
         effective = (alias or table.name).lower()
         columns = [OutputColumn(col.name, col.type) for col in table.columns]
         node = Scan(columns=columns, table=table.name, alias=effective)

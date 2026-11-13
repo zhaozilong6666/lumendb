@@ -43,12 +43,13 @@
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` 只改目录并同步索引列引用；
 >   `CREATE VIEW` 保存 `AS` 之后的词法切片，不物化数据，查询时展开为 `CteScan`，
->   支持 `OR REPLACE`、显式列名和 `SHOW VIEWS`，建视图时即校验绑定；
+>   支持 `OR REPLACE`、显式列名和 `SHOW VIEWS`，建视图时即校验绑定，
+>   并把真实表/视图依赖落进目录，`DROP TABLE` / `DROP VIEW` 会拒绝悬空删除；
 >   `EXPLAIN` 输出真实执行路径，`EXPLAIN ANALYZE` 标注实际耗时与行数；
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 683 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 686 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -91,14 +92,16 @@
 >   index column references without rewriting heap records;
 >   `CREATE VIEW` persists the token slice after `AS` instead of materializing
 >   data, expands to a `CteScan` at bind time, and supports `OR REPLACE`,
->   explicit column names and `SHOW VIEWS` with bind-time validation;
+>   explicit column names and `SHOW VIEWS` with bind-time validation; resolved
+>   table/view dependencies are persisted so `DROP TABLE` / `DROP VIEW` reject
+>   dangling deletions;
 >   `EXPLAIN` reports the plan that actually runs, and `EXPLAIN ANALYZE`
 >   annotates each operator with actual time, rows and loop count.
 > - Implemented the PostgreSQL v3 wire protocol (startup handshake,
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 683 automated tests including crash-injection and a 20-seed randomized
+> - 686 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
