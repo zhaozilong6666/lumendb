@@ -135,6 +135,7 @@ class CatalogStore:
                     META_OFF_CATALOG_ROOT,
                     struct.pack("<I", current),
                     old_bytes,
+                    clr=True,
                 )
                 meta_page.buf[
                     META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4

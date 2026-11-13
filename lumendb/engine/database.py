@@ -28,7 +28,7 @@ class Database:
         self.disk = DiskManager(self.path / "lumendb.data")
         self.wal = WAL(self.path / "lumendb.wal")
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
-        self.txns = TransactionManager(self.disk, self.wal)
+        self.txns = TransactionManager(self.disk, self.wal, self.bp)
 
         self.recovery_report = RecoveryManager(
             self.disk, self.wal, self.bp, self.txns

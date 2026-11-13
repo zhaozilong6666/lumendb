@@ -737,9 +737,35 @@ class Executor:
             raise
         return Result(tag="DROP INDEX")
 
+    def _snapshot_table_state(self, table, txn: Transaction) -> None:
+        """登记 DML 对表/索引根页号的逆操作。
+
+        堆表插入可能分配新页并修改 ``root_page``/``last_page``，索引插入可能
+        更换 B+ 树根页；这些字段在 Catalog 对象上原地变化，如果事务回滚只
+        撤销页内容而不撤销这些指针，内存目录就会指向已经恢复成空页的页。
+        """
+        state = (
+            table.root_page,
+            table.last_page,
+            table.row_count_hint,
+            {name: idx.root_page for name, idx in table.indexes.items()},
+        )
+
+        def undo() -> None:
+            table.root_page = state[0]
+            table.last_page = state[1]
+            table.row_count_hint = state[2]
+            for name, root_page in state[3].items():
+                idx = table.indexes.get(name)
+                if idx is not None:
+                    idx.root_page = root_page
+
+        txn.undo_log.append(undo)
+
     def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
         """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
         table = self._catalog.get_table(stmt.table)
+        self._snapshot_table_state(table, txn)
         rebuilt, entries_total = self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
@@ -778,6 +804,7 @@ class Executor:
         )
         kept = dead = pages = 0
         for table in tables:
+            self._snapshot_table_state(table, txn)
             heap = HeapFile(self._bp, table, self._txns)
             k, d, p = heap.vacuum(txn)
             kept += k
@@ -797,6 +824,7 @@ class Executor:
     def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
         """清空整表：页链保留但每一页重置为空页，索引随之重建为空。"""
         table = self._catalog.get_table(stmt.table)
+        self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         removed = heap.truncate(txn)
         self._rebuild_indexes(table, txn)
@@ -865,6 +893,7 @@ class Executor:
 
     def _insert(self, stmt: Insert, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
+        self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.query is not None:
             return self._insert_select(stmt, table, heap, txn)
@@ -998,6 +1027,7 @@ class Executor:
 
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
+        self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.ctes:
             self.binder.bind_ctes(stmt.ctes)
@@ -1070,6 +1100,7 @@ class Executor:
 
     def _delete(self, stmt: Delete, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
+        self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.ctes:
             self.binder.bind_ctes(stmt.ctes)

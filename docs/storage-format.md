@@ -165,7 +165,11 @@ WAL 只追加；checkpoint 成功后允许从头截断（保留 checkpoint 记�
 +8  u32 next_page_id   下一个可分配页号
 +12 u32 catalog_root   目录 JSON 所在的页号（0 表示内联）
 +16 u64 next_xid
-+24 u64 checkpoint_lsn
++24 u64 pageLSN       通用页头的日志位置（不能复用为 checkpoint）
++40 u64 checkpoint_lsn
 ```
 
-目录本身序列化为 JSON 存在独立的页链中（小数据量，便于人读与迁移）；页链满则追加新页。
+注意：`+24` 是通用页头的 `pageLSN`。早期实现曾把 checkpoint_lsn 放在这里，
+导致 `_persist_meta` 每次刷元数据都会把 pageLSN 覆盖成 0，恢复阶段于是会
+重放已经回滚的 `catalog_root` 更新。现在 checkpoint 改到 `+40`，pageLSN
+保持独立。

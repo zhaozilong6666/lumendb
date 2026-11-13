@@ -62,9 +62,12 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 
 DDL 不止改磁盘页，还会原地修改内存里的 `Catalog` 对象。因此 `Catalog` 的
 建表/删表/建索引/删索引/重命名/加列都会把一个逆操作登记到 `txn.undo_log`；
-`abort` 时逆序执行这些回调，先把内存目录恢复到事务开始前的样子，再由 WAL
-负责页级 undo。`CatalogStore` 还会把 page 0 的 `catalog_root` 指回旧链，否则
-显式 `ROLLBACK` 之后关闭再打开，会重新加载到未提交的新目录链。
+DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` 与索引
+根页的快照。Buffer Pool 另外按 `xid` 记录每次页写的 before image，`abort`
+时先逆序恢复页内容，再逆序恢复目录对象，最后由 WAL 负责崩溃后的页级 undo。
+页恢复会写 CLR 并推进 `pageLSN`，避免下次 redo 把回滚结果覆盖回去。
+`CatalogStore` 还会把 page 0 的 `catalog_root` 指回旧链，否则显式 `ROLLBACK`
+之后关闭再打开，会重新加载到未提交的新目录链。
 
 ### 2.6 回收（VACUUM）
 

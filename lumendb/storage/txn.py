@@ -16,11 +16,14 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..errors import TransactionAbortedError, TransactionError
 from .pager import DiskManager
 from .wal import WAL
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .bufferpool import BufferPoolManager
 
 #: 事务号预留块大小。崩溃后重启时，下一个 xid 从这个块的边界继续，
 #: 保证不会复用已经写进记录头的事务号。
@@ -62,9 +65,15 @@ class Transaction:
 class TransactionManager:
     """事务号分配、状态维护与可见性判定。"""
 
-    def __init__(self, disk: DiskManager, wal: WAL) -> None:
+    def __init__(
+        self,
+        disk: DiskManager,
+        wal: WAL,
+        buffer_pool: Optional["BufferPoolManager"] = None,
+    ) -> None:
         self._disk = disk
         self._wal = wal
+        self._bp = buffer_pool
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
@@ -109,6 +118,8 @@ class TransactionManager:
             txn.state = TxnState.COMMITTED
             self._states[txn.xid] = TxnState.COMMITTED
             self._active.discard(txn.xid)
+            if self._bp is not None:
+                self._bp.clear_undo(txn.xid)
             # DDL 的内存撤销信息在提交后不再需要。
             txn.undo_log.clear()
             if self._current is txn:
@@ -118,8 +129,12 @@ class TransactionManager:
         with self._lock:
             if txn.state is not TxnState.ACTIVE:
                 return
+            # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
+            # 这样 CatalogStore 的 root 回滚看到的是旧根页号，不会误判。
+            if self._bp is not None:
+                self._bp.undo_xid(txn.xid)
             # DDL 修改的是内存里的 Catalog 对象；WAL 只能恢复页，不能替
-            # 调用方恢复已变异的 Python 对象，所以这里先逆序执行内存 undo。
+            # 调用方恢复已变异的 Python 对象，所以这里再逆序执行内存 undo。
             while txn.undo_log:
                 undo = txn.undo_log.pop()
                 try:

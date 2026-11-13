@@ -71,6 +71,8 @@ class BufferPoolManager:
         self._frames: "OrderedDict[int, Page]" = OrderedDict()
         self._pins: dict[int, int] = {}
         self._dirty: set[int] = set()
+        # xid -> [(page_id, offset, before_image)]，用于显式 ROLLBACK 的页级撤销
+        self._undo: dict[int, list[tuple[int, int, bytes]]] = {}
         self.stats = BufferPoolStats()
 
     # -- 查询状态 -----------------------------------------------------------
@@ -162,7 +164,49 @@ class BufferPoolManager:
             )
             page.page_lsn = lsn
             self._dirty.add(page.page_id)
+            if not clr:
+                self._undo.setdefault(xid, []).append(
+                    (page.page_id, offset, bytes(old))
+                )
             return lsn
+
+    def clear_undo(self, xid: int) -> None:
+        """事务提交后丢弃页级撤销信息，避免长事务让缓冲池无限增长。"""
+        with self._lock:
+            self._undo.pop(xid, None)
+
+    def undo_xid(self, xid: int) -> int:
+        """逆序恢复该事务写过的页，并写 CLR 推进 pageLSN。
+
+        恢复顺序必须与写入顺序相反：同一偏移可能被写过多次，只有先撤销
+        后一次写，才能拿到前一次写的 after image。每恢复一页就立即刷盘，
+        并确保对应的 CLR 已经先落 WAL；这样崩溃后 redo 看到更高的
+        pageLSN 会跳过原始 UPDATE，不会把已回滚的数据复活。
+        """
+        with self._lock:
+            entries = self._undo.pop(xid, [])
+            if not entries:
+                return 0
+            touched: set[int] = set()
+            for page_id, offset, old in reversed(entries):
+                page = self.fetch_page(page_id)
+                try:
+                    current = bytes(page.buf[offset : offset + len(old)])
+                    if current == old:
+                        continue
+                    lsn = self.log_page_update(
+                        xid, page, offset, current, old, clr=True
+                    )
+                    page.buf[offset : offset + len(old)] = old
+                    # old image 里包含旧的 pageLSN；写回后必须重新盖上 CLR
+                    # 的 LSN，否则重启 redo 会按旧 LSN 重放原始 UPDATE。
+                    page.page_lsn = lsn
+                    touched.add(page_id)
+                finally:
+                    self.unpin(page_id, dirty=True)
+            for page_id in touched:
+                self.flush_page(page_id)
+            return len(touched)
 
     def flush_page(self, page_id: int) -> None:
         """把单个脏页写回磁盘（先刷 WAL）。"""

@@ -25,7 +25,10 @@ META_OFF_PAGE_SIZE = 6
 META_OFF_NEXT_PAGE = 8
 META_OFF_CATALOG_ROOT = 12
 META_OFF_NEXT_XID = 16
-META_OFF_CHECKPOINT_LSN = 24
+# 注意：24..32 是通用页头的 pageLSN，元数据页不能复用它存 checkpoint。
+# 把 checkpoint_lsn 放到页头之后的 40 字节处，避免每次刷新元数据时
+# 把 pageLSN 覆盖成 0，导致恢复阶段重放已经回滚的 catalog_root 更新。
+META_OFF_CHECKPOINT_LSN = 40
 
 
 class MetaPage(Page):
