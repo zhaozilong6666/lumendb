@@ -3332,6 +3332,7 @@ class TestForeignKey:
             "CREATE TABLE c (id INT PRIMARY KEY, pid INT, "
             "FOREIGN KEY (pid) REFERENCES p(id) ON UPDATE CASCADE)"
         )
+        db.execute_one("CREATE INDEX idx_c_pid ON c(pid)")
         db.execute_one("INSERT INTO p VALUES (1), (2)")
         db.execute_one("INSERT INTO c VALUES (10, 1), (20, 2)")
         db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
