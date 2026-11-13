@@ -280,10 +280,15 @@ class Select:
 
 @dataclass
 class CompoundSelect:
-    """``UNION [ALL]`` 连接的选择块；ORDER/LIMIT 作用于整个结果。"""
+    """集合运算表达式；``ops`` 与 ``parts[1:]`` 一一对应。
 
-    parts: list[Select]
+    ``order_by`` / ``limit`` 只出现在最外层。``parts`` 允许嵌套
+    ``CompoundSelect``，因此解析器可以按 SQL 优先级把 ``INTERSECT`` 收紧。
+    """
+
+    parts: list[Union[Select, "CompoundSelect"]]
     all_flags: list[bool]
+    ops: list[str] = field(default_factory=list)
     order_by: list[OrderItem] = field(default_factory=list)
     limit: Optional[Union[int, ParamRef]] = None
     offset: Optional[Union[int, ParamRef]] = None
@@ -370,6 +375,7 @@ class Update(Statement):
     assignments: list[tuple[str, Expr]]
     where: Optional[Expr] = None
     returning: Optional[list["SelectItem"]] = None
+    ctes: list["Cte"] = field(default_factory=list)
 
 
 @dataclass
@@ -377,6 +383,7 @@ class Delete(Statement):
     table: str
     where: Optional[Expr] = None
     returning: Optional[list["SelectItem"]] = None
+    ctes: list["Cte"] = field(default_factory=list)
 
 
 @dataclass

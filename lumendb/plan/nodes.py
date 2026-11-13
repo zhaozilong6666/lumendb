@@ -119,13 +119,16 @@ class CteScan(PlanNode):
 class SetOp(PlanNode):
     left: Optional[PlanNode] = None
     right: Optional[PlanNode] = None
+    op: str = "UNION"
     all: bool = False
 
     def children(self):
         return [c for c in (self.left, self.right) if c is not None]
 
     def describe(self) -> str:
-        return "UnionAll" if self.all else "Union"
+        if self.op == "UNION":
+            return "UnionAll" if self.all else "Union"
+        return self.op.title()
 
 
 @dataclass

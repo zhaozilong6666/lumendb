@@ -25,6 +25,8 @@ from lumendb.sql.ast import (
     ColumnRef,
     CompoundSelect,
     CreateTableAs,
+    Update,
+    Delete,
 )
 from lumendb.sql.parser import parse_sql, parse_statement
 
@@ -212,6 +214,23 @@ class TestSelect:
         stmt = parse_statement("WITH x AS (SELECT 1 AS a) SELECT a FROM x")
         assert stmt.ctes[0].name == "x"
         assert stmt.select.from_[0].name == "x"
+
+    def test_with_update(self):
+        stmt = parse_statement(
+            "WITH x AS (SELECT 2 AS id) UPDATE t SET a = 1 "
+            "WHERE id IN (SELECT id FROM x) RETURNING id"
+        )
+        assert isinstance(stmt, Update)
+        assert stmt.ctes[0].name == "x"
+        assert stmt.returning is not None
+
+    def test_with_delete(self):
+        stmt = parse_statement(
+            "WITH x AS (SELECT 1 AS id) DELETE FROM t "
+            "WHERE id IN (SELECT id FROM x)"
+        )
+        assert isinstance(stmt, Delete)
+        assert stmt.ctes[0].name == "x"
 
     def test_multiple_ctes(self):
         stmt = parse_statement(
@@ -473,9 +492,20 @@ class TestCompoundSelect:
         assert stmt.select.limit == 1
         assert stmt.select.parts[1].order_by == []
 
-    def test_except_still_rejected(self):
+    def test_except_and_intersect(self):
+        stmt = parse_statement("SELECT 1 EXCEPT SELECT 2 INTERSECT SELECT 3")
+        assert isinstance(stmt.select, CompoundSelect)
+        assert stmt.select.ops == ["EXCEPT"]
+        assert stmt.select.parts[1].ops == ["INTERSECT"]
+
+    def test_intersect_chain(self):
+        stmt = parse_statement("SELECT 1 INTERSECT SELECT 2 INTERSECT SELECT 3")
+        assert stmt.select.ops == ["INTERSECT"]
+        assert stmt.select.parts[0].ops == ["INTERSECT"]
+
+    def test_except_all_rejected(self):
         with pytest.raises(NotSupportedError):
-            parse_statement("SELECT 1 EXCEPT SELECT 2")
+            parse_statement("SELECT 1 EXCEPT ALL SELECT 2")
 
 
 class TestAlterTable:

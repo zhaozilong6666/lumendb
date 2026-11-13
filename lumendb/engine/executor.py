@@ -123,6 +123,9 @@ class Executor:
     ) -> Result:
         self._txn = txn
         self._params = list(params) if params else []
+        # Binder 保存 CTE 作用域和参数；每条语句必须从干净的作用域开始，
+        # 否则上一条 WITH 的 CTE 会泄漏到下一句（曾经确实泄漏过）。
+        self.binder = self._new_binder()
         self.binder.params = self._params
         try:
             if isinstance(stmt, Query):
@@ -338,18 +341,47 @@ class Executor:
 
     def _set_op(self, node: SetOp, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
-        if node.all:
-            yield from self._execute(node.left, txn)
-            yield from self._execute(node.right, txn)
+        if node.op == "UNION":
+            if node.all:
+                yield from self._execute(node.left, txn)
+                yield from self._execute(node.right, txn)
+                return
+            seen: set[tuple] = set()
+            for child in (node.left, node.right):
+                for row in self._execute(child, txn):
+                    row = tuple(row)
+                    if row in seen:
+                        continue
+                    seen.add(row)
+                    yield row
             return
-        seen: set[tuple] = set()
-        for child in (node.left, node.right):
-            for row in self._execute(child, txn):
+
+        if node.op == "EXCEPT":
+            right_rows = {tuple(row) for row in self._execute(node.right, txn)}
+            seen: set[tuple] = set()
+            for row in self._execute(node.left, txn):
                 row = tuple(row)
-                if row in seen:
+                if row in right_rows or row in seen:
                     continue
                 seen.add(row)
                 yield row
+            return
+
+        if node.op == "INTERSECT":
+            right_rows = {tuple(row) for row in self._execute(node.right, txn)}
+            seen: set[tuple] = set()
+            for row in self._execute(node.left, txn):
+                row = tuple(row)
+                if row not in right_rows or row in seen:
+                    continue
+                seen.add(row)
+                yield row
+            return
+
+        raise NotSupportedError(
+            f"集合运算 {node.op} 尚未实现",
+            hint="支持 UNION / UNION ALL / EXCEPT / INTERSECT",
+        )
 
     def _join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
@@ -758,6 +790,9 @@ class Executor:
         if stmt.ctes:
             # 即使 VALUES 不读表，CTE 里的 SQL 也必须被解析/绑定，不能静默跳过
             self.binder.bind_ctes(stmt.ctes)
+            self._active_ctes = dict(self.binder.ctes)
+        else:
+            self._active_ctes = {}
 
         empty_schema = Schema([])
         schema = Schema(
@@ -800,6 +835,7 @@ class Executor:
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        self._active_ctes = {}
         return Result(
             columns=ret_cols,
             rows=returned,
@@ -826,10 +862,7 @@ class Executor:
         # 先物化来源：INSERT INTO t SELECT * FROM t 不能边读边写，
         # 否则扫描器会把刚插入的新行也读出来，形成无限增长。
         self._active_ctes = dict(self.binder.ctes) if stmt.ctes else {}
-        try:
-            source_rows = [tuple(row) for row in self._execute(plan, txn)]
-        finally:
-            self._active_ctes = {}
+        source_rows = [tuple(row) for row in self._execute(plan, txn)]
         schema = Schema(
             [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
         )
@@ -862,6 +895,7 @@ class Executor:
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        self._active_ctes = {}
         return Result(
             columns=ret_cols,
             rows=returned,
@@ -884,6 +918,11 @@ class Executor:
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         heap = HeapFile(self._bp, table, self._txns)
+        if stmt.ctes:
+            self.binder.bind_ctes(stmt.ctes)
+            self._active_ctes = dict(self.binder.ctes)
+        else:
+            self._active_ctes = {}
 
         assignment_fns: list[tuple[int, Any]] = []
         schema = Schema(
@@ -940,6 +979,7 @@ class Executor:
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        self._active_ctes = {}
         return Result(
             columns=ret_cols,
             rows=returned,
@@ -950,6 +990,11 @@ class Executor:
     def _delete(self, stmt: Delete, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         heap = HeapFile(self._bp, table, self._txns)
+        if stmt.ctes:
+            self.binder.bind_ctes(stmt.ctes)
+            self._active_ctes = dict(self.binder.ctes)
+        else:
+            self._active_ctes = {}
 
         where_fn = None
         schema = Schema(
@@ -978,6 +1023,7 @@ class Executor:
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        self._active_ctes = {}
         return Result(
             columns=ret_cols,
             rows=returned,

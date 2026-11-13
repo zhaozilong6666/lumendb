@@ -129,6 +129,8 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 `RIGHT JOIN` / `FULL JOIN` 统一用 nested loop：右表做外层，`FULL` 额外记录右表
 哪些行被匹配过，最后补出未匹配的右行；两者都按 left+right 的列顺序输出，未匹配
 的一侧填 `NULL`。`CROSS JOIN` 是 `ON` 为真的 `INNER JOIN`。
+集合运算用 `SetOp`：`UNION ALL` 直接拼接，`UNION` 流式去重，`EXCEPT` 先物化右表
+再筛左表，`INTERSECT` 同理；`INTERSECT` 在解析时被收紧成更高的优先级。
 连接顺序枚举与代价模型仍未实现——`EXPLAIN` 输出的是真实执行的计划，不是理想计划。
 
 ## 4. 执行
@@ -166,6 +168,11 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 DML 的 `RETURNING` 不另建计划：绑定阶段把表达式编译成闭包，写入循环里对
 新行（INSERT/UPDATE）或旧行（DELETE）求值。绑定失败发生在任何写入之前，
 所以未知列不会留下半条记录；`ON CONFLICT DO NOTHING` 跳过的行自然不产出。
+`WITH ... UPDATE/DELETE` 把 CTE 注册表挂到当前语句的 Binder 上，执行器在
+DML 求值期间把同一作用域放进 `_active_ctes`，语句结束即丢弃。
+
+Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，不能跨语句复用；
+曾经复用 Binder 导致上一条 `WITH` 的 CTE 在下一句仍然可见，现已修复并加测试。
 
 ## 5. 协议
 

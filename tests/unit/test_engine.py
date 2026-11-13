@@ -1056,6 +1056,10 @@ class TestCte:
         )
         assert result == [(3,)]
 
+    def test_scalar_subquery_uses_output_type(self, db):
+        setup_users(db)
+        assert rows(db, "SELECT id FROM users WHERE id = (SELECT 2)") == [(2,)]
+
     def test_cte_aggregate(self, db):
         setup_users(db)
         result = rows(
@@ -1074,6 +1078,39 @@ class TestCte:
             "ORDER BY name",
         )
         assert result == [("alice",), ("carol",)]
+
+    def test_with_update(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "WITH target AS (SELECT 2 AS id) "
+            "UPDATE users SET age = age + 1 "
+            "WHERE id = (SELECT id FROM target) RETURNING id, age"
+        )
+        assert result.rows == [(2, 26)]
+
+    def test_with_insert_values_uses_cte(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "WITH x AS (SELECT 5 AS id) "
+            "INSERT INTO users VALUES ((SELECT id FROM x), 'eve', 20) "
+            "RETURNING id, name"
+        )
+        assert result.rows == [(5, "eve")]
+
+    def test_with_delete(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "WITH target AS (SELECT id FROM users WHERE age > 30) "
+            "DELETE FROM users WHERE id IN (SELECT id FROM target) "
+            "RETURNING id"
+        )
+        assert result.rows == [(3,)]
+
+    def test_cte_scope_does_not_leak_to_next_statement(self, db):
+        setup_users(db)
+        db.execute_one("WITH one AS (SELECT 1 AS id) SELECT * FROM one")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM one")
 
     def test_explain_analyze_cte(self, db):
         setup_users(db)
@@ -1148,6 +1185,39 @@ class TestUnion:
     def test_union_type_mismatch(self, db):
         with pytest.raises(TypeMismatchError):
             db.execute_one("SELECT 1 AS x UNION ALL SELECT 'a'")
+
+    def test_except(self, db):
+        db.execute_one("CREATE TABLE a (id INT)")
+        db.execute_one("CREATE TABLE b (id INT)")
+        db.execute_one("INSERT INTO a VALUES (1), (2), (2), (3)")
+        db.execute_one("INSERT INTO b VALUES (2), (3), (4)")
+        assert rows(
+            db, "SELECT id FROM a EXCEPT SELECT id FROM b ORDER BY id"
+        ) == [(1,)]
+
+    def test_intersect(self, db):
+        db.execute_one("CREATE TABLE a (id INT)")
+        db.execute_one("CREATE TABLE b (id INT)")
+        db.execute_one("INSERT INTO a VALUES (1), (2), (2), (3)")
+        db.execute_one("INSERT INTO b VALUES (2), (3), (4)")
+        assert rows(
+            db, "SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id"
+        ) == [(2,), (3,)]
+
+    def test_intersect_precedence_over_union(self, db):
+        assert rows(
+            db,
+            "SELECT 1 AS x UNION SELECT 2 AS x INTERSECT SELECT 3 AS x",
+        ) == [(1,)]
+
+    def test_except_null_is_set_member(self, db):
+        assert rows(
+            db, "SELECT NULL AS x INTERSECT SELECT NULL"
+        ) == [(None,)]
+
+    def test_except_all_rejected(self, db):
+        with pytest.raises(NotSupportedError):
+            db.execute_one("SELECT 1 EXCEPT ALL SELECT 2")
 
     def test_union_explain_plan(self, db):
         plan = "\n".join(

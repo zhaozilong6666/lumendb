@@ -587,7 +587,25 @@ class Binder:
                 )
             return rows[0][0]
 
-        return _sub, TypeSpec(DataType.TEXT)
+        type_spec = self._scalar_subquery_type(expr.query)
+        return _sub, type_spec
+
+    def _scalar_subquery_type(self, query) -> TypeSpec:
+        """只绑定、不执行，用输出列推断标量子查询的静态类型。
+
+        之前这里固定返回 TEXT，导致 ``id = (SELECT 2)`` 被误判为
+        INT 与 TEXT 比较；类型必须来自子查询的真实输出列。
+        """
+        binder = Binder(self.catalog, self.params)
+        binder.subquery_runner = self.subquery_runner
+        binder.ctes = dict(self.ctes)
+        _, cols = binder.bind_select(query)
+        if len(cols) != 1:
+            raise BinderError(
+                "标量子查询只能返回一列",
+                detail=f"实际返回 {len(cols)} 列",
+            )
+        return cols[0].type
 
     def _in_subquery(self, expr: InSubquery, schema, allow_agg):
         fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
@@ -850,16 +868,17 @@ class Binder:
         parts = select.parts
         node, out_cols = self.bind_select(parts[0])
         for i, part in enumerate(parts[1:]):
+            op = select.ops[i] if i < len(select.ops) else "UNION"
             right_node, right_cols = self.bind_select(part)
             if len(right_cols) != len(out_cols):
                 raise TypeMismatchError(
-                    "UNION 两侧的列数不同",
+                    f"{op} 两侧的列数不同",
                     detail=f"左侧 {len(out_cols)} 列，右侧 {len(right_cols)} 列",
                 )
             for left_col, right_col in zip(out_cols, right_cols):
                 if not _comparable_types(left_col.type, right_col.type):
                     raise TypeMismatchError(
-                        "UNION 两侧的列类型不兼容",
+                        f"{op} 两侧的列类型不兼容",
                         detail=(
                             f"{left_col.name}: {left_col.type.name} 与 "
                             f"{right_col.type.name}"
@@ -868,6 +887,7 @@ class Binder:
             node = SetOp(
                 left=node,
                 right=right_node,
+                op=op,
                 all=select.all_flags[i],
                 columns=list(out_cols),
             )
@@ -887,7 +907,7 @@ class Binder:
                         index = ordinal - 1
                 if index is None:
                     raise NotSupportedError(
-                        "UNION 的 ORDER BY 只支持输出列名或列序号",
+                        "集合查询的 ORDER BY 只支持输出列名或列序号",
                         hint="先给 SELECT 的输出列起别名，再按别名排序",
                     )
                 sort_keys.append((lambda ctx, i=index: ctx.row[i], item.descending))

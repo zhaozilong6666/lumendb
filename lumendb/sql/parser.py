@@ -292,7 +292,15 @@ class Parser:
             stmt = self._parse_insert()
             stmt.ctes = ctes
             return stmt
-        raise self._error("WITH 之后期望 SELECT 或 INSERT")
+        if self._cur.is_keyword("UPDATE"):
+            stmt = self._parse_update()
+            stmt.ctes = ctes
+            return stmt
+        if self._cur.is_keyword("DELETE"):
+            stmt = self._parse_delete()
+            stmt.ctes = ctes
+            return stmt
+        raise self._error("WITH 之后期望 SELECT、INSERT、UPDATE 或 DELETE")
 
     def _parse_create_table(self) -> Statement:
         if_not_exists = False
@@ -521,31 +529,59 @@ class Parser:
         return select
 
     def _parse_query_expression(self) -> Select | CompoundSelect:
-        """顶层查询：``SELECT ... UNION [ALL] SELECT ...``，尾部子句作用于整体。"""
-        parts = [self._parse_select_core()]
-        all_flags: list[bool] = []
-        while self._match_kw("UNION") is not None:
-            if self._match_kw("ALL") is not None:
-                all_flags.append(True)
-            else:
-                self._match_kw("DISTINCT")
-                all_flags.append(False)
-            parts.append(self._parse_select_core())
+        """顶层查询：``SELECT ... UNION / EXCEPT / INTERSECT ...``。
+
+        ``INTERSECT`` 的优先级高于 ``UNION`` / ``EXCEPT``；同一优先级内
+        从左到右结合。尾部 ORDER BY / LIMIT 只作用于整个表达式。
+        """
+        node = self._parse_intersect_chain()
+        while True:
+            tok = self._cur
+            if not tok.is_keyword("UNION", "EXCEPT"):
+                break
+            op = self._advance().value.upper()
+            all_rows = self._set_all_flag(op)
+            right = self._parse_intersect_chain()
+            node = CompoundSelect(
+                parts=[node, right],
+                all_flags=[all_rows],
+                ops=[op],
+            )
 
         order_by, limit, offset = self._parse_select_tail()
-        if len(parts) == 1:
-            first = parts[0]
-            first.order_by = order_by
-            first.limit = limit
-            first.offset = offset
-            return first
-        return CompoundSelect(
-            parts=parts,
-            all_flags=all_flags,
-            order_by=order_by,
-            limit=limit,
-            offset=offset,
-        )
+        if isinstance(node, CompoundSelect):
+            node.order_by = order_by
+            node.limit = limit
+            node.offset = offset
+            return node
+        node.order_by = order_by
+        node.limit = limit
+        node.offset = offset
+        return node
+
+    def _parse_intersect_chain(self) -> Select | CompoundSelect:
+        node = self._parse_select_core()
+        while self._cur.is_keyword("INTERSECT"):
+            self._advance()
+            all_rows = self._set_all_flag("INTERSECT")
+            right = self._parse_select_core()
+            node = CompoundSelect(
+                parts=[node, right],
+                all_flags=[all_rows],
+                ops=["INTERSECT"],
+            )
+        return node
+
+    def _set_all_flag(self, op: str) -> bool:
+        if self._match_kw("ALL") is not None:
+            if op != "UNION":
+                raise NotSupportedError(
+                    f"{op} ALL 尚未实现",
+                    hint="当前集合运算的 ALL 只支持 UNION ALL",
+                )
+            return True
+        self._match_kw("DISTINCT")
+        return False
 
     def _parse_select_core(self) -> Select:
         self._expect_kw("SELECT")
