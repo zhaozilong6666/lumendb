@@ -2125,6 +2125,76 @@ class TestAlterColumnType:
         db.execute_one("INSERT INTO t VALUES ('still-text')")
 
 
+class TestDropColumn:
+    def test_drop_column_rebuilds_indexes_and_reopen(self, tmp_path):
+        path = tmp_path / "drop_column"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (a INT, b TEXT, c INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20)")
+        db.execute_one("CREATE INDEX idx_a ON t (a)")
+        db.execute_one("ALTER TABLE t DROP COLUMN b")
+        assert rows(db, "SELECT a, c FROM t ORDER BY a") == [
+            (1, 10),
+            (2, 20),
+        ]
+        assert rows(db, "SELECT c FROM t WHERE a = 2") == [(20,)]
+        db.execute_one("INSERT INTO t VALUES (3, 30)")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT a, c FROM t ORDER BY a") == [
+            (1, 10),
+            (2, 20),
+            (3, 30),
+        ]
+        db2.execute_one("INSERT INTO t VALUES (4, 40)")
+        db2.close()
+
+    def test_drop_column_guards(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, b INT CHECK (b > 0), c TEXT UNIQUE)"
+        )
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t DROP COLUMN id")
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t DROP COLUMN b")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t DROP COLUMN c")
+
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t DROP COLUMN missing")
+        result = db.execute_one(
+            "ALTER TABLE t DROP COLUMN IF EXISTS missing"
+        )
+        assert "不存在" in result.notice
+
+    def test_drop_last_column_rejected(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t DROP COLUMN a")
+
+    def test_drop_column_rollback(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t DROP COLUMN b")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT a, b FROM t") == [(1, "x")]
+        db.execute_one("INSERT INTO t VALUES (3, 'z')")
+
+    def test_drop_column_preserves_unrelated_check(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT CHECK (a > 0), b TEXT)"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 'x')")
+        db.execute_one("ALTER TABLE t DROP COLUMN b")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0)")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [(1,), (2,)]
+
+
 class TestDropConstraintIndexes:
     def test_drop_unique_constraint_allows_duplicates(self, db):
         db.execute_one("CREATE TABLE t (a INT UNIQUE, b INT)")

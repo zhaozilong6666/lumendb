@@ -154,6 +154,20 @@ class TestCreateTable:
         assert isinstance(stmt.using, Cast)
         assert stmt.using.target.kind == DataType.TEXT
 
+    def test_drop_column(self):
+        from lumendb.sql.ast import AlterTableDropColumn
+
+        stmt = parse_statement("ALTER TABLE t DROP COLUMN b")
+        assert isinstance(stmt, AlterTableDropColumn)
+        assert stmt.column == "b"
+        assert stmt.if_exists is False
+
+        stmt = parse_statement("ALTER TABLE t DROP IF EXISTS b")
+        assert stmt.if_exists is True
+
+        stmt = parse_statement("ALTER TABLE t DROP COLUMN IF EXISTS b")
+        assert stmt.if_exists is True
+
     def test_create_view(self):
         from lumendb.sql.ast import CreateView
 

@@ -70,6 +70,7 @@ from .ast import (
     AlterTableAlterDefault,
     AlterTableAlterNullability,
     AlterTableAlterType,
+    AlterTableDropColumn,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
@@ -318,18 +319,23 @@ class Parser:
         self._expect_kw("TABLE")
         table = self._parse_ident("表名")
         if self._match_kw("DROP"):
-            if not self._match_kw("CONSTRAINT"):
-                raise NotSupportedError(
-                    "ALTER TABLE DROP 只支持 DROP CONSTRAINT",
-                    hint="删除列/索引请分别使用 DROP TABLE / DROP INDEX",
+            if self._match_kw("CONSTRAINT"):
+                if_exists = False
+                if self._match_kw("IF"):
+                    self._expect_kw("EXISTS")
+                    if_exists = True
+                name = self._parse_ident("约束名")
+                return AlterTableDropConstraint(
+                    table=table, name=name, if_exists=if_exists
                 )
+            self._match_kw("COLUMN")
             if_exists = False
             if self._match_kw("IF"):
                 self._expect_kw("EXISTS")
                 if_exists = True
-            name = self._parse_ident("约束名")
-            return AlterTableDropConstraint(
-                table=table, name=name, if_exists=if_exists
+            column = self._parse_ident("列名")
+            return AlterTableDropColumn(
+                table=table, column=column, if_exists=if_exists
             )
         if self._match_kw("ADD"):
             if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK"):
@@ -422,10 +428,10 @@ class Parser:
             )
 
         raise NotSupportedError(
-            "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN、RENAME 和 DROP CONSTRAINT",
+            "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN、DROP COLUMN、RENAME 和 DROP CONSTRAINT",
             hint=(
                 "支持 ADD [COLUMN] / ALTER [COLUMN] TYPE / SET DATA TYPE / "
-                "SET|DROP DEFAULT|NOT NULL / "
+                "SET|DROP DEFAULT|NOT NULL / DROP [COLUMN] [IF EXISTS] name / "
                 "DROP CONSTRAINT [IF EXISTS] name / "
                 "RENAME TO / RENAME [COLUMN] old TO new"
             ),

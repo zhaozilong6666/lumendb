@@ -109,13 +109,16 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 这样做的好处是 DDL 是 O(1)，不需要停机搬表；代价是"同一张表里新旧两种行格式
 共存"，解码路径必须显式知道缺列是合法的。`RENAME TO` / `RENAME COLUMN` 只改目录
 里的名字并同步索引列引用与 CHECK token，不搬页也不重写记录；真正需要行格式迁移的
-`DROP COLUMN` 仍未实现。`ALTER [COLUMN] ... TYPE` / `SET DATA TYPE` 则需要行格式
-迁移：先物化全部旧行，没有 `USING` 时用目标类型的 `coerce` 逐行预校验，有 `USING`
-时用旧表 schema 绑定表达式求值；再转换默认值、用临时 `TableDef` 编译所有 CHECK
-并验证转换后的行。全部通过后把可见行写入一棵新的 shadow heap，切换目录里的
-`root_page`/`last_page`，再从新堆表重建全部索引。这样扫描不会再用新 schema 解码
-旧版本字节；旧页链不再被引用，页空间暂不自动回收。任一步失败都由事务 undo 恢复
-目录、堆根页与索引根页，不会留下半转换的表。
+`ALTER TABLE ... ADD COLUMN` 的新列在旧记录缺失时按默认值/`NULL` 补齐；`DROP COLUMN` 与
+`ALTER [COLUMN] ... TYPE` / `SET DATA TYPE` 都需要行格式迁移。`DROP COLUMN` 先物化
+全部可见行、裁掉目标列的值并编译校验剩余 CHECK，然后写入新的 shadow heap，切换
+目录里的 `root_page`/`last_page` 并重建全部索引。若目标列被索引/约束引用或 CHECK
+引用该列，语句直接拒绝，要求先删除依赖；表至少保留一列。`ALTER TYPE` 先物化旧行，
+没有 `USING` 时用目标类型的 `coerce` 逐行预校验，有 `USING` 时用旧表 schema 绑定
+表达式求值；再转换默认值、用临时 `TableDef` 编译所有 CHECK 并验证转换后的行。全部
+通过后同样写入 shadow heap、切换根页、从新堆表重建全部索引。这样扫描不会再用新
+schema 解码旧版本字节；旧页链不再被引用，页空间暂不自动回收。任一步失败都由事务
+undo 恢复目录、堆根页与索引根页，不会留下半转换/半删列的表。
 
 ### 2.8 表级约束
 

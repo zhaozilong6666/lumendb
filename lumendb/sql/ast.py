@@ -471,6 +471,13 @@ class AlterTableAlterType(Statement):
 
 
 @dataclass
+class AlterTableDropColumn(Statement):
+    table: str
+    column: str
+    if_exists: bool = False
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
@@ -637,6 +644,7 @@ __all__ = [
     "AlterTableAddColumn",
     "AlterTableDropConstraint",
     "AlterTableAlterType",
+    "AlterTableDropColumn",
     "DropIndex",
     "Insert",
     "Update",

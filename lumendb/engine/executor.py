@@ -33,6 +33,7 @@ from ..sql.ast import (
     AlterTableAlterDefault,
     AlterTableAlterNullability,
     AlterTableAlterType,
+    AlterTableDropColumn,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
@@ -177,6 +178,8 @@ class Executor:
                 return self._alter_nullability(stmt, txn)
             if isinstance(stmt, AlterTableAlterType):
                 return self._alter_type(stmt, txn)
+            if isinstance(stmt, AlterTableDropColumn):
+                return self._alter_drop_column(stmt, txn)
             if isinstance(stmt, AlterTableRenameTable):
                 self._catalog.rename_table(txn, stmt.table, stmt.new_name)
                 return Result(
@@ -1363,6 +1366,103 @@ class Executor:
             notice=(
                 f"已把列 {old_column.name} 的类型从 {old_column.type.name} "
                 f"改为 {new_type.name}；重写 {len(converted)} 行"
+                f"{index_note}"
+            ),
+        )
+
+    def _alter_drop_column(
+        self, stmt: AlterTableDropColumn, txn: Transaction
+    ) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        if not table.has_column(stmt.column):
+            if stmt.if_exists:
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"列 {stmt.column} 不存在，已跳过",
+                )
+            raise BinderError(
+                f"列 {stmt.column!r} 不存在",
+                hint=f"可用列：{', '.join(table.column_names)}",
+            )
+        index = table.column_index(stmt.column)
+        column = table.columns[index]
+        if len(table.columns) == 1:
+            raise NotSupportedError(
+                "表必须至少保留一列，不能删除最后一列",
+                hint="可以先 DROP TABLE 再重建空表",
+            )
+        for idx in table.indexes.values():
+            if column.name in idx.columns:
+                raise NotSupportedError(
+                    f"列 {column.name!r} 被索引/约束 {idx.name!r} 引用",
+                    hint="先 DROP INDEX 或 ALTER TABLE ... DROP CONSTRAINT",
+                )
+        for check in table.checks.values():
+            tokens = list(check.tokens)
+            for pos, (kind, value) in enumerate(tokens):
+                if kind not in ("ident", "keyword"):
+                    continue
+                if value.lower() != column.name:
+                    continue
+                # ``t.a`` 里的 ``t`` 是表限定符，不是列引用。
+                if pos + 1 < len(tokens) and tokens[pos + 1][0] == "dot":
+                    continue
+                raise BinderError(
+                    f"CHECK 约束 {check.name!r} 引用了列 {column.name!r}",
+                    hint="先删除引用该列的 CHECK 约束",
+                )
+
+        heap = HeapFile(self._bp, table, self._txns)
+        source_rows = [
+            (rid, list(values)) for rid, values in heap.scan(txn)
+        ]
+        new_columns = [
+            col for pos, col in enumerate(table.columns) if pos != index
+        ]
+        new_rows: list[list[Any]] = []
+        for _rid, values in source_rows:
+            new_values = values[:index] + values[index + 1 :]
+            new_rows.append(new_values)
+
+        provisional = TableDef(
+            name=table.name,
+            columns=new_columns,
+            checks=table.checks,
+        )
+        for check in table.checks.values():
+            self._compile_check(provisional, check)
+        for values in new_rows:
+            self._check_checks(provisional, values)
+
+        old_columns = list(table.columns)
+        old_indexes = dict(table.indexes)
+        self._snapshot_table_state(table, txn)
+
+        shadow = TableDef(name=table.name, columns=new_columns)
+        shadow_heap = HeapFile(self._bp, shadow, self._txns)
+        for values in new_rows:
+            shadow_heap.insert(txn, values)
+
+        table.columns = new_columns
+        table.root_page = shadow.root_page
+        table.last_page = shadow.last_page
+        table.row_count_hint = shadow.row_count_hint
+
+        def undo() -> None:
+            table.columns = old_columns
+
+        txn.undo_log.append(undo)
+
+        rebuilt = 0
+        if old_indexes:
+            rebuilt, _entries = self._rebuild_indexes(table, txn)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        index_note = f"；重建 {rebuilt} 个索引" if rebuilt else ""
+        return Result(
+            tag="ALTER TABLE",
+            notice=(
+                f"已删除列 {column.name}；重写 {len(new_rows)} 行"
                 f"{index_note}"
             ),
         )

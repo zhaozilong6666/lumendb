@@ -35,6 +35,8 @@ ALTER TABLE t ALTER [COLUMN] age SET NOT NULL;
 ALTER TABLE t ALTER [COLUMN] age DROP NOT NULL;
 ALTER TABLE t ALTER [COLUMN] age TYPE BIGINT;
 ALTER TABLE t ALTER [COLUMN] age SET DATA TYPE TEXT USING age || '';
+ALTER TABLE t DROP [COLUMN] note;
+ALTER TABLE t DROP [COLUMN] IF EXISTS note;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
@@ -103,6 +105,15 @@ NULL 而列是 `NOT NULL`、或重建唯一索引时发现重复，整个语句�
 BIGINT→INT 且值在范围内、可解析字符串→数值、TEXT↔VARCHAR 长度检查）；`USING`
 可以写任意标量表达式，但不能包含聚合。这是 O(n) 操作，不适合在线大表；
 `NULL`/`NOT NULL`、`DEFAULT` 与 CHECK 约束都会保留。
+
+`ALTER TABLE ... DROP [COLUMN] [IF EXISTS] name` 也是 shadow heap 全表重写：先物化
+全部可见行，按列位置裁掉目标列的值，再用临时表定义编译校验所有 CHECK，通过后把
+新行写入新堆页链、切换 `root_page`/`last_page` 并重建全部索引；旧页链不再引用，
+页空间暂不自动回收。为避免留下半可用目录，若目标列被任何索引/唯一约束引用（包括
+主键），或 CHECK token 中出现该列的列引用，会直接报错，要求先 `DROP INDEX` /
+`DROP CONSTRAINT`；表必须至少保留一列，不能删除最后一列。`IF EXISTS` 遇到不存在的
+列返回 notice。事务回滚恢复列定义、根页和索引，旧堆页保持原样。视图的列级依赖目前
+不追踪；删除被视图引用的列后，查询该视图会在绑定阶段报列不存在，需先删除/重建视图。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
 同步更新所有索引的列引用与 CHECK token 里的标识符，不重写堆记录。重命名后旧名字
@@ -292,7 +303,6 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE ... DROP COLUMN` | 记录头保存列数，直接删列会让旧记录无法解码；需要先设计行重写/软删除方案 |
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |
