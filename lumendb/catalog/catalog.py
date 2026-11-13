@@ -17,7 +17,14 @@ from ..errors import (
 )
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.txn import Transaction
-from .schema import CheckDef, Column, IndexDef, TableDef, validate_table_def
+from .schema import (
+    CheckDef,
+    Column,
+    ForeignKeyDef,
+    IndexDef,
+    TableDef,
+    validate_table_def,
+)
 from .store import CatalogStore
 
 CATALOG_VERSION = 1
@@ -184,6 +191,7 @@ class Catalog:
         columns: list[Column],
         indexes: Optional[list[IndexDef]] = None,
         checks: Optional[dict[str, CheckDef]] = None,
+        foreign_keys: Optional[dict[str, ForeignKeyDef]] = None,
     ) -> TableDef:
         key = name.lower()
         if key in self.tables or key in self.views:
@@ -201,6 +209,7 @@ class Catalog:
             idx.table = key
             table.indexes[idx.name] = idx
         table.checks = dict(checks or {})
+        table.foreign_keys = dict(foreign_keys or {})
         validate_table_def(table)
         self.tables[key] = table
         txn.undo_log.append(lambda: self.tables.pop(key, None))
@@ -328,6 +337,40 @@ class Catalog:
             for dependent in dependents:
                 if dependent in self.views:
                     self.drop_view(txn, dependent, cascade=True)
+        fk_dependents = [
+            (other, fk.name)
+            for other in self.tables.values()
+            if other.name != key
+            for fk in other.foreign_keys.values()
+            if fk.ref_table == key
+        ]
+        if fk_dependents:
+            if not cascade:
+                names = ", ".join(
+                    f"{other.name}.{fk_name}"
+                    for other, fk_name in fk_dependents
+                )
+                raise BinderError(
+                    f"表 {name!r} 被外键引用：{names}",
+                    hint="使用 DROP TABLE ... CASCADE，或先删除引用它的外键",
+                )
+            old_fk_maps: dict[str, dict] = {}
+            for other, _fk_name in fk_dependents:
+                if other.name in old_fk_maps:
+                    continue
+                old_fk_maps[other.name] = dict(other.foreign_keys)
+                other.foreign_keys = {
+                    n: fk
+                    for n, fk in other.foreign_keys.items()
+                    if fk.ref_table != key
+                }
+
+            def undo_fks() -> None:
+                for tname, fks in old_fk_maps.items():
+                    if tname in self.tables:
+                        self.tables[tname].foreign_keys = fks
+
+            txn.undo_log.append(undo_fks)
         table = self.tables.pop(key)
 
         def undo() -> None:
@@ -361,6 +404,23 @@ class Catalog:
         )
         for index in table.indexes.values():
             index.table = new_key
+        old_fk_refs: dict[str, dict[str, ForeignKeyDef]] = {}
+        holders = [table] + [
+            t for t in self.tables.values() if t is not table
+        ]
+        for holder in holders:
+            targets = {
+                name: fk
+                for name, fk in holder.foreign_keys.items()
+                if fk.ref_table == old_key
+            }
+            if not targets:
+                continue
+            old_fk_refs[old_key if holder is table else holder.name] = dict(
+                holder.foreign_keys
+            )
+            for name, fk in targets.items():
+                holder.foreign_keys[name] = replace(fk, ref_table=new_key)
         self.tables[new_key] = table
 
         def undo() -> None:
@@ -369,6 +429,10 @@ class Catalog:
             table.checks = old_checks
             for index in table.indexes.values():
                 index.table = old_key
+            for holder_name, fks in old_fk_refs.items():
+                holder = table if holder_name == old_key else self.tables.get(holder_name)
+                if holder is not None:
+                    holder.foreign_keys = fks
             self.tables[old_key] = table
 
         txn.undo_log.append(undo)
@@ -406,12 +470,40 @@ class Catalog:
             idx.columns = tuple(
                 new_key if cname == old_key else cname for cname in idx.columns
             )
+        old_fk_maps: dict[str, dict[str, ForeignKeyDef]] = {}
+        holders = [table] + [
+            t for t in self.tables.values() if t is not table
+        ]
+        for holder in holders:
+            fks = dict(holder.foreign_keys)
+            changed = False
+            for name, fk in list(fks.items()):
+                columns = tuple(
+                    new_key if cname == old_key else cname
+                    for cname in fk.columns
+                ) if holder is table else fk.columns
+                ref_columns = tuple(
+                    new_key if cname == old_key else cname
+                    for cname in fk.ref_columns
+                ) if fk.ref_table == table.name else fk.ref_columns
+                if (columns, ref_columns) != (fk.columns, fk.ref_columns):
+                    fks[name] = replace(
+                        fk, columns=columns, ref_columns=ref_columns
+                    )
+                    changed = True
+            if changed:
+                old_fk_maps[holder.name] = dict(holder.foreign_keys)
+                holder.foreign_keys = fks
 
         def undo() -> None:
             table.columns[index] = old_column
             table.checks = old_checks
             for idx in table.indexes.values():
                 idx.columns = old_index_columns.get(idx.name, idx.columns)
+            for holder_name, fks in old_fk_maps.items():
+                holder = self.tables.get(holder_name)
+                if holder is not None:
+                    holder.foreign_keys = fks
 
         txn.undo_log.append(undo)
         validate_table_def(table)

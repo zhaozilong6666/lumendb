@@ -149,7 +149,32 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 `ADD COLUMN ... CHECK` 会先用“旧列 + 新列默认值”拼出完整存量行，验证通过后才把
 列和约束一起写入目录，因此不会出现列已加上但约束没落地的半状态。
 
-### 2.9 视图
+### 2.9 外键
+
+外键是 `TableDef.foreign_keys` 里独立的 `ForeignKeyDef`：`name`、本地 `columns`、
+`ref_table`、被引用 `ref_columns`。它不建索引，随目录 JSON 持久化，事务 undo / 恢复
+都会恢复整个字典。建表时执行器先把列级 `REFERENCES` 与表级 `FOREIGN KEY` 收集成
+目录对象，并解析省略的被引用列：自引用取当前表主键，其它表取目标表的 `PRIMARY`
+索引列；随后校验被引用列存在、上有 UNIQUE/PRIMARY 索引、本地列与被引用列类型完全
+一致，并生成 `<table>_<cols>_fkey` 默认名（冲突追加 `_2`）。被引用唯一索引可以来自
+主键、UNIQUE 约束或普通 `CREATE UNIQUE INDEX`，只要索引键完全匹配。
+
+写入路径在 `_check_foreign_keys` 中按 `MATCH SIMPLE` 检查：本地键任一列为 `NULL`
+就跳过，否则扫描被引用表，找不到完整匹配行就抛 `ForeignKeyViolationError`
+（SQLSTATE `23503`）。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
+`UPDATE` 都走同一入口；`UPDATE` 改被引用键、`DELETE` 删被引用行时，再由
+`_check_referenced_by` 扫描所有引用表（自引用时跳过当前 RID）执行 `RESTRICT`。
+实现是逐表扫描而非依赖索引定位，正确性优先，规模上仍是 O(子表行数)。
+
+DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
+拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 拒绝删除支撑外键的唯一键；
+`DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
+拒绝被引用的表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
+`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前不支持
+`ON DELETE/UPDATE CASCADE`、`SET NULL`、`DEFERRABLE`、`MATCH FULL/PARTIAL`，也不支持
+`ADD COLUMN ... REFERENCES`。
+
+### 2.10 视图
 
 `CREATE VIEW` 只保存视图定义，不复制基表数据：目录里存的是 `AS` 之后的
 **词法 token 切片**，而不是 AST 或某次查询的物化结果。这样做的好处是视图定义

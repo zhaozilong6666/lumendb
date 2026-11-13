@@ -52,7 +52,10 @@
 >   写入新的 shadow heap 后切换根页、重建全部索引；`DROP COLUMN` 同样走 shadow
 >   heap，被索引/约束引用的列要求先删除依赖；`UPDATE ... FROM` 支持单源表连接更新，
 >   `DELETE ... USING` 支持单源表连接删除；`RENAME CONSTRAINT` 可改 CHECK/UNIQUE/
->   主键约束名；
+>   主键约束名；列级 `REFERENCES` / 表级 `FOREIGN KEY` 支持复合键、自引用和默认
+>   取主键，`MATCH SIMPLE` NULL 跳过、只做 `RESTRICT`，写入/更新/删除统一校验并在
+>   目录中持久化，同时保护 DROP COLUMN / ALTER TYPE / DROP TABLE / TRUNCATE 等
+>   依赖路径；
 >   `CREATE VIEW` 保存 `AS` 之后的词法切片，不物化数据，查询时展开为 `CteScan`，
 >   支持 `OR REPLACE`、显式列名和 `SHOW VIEWS`，建视图时即校验绑定，
 >   并把真实表/视图依赖落进目录，`DROP TABLE` / `DROP VIEW` 会拒绝悬空删除；
@@ -60,7 +63,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 789 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 807 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -118,6 +121,11 @@
 >   dropped; `UPDATE ... FROM` joins one source table into the update target;
 >   `DELETE ... USING` supports one source table for joined deletes;
 >   `RENAME CONSTRAINT` renames CHECK/UNIQUE/primary-key constraints;
+>   column-level `REFERENCES` and table-level `FOREIGN KEY` constraints support
+>   composite keys, self-references and implicit primary-key targets, enforce
+>   `MATCH SIMPLE` NULL semantics and `RESTRICT` on writes, updates and deletes,
+>   persist in the catalog, and guard `DROP COLUMN` / `ALTER TYPE` / `DROP TABLE`
+>   / `TRUNCATE` dependency paths;
 >   `CREATE VIEW` persists the token slice after `AS` instead of materializing
 >   data, expands to a `CteScan` at bind time, and supports `OR REPLACE`,
 >   explicit column names and `SHOW VIEWS` with bind-time validation; resolved
@@ -129,7 +137,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 789 automated tests including crash-injection and a 20-seed randomized
+> - 807 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

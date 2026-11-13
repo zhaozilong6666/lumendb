@@ -104,6 +104,33 @@ class CheckDef:
         )
 
 
+@dataclass(frozen=True)
+class ForeignKeyDef:
+    """引用另一张表（或自身）的外键约束；只做 RESTRICT，不做级联。"""
+
+    name: str
+    columns: tuple[str, ...]
+    ref_table: str
+    ref_columns: tuple[str, ...]
+
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "columns": list(self.columns),
+            "ref_table": self.ref_table,
+            "ref_columns": list(self.ref_columns),
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> "ForeignKeyDef":
+        return cls(
+            name=data["name"],
+            columns=tuple(data["columns"]),
+            ref_table=data["ref_table"],
+            ref_columns=tuple(data["ref_columns"]),
+        )
+
+
 @dataclass
 class TableDef:
     name: str
@@ -113,6 +140,7 @@ class TableDef:
     row_count_hint: int = 0
     indexes: dict[str, IndexDef] = field(default_factory=dict)
     checks: dict[str, CheckDef] = field(default_factory=dict)
+    foreign_keys: dict[str, ForeignKeyDef] = field(default_factory=dict)
 
     # -- 列查找 -------------------------------------------------------------
 
@@ -175,6 +203,9 @@ class TableDef:
             "row_count_hint": self.row_count_hint,
             "indexes": {k: v.to_json() for k, v in self.indexes.items()},
             "checks": {k: v.to_json() for k, v in self.checks.items()},
+            "foreign_keys": {
+                k: v.to_json() for k, v in self.foreign_keys.items()
+            },
         }
 
     @classmethod
@@ -190,6 +221,10 @@ class TableDef:
             },
             checks={
                 k: CheckDef.from_json(v) for k, v in data.get("checks", {}).items()
+            },
+            foreign_keys={
+                k: ForeignKeyDef.from_json(v)
+                for k, v in data.get("foreign_keys", {}).items()
             },
         )
 
@@ -237,5 +272,34 @@ def validate_table_def(table: TableDef) -> None:
                 hint="给 CHECK 换一个名字",
             )
 
+    for name, fk in table.foreign_keys.items():
+        if name != fk.name:
+            raise NotSupportedError(f"外键 {name!r} 的目录键与名字不一致")
+        if name in table.checks or name in table.indexes:
+            raise NotSupportedError(
+                f"外键名 {name!r} 与 CHECK/索引名冲突",
+                hint="给外键换一个名字",
+            )
+        if len(fk.columns) != len(fk.ref_columns):
+            raise NotSupportedError(
+                f"外键 {name!r} 的列数与被引用列数不一致"
+            )
+        if not fk.ref_columns:
+            raise NotSupportedError(f"外键 {name!r} 没有被引用列")
+        for cname in fk.columns:
+            if not table.has_column(cname):
+                raise ColumnNotFoundError(
+                    f"外键 {name!r} 引用了本表不存在的列 {cname!r}"
+                )
+        if not fk.ref_table:
+            raise NotSupportedError(f"外键 {name!r} 缺少被引用表名")
 
-__all__ = ["CheckDef", "Column", "IndexDef", "TableDef", "validate_table_def"]
+
+__all__ = [
+    "CheckDef",
+    "Column",
+    "ForeignKeyDef",
+    "IndexDef",
+    "TableDef",
+    "validate_table_def",
+]

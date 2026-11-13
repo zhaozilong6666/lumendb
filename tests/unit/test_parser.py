@@ -89,10 +89,40 @@ class TestCreateTable:
         with pytest.raises(NotSupportedError):
             parse_statement("CREATE TABLE t (a MONEY)")
 
-    def test_foreign_key_rejected(self):
-        with pytest.raises(NotSupportedError) as exc:
-            parse_statement("CREATE TABLE t (a INT REFERENCES other(id))")
-        assert "外键" in str(exc.value)
+    def test_foreign_key_column_reference(self):
+        stmt = parse_statement("CREATE TABLE t (a INT REFERENCES other(id))")
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.columns == ["a"]
+        assert ref.ref_table == "other"
+        assert ref.ref_columns == ["id"]
+        assert ref.name is None
+
+    def test_foreign_key_table_constraint(self):
+        from lumendb.sql.ast import TableConstraint
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, b INT, "
+            "CONSTRAINT fk_ab FOREIGN KEY (a, b) REFERENCES other(x, y))"
+        )
+        fk = next(c for c in stmt.constraints if c.kind == "FOREIGN KEY")
+        assert isinstance(fk, TableConstraint)
+        assert fk.name == "fk_ab"
+        assert fk.columns == ["a", "b"]
+        assert fk.ref_table == "other"
+        assert fk.ref_columns == ["x", "y"]
+
+    def test_foreign_key_alter_add_constraint(self):
+        from lumendb.sql.ast import AlterTableAddConstraint
+
+        stmt = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) "
+            "REFERENCES other(id)"
+        )
+        assert isinstance(stmt, AlterTableAddConstraint)
+        assert stmt.constraint.kind == "FOREIGN KEY"
+        assert stmt.constraint.ref_table == "other"
+        assert stmt.constraint.ref_columns == ["id"]
 
     def test_check_constraints(self):
         stmt = parse_statement(

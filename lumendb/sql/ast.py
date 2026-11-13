@@ -338,6 +338,16 @@ class CheckSpec:
 
 
 @dataclass(frozen=True)
+class ForeignKeySpec:
+    """REFERENCES / FOREIGN KEY 的解析结果；ref_columns 为空时取被引用表主键。"""
+
+    columns: list[str]
+    ref_table: str
+    ref_columns: list[str] = field(default_factory=list)
+    name: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ColumnDef:
     name: str
     type: TypeSpec
@@ -346,16 +356,19 @@ class ColumnDef:
     unique: bool = False
     default: Optional[Expr] = None
     checks: tuple[CheckSpec, ...] = ()
+    references: Optional[ForeignKeySpec] = None
 
 
 @dataclass(frozen=True)
 class TableConstraint:
-    """表级约束：复合 PRIMARY KEY、UNIQUE 或 CHECK。"""
+    """表级约束：复合 PRIMARY KEY、UNIQUE、CHECK 或 FOREIGN KEY。"""
 
-    kind: str  # "PRIMARY KEY" / "UNIQUE" / "CHECK"
+    kind: str  # "PRIMARY KEY" / "UNIQUE" / "CHECK" / "FOREIGN KEY"
     columns: list[str]
     name: Optional[str] = None
     check: Optional[CheckSpec] = None
+    ref_table: Optional[str] = None
+    ref_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -646,6 +659,7 @@ __all__ = [
     "Select",
     "CompoundSelect",
     "CheckSpec",
+    "ForeignKeySpec",
     "ColumnDef",
     "Statement",
     "CreateTable",

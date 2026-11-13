@@ -14,12 +14,19 @@ from collections import Counter
 from typing import Any, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
-from ..catalog.schema import CheckDef, Column, IndexDef, TableDef
+from ..catalog.schema import (
+    CheckDef,
+    Column,
+    ForeignKeyDef,
+    IndexDef,
+    TableDef,
+)
 from ..datatypes import DataType, TypeSpec
 from ..errors import (
     BinderError,
     CheckViolationError,
     DuplicateKeyError,
+    ForeignKeyViolationError,
     IndexAlreadyExistsError,
     NotNullViolationError,
     NotSupportedError,
@@ -49,6 +56,7 @@ from ..sql.ast import (
     DropView,
     Expr,
     Explain,
+    ForeignKeySpec,
     Insert,
     Query,
     Reindex,
@@ -851,8 +859,11 @@ class Executor:
 
         checks = self._collect_create_checks(stmt, columns, indexes)
         self._validate_check_defs(stmt.name.lower(), columns, checks)
+        foreign_keys = self._collect_create_foreign_keys(
+            stmt, columns, indexes, checks, primary_columns
+        )
         self._catalog.create_table(
-            txn, stmt.name, columns, indexes, checks
+            txn, stmt.name, columns, indexes, checks, foreign_keys
         )
         return Result(tag="CREATE TABLE")
 
@@ -898,6 +909,129 @@ class Executor:
                 constraint.name,
             )
         return checks
+
+    def _collect_create_foreign_keys(
+        self,
+        stmt: CreateTable,
+        columns: list[Column],
+        indexes: list[IndexDef],
+        checks: dict[str, CheckDef],
+        primary_columns: tuple[str, ...],
+    ) -> dict[str, ForeignKeyDef]:
+        table_name = stmt.name.lower()
+        used = set(checks) | {idx.name for idx in indexes}
+        result: dict[str, ForeignKeyDef] = {}
+        by_name = {c.name: c for c in columns}
+
+        def add(spec: ForeignKeySpec, fallback_columns: list[str]) -> None:
+            local_columns = tuple(
+                name.lower() for name in (spec.columns or fallback_columns)
+            )
+            if len(set(local_columns)) != len(local_columns):
+                raise BinderError("外键的本地列不能重复")
+            for name in local_columns:
+                if name not in by_name:
+                    raise BinderError(
+                        f"外键引用了本表不存在的列 {name!r}"
+                    )
+            ref_table = spec.ref_table.lower()
+            if ref_table == table_name:
+                ref_columns = tuple(
+                    name.lower()
+                    for name in (spec.ref_columns or primary_columns)
+                )
+                if not ref_columns:
+                    raise BinderError(
+                        "自引用外键需要显式指定被引用列，或先声明主键"
+                    )
+                ref_indexes = list(indexes)
+                ref_by_name = by_name
+            else:
+                ref = self._catalog.get_table(ref_table)
+                if spec.ref_columns:
+                    ref_columns = tuple(
+                        name.lower() for name in spec.ref_columns
+                    )
+                else:
+                    primary = next(
+                        (
+                            idx
+                            for idx in ref.indexes.values()
+                            if idx.constraint_kind == "PRIMARY"
+                        ),
+                        None,
+                    )
+                    if primary is None:
+                        raise BinderError(
+                            f"被引用表 {ref_table!r} 没有主键，"
+                            "REFERENCES 必须显式给出列"
+                        )
+                    ref_columns = primary.columns
+                ref_indexes = list(ref.indexes.values())
+                ref_by_name = {c.name: c for c in ref.columns}
+
+            if len(local_columns) != len(ref_columns):
+                raise BinderError(
+                    "外键本地列数与被引用列数不一致",
+                    detail=f"{local_columns} -> {ref_columns}",
+                )
+            for name in ref_columns:
+                if name not in ref_by_name:
+                    raise BinderError(
+                        f"被引用表 {ref_table!r} 没有列 {name!r}"
+                    )
+            if not any(
+                idx.unique and tuple(idx.columns) == ref_columns
+                for idx in ref_indexes
+            ):
+                raise BinderError(
+                    "被引用列必须上有 UNIQUE 或 PRIMARY KEY 约束",
+                    detail=f"{ref_table}({', '.join(ref_columns)})",
+                    hint="先给被引用列建唯一约束/唯一索引",
+                )
+            for local, referenced in zip(local_columns, ref_columns):
+                if by_name[local].type != ref_by_name[referenced].type:
+                    raise TypeMismatchError(
+                        f"外键列 {local} 与被引用列 {referenced} 类型不一致"
+                    )
+
+            explicit = spec.name.lower() if spec.name is not None else None
+            base = (
+                f"{table_name}_" + "_".join(local_columns) + "_fkey"
+            )
+            name = explicit or base
+            if explicit is None:
+                while name in used or name in result:
+                    name += "_2"
+            if name in used or name in result:
+                raise BinderError(
+                    f"外键约束名重复：{name}",
+                    hint="给 FOREIGN KEY 指定唯一名称",
+                )
+            result[name] = ForeignKeyDef(
+                name=name,
+                columns=local_columns,
+                ref_table=ref_table,
+                ref_columns=ref_columns,
+            )
+            used.add(name)
+
+        for col_def, col in zip(stmt.columns, columns):
+            if col_def.references is not None:
+                add(col_def.references, [col.name])
+        for constraint in stmt.constraints:
+            if constraint.kind != "FOREIGN KEY":
+                continue
+            add(
+                ForeignKeySpec(
+                    columns=list(constraint.columns),
+                    ref_table=constraint.ref_table or "",
+                    ref_columns=list(constraint.ref_columns),
+                    name=constraint.name,
+                ),
+                list(constraint.columns),
+            )
+        return result
 
     def _collect_column_checks(
         self,
@@ -1118,6 +1252,11 @@ class Executor:
                 hint="换一个列名，或先 DROP TABLE 重建",
             )
         column = _to_column(stmt.column)
+        if stmt.column.references is not None:
+            raise NotSupportedError(
+                "ADD COLUMN 暂不支持 REFERENCES",
+                hint="先 ADD COLUMN，再用 ALTER TABLE ADD CONSTRAINT FOREIGN KEY",
+            )
         if not column.nullable and column.default is None:
             raise NotSupportedError(
                 "ADD COLUMN NOT NULL 需要提供 DEFAULT",
@@ -1268,7 +1407,23 @@ class Executor:
                 tag="ALTER TABLE",
                 notice=f"列 {old_column.name} 的类型已经是 {new_type.name}",
             )
-
+        for fk in table.foreign_keys.values():
+            if old_column.name in fk.columns:
+                raise NotSupportedError(
+                    f"列 {old_column.name!r} 被外键约束 {fk.name!r} 引用",
+                    hint="先删除外键约束，再修改列类型",
+                )
+        for other in self._catalog.list_tables():
+            for fk in other.foreign_keys.values():
+                if (
+                    fk.ref_table == table.name
+                    and old_column.name in fk.ref_columns
+                ):
+                    raise NotSupportedError(
+                        f"列 {old_column.name!r} 被表 {other.name} 的外键 "
+                        f"{fk.name!r} 引用",
+                        hint="先删除外键约束，再修改列类型",
+                    )
         # 先物化旧行：类型一旦改变，后续 scan 会按新类型解码旧记录。
         heap = HeapFile(self._bp, table, self._txns)
         source_rows = [
@@ -1394,6 +1549,20 @@ class Executor:
                 "表必须至少保留一列，不能删除最后一列",
                 hint="可以先 DROP TABLE 再重建空表",
             )
+        for fk in table.foreign_keys.values():
+            if column.name in fk.columns:
+                raise NotSupportedError(
+                    f"列 {column.name!r} 被外键约束 {fk.name!r} 引用",
+                    hint="先 ALTER TABLE ... DROP CONSTRAINT 删除外键",
+                )
+        for other in self._catalog.list_tables():
+            for fk in other.foreign_keys.values():
+                if fk.ref_table == table.name and column.name in fk.ref_columns:
+                    raise NotSupportedError(
+                        f"列 {column.name!r} 被表 {other.name} 的外键 "
+                        f"{fk.name!r} 引用",
+                        hint="先删除引用它的外键约束",
+                    )
         for idx in table.indexes.values():
             if column.name in idx.columns:
                 raise NotSupportedError(
@@ -1476,12 +1645,20 @@ class Executor:
         table = self._catalog.get_table(stmt.table)
         old_key = stmt.old_name.lower()
         new_key = stmt.new_name.lower()
-        if old_key not in table.checks and old_key not in table.indexes:
+        if (
+            old_key not in table.checks
+            and old_key not in table.indexes
+            and old_key not in table.foreign_keys
+        ):
             raise BinderError(
                 f"表 {table.name} 没有约束 {stmt.old_name!r}",
                 hint="约束名可由 SHOW CREATE TABLE 或 \\d 查看",
             )
-        if new_key in table.checks or new_key in table.indexes:
+        if (
+            new_key in table.checks
+            or new_key in table.indexes
+            or new_key in table.foreign_keys
+        ):
             if new_key != old_key:
                 raise BinderError(
                     f"约束名 {stmt.new_name!r} 已被占用",
@@ -1502,6 +1679,17 @@ class Executor:
             def undo() -> None:
                 table.checks.pop(new_key, None)
                 table.checks[old_key] = check
+
+            txn.undo_log.append(undo)
+        elif old_key in table.foreign_keys:
+            fk = table.foreign_keys[old_key]
+            new_fk = replace(fk, name=new_key)
+            table.foreign_keys.pop(old_key)
+            table.foreign_keys[new_key] = new_fk
+
+            def undo() -> None:
+                table.foreign_keys.pop(new_key, None)
+                table.foreign_keys[old_key] = fk
 
             txn.undo_log.append(undo)
         else:
@@ -1576,6 +1764,96 @@ class Executor:
             return Result(
                 tag="ALTER TABLE",
                 notice=f"已添加 CHECK 约束 {name}",
+            )
+        if constraint.kind == "FOREIGN KEY":
+            if constraint.ref_table is None:
+                raise BinderError("FOREIGN KEY 缺少 REFERENCES 目标")
+            ref_name = constraint.ref_table.lower()
+            ref_table = self._catalog.get_table(ref_name)
+            if constraint.ref_columns:
+                ref_columns = tuple(
+                    name.lower() for name in constraint.ref_columns
+                )
+            else:
+                primary = next(
+                    (
+                        idx
+                        for idx in ref_table.indexes.values()
+                        if idx.constraint_kind == "PRIMARY"
+                    ),
+                    None,
+                )
+                if primary is None:
+                    raise BinderError(
+                        f"被引用表 {ref_name!r} 没有主键，"
+                        "REFERENCES 必须显式给出列"
+                    )
+                ref_columns = primary.columns
+            if len(names) != len(ref_columns):
+                raise BinderError(
+                    "外键本地列数与被引用列数不一致",
+                    detail=f"{names} -> {ref_columns}",
+                )
+            for ref_col in ref_columns:
+                ref_table.column(ref_col)
+            if not any(
+                idx.unique and tuple(idx.columns) == ref_columns
+                for idx in ref_table.indexes.values()
+            ):
+                raise BinderError(
+                    "被引用列必须上有 UNIQUE 或 PRIMARY KEY 约束",
+                    detail=f"{ref_name}({', '.join(ref_columns)})",
+                )
+            for local, referenced in zip(names, ref_columns):
+                if table.column(local).type != ref_table.column(referenced).type:
+                    raise TypeMismatchError(
+                        f"外键列 {local} 与被引用列 {referenced} 类型不一致"
+                    )
+            explicit = (
+                constraint.name.lower()
+                if constraint.name is not None
+                else None
+            )
+            fk_name = explicit or (
+                f"{table.name}_" + "_".join(names) + "_fkey"
+            )
+            used = set(table.checks) | set(table.indexes) | set(table.foreign_keys)
+            if explicit is None:
+                while fk_name in used:
+                    fk_name += "_2"
+            if fk_name in used:
+                raise BinderError(
+                    f"外键约束名重复：{fk_name}",
+                    hint="给 FOREIGN KEY 指定唯一名称",
+                )
+            fk = ForeignKeyDef(
+                name=fk_name,
+                columns=names,
+                ref_table=ref_name,
+                ref_columns=ref_columns,
+            )
+            provisional = TableDef(
+                name=table.name,
+                columns=table.columns,
+                indexes=table.indexes,
+                checks=table.checks,
+                foreign_keys=dict(table.foreign_keys, **{fk_name: fk}),
+            )
+            heap = HeapFile(self._bp, table, self._txns)
+            for _rid, values in heap.scan(txn):
+                self._check_foreign_keys(provisional, values, txn)
+            old_fks = dict(table.foreign_keys)
+            table.foreign_keys[fk_name] = fk
+
+            def undo_fk() -> None:
+                table.foreign_keys = old_fks
+
+            txn.undo_log.append(undo_fk)
+            self._catalog.mark_dirty()
+            self._catalog.persist(txn)
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已添加外键约束 {fk_name}",
             )
         if constraint.kind == "UNIQUE":
             index_name = (
@@ -1663,6 +1941,20 @@ class Executor:
     ) -> Result:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
+        if name in table.foreign_keys:
+            old_fks = dict(table.foreign_keys)
+            del table.foreign_keys[name]
+
+            def undo_fk() -> None:
+                table.foreign_keys = old_fks
+
+            txn.undo_log.append(undo_fk)
+            self._catalog.mark_dirty()
+            self._catalog.persist(txn)
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已删除外键约束 {name}",
+            )
         if name not in table.checks:
             index = table.indexes.get(name)
             if index is not None:
@@ -1675,6 +1967,16 @@ class Executor:
                     raise NotSupportedError(
                         f"不支持的约束索引类型：{index.constraint_kind!r}"
                     )
+                for other in self._catalog.list_tables():
+                    for fk in other.foreign_keys.values():
+                        if (
+                            fk.ref_table == table.name
+                            and tuple(fk.ref_columns) == tuple(index.columns)
+                        ):
+                            raise NotSupportedError(
+                                f"约束 {name!r} 仍被外键 {fk.name!r} 依赖",
+                                hint="先删除引用该唯一键的外键约束",
+                            )
                 old_columns = list(table.columns)
                 self._catalog.drop_index(txn, name)
                 if index.constraint_kind == "PRIMARY":
@@ -1708,6 +2010,7 @@ class Executor:
                 f"约束 {name!r} 不存在",
                 hint=(
                     f"可用 CHECK 约束：{', '.join(table.checks) or '无'}；"
+                    f"可用外键约束：{', '.join(table.foreign_keys) or '无'}；"
                     f"可用唯一/主键索引："
                     f"{', '.join(n for n, i in table.indexes.items() if i.constraint_kind) or '无'}"
                 ),
@@ -1789,6 +2092,17 @@ class Executor:
                     f"索引 {name!r} 由表约束创建，不能直接 DROP INDEX",
                     hint="使用 ALTER TABLE ... DROP CONSTRAINT 删除约束",
                 )
+            if idx is not None and idx.unique:
+                for other in self._catalog.list_tables():
+                    for fk in other.foreign_keys.values():
+                        if (
+                            fk.ref_table == table.name
+                            and tuple(fk.ref_columns) == tuple(idx.columns)
+                        ):
+                            raise NotSupportedError(
+                                f"索引 {name!r} 仍被外键 {fk.name!r} 依赖",
+                                hint="先删除引用该唯一键的外键约束",
+                            )
         try:
             self._catalog.drop_index(txn, name)
         except Exception:
@@ -1884,6 +2198,13 @@ class Executor:
     def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
         """清空整表：页链保留但每一页重置为空页，索引随之重建为空。"""
         table = self._catalog.get_table(stmt.table)
+        for other in self._catalog.list_tables():
+            for fk in other.foreign_keys.values():
+                if fk.ref_table == table.name:
+                    raise BinderError(
+                        f"表 {table.name!r} 被外键 {fk.name!r} 引用，不能直接 TRUNCATE",
+                        hint="先删除引用它的外键，或逐个 DELETE 引用行",
+                    )
         self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         removed = heap.truncate(txn)
@@ -2192,6 +2513,23 @@ class Executor:
         old_tuple = tuple(old_values)
         prepared = self._prepare_values(table, None, new_values)
         self._check_checks(table, prepared)
+        self._check_foreign_keys(table, prepared, txn)
+        for ref_table in self._catalog.list_tables():
+            for fk in ref_table.foreign_keys.values():
+                if fk.ref_table != table.name:
+                    continue
+                if any(
+                    old_tuple[table.column_index(name)]
+                    != prepared[table.column_index(name)]
+                    for name in fk.ref_columns
+                ):
+                    self._check_referenced_by(
+                        table, list(old_tuple), txn, skip_rid=rid
+                    )
+                    break
+            else:
+                continue
+            break
 
         changed_indexes = [
             idx
@@ -2343,6 +2681,7 @@ class Executor:
         else:
             self._check_constraints(table, prepared, txn)
 
+        self._check_foreign_keys(table, prepared, txn)
         rid = heap.insert(txn, prepared)
         for idx in table.indexes.values():
             tree = self._tree_for(table, idx)
@@ -2520,6 +2859,9 @@ class Executor:
                 returned.append(
                     tuple(fn(EvalContext(old_tuple)) for fn in ret_fns)
                 )
+            self._check_referenced_by(
+                table, values, txn, skip_rid=rid
+            )
             heap.delete(txn, rid)
             deleted += 1
 
@@ -2636,6 +2978,86 @@ class Executor:
         )
         if conflict is not None:
             raise self._duplicate_key_error(conflict[0])
+
+    def _check_foreign_keys(
+        self, table: TableDef, values: list[Any], txn: Transaction
+    ) -> None:
+        """MATCH SIMPLE：任一本地列为 NULL 就跳过；否则被引用行必须存在。"""
+        for fk in table.foreign_keys.values():
+            local_key = tuple(
+                values[table.column_index(name)] for name in fk.columns
+            )
+            if any(value is None for value in local_key):
+                continue
+            ref_table = self._catalog.get_table(fk.ref_table)
+            ref_positions = [ref_table.column_index(name) for name in fk.ref_columns]
+            found = False
+            if ref_table.name == table.name:
+                # 自引用：候选行本身也参与匹配，允许 ``(id, parent_id) = (1, 1)``
+                # 这种 PostgreSQL 接受的自引用行。
+                candidate_key = tuple(
+                    values[pos] for pos in ref_positions
+                )
+                found = candidate_key == local_key
+            ref_heap = HeapFile(self._bp, ref_table, self._txns)
+            for _rid, ref_values in ref_heap.scan(txn):
+                if all(
+                    ref_values[pos] == value
+                    for pos, value in zip(ref_positions, local_key)
+                ):
+                    found = True
+                    break
+            if not found:
+                raise ForeignKeyViolationError(
+                    f"外键约束 {fk.name!r} 违反",
+                    detail=(
+                        f"表 {table.name} 的 {fk.columns} 找不到 "
+                        f"{ref_table.name}.{fk.ref_columns} 中的对应行"
+                    ),
+                    hint="先插入/更新被引用行，或检查外键列的值",
+                )
+
+    def _check_referenced_by(
+        self,
+        table: TableDef,
+        values: list[Any],
+        txn: Transaction,
+        *,
+        skip_rid: Optional[RID] = None,
+    ) -> None:
+        """RESTRICT：被其他表（或自身）的外键引用的键不能被删除/改掉。"""
+        for ref_table in self._catalog.list_tables():
+            for fk in ref_table.foreign_keys.values():
+                if fk.ref_table != table.name:
+                    continue
+                key = tuple(
+                    values[table.column_index(name)] for name in fk.ref_columns
+                )
+                if any(value is None for value in key):
+                    continue
+                ref_heap = HeapFile(self._bp, ref_table, self._txns)
+                for rid, child_values in ref_heap.scan(txn):
+                    if (
+                        ref_table.name == table.name
+                        and skip_rid is not None
+                        and rid == skip_rid
+                    ):
+                        continue
+                    child_key = tuple(
+                        child_values[ref_table.column_index(name)]
+                        for name in fk.columns
+                    )
+                    if any(value is None for value in child_key):
+                        continue
+                    if child_key == key:
+                        raise ForeignKeyViolationError(
+                            f"外键约束 {fk.name!r} 阻止修改/删除被引用行",
+                            detail=(
+                                f"表 {ref_table.name} 中仍有行引用 "
+                                f"{table.name}.{fk.ref_columns} = {key}"
+                            ),
+                            hint="先 DELETE/UPDATE 引用行，或不要改被引用键",
+                        )
 
     def _check_constraints(
         self,

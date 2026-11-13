@@ -135,6 +135,10 @@ class CheckViolationError(ConstraintViolationError):
     sqlstate = "23514"
 
 
+class ForeignKeyViolationError(ConstraintViolationError):
+    sqlstate = "23503"
+
+
 # ---------------------------------------------------------------------------
 # 存储
 # ---------------------------------------------------------------------------
@@ -221,6 +225,8 @@ __all__ = [
     "ConstraintViolationError",
     "DuplicateKeyError",
     "NotNullViolationError",
+    "CheckViolationError",
+    "ForeignKeyViolationError",
     "StorageError",
     "PageNotFoundError",
     "CorruptedPageError",

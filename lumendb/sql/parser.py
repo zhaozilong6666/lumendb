@@ -28,6 +28,7 @@ from .ast import (
     CreateView,
     CheckSpec,
     Cte,
+    ForeignKeySpec,
     Delete,
     DefaultValue,
     DropIndex,
@@ -339,7 +340,9 @@ class Parser:
                 table=table, column=column, if_exists=if_exists
             )
         if self._match_kw("ADD"):
-            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK"):
+            if self._cur.is_keyword(
+                "CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"
+            ):
                 constraint = self._parse_table_constraint()
                 return AlterTableAddConstraint(
                     table=table, constraint=constraint
@@ -534,7 +537,9 @@ class Parser:
         columns: list[ColumnDef] = []
         constraints: list[TableConstraint] = []
         while True:
-            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK"):
+            if self._cur.is_keyword(
+                "CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"
+            ):
                 constraints.append(self._parse_table_constraint())
             else:
                 columns.append(self._parse_column_def())
@@ -562,8 +567,32 @@ class Parser:
             return TableConstraint(
                 kind="CHECK", columns=[], name=name, check=check
             )
+        elif self._match_kw("FOREIGN"):
+            self._expect_kw("KEY")
+            self._expect_punct("lparen", "(")
+            fk_columns = [self._parse_ident("列名")]
+            while self._match_punct("comma"):
+                fk_columns.append(self._parse_ident("列名"))
+            self._expect_punct("rparen", ")")
+            self._expect_kw("REFERENCES")
+            ref_table = self._parse_ident("被引用表名")
+            ref_columns: list[str] = []
+            if self._match_punct("lparen"):
+                ref_columns.append(self._parse_ident("被引用列名"))
+                while self._match_punct("comma"):
+                    ref_columns.append(self._parse_ident("被引用列名"))
+                self._expect_punct("rparen", ")")
+            return TableConstraint(
+                kind="FOREIGN KEY",
+                columns=fk_columns,
+                name=name,
+                ref_table=ref_table,
+                ref_columns=ref_columns,
+            )
         else:
-            raise self._error("表级约束期望 PRIMARY KEY、UNIQUE 或 CHECK")
+            raise self._error(
+                "表级约束期望 PRIMARY KEY、UNIQUE、CHECK 或 FOREIGN KEY"
+            )
         self._expect_punct("lparen", "(")
         columns = [self._parse_ident("列名")]
         while self._match_punct("comma"):
@@ -589,12 +618,21 @@ class Parser:
         unique = False
         default = None
         checks: list[CheckSpec] = []
+        references = None
 
         while True:
             if self._match_kw("CONSTRAINT"):
                 constraint_name = self._parse_ident("约束名")
-                self._expect_kw("CHECK")
-                checks.append(self._parse_check_spec(constraint_name))
+                if self._match_kw("CHECK"):
+                    checks.append(self._parse_check_spec(constraint_name))
+                elif self._match_kw("REFERENCES"):
+                    references = self._parse_references(
+                        [name], constraint_name
+                    )
+                else:
+                    raise self._error(
+                        "列级 CONSTRAINT 之后期望 CHECK 或 REFERENCES"
+                    )
             elif self._match_kw("PRIMARY"):
                 self._expect_kw("KEY")
                 primary_key = True
@@ -611,11 +649,7 @@ class Parser:
             elif self._match_kw("CHECK"):
                 checks.append(self._parse_check_spec())
             elif self._match_kw("REFERENCES"):
-                raise NotSupportedError(
-                    "外键约束尚未实现",
-                    detail="REFERENCES 会引入跨表级联与延迟检查",
-                    hint="在应用层保证引用完整性",
-                )
+                references = self._parse_references([name])
             elif self._cur.is_keyword("COLLATE", "GENERATED", "AUTOINCREMENT", "AUTO_INCREMENT"):
                 raise NotSupportedError(f"{self._cur.value.upper()} 尚未实现")
             else:
@@ -628,6 +662,24 @@ class Parser:
             unique=unique,
             default=default,
             checks=tuple(checks),
+            references=references,
+        )
+
+    def _parse_references(
+        self, columns: list[str], name: Optional[str] = None
+    ) -> ForeignKeySpec:
+        ref_table = self._parse_ident("被引用表名")
+        ref_columns: list[str] = []
+        if self._match_punct("lparen"):
+            ref_columns.append(self._parse_ident("被引用列名"))
+            while self._match_punct("comma"):
+                ref_columns.append(self._parse_ident("被引用列名"))
+            self._expect_punct("rparen", ")")
+        return ForeignKeySpec(
+            columns=columns,
+            ref_table=ref_table,
+            ref_columns=ref_columns,
+            name=name,
         )
 
     def _parse_type(self) -> TypeSpec:

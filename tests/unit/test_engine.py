@@ -8,6 +8,7 @@ from lumendb.errors import (
     CheckViolationError,
     ColumnNotFoundError,
     DuplicateKeyError,
+    ForeignKeyViolationError,
     IndexAlreadyExistsError,
     NotNullViolationError,
     NotSupportedError,
@@ -3066,6 +3067,231 @@ class TestPersistence:
         setup_users(db)
         assert db.execute_one("CHECKPOINT").tag == "CHECKPOINT"
         assert rows(db, "SELECT COUNT(*) FROM users") == [(3,)]
+
+
+class TestForeignKey:
+    def test_insert_update_delete_restrict(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("INSERT INTO p VALUES (1, 'a'), (2, 'b')")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))"
+        )
+        db.execute_one("INSERT INTO c VALUES (10, 1), (20, NULL)")
+
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (30, 99)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("DELETE FROM p WHERE id = 1")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("UPDATE p SET id = 3 WHERE id = 1")
+
+        db.execute_one("DELETE FROM c WHERE id = 10")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT id FROM p ORDER BY id") == [(2,)]
+        assert rows(db, "SELECT id, pid FROM c ORDER BY id") == [(20, None)]
+
+    def test_table_constraint_uses_primary_key(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT, "
+            "CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+
+    def test_unique_reference_and_type_check(self, db):
+        db.execute_one("CREATE TABLE p (code TEXT UNIQUE)")
+        db.execute_one(
+            "CREATE TABLE c (code TEXT REFERENCES p(code))"
+        )
+        db.execute_one("INSERT INTO p VALUES ('x')")
+        db.execute_one("INSERT INTO c VALUES ('x')")
+        db.execute_one("INSERT INTO c VALUES (NULL)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES ('y')")
+
+        db.execute_one("CREATE TABLE p2 (id INT)")
+        with pytest.raises(BinderError):
+            db.execute_one(
+                "CREATE TABLE c2 (pid INT REFERENCES p2(id))"
+            )
+        db.execute_one("CREATE TABLE p3 (id INT PRIMARY KEY)")
+        with pytest.raises(TypeMismatchError):
+            db.execute_one(
+                "CREATE TABLE c3 (pid TEXT REFERENCES p3(id))"
+            )
+
+    def test_self_reference(self, db):
+        db.execute_one(
+            "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT "
+            "REFERENCES node(id))"
+        )
+        db.execute_one("INSERT INTO node VALUES (1, NULL), (2, 1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("DELETE FROM node WHERE id = 1")
+        db.execute_one("DELETE FROM node WHERE id = 2")
+        db.execute_one("DELETE FROM node WHERE id = 1")
+        db.execute_one("INSERT INTO node VALUES (3, 3)")
+        db.execute_one("DELETE FROM node WHERE id = 3")
+        assert rows(db, "SELECT COUNT(*) FROM node") == [(0,)]
+
+    def test_alter_add_and_drop_foreign_key(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id)"
+        )
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+        db.execute_one("ALTER TABLE c DROP CONSTRAINT fk_c")
+        db.execute_one("INSERT INTO c VALUES (2)")
+        assert rows(db, "SELECT pid FROM c ORDER BY pid") == [(1,), (2,)]
+
+    def test_alter_add_foreign_key_validates_existing_rows(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one(
+                "ALTER TABLE c ADD CONSTRAINT fk_c "
+                "FOREIGN KEY (pid) REFERENCES p(id)"
+            )
+        db.execute_one("INSERT INTO p VALUES (99)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id)"
+        )
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (100)")
+
+    def test_drop_table_requires_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(BinderError):
+            db.execute_one("DROP TABLE p")
+        db.execute_one("DROP TABLE p CASCADE")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        assert rows(db, "SELECT pid FROM c ORDER BY pid") == [(1,), (99,)]
+
+    def test_rename_table_and_column_sync_metadata(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("ALTER TABLE p RENAME TO p_new")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+        db.execute_one("ALTER TABLE p_new RENAME COLUMN id TO code")
+        db.execute_one("INSERT INTO p_new VALUES (2)")
+        db.execute_one("INSERT INTO c VALUES (2)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (3)")
+
+    def test_drop_column_and_type_rejected_for_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE p DROP COLUMN id")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE p ALTER COLUMN id TYPE BIGINT")
+        result = db.execute_one("ALTER TABLE p ALTER COLUMN id TYPE INT")
+        assert "已经是" in result.notice
+
+    def test_error_sqlstate_and_truncate_guard(self, db):
+        assert ForeignKeyViolationError.sqlstate == "23503"
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(BinderError):
+            db.execute_one("TRUNCATE TABLE p")
+
+    def test_drop_unique_constraint_rejected_when_referenced(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT, "
+            "CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p(id))"
+        )
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE p DROP CONSTRAINT p_pkey")
+        db.execute_one("ALTER TABLE c DROP CONSTRAINT fk_c")
+        db.execute_one("ALTER TABLE p DROP CONSTRAINT p_pkey")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        assert rows(db, "SELECT id FROM p ORDER BY id") == [(1,), (1,)]
+
+    def test_composite_foreign_key(self, db):
+        db.execute_one(
+            "CREATE TABLE p (a INT, b INT, PRIMARY KEY (a, b))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2), (3, 4)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1, 3)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("DELETE FROM p WHERE a = 1 AND b = 2")
+
+    def test_rename_foreign_key_constraint(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT, "
+            "CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p(id))"
+        )
+        db.execute_one("ALTER TABLE c RENAME CONSTRAINT fk_c TO fk_renamed")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+        db.execute_one("ALTER TABLE c DROP CONSTRAINT fk_renamed")
+        db.execute_one("INSERT INTO c VALUES (2)")
+
+    def test_alter_add_column_references_rejected(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (id INT)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one(
+                "ALTER TABLE c ADD COLUMN pid INT REFERENCES p(id)"
+            )
+
+    def test_drop_table_cascade_rollback_restores_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("DROP TABLE p CASCADE")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+        db.execute_one("INSERT INTO p VALUES (2)")
+        db.execute_one("INSERT INTO c VALUES (2)")
+
+    def test_persisted_foreign_key(self, tmp_path):
+        path = tmp_path / "fk"
+        db = Database(path)
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.close()
+
+        db2 = Database(path)
+        with pytest.raises(ForeignKeyViolationError):
+            db2.execute_one("INSERT INTO c VALUES (2)")
+        db2.execute_one("INSERT INTO p VALUES (2)")
+        db2.execute_one("INSERT INTO c VALUES (2)")
+        db2.close()
 
 
 class TestErrorQuality:

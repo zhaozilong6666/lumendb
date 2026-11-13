@@ -123,6 +123,42 @@ old TO new` 可以重命名 CHECK 约束或由 UNIQUE/PRIMARY KEY 创建的约�
 表的约束/索引命名空间内必须唯一；重命名只改目录，事务回滚恢复旧名字。重命名后旧名字
 立即失效；客户端需要重新解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
 
+外键约束支持列级 `REFERENCES` 和表级 `FOREIGN KEY`，例如：
+
+```sql
+CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE);
+CREATE TABLE child (
+  id INT PRIMARY KEY,
+  pid INT REFERENCES parent(id),
+  pcode TEXT,
+  CONSTRAINT fk_child_parent FOREIGN KEY (pcode) REFERENCES parent(code)
+);
+ALTER TABLE child ADD CONSTRAINT fk_child_parent2
+  FOREIGN KEY (pid) REFERENCES parent(id);
+```
+
+列级 `REFERENCES` 可省略被引用列（`pid INT REFERENCES parent`），此时取被引用表的
+主键；表级约束也遵循同样规则。被引用列必须存在，并且上有 `UNIQUE` 或 `PRIMARY KEY`
+索引；引用列与被引用列数量、顺序一致，类型必须完全相同。外键按 SQL 的 `MATCH
+SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查。当前只实现 `RESTRICT`：
+`INSERT` / `UPDATE` 写入不存在的被引用键会抛 `ForeignKeyViolationError`（SQLSTATE
+`23503`）；`UPDATE` 改被引用列或 `DELETE` 被引用行时，只要还有子行引用旧键就拒绝。
+没有 `ON DELETE/UPDATE CASCADE`、`SET NULL`、`SET DEFAULT` 或 `DEFERRABLE` 延迟检查。
+外键定义随目录 JSON 持久化，事务 undo 会恢复外键字典；支持自引用（同一张表内
+`REFERENCES` 自身），自引用未显式给列时同样取当前表主键。
+
+外键命名空间与 CHECK、索引共享：显式 `CONSTRAINT name` 重名会报错；省略名字时自动生成
+`<table>_<cols>_fkey`，冲突时追加 `_2`。`ALTER TABLE ... DROP CONSTRAINT` 可删除外键，
+`RENAME CONSTRAINT` 也可重命名外键。已有表添加外键时会扫描存量行，任一可见行违反
+约束则整条 `ALTER TABLE` 失败并回滚，不会留下半成品外键。
+
+为避免悬空引用，DDL 还有以下保护：`ADD COLUMN ... REFERENCES` 暂不支持（先加列，再
+`ADD CONSTRAINT FOREIGN KEY`）；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
+`ALTER COLUMN TYPE` 会拒绝；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
+CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 拒绝被外键引用的表；
+删除支撑外键的唯一索引/唯一约束前，必须先删除外键。`RENAME TO` / `RENAME COLUMN`
+会同步更新其它表外键中的 `ref_table` / `ref_columns`，以及本表外键的本地列引用。
+
 `CREATE VIEW` 创建只读视图，视图不物化数据，也不占数据页；每次查询时按目录里保存的
 定义重新绑定到 `CteScan` 计划。查询视图会读到基表的最新已提交数据，事务/MVCC 语义与
 普通查询一致。视图名和表名共享命名空间；视图可以互相引用，但循环引用会被检测并报错。
@@ -323,7 +359,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键约束 | 需要跨表级联与延迟检查 |
+| 外键级联 / 延迟检查 | 只实现 `RESTRICT`，不支持 `ON DELETE/UPDATE CASCADE`、`SET NULL`、`SET DEFAULT`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；`ADD COLUMN ... REFERENCES` 暂不支持 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |
