@@ -305,13 +305,20 @@ class Parser:
                     table=table, constraint=constraint
                 )
             self._match_kw("COLUMN")
+            if_not_exists = False
+            if self._match_kw("IF"):
+                self._expect_kw("NOT")
+                self._expect_kw("EXISTS")
+                if_not_exists = True
             column = self._parse_column_def()
             if column.primary_key or column.unique:
                 raise NotSupportedError(
                     "ALTER TABLE ADD COLUMN 暂不支持主键或唯一约束",
                     hint="先加普通列，再 CREATE UNIQUE INDEX",
                 )
-            return AlterTableAddColumn(table=table, column=column)
+            return AlterTableAddColumn(
+                table=table, column=column, if_not_exists=if_not_exists
+            )
 
         if self._match_kw("ALTER"):
             self._match_kw("COLUMN")

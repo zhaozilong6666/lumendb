@@ -686,6 +686,13 @@ class TestAlterTable:
         stmt = parse_statement("ALTER TABLE users ADD age INT")
         assert stmt.column.name == "age"
 
+    def test_add_column_if_not_exists(self):
+        stmt = parse_statement(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS age INT"
+        )
+        assert stmt.column.name == "age"
+        assert stmt.if_not_exists is True
+
     def test_alter_column_default(self):
         from lumendb.sql.ast import AlterTableAlterDefault
 

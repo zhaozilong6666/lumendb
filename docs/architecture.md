@@ -95,7 +95,7 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 ### 2.7 加列与旧记录
 
 `ALTER TABLE ... ADD COLUMN` **不重写堆页**：目录里追加列定义并持久化，旧记录的
-`ncols` 仍是旧值。`decode_record(..., allow_missing=True)` 在读取时按新列的
+`ncols` 仍是旧值。`ADD COLUMN IF NOT EXISTS` 遇到同名列只返回跳过 notice，不改目录。`decode_record(..., allow_missing=True)` 在读取时按新列的
 `DEFAULT`（没有默认值就是 `NULL`）补齐尾部；`UPDATE` / `VACUUM` 把该行重新编码时
 才会写成包含新列的完整格式。
 

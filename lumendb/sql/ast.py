@@ -399,6 +399,7 @@ class CreateIndex(Statement):
 class AlterTableAddColumn(Statement):
     table: str
     column: ColumnDef
+    if_not_exists: bool = False
 
 
 @dataclass

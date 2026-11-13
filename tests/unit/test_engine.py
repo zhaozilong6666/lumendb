@@ -1670,6 +1670,22 @@ class TestJoin:
 
 
 class TestAlterTable:
+    def test_add_column_if_not_exists(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ALTER TABLE t ADD COLUMN IF NOT EXISTS age INT")
+        result = db.execute_one(
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS age TEXT"
+        )
+        assert "已跳过" in result.notice
+        assert rows(db, "SELECT id, age FROM t") == [(1, None)]
+        db.execute_one("INSERT INTO t VALUES (2, 30)")
+        assert rows(db, "SELECT id, age FROM t ORDER BY id") == [
+            (1, None), (2, 30)
+        ]
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t ADD COLUMN age TEXT")
+
     def test_add_column_with_default_pads_old_rows(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")

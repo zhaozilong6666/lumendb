@@ -20,6 +20,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
 ALTER TABLE t ADD [COLUMN] note TEXT;
+ALTER TABLE t ADD [COLUMN] IF NOT EXISTS note TEXT;
 ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
 ALTER TABLE t ALTER [COLUMN] age SET DEFAULT 21;
 ALTER TABLE t ALTER [COLUMN] age DROP DEFAULT;
@@ -49,7 +50,9 @@ DROP TABLE t [CASCADE];
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
 带非空 `DEFAULT`；主键/唯一约束请先加普通列，再 `ALTER TABLE ... ADD [CONSTRAINT name]
-UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TABLE ... ADD UNIQUE` 会回填已有数据，
+UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ADD COLUMN IF NOT
+EXISTS` 遇到同名列会跳过并返回 notice，不会比较新定义的类型；没有 `IF NOT EXISTS`
+时同名列仍报错。`ALTER TABLE ... ADD UNIQUE` 会回填已有数据，
 已有重复值时直接报错，不会留下半成品索引。
 
 `ALTER [COLUMN] ... SET DEFAULT` / `DROP DEFAULT` 只修改目录里的默认值，不重写已有行；

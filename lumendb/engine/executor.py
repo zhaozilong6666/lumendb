@@ -932,6 +932,11 @@ class Executor:
         table = self._catalog.get_table(stmt.table)
         name = stmt.column.name.lower()
         if table.has_column(name):
+            if stmt.if_not_exists:
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"列 {name} 已存在，已跳过",
+                )
             raise BinderError(
                 f"列 {name!r} 已存在",
                 hint="换一个列名，或先 DROP TABLE 重建",
