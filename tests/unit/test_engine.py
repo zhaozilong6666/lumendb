@@ -595,6 +595,22 @@ class TestInsert:
         )
         assert rows(db, "SELECT * FROM v") == [(1,), (2,), (3,)]
 
+    def test_recursive_cte_walks_a_table_hierarchy(self, db):
+        db.execute_one("CREATE TABLE tree (id INT, parent INT)")
+        db.execute_one(
+            "INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2), (4, 1)"
+        )
+        result = rows(
+            db,
+            "WITH RECURSIVE descendants AS ("
+            "SELECT id, parent FROM tree WHERE parent IS NULL "
+            "UNION ALL "
+            "SELECT t.id, t.parent FROM tree AS t "
+            "JOIN descendants AS d ON t.parent = d.id"
+            ") SELECT id FROM descendants ORDER BY id",
+        )
+        assert result == [(1,), (2,), (3,), (4,)]
+
     def test_drop_table_blocked_by_view_dependency(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("CREATE VIEW v AS SELECT a FROM t")
