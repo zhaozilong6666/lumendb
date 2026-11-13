@@ -132,7 +132,8 @@ token 切片持久化，重开数据库后重新解析 AST、再经 Binder 绑�
 以及 UPDATE 都会经过同一套校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量的
 `UNKNOWN` 可通过），只有结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 按 SQL 语义视为通过。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
 整个堆表，发现存量违反行就整体失败；带 CHECK 的表暂不支持重命名表/列，因为持久化
-token 里仍保留旧名字，重建 AST 时会绑定失败。
+token 里仍保留旧名字，重建 AST 时会绑定失败。`DROP CONSTRAINT` 只删除 CHECK 目录
+对象并登记 undo，不扫描也不重写堆记录；唯一/主键约束仍通过 `DROP INDEX` 管理。
 
 ### 2.9 视图
 

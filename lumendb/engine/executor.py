@@ -32,6 +32,7 @@ from ..sql.ast import (
     AlterTableAddConstraint,
     AlterTableAlterDefault,
     AlterTableAlterNullability,
+    AlterTableDropConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
     CreateIndex,
@@ -167,6 +168,8 @@ class Executor:
                 return self._alter_add_column(stmt, txn)
             if isinstance(stmt, AlterTableAddConstraint):
                 return self._alter_add_constraint(stmt, txn)
+            if isinstance(stmt, AlterTableDropConstraint):
+                return self._alter_drop_constraint(stmt, txn)
             if isinstance(stmt, AlterTableAlterDefault):
                 return self._alter_default(stmt, txn)
             if isinstance(stmt, AlterTableAlterNullability):
@@ -1306,6 +1309,40 @@ class Executor:
 
         raise NotSupportedError(
             f"不支持的表级约束：{constraint.kind}"
+        )
+
+    def _alter_drop_constraint(
+        self, stmt: AlterTableDropConstraint, txn: Transaction
+    ) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        name = stmt.name.lower()
+        if name not in table.checks:
+            if name in table.indexes:
+                raise NotSupportedError(
+                    f"约束 {name!r} 是索引/唯一约束，暂不支持 DROP CONSTRAINT",
+                    hint="使用 DROP INDEX 删除唯一索引",
+                )
+            if stmt.if_exists:
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"CHECK 约束 {name} 不存在，已跳过",
+                )
+            raise BinderError(
+                f"CHECK 约束 {name!r} 不存在",
+                hint=f"可用 CHECK 约束：{', '.join(table.checks) or '无'}",
+            )
+        old_checks = dict(table.checks)
+        del table.checks[name]
+
+        def undo_check() -> None:
+            table.checks = old_checks
+
+        txn.undo_log.append(undo_check)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"已删除 CHECK 约束 {name}",
         )
 
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:

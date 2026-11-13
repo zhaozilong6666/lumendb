@@ -121,6 +121,14 @@ class TestCreateTable:
         assert stmt.constraint.kind == "CHECK"
         assert stmt.constraint.name == "ck"
 
+    def test_drop_check_constraint(self):
+        from lumendb.sql.ast import AlterTableDropConstraint
+
+        stmt = parse_statement("ALTER TABLE t DROP CONSTRAINT IF EXISTS ck")
+        assert isinstance(stmt, AlterTableDropConstraint)
+        assert stmt.name == "ck"
+        assert stmt.if_exists is True
+
     def test_create_view(self):
         from lumendb.sql.ast import CreateView
 

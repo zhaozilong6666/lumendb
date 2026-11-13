@@ -2078,6 +2078,46 @@ class TestCheckConstraints:
         with pytest.raises(TypeMismatchError):
             db.execute_one("CREATE TABLE t (a INT CHECK (a))")
 
+    def test_drop_check_constraint(self, db):
+        db.execute_one("CREATE TABLE t (a INT, CONSTRAINT ck CHECK (a > 0))")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        result = db.execute_one("ALTER TABLE t DROP CONSTRAINT ck")
+        assert "ck" in result.notice
+        db.execute_one("INSERT INTO t VALUES (0)")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [(0,), (1,)]
+
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t DROP CONSTRAINT ck")
+        result = db.execute_one(
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS ck"
+        )
+        assert "不存在" in result.notice
+
+    def test_drop_check_can_rollback(self, db):
+        db.execute_one("CREATE TABLE t (a INT, CHECK (a > 0))")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_check_1")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0)")
+
+    def test_drop_index_constraint_rejected(self, db):
+        db.execute_one("CREATE TABLE t (a INT UNIQUE)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t DROP CONSTRAINT t_a_key")
+
+    def test_drop_check_survives_reopen(self, tmp_path):
+        path = tmp_path / "check_drop_reopen"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (a INT, CONSTRAINT ck CHECK (a > 0))")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT ck")
+        db.close()
+
+        db2 = Database(path)
+        db2.execute_one("INSERT INTO t VALUES (-1)")
+        assert rows(db2, "SELECT a FROM t") == [(-1,)]
+        db2.close()
+
     def test_check_string_and_boolean_expression(self, db):
         db.execute_one(
             "CREATE TABLE t (name TEXT CHECK (name <> ''), "

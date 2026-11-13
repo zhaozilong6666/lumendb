@@ -22,6 +22,7 @@ CREATE TABLE t4 (
   CONSTRAINT ck_ab CHECK (a < b)
 );
 ALTER TABLE t4 ADD CONSTRAINT ck_extra CHECK (a < 100);
+ALTER TABLE t4 DROP CONSTRAINT IF EXISTS ck_extra;
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
@@ -63,7 +64,9 @@ DROP TABLE t [CASCADE];
 SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)`
 会先扫描存量行，发现违反行时整体失败、不留下约束；`ADD COLUMN` 暂不支持同时声明
 `CHECK`，带 `CHECK` 的表也暂不支持 `RENAME TO` / `RENAME COLUMN`，避免目录里的
-token 保留旧列名。
+token 保留旧列名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name` 目前只删除
+CHECK 约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层是索引，请用
+`DROP INDEX` 删除。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
@@ -269,7 +272,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `ADD [CONSTRAINT name] CHECK (expr)` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `ADD [CONSTRAINT name] CHECK (expr)` / `DROP CONSTRAINT [IF EXISTS] name` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |
