@@ -455,12 +455,14 @@ class Parser:
                     "ON CONFLICT DO UPDATE 尚未实现",
                     hint="当前只支持 ON CONFLICT DO NOTHING",
                 )
+        returning = self._parse_returning()
         return Insert(
             table=table,
             columns=columns,
             rows=rows,
             query=query,
             on_conflict_nothing=on_conflict_nothing,
+            returning=returning,
         )
 
     def _parse_update(self) -> Update:
@@ -480,7 +482,12 @@ class Parser:
         where = None
         if self._match_kw("WHERE"):
             where = self._parse_expr()
-        return Update(table=table, assignments=assignments, where=where)
+        return Update(
+            table=table,
+            assignments=assignments,
+            where=where,
+            returning=self._parse_returning(),
+        )
 
     def _parse_delete(self) -> Delete:
         self._expect_kw("DELETE")
@@ -489,7 +496,19 @@ class Parser:
         where = None
         if self._match_kw("WHERE"):
             where = self._parse_expr()
-        return Delete(table=table, where=where)
+        return Delete(
+            table=table,
+            where=where,
+            returning=self._parse_returning(),
+        )
+
+    def _parse_returning(self) -> Optional[list[SelectItem]]:
+        if not self._match_kw("RETURNING"):
+            return None
+        items = [self._parse_select_item()]
+        while self._match_punct("comma"):
+            items.append(self._parse_select_item())
+        return items
 
     # ------------------------------------------------------------------
     # SELECT

@@ -365,6 +365,25 @@ class TestMaintenance:
         assert parse_statement("TRUNCATE users").table == "users"
 
 
+class TestReturning:
+    def test_insert_returning(self):
+        stmt = parse_statement(
+            "INSERT INTO t VALUES (1, 'a') RETURNING id, name AS n"
+        )
+        assert len(stmt.returning) == 2
+        assert isinstance(stmt.returning[0].expr, ColumnRef)
+        assert stmt.returning[1].alias == "n"
+
+    def test_update_returning_star(self):
+        stmt = parse_statement("UPDATE t SET x = 1 RETURNING *")
+        assert isinstance(stmt.returning[0].expr, Star)
+
+    def test_delete_returning_expression(self):
+        stmt = parse_statement("DELETE FROM t WHERE id = 1 RETURNING id + 1")
+        assert stmt.returning is not None
+        assert stmt.returning[0].expr is not None
+
+
 class TestInsertConflict:
     def test_on_conflict_do_nothing(self):
         stmt = parse_statement(

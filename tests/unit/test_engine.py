@@ -397,6 +397,66 @@ class TestCreateTableAs:
         assert rows(db, "SELECT id FROM t") == [(1,)]
 
 
+class TestReturning:
+    def test_insert_returning(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users VALUES (4, 'dave', 40) RETURNING id, name AS n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(4, "dave")]
+        assert [c.name for c in result.columns] == ["id", "n"]
+
+    def test_insert_returning_star(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users VALUES (4, 'dave', 40) RETURNING *"
+        )
+        assert result.rows == [(4, "dave", 40)]
+        assert [c.name for c in result.columns] == ["id", "name", "age"]
+
+    def test_insert_select_returning(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users SELECT 4, 'dave', 40 RETURNING name"
+        )
+        assert result.rows == [("dave",)]
+
+    def test_update_returning_uses_new_row(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "UPDATE users SET age = age + 1 WHERE id = 2 RETURNING id, age"
+        )
+        assert result.rows == [(2, 26)]
+        assert result.affected == 1
+
+    def test_delete_returning_uses_old_row(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "DELETE FROM users WHERE id = 2 RETURNING id, name"
+        )
+        assert result.rows == [(2, "bob")]
+        assert result.affected == 1
+        assert rows(db, "SELECT COUNT(*) FROM users") == [(2,)]
+
+    def test_on_conflict_returns_only_inserted_rows(self, db):
+        setup_users(db)
+        result = db.execute_one(
+            "INSERT INTO users VALUES (1, 'x', 1) "
+            "ON CONFLICT DO NOTHING RETURNING id"
+        )
+        assert result.affected == 0
+        assert result.rows == []
+
+    def test_returning_unknown_column_does_not_write(self, db):
+        setup_users(db)
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one(
+                "INSERT INTO users VALUES (4, 'dave', 40) RETURNING nope"
+            )
+        assert rows(db, "SELECT COUNT(*) FROM users") == [(3,)]
+
+
 class TestSelectBasics:
     def test_star(self, db):
         setup_users(db)

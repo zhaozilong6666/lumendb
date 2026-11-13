@@ -37,9 +37,13 @@ INSERT INTO t VALUES (1, 'a', 3), (2, 'b', 4);
 INSERT INTO t (id, name) VALUES (1, 'a');
 INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING;  -- 唯一键冲突时跳过该行
 INSERT INTO t (id, name) SELECT id, name FROM src WHERE age >= 18;
-UPDATE t SET age = age + 1 WHERE id = 1;
-DELETE FROM t WHERE age < 0;
+UPDATE t SET age = age + 1 WHERE id = 1 RETURNING id, age;
+DELETE FROM t WHERE age < 0 RETURNING id, name;
 ```
+
+`RETURNING` 支持 `*` 和任意表达式，可带 `AS` 别名；INSERT/UPDATE 在**新行**上求值，
+DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此未知列的 `RETURNING`
+不会先写入再报错。`ON CONFLICT DO NOTHING` 跳过的行不会出现在返回结果里。
 
 `INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
 检查；来源查询先完整物化再写入，所以 `INSERT INTO t SELECT * FROM t` 不会边读边写
@@ -142,7 +146,6 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 窗口函数 | 未实现 |
 | 递归 CTE | 只实现了非递归 `WITH` |
 | `EXCEPT` / `INTERSECT` | 只实现了 `UNION` / `UNION ALL`，其余集合运算未实现 |
-| `RIGHT JOIN` / `FULL JOIN` / `CROSS JOIN` | 已支持；`RIGHT`/`FULL` 用嵌套循环，未匹配侧补 `NULL` |
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |

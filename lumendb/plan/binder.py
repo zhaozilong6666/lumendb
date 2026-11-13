@@ -672,6 +672,46 @@ class Binder:
         self.bind_ctes(query.ctes)
         return self.bind_select(query.select)
 
+    def bind_returning(self, items, schema) -> tuple[list, list[OutputColumn]]:
+        """把 ``RETURNING`` 列表编译成 (表达式函数, 输出列)。
+
+        表达式在 DML 的行上求值：INSERT/UPDATE 用新行，DELETE 用旧行。
+        ``*`` 直接展开成表的全部列，顺序与表定义一致。
+        """
+        if not items:
+            return [], []
+        fns: list = []
+        cols: list[OutputColumn] = []
+        for item in items:
+            if isinstance(item.expr, Star):
+                if item.expr.table:
+                    wanted = item.expr.table.lower()
+                    picked = [c for c in schema.columns if c.qualifier == wanted]
+                    if not picked:
+                        raise TableNotFoundError(
+                            f"没有名为 {item.expr.table} 的表"
+                        )
+                else:
+                    picked = list(schema.columns)
+                for col in picked:
+                    index = schema.resolve(col.qualifier, col.name)
+                    fns.append(lambda ctx, i=index: ctx.row[i])
+                    cols.append(OutputColumn(col.name, col.type))
+                continue
+
+            fn, type_spec = self.compile(item.expr, schema, allow_agg=False)
+            fns.append(fn)
+            name = item.alias
+            if name is None:
+                if isinstance(item.expr, ColumnRef):
+                    name = item.expr.name
+                else:
+                    name = render_expr(item.expr)
+            cols.append(
+                OutputColumn(name.lower() if item.alias else name, type_spec)
+            )
+        return fns, cols
+
     def bind_select(self, select) -> tuple[PlanNode, list[OutputColumn]]:
         if isinstance(select, CompoundSelect):
             return self._bind_compound(select)

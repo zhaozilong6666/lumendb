@@ -760,6 +760,11 @@ class Executor:
             self.binder.bind_ctes(stmt.ctes)
 
         empty_schema = Schema([])
+        schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        )
+        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        returned: list[tuple] = []
         count = 0
 
         for row_exprs in stmt.rows:
@@ -787,11 +792,20 @@ class Executor:
                     continue
                 tree.insert(txn, key, rid)
                 idx.root_page = tree.root_page
+            if ret_fns:
+                returned.append(
+                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
+                )
             count += 1
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(affected=count, tag=f"INSERT {count}")
+        return Result(
+            columns=ret_cols,
+            rows=returned,
+            affected=count,
+            tag=f"INSERT {count}",
+        )
 
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
         if stmt.ctes:
@@ -816,6 +830,11 @@ class Executor:
             source_rows = [tuple(row) for row in self._execute(plan, txn)]
         finally:
             self._active_ctes = {}
+        schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        )
+        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        returned: list[tuple] = []
         count = 0
         for values in source_rows:
             prepared = self._prepare_values(table, stmt.columns, list(values))
@@ -835,11 +854,20 @@ class Executor:
                     continue
                 tree.insert(txn, key, rid)
                 idx.root_page = tree.root_page
+            if ret_fns:
+                returned.append(
+                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
+                )
             count += 1
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(affected=count, tag=f"INSERT {count}")
+        return Result(
+            columns=ret_cols,
+            rows=returned,
+            affected=count,
+            tag=f"INSERT {count}",
+        )
 
     def _has_unique_conflict(self, table, values, txn: Transaction) -> bool:
         """ON CONFLICT DO NOTHING 的前置检查：任一唯一索引上已有同样的键。"""
@@ -870,6 +898,8 @@ class Executor:
         if stmt.where is not None:
             where_fn, _ = self.binder.compile(stmt.where, schema, allow_agg=False)
 
+        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        returned: list[tuple] = []
         updated = 0
         # 必须先物化目标行：更新会向堆里追加新版本，边扫边写会让扫描器
         # 不断看到刚写进去的新版本（root RID 不变），从而反复更新同一行。
@@ -902,23 +932,34 @@ class Executor:
                 if new_key is not None:
                     tree.insert(txn, new_key, rid)
                 idx.root_page = tree.root_page
+            if ret_fns:
+                returned.append(
+                    tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
+                )
             updated += 1
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(affected=updated, tag=f"UPDATE {updated}")
+        return Result(
+            columns=ret_cols,
+            rows=returned,
+            affected=updated,
+            tag=f"UPDATE {updated}",
+        )
 
     def _delete(self, stmt: Delete, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         heap = HeapFile(self._bp, table, self._txns)
 
         where_fn = None
+        schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        )
         if stmt.where is not None:
-            schema = Schema(
-                [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
-            )
             where_fn, _ = self.binder.compile(stmt.where, schema, allow_agg=False)
 
+        ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        returned: list[tuple] = []
         deleted = 0
         for rid, values in heap.scan(txn):
             ctx = EvalContext(tuple(values))
@@ -928,12 +969,21 @@ class Executor:
                 key = self._key_for(table, idx, values)
                 if key is not None:
                     self._tree_for(table, idx).delete(txn, key, rid)
+            if ret_fns:
+                returned.append(
+                    tuple(fn(EvalContext(tuple(values))) for fn in ret_fns)
+                )
             heap.delete(txn, rid)
             deleted += 1
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(affected=deleted, tag=f"DELETE {deleted}")
+        return Result(
+            columns=ret_cols,
+            rows=returned,
+            affected=deleted,
+            tag=f"DELETE {deleted}",
+        )
 
     # ------------------------------------------------------------------
     # 约束与索引辅助

@@ -163,6 +163,10 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 全是可空列的空表，再物化结果并逐行插入。它不复制来源表的索引、主键或约束——
 这些需要显式 `CREATE INDEX`。
 
+DML 的 `RETURNING` 不另建计划：绑定阶段把表达式编译成闭包，写入循环里对
+新行（INSERT/UPDATE）或旧行（DELETE）求值。绑定失败发生在任何写入之前，
+所以未知列不会留下半条记录；`ON CONFLICT DO NOTHING` 跳过的行自然不产出。
+
 ## 5. 协议
 
 实现 PostgreSQL v3：
