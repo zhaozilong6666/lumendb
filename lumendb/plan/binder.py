@@ -21,6 +21,7 @@ from ..catalog.schema import Column, TableDef
 from ..datatypes import DataType, TypeSpec
 from ..errors import (
     AmbiguousColumnError,
+    BinderError,
     ColumnNotFoundError,
     NotSupportedError,
     TableNotFoundError,
@@ -34,6 +35,7 @@ from ..sql.ast import (
     CaseWhen,
     ColumnRef,
     CompoundSelect,
+    Cte,
     Exists,
     Expr,
     FunctionCall,
@@ -50,6 +52,7 @@ from ..sql.ast import (
 )
 from .nodes import (
     Aggregate,
+    CteScan,
     Distinct,
     EvalContext,
     Filter,
@@ -223,6 +226,8 @@ class Binder:
         self._agg_base: int = 0
         #: 需要执行子查询时由执行器注入的钩子
         self.subquery_runner: Optional[Callable[[Any, EvalContext], Any]] = None
+        #: 当前查询可见的 CTE：name -> (已绑定计划, 输出列)
+        self.ctes: dict[str, tuple[PlanNode, list[OutputColumn]]] = {}
 
     # -- 表达式 ---------------------------------------------------------
 
@@ -643,6 +648,26 @@ class Binder:
 
     # -- SELECT 绑定 -----------------------------------------------------
 
+    def bind_query(self, query) -> tuple[PlanNode, list[OutputColumn]]:
+        """绑定一条带 ``WITH`` 的顶层查询。
+
+        CTE 注册表在成功后保留，供执行阶段的子查询复用同一个作用域；
+        执行器每次执行语句都会新建 Binder，所以不会泄漏到下一条语句。
+        """
+        saved = self.ctes
+        self.ctes = dict(self.ctes)
+        try:
+            for cte in query.ctes:
+                name = cte.name.lower()
+                if name in self.ctes:
+                    raise BinderError(f"CTE {cte.name!r} 重复定义")
+                node, cols = self.bind_select(cte.query)
+                self.ctes[name] = (node, cols)
+            return self.bind_select(query.select)
+        except Exception:
+            self.ctes = saved
+            raise
+
     def bind_select(self, select) -> tuple[PlanNode, list[OutputColumn]]:
         if isinstance(select, CompoundSelect):
             return self._bind_compound(select)
@@ -1028,20 +1053,35 @@ class Binder:
         assert node is not None
         return node, schema
 
-    def _bind_table_ref(self, ref) -> tuple[PlanNode, Schema]:
-        table = self.catalog.get_table(ref.name)
-        alias = (ref.alias or table.name).lower()
+    def _source_for(
+        self, name: str, alias: Optional[str]
+    ) -> tuple[PlanNode, Schema, list[OutputColumn]]:
+        """解析 ``FROM`` 里的一个数据源：优先查 CTE，再查目录表。"""
+        entry = self.ctes.get(name.lower())
+        if entry is not None:
+            child, cols = entry
+            effective = (alias or name).lower()
+            node = CteScan(child=child, columns=list(cols))
+            schema = Schema(
+                [SchemaColumn(effective, col.name, col.type) for col in cols]
+            )
+            return node, schema, list(cols)
+
+        table = self.catalog.get_table(name)
+        effective = (alias or table.name).lower()
         columns = [OutputColumn(col.name, col.type) for col in table.columns]
-        node: PlanNode = Scan(columns=columns, table=table.name, alias=alias)
-        schema = Schema([SchemaColumn(alias, col.name, col.type) for col in table.columns])
+        node = Scan(columns=columns, table=table.name, alias=effective)
+        schema = Schema(
+            [SchemaColumn(effective, col.name, col.type) for col in table.columns]
+        )
+        return node, schema, columns
+
+    def _bind_table_ref(self, ref) -> tuple[PlanNode, Schema]:
+        node, schema, columns = self._source_for(ref.name, ref.alias)
 
         for join in ref.joins:
-            right_table = self.catalog.get_table(join.table.name)
-            right_alias = (join.table.alias or right_table.name).lower()
-            right_cols = [OutputColumn(col.name, col.type) for col in right_table.columns]
-            right_node = Scan(columns=right_cols, table=right_table.name, alias=right_alias)
-            right_schema = Schema(
-                [SchemaColumn(right_alias, col.name, col.type) for col in right_table.columns]
+            right_node, right_schema, right_cols = self._source_for(
+                join.table.name, join.table.alias
             )
             merged = schema.concat(right_schema)
             on_fn = None

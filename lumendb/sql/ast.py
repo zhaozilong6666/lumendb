@@ -367,6 +367,13 @@ class Delete(Statement):
 @dataclass
 class Query(Statement):
     select: Select
+    ctes: list["Cte"] = field(default_factory=list)
+
+
+@dataclass
+class Cte:
+    name: str
+    query: Union[Select, CompoundSelect]
 
 
 @dataclass
@@ -454,6 +461,7 @@ __all__ = [
     "Update",
     "Delete",
     "Query",
+    "Cte",
     "Begin",
     "Commit",
     "Rollback",

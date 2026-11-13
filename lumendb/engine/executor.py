@@ -52,6 +52,7 @@ from ..storage.wal import WAL
 from ..plan.binder import AggregateAccumulatorGroup, Binder, Schema, SchemaColumn
 from ..plan.nodes import (
     Aggregate,
+    CteScan,
     Distinct,
     EvalContext,
     Filter,
@@ -102,6 +103,8 @@ class Executor:
         self._profile: Optional[dict[int, list]] = None
         #: 当前语句的 ``$n`` 绑定值；run() 每次覆盖，子查询 binder 共享
         self._params: list[Any] = []
+        #: 当前语句的 CTE 作用域；子查询执行时复用
+        self._active_ctes: dict[str, Any] = {}
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
@@ -163,10 +166,13 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _select(self, stmt: Query, txn: Transaction) -> Result:
-        plan, out_cols = self.binder.bind_select(stmt.select)
-        rows = self._execute(plan, txn)
+        plan, out_cols = self.binder.bind_query(stmt)
         width = len(out_cols)
-        materialized = [tuple(r)[:width] for r in rows]
+        self._active_ctes = dict(self.binder.ctes)
+        try:
+            materialized = [tuple(r)[:width] for r in self._execute(plan, txn)]
+        finally:
+            self._active_ctes = {}
         return Result(
             columns=[ColumnMeta(c.name, c.type) for c in out_cols],
             rows=materialized,
@@ -182,6 +188,7 @@ class Executor:
         # 子查询在"没有外层列可用"的 schema 下绑定：如果它引用了外层列，
         # binder 会报 ColumnNotFoundError，这就是"相关子查询不支持"的明确表现。
         binder = self._new_binder()
+        binder.ctes = dict(self._active_ctes or self.binder.ctes)
         plan, _ = binder.bind_select(select)
         return list(self._execute(plan, self._require_txn()))
 
@@ -218,6 +225,9 @@ class Executor:
     def _execute_inner(self, node: PlanNode, txn: Transaction) -> Iterator[tuple]:
         if isinstance(node, Values):
             yield from node.rows
+            return
+        if isinstance(node, CteScan):
+            yield from self._execute(node.child, txn)
             return
         if isinstance(node, Scan):
             yield from self._scan(node, txn)
@@ -612,11 +622,12 @@ class Executor:
     def _explain(self, stmt: Explain) -> Result:
         inner = stmt.statement
         if isinstance(inner, Query):
-            plan, cols = self.binder.bind_select(inner.select)
+            plan, cols = self.binder.bind_query(inner)
             if stmt.analyze:
                 assert self._txn is not None
                 profile: dict[int, list] = {}
                 self._profile = profile
+                self._active_ctes = dict(self.binder.ctes)
                 started = time.perf_counter()
                 count = 0
                 try:
@@ -624,6 +635,7 @@ class Executor:
                         count += 1
                 finally:
                     self._profile = None
+                    self._active_ctes = {}
                 elapsed = (time.perf_counter() - started) * 1000
                 lines = list(_describe_plan(plan, profile=profile))
                 lines.append(

@@ -58,6 +58,21 @@ SELECT ... UNION ALL SELECT ... ORDER BY 1 LIMIT 5
 输出列名取第一个 `SELECT`。`ORDER BY` / `LIMIT` / `OFFSET` 作用于整个集合结果，
 排序键只支持输出列名或从 1 开始的列序号。`EXCEPT` / `INTERSECT` 仍未实现。
 
+公共表表达式（非递归 CTE）：
+
+```sql
+WITH adults AS (
+  SELECT id, name FROM users WHERE age >= 18
+), names AS (
+  SELECT id, name FROM adults
+)
+SELECT * FROM names;
+```
+
+CTE 按书写顺序绑定：后面的 CTE 和主查询都可以引用前面的 CTE；同名的 CTE 会遮蔽
+真实表。没有实现递归 `WITH RECURSIVE`，也不支持 `WITH x(a, b) AS (...)` 这种
+列别名清单。
+
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 
 表达式：`+ - * / %`、`||`（字符串拼接，`NULL` 传染）、`= <> < <= > >=`、`AND OR NOT`、`IS NULL`、`IN (...)`、`BETWEEN a AND b`、`LIKE`（`%` / `_`）、`CAST(x AS type)`、括号、函数 `LENGTH` / `UPPER` / `LOWER` / `ABS` / `COALESCE`。
@@ -114,7 +129,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 视图 / 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
-| 递归 CTE / 普通 CTE（`WITH`） | 未实现 |
+| 递归 CTE | 只实现了非递归 `WITH` |
 | `EXCEPT` / `INTERSECT` | 只实现了 `UNION` / `UNION ALL`，其余集合运算未实现 |
 | `RIGHT JOIN` / `FULL JOIN` / `CROSS JOIN` | 可用 `LEFT JOIN` 或逗号连接等价改写 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

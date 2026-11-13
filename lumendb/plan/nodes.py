@@ -103,6 +103,19 @@ class IndexRange(PlanNode):
 
 
 @dataclass
+class CteScan(PlanNode):
+    """``WITH ...`` 定义的命名子查询；child 是已经绑定好的计划。"""
+
+    child: Optional[PlanNode] = None
+
+    def children(self):
+        return [self.child] if self.child else []
+
+    def describe(self) -> str:
+        return "CteScan"
+
+
+@dataclass
 class SetOp(PlanNode):
     left: Optional[PlanNode] = None
     right: Optional[PlanNode] = None

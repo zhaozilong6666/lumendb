@@ -171,9 +171,20 @@ class TestSelect:
         with pytest.raises(SQLSyntaxError):
             parse_statement("SELECT * FROM a LEFT JOIN b")
 
-    def test_cte_rejected(self):
+    def test_cte_parses(self):
+        stmt = parse_statement("WITH x AS (SELECT 1 AS a) SELECT a FROM x")
+        assert stmt.ctes[0].name == "x"
+        assert stmt.select.from_[0].name == "x"
+
+    def test_multiple_ctes(self):
+        stmt = parse_statement(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM b"
+        )
+        assert [c.name for c in stmt.ctes] == ["a", "b"]
+
+    def test_recursive_cte_rejected(self):
         with pytest.raises(NotSupportedError):
-            parse_statement("WITH x AS (SELECT 1) SELECT * FROM x")
+            parse_statement("WITH RECURSIVE x AS (SELECT 1) SELECT * FROM x")
 
 
 class TestExpressions:

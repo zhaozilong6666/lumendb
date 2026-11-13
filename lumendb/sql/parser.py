@@ -24,6 +24,7 @@ from .ast import (
     CompoundSelect,
     CreateIndex,
     CreateTable,
+    Cte,
     Delete,
     DropIndex,
     DropTable,
@@ -180,11 +181,7 @@ class Parser:
         if kw == "ALTER":
             return self._parse_alter_table()
         if kw == "WITH":
-            raise NotSupportedError(
-                "公共表表达式（CTE）尚未实现",
-                detail="包含递归 CTE",
-                hint="可以用子查询表达等价逻辑",
-            )
+            return self._parse_with()
         if kw == "INSERT":
             return self._parse_insert()
         if kw == "UPDATE":
@@ -270,6 +267,28 @@ class Parser:
                 hint="先加普通列，再 CREATE UNIQUE INDEX",
             )
         return AlterTableAddColumn(table=table, column=column)
+
+    def _parse_with(self) -> Query:
+        self._expect_kw("WITH")
+        if self._match_kw("RECURSIVE") is not None:
+            raise NotSupportedError(
+                "递归 CTE 尚未实现",
+                hint="当前只支持非递归 WITH",
+            )
+        ctes: list[Cte] = []
+        while True:
+            name = self._parse_ident("CTE 名")
+            self._expect_kw("AS")
+            self._expect_punct("lparen", "(")
+            query = self._parse_query_expression()
+            self._expect_punct("rparen", ")")
+            ctes.append(Cte(name=name, query=query))
+            if not self._match_punct("comma"):
+                break
+        if not self._cur.is_keyword("SELECT"):
+            raise self._error("WITH 之后期望 SELECT")
+        select = self._parse_query_expression()
+        return Query(select=select, ctes=ctes)
 
     def _parse_create_table(self) -> CreateTable:
         if_not_exists = False

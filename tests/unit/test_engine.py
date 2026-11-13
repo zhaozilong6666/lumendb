@@ -784,6 +784,97 @@ class TestAlterTable:
         db2.close()
 
 
+class TestCte:
+    def test_filtered_cte(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH adults AS (SELECT id, name FROM users WHERE age >= 30) "
+            "SELECT name FROM adults ORDER BY name",
+        )
+        assert result == [("alice",), ("carol",)]
+
+    def test_cte_referenced_twice(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH young AS (SELECT id FROM users WHERE age < 30) "
+            "SELECT * FROM young UNION ALL SELECT * FROM young",
+        )
+        assert result == [(2,), (2,)]
+
+    def test_cte_joined_with_table(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH named AS (SELECT id, name FROM users) "
+            "SELECT n.name, u.age FROM named n JOIN users u ON n.id = u.id "
+            "WHERE u.age > 30 ORDER BY n.name",
+        )
+        assert result == [("carol", 35)]
+
+    def test_cte_can_reference_earlier_cte(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH adults AS (SELECT id FROM users WHERE age >= 30), "
+            "rich AS (SELECT id FROM adults WHERE id > 1) "
+            "SELECT * FROM rich",
+        )
+        assert result == [(3,)]
+
+    def test_cte_aggregate(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH stats AS (SELECT COUNT(*) AS n, age FROM users GROUP BY age) "
+            "SELECT n FROM stats WHERE age = 30",
+        )
+        assert result == [(1,)]
+
+    def test_cte_visible_inside_subquery(self, db):
+        setup_users(db)
+        result = rows(
+            db,
+            "WITH adults AS (SELECT id FROM users WHERE age >= 30) "
+            "SELECT name FROM users WHERE id IN (SELECT id FROM adults) "
+            "ORDER BY name",
+        )
+        assert result == [("alice",), ("carol",)]
+
+    def test_explain_analyze_cte(self, db):
+        setup_users(db)
+        plan = rows(
+            db,
+            "EXPLAIN ANALYZE WITH adults AS "
+            "(SELECT id FROM users WHERE age >= 30) SELECT * FROM adults",
+        )
+        text = "\n".join(r[0] for r in plan)
+        assert "CteScan" in text
+        assert "actual time=" in text
+
+    def test_self_reference_is_table_not_found(self, db):
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("WITH x AS (SELECT * FROM x) SELECT * FROM x")
+
+    def test_duplicate_cte_name(self, db):
+        with pytest.raises(Exception):
+            db.execute_one(
+                "WITH x AS (SELECT 1), x AS (SELECT 2) SELECT * FROM x"
+            )
+
+    def test_explain_shows_cte_scan(self, db):
+        setup_users(db)
+        plan = rows(
+            db,
+            "EXPLAIN WITH adults AS (SELECT id FROM users WHERE age >= 30) "
+            "SELECT * FROM adults",
+        )
+        text = "\n".join(r[0] for r in plan)
+        assert "CteScan" in text
+        assert "Index" in text or "Scan" in text
+
+
 class TestUnion:
     def test_union_all_keeps_duplicates(self, db):
         assert rows(db, "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 2") == [
@@ -976,7 +1067,7 @@ class TestErrorQuality:
 
     def test_unsupported_syntax(self, db):
         with pytest.raises(NotSupportedError):
-            db.execute_one("WITH x AS (SELECT 1) SELECT * FROM x")
+            db.execute_one("CREATE VIEW v AS SELECT 1")
 
     def test_keyword_as_name_rejected(self, db):
         with pytest.raises(Exception):
