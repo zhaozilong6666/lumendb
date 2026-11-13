@@ -940,7 +940,9 @@ class Executor:
         conflict_where_fn = None
         if stmt.on_conflict_where is not None:
             conflict_where_fn, _ = self.binder.compile(
-                stmt.on_conflict_where, schema, allow_agg=False
+                stmt.on_conflict_where,
+                self._conflict_schema(table),
+                allow_agg=False,
             )
         returned: list[tuple] = []
         count = 0
@@ -1014,6 +1016,20 @@ class Executor:
         )
         return conflict[1] if conflict is not None else None
 
+    def _conflict_schema(self, table: TableDef) -> Schema:
+        """旧行 + ``excluded`` 行的复合 schema，用于 upsert 赋值/WHERE。
+
+        两套列名相同，因此给 Schema 一个默认 qualifier：未限定列名落到
+        目标表（旧行），只有 ``excluded.col`` 才访问待插入行。
+        """
+        old_cols = [
+            SchemaColumn(table.name, c.name, c.type) for c in table.columns
+        ]
+        excluded_cols = [
+            SchemaColumn("excluded", c.name, c.type) for c in table.columns
+        ]
+        return Schema(old_cols + excluded_cols, default_qualifier=table.name)
+
     def _compile_conflict_assignments(
         self,
         table: TableDef,
@@ -1021,9 +1037,7 @@ class Executor:
     ) -> list[tuple[int, Any]]:
         if assignments is None:
             return []
-        schema = Schema(
-            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
-        )
+        schema = self._conflict_schema(table)
         compiled: list[tuple[int, Any]] = []
         for name, expr in assignments:
             index = table.column_index(name)
@@ -1038,10 +1052,13 @@ class Executor:
         txn: Transaction,
         rid: RID,
         old_values: list[Any],
+        excluded_values: list[Any],
         assignment_fns: list[tuple[int, Any]],
     ) -> list[Any]:
         old_tuple = tuple(old_values)
-        ctx = EvalContext(old_tuple)
+        # 赋值表达式可以引用旧行（默认 qualifier）和 excluded.col；
+        # 两者在同一个 tuple 里连续排放，列下标由 _conflict_schema 决定。
+        ctx = EvalContext(old_tuple + tuple(excluded_values))
         new_values = list(old_tuple)
         for index, fn in assignment_fns:
             new_values[index] = fn(ctx)
@@ -1110,7 +1127,9 @@ class Executor:
         conflict_where_fn = None
         if stmt.on_conflict_where is not None:
             conflict_where_fn, _ = self.binder.compile(
-                stmt.on_conflict_where, schema, allow_agg=False
+                stmt.on_conflict_where,
+                self._conflict_schema(table),
+                allow_agg=False,
             )
         returned: list[tuple] = []
         count = 0
@@ -1182,11 +1201,13 @@ class Executor:
             old_values = heap.get(txn, rid) if rid is not None else None
             if old_values is not None:
                 if conflict_where_fn is not None and not _truthy(
-                    conflict_where_fn(EvalContext(tuple(old_values)))
+                    conflict_where_fn(
+                        EvalContext(tuple(old_values) + tuple(prepared))
+                    )
                 ):
                     return 0, None
                 prepared = self._apply_conflict_update(
-                    table, heap, txn, rid, old_values, assignment_fns
+                    table, heap, txn, rid, old_values, prepared, assignment_fns
                 )
                 returning_row = (
                     tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)

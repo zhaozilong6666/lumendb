@@ -196,6 +196,11 @@ NOT NULL、唯一索引检查、`ON CONFLICT` 分派和索引维护都在写堆�
 新增插入路径必须复用这个入口，不能绕过去直接写 `HeapFile`，否则会重现
 "先写行、后建索引"或静默重复唯一键的问题。
 
+`ON CONFLICT DO UPDATE` 的赋值和 `WHERE` 在“旧行 + excluded 行”的复合
+Schema 上绑定：默认 qualifier 是目标表，因此未限定列名访问旧行，
+`excluded.col` 访问待插入行。两者在同一个 `EvalContext` 元组里连续排放；
+执行器只把赋值结果写回堆，excluded 行本身不会被写入。
+
 Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，不能跨语句复用；
 曾经复用 Binder 导致上一条 `WITH` 的 CTE 在下一句仍然可见，现已修复并加测试。
 

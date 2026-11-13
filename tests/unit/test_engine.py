@@ -402,6 +402,36 @@ class TestInsert:
         assert result.affected == 1
         assert rows(db, "SELECT id, n FROM dst") == [(1, 20)]
 
+    def test_on_conflict_do_update_uses_excluded_values(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 20) "
+            "ON CONFLICT DO UPDATE SET n = n + excluded.n RETURNING id, n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 30)]
+
+    def test_on_conflict_do_update_where_uses_excluded(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 20) "
+            "ON CONFLICT DO UPDATE SET n = excluded.n "
+            "WHERE excluded.n > n RETURNING id, n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 20)]
+
+    def test_on_conflict_excluded_unknown_column(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one(
+                "INSERT INTO t VALUES (1, 20) "
+                "ON CONFLICT DO UPDATE SET n = excluded.missing"
+            )
+
     def test_on_conflict_do_nothing_with_target_only_skips_target(self, db):
         db.execute_one(
             "CREATE TABLE t (id INT PRIMARY KEY, a INT UNIQUE, b INT UNIQUE)"

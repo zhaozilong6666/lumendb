@@ -87,15 +87,25 @@ class SchemaColumn:
 class Schema:
     """一行数据的列布局，用于把名字解析成下标。"""
 
-    def __init__(self, columns: Iterable[SchemaColumn]) -> None:
+    def __init__(
+        self,
+        columns: Iterable[SchemaColumn],
+        *,
+        default_qualifier: Optional[str] = None,
+    ) -> None:
         self.columns = list(columns)
+        # 冲突更新时 schema 同时含旧行和 excluded 行；未限定的列名
+        # 必须优先落到目标表，而不是因为两个 qualifier 同名而报歧义。
+        self.default_qualifier = (
+            default_qualifier.lower() if default_qualifier else None
+        )
 
     def __len__(self) -> int:
         return len(self.columns)
 
     def resolve(self, table: Optional[str], name: str) -> int:
         lowered = name.lower()
-        qualifier = table.lower() if table else None
+        qualifier = table.lower() if table else self.default_qualifier
         matches = [
             i
             for i, col in enumerate(self.columns)
