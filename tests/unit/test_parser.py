@@ -553,6 +553,15 @@ class TestAlterTable:
         with pytest.raises(NotSupportedError):
             parse_statement("ALTER TABLE users ADD COLUMN id INT PRIMARY KEY")
 
+    def test_add_unique_constraint(self):
+        stmt = parse_statement(
+            "ALTER TABLE users ADD CONSTRAINT uq_ab UNIQUE (name, age)"
+        )
+        assert stmt.table == "users"
+        assert stmt.constraint.kind == "UNIQUE"
+        assert stmt.constraint.name == "uq_ab"
+        assert stmt.constraint.columns == ["name", "age"]
+
     def test_rename_table(self):
         stmt = parse_statement("ALTER TABLE users RENAME TO accounts")
         assert isinstance(stmt, AlterTableRenameTable)

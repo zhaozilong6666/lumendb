@@ -60,6 +60,7 @@ from .ast import (
     Vacuum,
     Truncate,
     AlterTableAddColumn,
+    AlterTableAddConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
 )
@@ -276,6 +277,16 @@ class Parser:
         self._expect_kw("TABLE")
         table = self._parse_ident("表名")
         if self._match_kw("ADD"):
+            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE"):
+                constraint = self._parse_table_constraint()
+                if constraint.kind != "UNIQUE":
+                    raise NotSupportedError(
+                        "ALTER TABLE 暂不支持添加主键",
+                        hint="先 CREATE TABLE 声明主键，或使用 UNIQUE 约束",
+                    )
+                return AlterTableAddConstraint(
+                    table=table, constraint=constraint
+                )
             self._match_kw("COLUMN")
             column = self._parse_column_def()
             if column.primary_key or column.unique:

@@ -28,6 +28,7 @@ from ..errors import (
 )
 from ..sql.ast import (
     AlterTableAddColumn,
+    AlterTableAddConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
     CreateIndex,
@@ -147,6 +148,8 @@ class Executor:
                 return self._create_table_as(stmt, txn)
             if isinstance(stmt, AlterTableAddColumn):
                 return self._alter_add_column(stmt, txn)
+            if isinstance(stmt, AlterTableAddConstraint):
+                return self._alter_add_constraint(stmt, txn)
             if isinstance(stmt, AlterTableRenameTable):
                 self._catalog.rename_table(txn, stmt.table, stmt.new_name)
                 return Result(
@@ -809,6 +812,37 @@ class Executor:
                 f"已添加列 {name}；旧记录在读取时按默认值补齐，"
                 "不重写堆页"
             ),
+        )
+
+    def _alter_add_constraint(
+        self, stmt: AlterTableAddConstraint, txn: Transaction
+    ) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        constraint = stmt.constraint
+        if constraint.kind != "UNIQUE":
+            raise NotSupportedError("ALTER TABLE 暂不支持添加主键")
+        names = tuple(name.lower() for name in constraint.columns)
+        for name in names:
+            table.column(name)
+        index_name = (
+            constraint.name.lower()
+            if constraint.name is not None
+            else f"{table.name}_{'_'.join(names)}_key"
+        )
+        # 复用 CREATE UNIQUE INDEX 的回填逻辑：先建目录索引，再扫描堆表
+        # 填入键；已有重复值会直接报 DuplicateKeyError，并随事务回滚。
+        self._create_index(
+            CreateIndex(
+                name=index_name,
+                table=table.name,
+                columns=list(names),
+                unique=True,
+            ),
+            txn,
+        )
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"已添加唯一约束 {index_name}",
         )
 
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:

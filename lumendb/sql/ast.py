@@ -359,6 +359,12 @@ class AlterTableAddColumn(Statement):
 
 
 @dataclass
+class AlterTableAddConstraint(Statement):
+    table: str
+    constraint: TableConstraint
+
+
+@dataclass
 class AlterTableRenameTable(Statement):
     table: str
     new_name: str

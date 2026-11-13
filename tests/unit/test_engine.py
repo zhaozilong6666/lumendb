@@ -390,6 +390,26 @@ class TestInsert:
                 "CREATE TABLE t3 (a INT, b INT, PRIMARY KEY (a), PRIMARY KEY (b))"
             )
 
+    def test_alter_add_unique_constraint(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT uq_ab UNIQUE (a, b)"
+        )
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 2)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 2) "
+            "ON CONFLICT ON CONSTRAINT uq_ab DO NOTHING"
+        )
+        assert result.affected == 0
+
+    def test_alter_add_unique_rejects_existing_duplicates(self, db):
+        db.execute_one("CREATE TABLE t (a INT, b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 2), (1, 2)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("ALTER TABLE t ADD UNIQUE (a, b)")
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")
