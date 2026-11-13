@@ -369,7 +369,7 @@ class TestExtendedQuery:
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
 
-    def test_describe_statement_with_param_falls_back_to_nodata(self, tmp_path):
+    def test_describe_statement_with_param_returns_row_description(self, tmp_path):
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (id INT)")
         server = PGWireServer(db)
@@ -383,7 +383,9 @@ class TestExtendedQuery:
             await writer.drain()
             messages = await _read_until_ready(reader)
             kinds = [k for k, _ in messages]
-            assert kinds == [b"1", b"t", b"n", b"Z"]
+            assert kinds == [b"1", b"t", b"T", b"Z"]
+            desc = next(p for k, p in messages if k == b"T")
+            assert _parse_row_description(desc) == ["id"]
             writer.close()
             await writer.wait_closed()
 

@@ -477,12 +477,15 @@ class PGWireServer:
                 self._send_error(writer, ProtocolError(f"未找到预处理语句 {name!r}"))
                 return
             self._send_parameter_description(writer, stmt.param_oids)
-            # 没有参数的语句可以在 Parse 之后直接静态描述；带 $n 的语句
-            # 需要 Bind 的实际值才能推断类型，此时退回 NoData，客户端在
-            # Bind 后 Describe 门户即可拿到 RowDescription。
+            # 没有参数的语句可以在 Parse 之后直接静态描述。带 $n 的语句
+            # 用声明过的占位参数做绑定：Binding 只需要值的类型，不需要真实
+            # 数据，所以 NULL 占位足够，既不会执行 DML，也能返回列元数据。
+            placeholders = [None] * len(stmt.param_oids)
             try:
                 async with self._lock:
-                    columns = session.database.executor.describe(stmt.parsed, [])
+                    columns = session.database.executor.describe(
+                        stmt.parsed, placeholders
+                    )
             except UndefinedParameterError:
                 columns = []
             except LumenError as exc:
