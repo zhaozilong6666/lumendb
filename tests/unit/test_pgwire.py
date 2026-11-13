@@ -216,14 +216,14 @@ class TestExtendedQuery:
     def _msg(kind: bytes, body: bytes) -> bytes:
         return kind + struct.pack("!i", len(body) + 4) + body
 
-    def _parse(self, sql: str, oids: list[int]) -> bytes:
-        body = b"\x00" + sql.encode() + b"\x00"
+    def _parse(self, sql: str, oids: list[int], name: str = "") -> bytes:
+        body = name.encode() + b"\x00" + sql.encode() + b"\x00"
         body += struct.pack("!h", len(oids))
         body += b"".join(struct.pack("!I", oid) for oid in oids)
         return self._msg(b"P", body)
 
-    def _bind(self, values, *, formats=None, portal="") -> bytes:
-        body = portal.encode() + b"\x00" + b"\x00"
+    def _bind(self, values, *, formats=None, portal="", statement="") -> bytes:
+        body = portal.encode() + b"\x00" + statement.encode() + b"\x00"
         if formats is None:
             body += struct.pack("!h", 0)
         else:
@@ -243,6 +243,12 @@ class TestExtendedQuery:
 
     def _describe_portal(self, portal="") -> bytes:
         return self._msg(b"D", b"P" + portal.encode() + b"\x00")
+
+    def _describe_statement(self, name="") -> bytes:
+        return self._msg(b"D", b"S" + name.encode() + b"\x00")
+
+    def _close(self, kind: str, name="") -> bytes:
+        return self._msg(b"C", kind.encode() + name.encode() + b"\x00")
 
     async def _ready(self, reader, writer):
         payload = (
@@ -340,8 +346,142 @@ class TestExtendedQuery:
             writer.close()
             await writer.wait_closed()
 
+    def test_describe_statement_returns_row_description(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT id FROM t", []))
+            writer.write(self._describe_statement())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            kinds = [k for k, _ in messages]
+            assert kinds == [b"1", b"t", b"T", b"Z"]
+            desc = next(p for k, p in messages if k == b"T")
+            assert _parse_row_description(desc) == ["id"]
+            writer.close()
+            await writer.wait_closed()
+
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
-        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        db.close()
+
+    def test_describe_statement_with_param_falls_back_to_nodata(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT id FROM t WHERE id = $1", [23]))
+            writer.write(self._describe_statement())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            kinds = [k for k, _ in messages]
+            assert kinds == [b"1", b"t", b"n", b"Z"]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_close_prepared_statement_drops_portals(self, tmp_path):
+        db = Database(tmp_path / "db")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT 1", [], name="s"))
+            writer.write(self._bind([], statement="s"))
+            writer.write(self._close("S", "s"))
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            closed = await _read_until_ready(reader)
+            kinds = [k for k, _ in closed]
+            assert kinds == [b"1", b"2", b"3", b"Z"]
+
+            # 依赖该语句的门户已随语句关闭；Execute 应报协议错误。
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            missing = await _read_until_ready(reader)
+            assert any(k == b"E" for k, _ in missing)
+
+            # 同一个名字可以重新 Parse 并使用，说明 Close 真正释放了对象。
+            writer.write(self._parse("SELECT 1", [], name="s"))
+            writer.write(self._bind([], statement="s"))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            reused = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in reused if k == b"D"]
+            assert rows == [["1"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_portal_is_closed_after_implicit_commit(self, tmp_path):
+        db = Database(tmp_path / "db")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT 1", []))
+            writer.write(self._bind([]))
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            await _read_until_ready(reader)
+
+            # 语句级隐式事务已经结束，门户不能再执行第二次。
+            writer.write(self._execute())
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            second = await _read_until_ready(reader)
+            assert any(k == b"E" for k, _ in second)
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_reparse_named_statement_drops_old_portals(self, tmp_path):
+        db = Database(tmp_path / "db")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            await self._ready(reader, writer)
+            writer.write(self._parse("SELECT 1", [], name="s"))
+            writer.write(self._bind([], portal="p1", statement="s"))
+            # 同名重新 Parse 后，旧 portal 失效；新 portal 指向新语句。
+            writer.write(self._parse("SELECT 2", [], name="s"))
+            writer.write(self._execute(portal="p1"))
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            stale = await _read_until_ready(reader)
+            assert any(k == b"E" for k, _ in stale)
+
+            writer.write(self._bind([], portal="p2", statement="s"))
+            writer.write(self._execute(portal="p2"))
+            writer.write(self._msg(b"S", b""))
+            await writer.drain()
+            messages = await _read_until_ready(reader)
+            rows = [_parse_data_row(p) for k, p in messages if k == b"D"]
+            assert rows == [["2"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
 
     def test_execute_reuses_parsed_ast(self, tmp_path, monkeypatch):

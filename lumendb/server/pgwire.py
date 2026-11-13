@@ -28,6 +28,7 @@ from ..errors import (
     NotSupportedError,
     ProtocolError,
     TransactionError,
+    UndefinedParameterError,
 )
 from ..sql.ast import Begin, Commit, Rollback, Statement
 from ..sql.parser import parse_sql
@@ -35,6 +36,11 @@ from ..sql.parser import parse_sql
 PROTOCOL_VERSION = 196608  # 3.0
 SSL_REQUEST_CODE = 80877103
 CANCEL_REQUEST_CODE = 80877102
+
+# 每个连接允许保留的协议对象；超过上限时要求客户端先 Close，避免长时间
+# 运行的连接把预处理语句和门户无限增长。
+MAX_PREPARED_STATEMENTS = 1024
+MAX_PORTALS = 1024
 
 # PostgreSQL 的类型 OID
 _OID_BY_TYPE = {
@@ -219,7 +225,7 @@ class PGWireServer:
             await writer.drain()
             return True
         if kind == b"C":  # Close
-            self._send(writer, b"3", b"")
+            await self._close(session, writer, payload)
             return True
         # 其它消息（如 Describe 变体）暂不实现，回 ReadyForQuery 保持连接
         self._send_ready(session, writer)
@@ -251,11 +257,15 @@ class PGWireServer:
             session.txn = None
             if isinstance(statement, Commit) and not session.failed:
                 database.txns.commit(txn)
-                return Result(tag="COMMIT")
-            # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
-            database.txns.abort(txn)
-            session.failed = False
-            return Result(tag="ROLLBACK")
+                result = Result(tag="COMMIT")
+            else:
+                # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
+                database.txns.abort(txn)
+                session.failed = False
+                result = Result(tag="ROLLBACK")
+            # 门户在事务结束时关闭；预处理语句仍然保留。
+            session.portals.clear()
+            return result
 
         if session.failed:
             raise TransactionError(
@@ -271,8 +281,12 @@ class PGWireServer:
             result = database.executor.run(statement, txn, params)
         except BaseException:
             database.txns.abort(txn)
+            # 隐式事务失败后同样没有仍然有效的门户。
+            session.portals.clear()
             raise
         database.txns.commit(txn)
+        # 语句级隐式事务结束，关闭本次事务创建的门户。
+        session.portals.clear()
         return result
 
     def _run_statements(
@@ -357,6 +371,25 @@ class PGWireServer:
                 ),
             )
             return
+        if (
+            name not in session.prepared
+            and len(session.prepared) >= MAX_PREPARED_STATEMENTS
+        ):
+            self._send_error(
+                writer,
+                ProtocolError(
+                    f"每个连接最多保留 {MAX_PREPARED_STATEMENTS} 条预处理语句",
+                    hint="关闭不再使用的预处理语句后再 Parse",
+                ),
+            )
+            return
+        old_statement = session.prepared.get(name)
+        if old_statement is not None:
+            # 同名 Parse 是重新定义语句；依赖旧定义的 portal 不能继续指向
+            # 一个已经从字典里替换掉的对象。
+            for portal_name, portal in list(session.portals.items()):
+                if portal.statement is old_statement:
+                    session.portals.pop(portal_name, None)
         session.prepared[name] = PreparedStatement(
             name=name,
             sql=sql,
@@ -418,6 +451,18 @@ class PGWireServer:
         except LumenError as exc:
             self._send_error(writer, exc)
             return
+        if (
+            portal_name not in session.portals
+            and len(session.portals) >= MAX_PORTALS
+        ):
+            self._send_error(
+                writer,
+                ProtocolError(
+                    f"每个连接最多保留 {MAX_PORTALS} 个门户",
+                    hint="关闭不再使用的门户后再 Bind",
+                ),
+            )
+            return
         session.portals[portal_name] = Portal(
             name=portal_name, statement=stmt, params=values
         )
@@ -432,9 +477,21 @@ class PGWireServer:
                 self._send_error(writer, ProtocolError(f"未找到预处理语句 {name!r}"))
                 return
             self._send_parameter_description(writer, stmt.param_oids)
-            # 结果列要等 Bind 之后才知道（参数会影响类型推断），先回 NoData；
-            # 客户端按协议会在 Bind 之后 Describe 门户再拿 RowDescription。
-            self._send(writer, b"n", b"")
+            # 没有参数的语句可以在 Parse 之后直接静态描述；带 $n 的语句
+            # 需要 Bind 的实际值才能推断类型，此时退回 NoData，客户端在
+            # Bind 后 Describe 门户即可拿到 RowDescription。
+            try:
+                async with self._lock:
+                    columns = session.database.executor.describe(stmt.parsed, [])
+            except UndefinedParameterError:
+                columns = []
+            except LumenError as exc:
+                self._send_error(writer, exc)
+                return
+            if columns:
+                self._send_row_description(writer, columns, include_header=True)
+            else:
+                self._send(writer, b"n", b"")
             return
         portal = session.portals.get(name)
         if portal is None:
@@ -454,6 +511,29 @@ class PGWireServer:
             self._send_row_description(writer, columns, include_header=True)
         else:
             self._send(writer, b"n", b"")  # NoData
+
+    async def _close(self, session: Session, writer, payload: bytes) -> None:
+        kind = payload[:1]
+        name, _ = _split_cstr(payload[1:])
+        if kind == b"S":
+            stmt = session.prepared.pop(name, None)
+            if stmt is not None:
+                # 关闭预处理语句时，按 PostgreSQL 语义一并关闭由它创建的门户。
+                for portal_name, portal in list(session.portals.items()):
+                    if portal.statement is stmt:
+                        session.portals.pop(portal_name, None)
+        elif kind == b"P":
+            session.portals.pop(name, None)
+        else:
+            self._send_error(
+                writer,
+                ProtocolError(
+                    f"Close 的目标类型 {kind!r} 非法",
+                    hint="Close 的目标类型必须是 S（语句）或 P（门户）",
+                ),
+            )
+            return
+        self._send(writer, b"3", b"")  # CloseComplete
 
     async def _execute(self, session: Session, writer, payload: bytes) -> None:
         portal_name, rest = _split_cstr(payload)

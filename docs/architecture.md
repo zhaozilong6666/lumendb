@@ -192,10 +192,15 @@ Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，
 - 参数：支持 `INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR` 的文本与二进制格式；
   OID 0（客户端未声明）时按字面量推断。参数个数与 `Bind` 不一致报 `08P01`，
   `$n` 没有值报 `42P02`；
-- `Describe` 语句返回 `ParameterDescription`（真实 OID 列表）；结果列要等 `Bind`
-  之后 `Describe` 门户才能确定，此时回 `RowDescription`。门户的 `Describe`
-  **只做静态绑定**，绝不执行语句——否则同一条 `INSERT/UPDATE/DELETE` 会在
-  `Describe` 和 `Execute` 中各执行一次；
+- `Describe` 语句先回 `ParameterDescription`（真实 OID 列表）；没有 `$n` 的语句
+  可以在 Parse 之后直接静态绑定并回 `RowDescription`，带参数、无法静态推断
+  类型的语句退回 `NoData`，客户端在 `Bind` 之后 `Describe` 门户即可拿到列信息。
+  门户的 `Describe` **只做静态绑定**，绝不执行语句——否则同一条
+  `INSERT/UPDATE/DELETE` 会在 `Describe` 和 `Execute` 中各执行一次；
+- `Close` 支持关闭预处理语句（`S`）和门户（`P`）；关闭语句时连带关闭由它
+  创建的门户，名字可以重新 `Parse`/`Bind`。每个连接对预处理语句和门户各保留
+  1024 个上限，超过时返回明确错误，避免长连接无界增长。每次事务提交/回滚后
+  关闭该事务的门户；同名重新 `Parse` 也会让旧语句创建的门户失效。
 - 错误：`ErrorResponse` 带 `SQLSTATE`、`MESSAGE`、`DETAIL`、`HINT`，
   客户端（psql / JDBC）能按标准字段展示；
 - **会话事务**：`BEGIN` 创建的事务挂在 `Session` 上，而不是共用 `Database`
