@@ -175,38 +175,59 @@ class BufferPoolManager:
         with self._lock:
             self._undo.pop(xid, None)
 
-    def undo_xid(self, xid: int) -> int:
-        """逆序恢复该事务写过的页，并写 CLR 推进 pageLSN。
+    def undo_depth(self, xid: int) -> int:
+        """返回该事务当前累计的页级撤销记录数，供 SAVEPOINT 打点。"""
+        with self._lock:
+            return len(self._undo.get(xid, []))
 
-        恢复顺序必须与写入顺序相反：同一偏移可能被写过多次，只有先撤销
-        后一次写，才能拿到前一次写的 after image。每恢复一页就立即刷盘，
-        并确保对应的 CLR 已经先落 WAL；这样崩溃后 redo 看到更高的
-        pageLSN 会跳过原始 UPDATE，不会把已回滚的数据复活。
-        """
+    def undo_xid(self, xid: int) -> int:
+        """逆序恢复该事务写过的全部页，并写 CLR 推进 pageLSN。"""
         with self._lock:
             entries = self._undo.pop(xid, [])
-            if not entries:
+            return self._apply_undo_entries(xid, entries)
+
+    def undo_to(self, xid: int, mark: int) -> int:
+        """只撤销 ``mark`` 之后的页写，保留更早的撤销记录。
+
+        ``ROLLBACK TO SAVEPOINT`` 使用这个入口：保存点之前的页原像仍然
+        需要留给后续事务级 abort；保存点之后的原像在应用后丢弃。
+        """
+        with self._lock:
+            entries = self._undo.get(xid, [])
+            if mark < 0:
+                mark = 0
+            if mark >= len(entries):
                 return 0
-            touched: set[int] = set()
-            for page_id, offset, old in reversed(entries):
-                page = self.fetch_page(page_id)
-                try:
-                    current = bytes(page.buf[offset : offset + len(old)])
-                    if current == old:
-                        continue
-                    lsn = self.log_page_update(
-                        xid, page, offset, current, old, clr=True
-                    )
-                    page.buf[offset : offset + len(old)] = old
-                    # old image 里包含旧的 pageLSN；写回后必须重新盖上 CLR
-                    # 的 LSN，否则重启 redo 会按旧 LSN 重放原始 UPDATE。
-                    page.page_lsn = lsn
-                    touched.add(page_id)
-                finally:
-                    self.unpin(page_id, dirty=True)
-            for page_id in touched:
-                self.flush_page(page_id)
-            return len(touched)
+            tail = entries[mark:]
+            del entries[mark:]
+            return self._apply_undo_entries(xid, tail)
+
+    def _apply_undo_entries(
+        self, xid: int, entries: list[tuple[int, int, bytes]]
+    ) -> int:
+        """在已持有 ``_lock`` 的前提下逆序应用页原像。"""
+        if not entries:
+            return 0
+        touched: set[int] = set()
+        for page_id, offset, old in reversed(entries):
+            page = self.fetch_page(page_id)
+            try:
+                current = bytes(page.buf[offset : offset + len(old)])
+                if current == old:
+                    continue
+                lsn = self.log_page_update(
+                    xid=xid, page=page, offset=offset, old=current, new=old, clr=True
+                )
+                page.buf[offset : offset + len(old)] = old
+                # old image 里包含旧的 pageLSN；写回后必须重新盖上 CLR
+                # 的 LSN，否则重启 redo 会按旧 LSN 重放原始 UPDATE。
+                page.page_lsn = lsn
+                touched.add(page_id)
+            finally:
+                self.unpin(page_id, dirty=True)
+        for page_id in touched:
+            self.flush_page(page_id)
+        return len(touched)
 
     def flush_page(self, page_id: int) -> None:
         """把单个脏页写回磁盘（先刷 WAL）。"""

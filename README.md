@@ -97,6 +97,17 @@ UPDATE users SET age = 46 WHERE name = 'Grace';
 ROLLBACK;
 ```
 
+保存点让事务可以只撤销一部分：
+
+```sql
+BEGIN;
+SAVEPOINT before_cleanup;
+DELETE FROM users WHERE age > 50;
+ROLLBACK TO SAVEPOINT before_cleanup;  -- 只撤销 DELETE，事务继续
+INSERT INTO users VALUES (4, 'Margaret', 85);
+COMMIT;
+```
+
 也可以用内置 REPL：
 
 ```bash
@@ -137,7 +148,7 @@ psycopg2 都不会正常返回结果。
 | 聚合 | `GROUP BY`（列或表达式）、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、`COUNT(DISTINCT x)` |
 | 表达式 | 算术、`\|\|` 拼接、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN` |
 | 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
-| 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，MVCC 快照隔离 |
+| 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，`SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE`，MVCC 快照隔离 |
 | 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX`、`VACUUM`、`TRUNCATE` |
 
 未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
@@ -192,7 +203,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **622 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **632 个自动化测试**（`python -m pytest tests -q`，约 12–25 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

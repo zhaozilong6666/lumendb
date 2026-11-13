@@ -69,13 +69,19 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 `CatalogStore` 还会把 page 0 的 `catalog_root` 指回旧链，否则显式 `ROLLBACK`
 之后关闭再打开，会重新加载到未提交的新目录链。
 
+`SAVEPOINT` 记录当时 Buffer Pool 的页 undo 深度和 `txn.undo_log` 深度。
+`ROLLBACK TO SAVEPOINT` 只应用这个深度之后的页原像（同样写 CLR），再逆序
+执行这个深度之后的目录对象 undo；更早的原像保留给后续事务级 abort。
+`RELEASE` 只丢弃保存点标记，不撤销任何写入。保存点是事务内状态，不写 WAL。
+
 ### 2.6 回收（VACUUM）
 
 `UPDATE` 写新版本、`DELETE` 只打 `xmax`，所以表会持续膨胀。`VACUUM [table]`
 负责回收：
 
-1. 在**没有并发事务**的前提下（本引擎同一时刻只允许一个活跃事务，这条
-   前提在进程内天然成立）扫描整表，保留当前快照可见的那一版；
+1. 要求调用时没有其它活跃事务；服务端多连接下这个前提不是天然成立的，
+   执行器会检查 `active_xids`，否则拒绝 `VACUUM`。扫描整表，保留当前
+   快照可见的那一版；
 2. 把存活行重排成"每行只有一条根元组"：`root/newest` 指向自己、`prev` 为空；
    页内顺序紧凑，死版本的空间被真正收回；
 3. 重排会改变所有 RID，所以紧接着**重建该表的所有索引**；

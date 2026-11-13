@@ -43,7 +43,10 @@ from .ast import (
     ParamRef,
     Query,
     Reindex,
+    ReleaseSavepoint,
     Rollback,
+    RollbackToSavepoint,
+    Savepoint,
     ScalarSubquery,
     Select,
     SelectItem,
@@ -209,7 +212,17 @@ class Parser:
         if kw == "ROLLBACK":
             self._advance()
             self._match_kw("TRANSACTION")
+            if self._match_kw("TO") is not None:
+                self._match_kw("SAVEPOINT")
+                return RollbackToSavepoint(self._parse_ident("保存点名"))
             return Rollback()
+        if kw == "SAVEPOINT":
+            self._advance()
+            return Savepoint(self._parse_ident("保存点名"))
+        if kw == "RELEASE":
+            self._advance()
+            self._match_kw("SAVEPOINT")
+            return ReleaseSavepoint(self._parse_ident("保存点名"))
         if kw == "EXPLAIN":
             self._advance()
             analyze = self._match_kw("ANALYZE") is not None

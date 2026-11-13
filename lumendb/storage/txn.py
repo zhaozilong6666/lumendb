@@ -37,6 +37,15 @@ class TxnState(IntEnum):
 
 
 @dataclass
+class TxnSavepoint:
+    """事务内保存点：记录页 undo 与 DDL 内存 undo 的深度。"""
+
+    name: str
+    page_depth: int
+    undo_depth: int
+
+
+@dataclass
 class Transaction:
     xid: int
     snapshot_xid: int
@@ -46,6 +55,8 @@ class Transaction:
     last_lsn: int = 0
     #: DDL 的内存逆操作；abort 时逆序执行，页级 undo 由 WAL 负责。
     undo_log: list = field(default_factory=list)
+    #: SAVEPOINT 栈；ROLLBACK TO 只撤销保存点之后的页/对象变更。
+    savepoints: list[TxnSavepoint] = field(default_factory=list)
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:
@@ -122,6 +133,7 @@ class TransactionManager:
                 self._bp.clear_undo(txn.xid)
             # DDL 的内存撤销信息在提交后不再需要。
             txn.undo_log.clear()
+            txn.savepoints.clear()
             if self._current is txn:
                 self._current = None
 
@@ -141,6 +153,7 @@ class TransactionManager:
                     undo()
                 except Exception:  # pragma: no cover - 撤销本身不应改变事务结局
                     pass
+            txn.savepoints.clear()
             txn.last_lsn = self._wal.abort(txn.xid)
             self._wal.flush()
             txn.state = TxnState.ABORTED
@@ -148,6 +161,58 @@ class TransactionManager:
             self._active.discard(txn.xid)
             if self._current is txn:
                 self._current = None
+
+    # -- SAVEPOINT ---------------------------------------------------------
+
+    def savepoint(self, txn: Transaction, name: str) -> TxnSavepoint:
+        """记录当前页 undo / 对象 undo 的深度。"""
+        with self._lock:
+            txn.require_active()
+            sp = TxnSavepoint(
+                name=name,
+                page_depth=(
+                    self._bp.undo_depth(txn.xid) if self._bp is not None else 0
+                ),
+                undo_depth=len(txn.undo_log),
+            )
+            txn.savepoints.append(sp)
+            return sp
+
+    def _find_savepoint(self, txn: Transaction, name: str) -> int:
+        # 同名保存点可以重复建立；最近建立的那个先被找到。
+        for i in range(len(txn.savepoints) - 1, -1, -1):
+            if txn.savepoints[i].name == name:
+                return i
+        raise TransactionError(
+            f"保存点 {name} 不存在",
+            hint="先执行 SAVEPOINT",
+        )
+
+    def rollback_to(self, txn: Transaction, name: str) -> int:
+        """撤销到保存点，但保留该保存点和更早的保存点。"""
+        with self._lock:
+            txn.require_active()
+            idx = self._find_savepoint(txn, name)
+            target = txn.savepoints[idx]
+            pages = 0
+            if self._bp is not None:
+                pages = self._bp.undo_to(txn.xid, target.page_depth)
+            while len(txn.undo_log) > target.undo_depth:
+                undo = txn.undo_log.pop()
+                try:
+                    undo()
+                except Exception:  # pragma: no cover
+                    pass
+            # 保存点之后的保存点已经被这次回滚销毁。
+            del txn.savepoints[idx + 1 :]
+            return pages
+
+    def release(self, txn: Transaction, name: str) -> None:
+        """释放保存点；它和它之后建立的保存点一起失效。"""
+        with self._lock:
+            txn.require_active()
+            idx = self._find_savepoint(txn, name)
+            del txn.savepoints[idx:]
 
     # -- 查询状态 -----------------------------------------------------------
 

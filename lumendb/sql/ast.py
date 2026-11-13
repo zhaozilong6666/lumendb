@@ -427,6 +427,21 @@ class Rollback(Statement):
 
 
 @dataclass
+class Savepoint(Statement):
+    name: str
+
+
+@dataclass
+class ReleaseSavepoint(Statement):
+    name: str
+
+
+@dataclass
+class RollbackToSavepoint(Statement):
+    name: str
+
+
+@dataclass
 class Explain(Statement):
     statement: Statement
     analyze: bool = False
@@ -501,6 +516,9 @@ __all__ = [
     "Begin",
     "Commit",
     "Rollback",
+    "Savepoint",
+    "ReleaseSavepoint",
+    "RollbackToSavepoint",
     "Explain",
     "ShowTables",
     "Checkpoint",

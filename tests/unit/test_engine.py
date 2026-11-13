@@ -11,6 +11,7 @@ from lumendb.errors import (
     NotSupportedError,
     SQLSyntaxError,
     TableNotFoundError,
+    TransactionError,
     TypeMismatchError,
     UndefinedParameterError,
     TableAlreadyExistsError,
@@ -1519,6 +1520,78 @@ class TestTransactions:
     def test_commit_without_begin(self, db):
         with pytest.raises(Exception):
             db.execute("COMMIT")
+
+    def test_savepoint_rolls_back_only_recent_dml(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        db.execute_one("SAVEPOINT t2")
+        db.execute_one("INSERT INTO t VALUES (3)")
+        db.execute_one("ROLLBACK TO SAVEPOINT t2")
+        assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,), (2,)]
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,)]
+        db.execute_one("COMMIT")
+
+    def test_savepoint_survives_reopen(self, tmp_path):
+        path = tmp_path / "savepoint_reopen"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        db.execute_one("COMMIT")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT id FROM t") == [(1,)]
+        db2.close()
+
+    def test_savepoint_rolls_back_ddl(self, db):
+        db.execute_one("BEGIN")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("CREATE TABLE x (id INT)")
+        db.execute_one("INSERT INTO x VALUES (1)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one("SELECT * FROM x")
+        db.execute_one("CREATE TABLE x (id INT)")
+        db.execute_one("INSERT INTO x VALUES (2)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT * FROM x") == [(2,)]
+
+    def test_savepoint_recovers_failed_statement(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("BEGIN")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(0,)]
+        db.execute_one("COMMIT")
+
+    def test_released_savepoint_cannot_be_rolled_back(self, db):
+        db.execute_one("BEGIN")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("RELEASE SAVEPOINT s")
+        with pytest.raises(TransactionError):
+            db.execute_one("ROLLBACK TO SAVEPOINT s")
+        db.execute_one("ROLLBACK")
+
+    def test_savepoint_rolls_back_truncate(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        db.execute_one("BEGIN")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("TRUNCATE TABLE t")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,), (2,)]
+        db.execute_one("COMMIT")
 
 
 class TestPersistence:

@@ -26,6 +26,9 @@
 > - 显式 `ROLLBACK` 不只写 abort 日志：Buffer Pool 按事务记录页的 before image，
 >   逆序恢复并写 CLR 推进 pageLSN；同时恢复 Catalog 的表/索引根页与目录根指针，
 >   使 `TRUNCATE`、`VACUUM`、DDL 在事务中真正可回滚（含重启回归测试）；
+> - 实现事务内 `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE`：保存点记录
+>   页 undo 与目录 undo 的深度，回滚只撤销保存点之后的部分，失败语句可用保存点
+>   恢复后继续事务；
 > - 手写 SQL 词法分析器与递归下降解析器，把表达式编译成闭包以消除执行期的
 >   名字解析开销；等值和范围条件命中索引时生成索引计划，
 >   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
@@ -41,7 +44,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 622 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 632 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -60,6 +63,9 @@
 > - Explicit ROLLBACK restores page before-images in reverse order and writes
 >   CLRs to advance pageLSN; catalog table/index root pointers and catalog_root
 >   are restored too, so TRUNCATE, VACUUM and DDL are rollback-safe across reopen.
+> - Implemented transactional SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE:
+>   savepoints capture page-undo and catalog-undo depths, so a failed statement
+>   can be rolled back while the transaction continues.
 > - Wrote the SQL lexer and recursive-descent parser by hand, and compile
 >   expressions into closures so name resolution is paid once at bind time.
 >   Equality and range predicates on indexed columns become index scans;
@@ -83,7 +89,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 622 automated tests including crash-injection and a 20-seed randomized
+> - 632 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

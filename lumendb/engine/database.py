@@ -11,7 +11,14 @@ from typing import Any, Optional
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
 from ..errors import TransactionError
-from ..sql.ast import Begin, Commit, Rollback
+from ..sql.ast import (
+    Begin,
+    Commit,
+    ReleaseSavepoint,
+    Rollback,
+    RollbackToSavepoint,
+    Savepoint,
+)
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
 from ..storage.pager import DiskManager
@@ -89,6 +96,24 @@ class Database:
             txn = self._txn
             self._txn = None
             self.txns.abort(txn)
+            return Result(tag="ROLLBACK")
+
+        if isinstance(statement, Savepoint):
+            if self._txn is None:
+                raise TransactionError("SAVEPOINT 必须在事务中执行")
+            self.txns.savepoint(self._txn, statement.name)
+            return Result(tag="SAVEPOINT")
+
+        if isinstance(statement, ReleaseSavepoint):
+            if self._txn is None:
+                raise TransactionError("RELEASE 必须在事务中执行")
+            self.txns.release(self._txn, statement.name)
+            return Result(tag="RELEASE")
+
+        if isinstance(statement, RollbackToSavepoint):
+            if self._txn is None:
+                raise TransactionError("ROLLBACK TO 必须在事务中执行")
+            self.txns.rollback_to(self._txn, statement.name)
             return Result(tag="ROLLBACK")
 
         if self._txn is not None:

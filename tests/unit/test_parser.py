@@ -459,6 +459,18 @@ class TestTransactions:
     def test_rollback(self):
         assert parse_statement("ROLLBACK") is not None
 
+    def test_savepoint(self):
+        stmt = parse_statement("SAVEPOINT s")
+        assert stmt.name == "s"
+
+    def test_rollback_to_savepoint(self):
+        stmt = parse_statement("ROLLBACK TO SAVEPOINT s")
+        assert stmt.name == "s"
+
+    def test_release_savepoint(self):
+        stmt = parse_statement("RELEASE SAVEPOINT s")
+        assert stmt.name == "s"
+
     def test_explain(self):
         stmt = parse_statement("EXPLAIN SELECT 1")
         assert stmt.statement.select is not None

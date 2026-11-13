@@ -208,6 +208,39 @@ class TestSessionIsolation:
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
 
+    def test_rollback_to_savepoint_recovers_failed_transaction(self, tmp_path):
+        db = Database(tmp_path / "db")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            c1 = await _connect(port)
+            await _query(c1[0], c1[1], "BEGIN")
+            await _query(c1[0], c1[1], "SAVEPOINT s")
+            await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
+            failed = await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'dup')")
+            assert _ready_status(failed) == b"E"
+
+            restored = await _query(
+                c1[0], c1[1], "ROLLBACK TO SAVEPOINT s"
+            )
+            assert _ready_status(restored) == b"T"
+            count = await _query(c1[0], c1[1], "SELECT COUNT(*) FROM t")
+            data = [_parse_data_row(p) for k, p in count if k == b"D"]
+            assert data == [["0"]], "ROLLBACK TO 必须撤销失败语句之前的插入"
+
+            await _query(c1[0], c1[1], "INSERT INTO t VALUES (2, 'b')")
+            commit = await _query(c1[0], c1[1], "COMMIT")
+            assert _ready_status(commit) == b"I"
+            count = await _query(c1[0], c1[1], "SELECT COUNT(*) FROM t")
+            data = [_parse_data_row(p) for k, p in count if k == b"D"]
+            assert data == [["1"]]
+            c1[1].close()
+            await c1[1].wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
 
 class TestExtendedQuery:
     """扩展协议：Parse/Bind/Describe/Execute/Sync + ``$n`` 参数。"""

@@ -143,6 +143,9 @@ SELECT * FROM t ORDER BY id LIMIT $1;
 ```sql
 BEGIN;  START TRANSACTION;
 COMMIT; ROLLBACK;
+SAVEPOINT name;
+ROLLBACK TO [SAVEPOINT] name;  -- 撤销到保存点，事务继续
+RELEASE [SAVEPOINT] name;       -- 释放保存点及其之后建立的保存点
 EXPLAIN <query>;
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
@@ -176,6 +179,9 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 - `SELECT FROM` 这类把关键字当列名的笔误会在解析阶段报错，不会被静默解释成
   "列名叫 FROM"。
 - `ORDER BY` 先按输出别名解析，解析不到再按输入列编译成隐藏列。
+- `SAVEPOINT` 是事务内保存点：`ROLLBACK TO` 会撤销保存点之后的页写入
+  和 DDL/目录对象变更，事务继续保持活动；`RELEASE` 连同它之后建立的
+  保存点一起释放。保存点不写 WAL、不跨连接持久化。
 - 单列等值条件与单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）在列上有索引时
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。

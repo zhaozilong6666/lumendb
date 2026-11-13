@@ -30,7 +30,15 @@ from ..errors import (
     TransactionError,
     UndefinedParameterError,
 )
-from ..sql.ast import Begin, Commit, Rollback, Statement
+from ..sql.ast import (
+    Begin,
+    Commit,
+    ReleaseSavepoint,
+    Rollback,
+    RollbackToSavepoint,
+    Savepoint,
+    Statement,
+)
 from ..sql.parser import parse_sql
 
 PROTOCOL_VERSION = 196608  # 3.0
@@ -267,11 +275,31 @@ class PGWireServer:
             session.portals.clear()
             return result
 
+        if isinstance(statement, RollbackToSavepoint):
+            if session.txn is None:
+                raise TransactionError("ROLLBACK TO 必须在事务中执行")
+            database.txns.rollback_to(session.txn, statement.name)
+            session.failed = False
+            session.portals.clear()
+            return Result(tag="ROLLBACK")
+
         if session.failed:
             raise TransactionError(
                 "当前事务已失败",
-                hint="执行 ROLLBACK 之后再继续",
+                hint="执行 ROLLBACK 或 ROLLBACK TO SAVEPOINT 之后再继续",
             )
+
+        if isinstance(statement, Savepoint):
+            if session.txn is None:
+                raise TransactionError("SAVEPOINT 必须在事务中执行")
+            database.txns.savepoint(session.txn, statement.name)
+            return Result(tag="SAVEPOINT")
+
+        if isinstance(statement, ReleaseSavepoint):
+            if session.txn is None:
+                raise TransactionError("RELEASE 必须在事务中执行")
+            database.txns.release(session.txn, statement.name)
+            return Result(tag="RELEASE")
 
         if session.txn is not None:
             return database.executor.run(statement, session.txn, params)
