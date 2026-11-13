@@ -94,6 +94,33 @@ class TestCreateTable:
             parse_statement("CREATE TABLE t (a INT REFERENCES other(id))")
         assert "外键" in str(exc.value)
 
+    def test_check_constraints(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT CHECK (a > 0) "
+            "CONSTRAINT a_high CHECK (a < 100), "
+            "CONSTRAINT ck_pair CHECK (a <> 50))"
+        )
+        col_checks = stmt.columns[0].checks
+        assert len(col_checks) == 2
+        assert col_checks[0].name is None
+        assert col_checks[1].name == "a_high"
+        assert col_checks[0].tokens
+        table_check = stmt.constraints[0]
+        assert table_check.kind == "CHECK"
+        assert table_check.name == "ck_pair"
+        assert table_check.check is not None
+        assert table_check.check.tokens
+
+    def test_add_check_constraint(self):
+        from lumendb.sql.ast import AlterTableAddConstraint
+
+        stmt = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0)"
+        )
+        assert isinstance(stmt, AlterTableAddConstraint)
+        assert stmt.constraint.kind == "CHECK"
+        assert stmt.constraint.name == "ck"
+
     def test_create_view(self):
         from lumendb.sql.ast import CreateView
 

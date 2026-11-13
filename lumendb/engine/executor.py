@@ -14,10 +14,11 @@ from collections import Counter
 from typing import Any, Iterable, Iterator, Optional
 
 from ..catalog.catalog import Catalog
-from ..catalog.schema import Column, IndexDef, TableDef
+from ..catalog.schema import CheckDef, Column, IndexDef, TableDef
 from ..datatypes import DataType, TypeSpec
 from ..errors import (
     BinderError,
+    CheckViolationError,
     DuplicateKeyError,
     IndexAlreadyExistsError,
     NotNullViolationError,
@@ -124,6 +125,8 @@ class Executor:
         self._active_ctes: dict[str, Any] = {}
         #: 递归 CTE 当前轮的工作表，只在执行递归节点期间有值
         self._recursive_rows: dict[str, list[tuple]] = {}
+        #: CHECK 约束 token -> 编译后谓词；DDL 改约束时键会变化，无需主动失效
+        self._check_cache: dict[tuple, Any] = {}
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
@@ -831,8 +834,115 @@ class Executor:
                 )
             seen_index_names.add(idx.name)
 
-        self._catalog.create_table(txn, stmt.name, columns, indexes)
+        checks = self._collect_create_checks(stmt, columns, indexes)
+        self._validate_check_defs(stmt.name.lower(), columns, checks)
+        self._catalog.create_table(
+            txn, stmt.name, columns, indexes, checks
+        )
         return Result(tag="CREATE TABLE")
+
+    def _collect_create_checks(
+        self,
+        stmt: CreateTable,
+        columns: list[Column],
+        indexes: list[IndexDef],
+    ) -> dict[str, CheckDef]:
+        """把列级/表级 CHECK 收集成目录对象，并生成稳定的默认约束名。"""
+        table_name = stmt.name.lower()
+        used = {idx.name for idx in indexes}
+        checks: dict[str, CheckDef] = {}
+
+        def add(spec, base_name: str, explicit_name: Optional[str] = None) -> None:
+            explicit = (
+                explicit_name.lower()
+                if explicit_name is not None
+                else (spec.name.lower() if spec.name is not None else None)
+            )
+            name = explicit or base_name
+            if explicit is None:
+                while name in used or name in checks:
+                    name += "_2"
+            if name in used or name in checks:
+                raise BinderError(
+                    f"CHECK 约束名重复：{name}",
+                    hint="给 CHECK 指定唯一名称，或避免与索引名冲突",
+                )
+            checks[name] = CheckDef(name=name, tokens=tuple(spec.tokens))
+            used.add(name)
+
+        for col_def, col in zip(stmt.columns, columns):
+            for spec in col_def.checks:
+                add(spec, f"{table_name}_{col.name}_check")
+        for constraint in stmt.constraints:
+            if constraint.kind != "CHECK":
+                continue
+            assert constraint.check is not None
+            add(
+                constraint.check,
+                f"{table_name}_check_{len(checks) + 1}",
+                constraint.name,
+            )
+        return checks
+
+    def _validate_check_defs(
+        self,
+        table_name: str,
+        columns: list[Column],
+        checks: dict[str, CheckDef],
+    ) -> None:
+        if not checks:
+            return
+        table = TableDef(name=table_name, columns=columns, checks=checks)
+        for check in checks.values():
+            self._compile_check(table, check)
+
+    def _compile_check(self, table: TableDef, check: CheckDef) -> Any:
+        """从持久化 token 重建 CHECK 谓词；结果按 (表, 名, token) 缓存。"""
+        key = (table.name, check.name, check.tokens)
+        cached = self._check_cache.get(key)
+        if cached is not None:
+            return cached
+        from ..sql.lexer import Token
+        from ..sql.parser import Parser
+
+        if any(
+            kind == "keyword" and value.upper() in ("SELECT", "WITH")
+            for kind, value in check.tokens
+        ):
+            raise NotSupportedError(
+                f"CHECK 约束 {check.name} 不支持子查询",
+                hint="把约束条件写成只引用当前行列的表达式",
+            )
+        tokens = [
+            Token(kind, value, 0, 0) for kind, value in check.tokens
+        ]
+        tokens.append(Token("eof", "", 0, 0))
+        expr = Parser(tokens).parse_expression()
+        schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        )
+        fn, result_type = self.binder.compile(
+            expr, schema, allow_agg=False
+        )
+        if not result_type.unknown and result_type.kind is not DataType.BOOLEAN:
+            raise TypeMismatchError(
+                f"CHECK 约束 {check.name} 的表达式必须返回 BOOLEAN",
+                detail=f"实际类型 {result_type.name}",
+                hint="改写比较表达式，或使用布尔列",
+            )
+        self._check_cache[key] = fn
+        return fn
+
+    def _check_checks(self, table: TableDef, values: list[Any]) -> None:
+        for check in table.checks.values():
+            fn = self._compile_check(table, check)
+            result = fn(EvalContext(tuple(values)))
+            # SQL CHECK 只在结果为 FALSE 时拒绝；NULL / UNKNOWN 视为通过。
+            if result is not None and not bool(result):
+                raise CheckViolationError(
+                    f"违反 CHECK 约束 {check.name!r}",
+                    detail=f"表 {table.name} 的行不满足约束条件",
+                )
 
     def _refresh_view_dependencies(self, txn: Transaction) -> None:
         updates: dict[str, set[str]] = {}
@@ -959,6 +1069,11 @@ class Executor:
                 hint="换一个列名，或先 DROP TABLE 重建",
             )
         column = _to_column(stmt.column)
+        if stmt.column.checks:
+            raise NotSupportedError(
+                "ALTER TABLE ADD COLUMN 暂不支持 CHECK 约束",
+                hint="先加列，再用 ALTER TABLE ADD CONSTRAINT 添加 CHECK",
+            )
         if not column.nullable and column.default is None:
             raise NotSupportedError(
                 "ADD COLUMN NOT NULL 需要提供 DEFAULT",
@@ -1073,6 +1188,47 @@ class Executor:
         names = tuple(name.lower() for name in constraint.columns)
         for name in names:
             table.column(name)
+        if constraint.kind == "CHECK":
+            assert constraint.check is not None
+            spec = constraint.check
+            explicit = (
+                constraint.name.lower()
+                if constraint.name is not None
+                else (spec.name.lower() if spec.name is not None else None)
+            )
+            name = explicit or f"{table.name}_check_{len(table.checks) + 1}"
+            if explicit is None:
+                while name in table.checks or name in table.indexes:
+                    name += "_2"
+            if name in table.checks or name in table.indexes:
+                raise BinderError(
+                    f"CHECK 约束名重复：{name}",
+                    hint="给 CHECK 指定唯一名称，或避免与索引名冲突",
+                )
+            check = CheckDef(name=name, tokens=tuple(spec.tokens))
+            fn = self._compile_check(table, check)
+            heap = HeapFile(self._bp, table, self._txns)
+            for _rid, values in heap.scan(txn):
+                result = fn(EvalContext(tuple(values)))
+                if result is not None and not bool(result):
+                    raise CheckViolationError(
+                        f"已有行违反 CHECK 约束 {name!r}",
+                        detail=f"表 {table.name} 的存量数据不满足约束条件",
+                        hint="先 UPDATE 修正存量行，再添加约束",
+                    )
+            old_checks = dict(table.checks)
+            table.checks[name] = check
+
+            def undo_check() -> None:
+                table.checks = old_checks
+
+            txn.undo_log.append(undo_check)
+            self._catalog.mark_dirty()
+            self._catalog.persist(txn)
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已添加 CHECK 约束 {name}",
+            )
         if constraint.kind == "UNIQUE":
             index_name = (
                 constraint.name.lower()
@@ -1602,6 +1758,7 @@ class Executor:
         """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。"""
         old_tuple = tuple(old_values)
         prepared = self._prepare_values(table, None, new_values)
+        self._check_checks(table, prepared)
 
         changed_indexes = [
             idx
@@ -1986,9 +2143,10 @@ class Executor:
         *,
         skip_unique: bool = False,
     ) -> None:
+        self._check_checks(table, values)
         if skip_unique:
             # ON CONFLICT DO NOTHING：唯一冲突由调用方判断并跳过，
-            # 但 NOT NULL 之类的约束仍然必须报错。
+            # 但 NOT NULL / CHECK 之类的约束仍然必须报错。
             return
         conflict = self._find_unique_conflict(table, values, txn)
         if conflict is not None:

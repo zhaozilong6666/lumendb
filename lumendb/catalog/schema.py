@@ -82,6 +82,24 @@ class IndexDef:
         )
 
 
+@dataclass(frozen=True)
+class CheckDef:
+    """一条 CHECK 约束；表达式以 token 切片持久化，加载后重新解析绑定。"""
+
+    name: str
+    tokens: tuple[tuple[str, str], ...]
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "tokens": [list(t) for t in self.tokens]}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "CheckDef":
+        return cls(
+            name=data["name"],
+            tokens=tuple((kind, value) for kind, value in data.get("tokens", [])),
+        )
+
+
 @dataclass
 class TableDef:
     name: str
@@ -90,6 +108,7 @@ class TableDef:
     last_page: int = INVALID_PAGE_ID
     row_count_hint: int = 0
     indexes: dict[str, IndexDef] = field(default_factory=dict)
+    checks: dict[str, CheckDef] = field(default_factory=dict)
 
     # -- 列查找 -------------------------------------------------------------
 
@@ -151,6 +170,7 @@ class TableDef:
             "last_page": self.last_page,
             "row_count_hint": self.row_count_hint,
             "indexes": {k: v.to_json() for k, v in self.indexes.items()},
+            "checks": {k: v.to_json() for k, v in self.checks.items()},
         }
 
     @classmethod
@@ -163,6 +183,9 @@ class TableDef:
             row_count_hint=data.get("row_count_hint", 0),
             indexes={
                 k: IndexDef.from_json(v) for k, v in data.get("indexes", {}).items()
+            },
+            checks={
+                k: CheckDef.from_json(v) for k, v in data.get("checks", {}).items()
             },
         )
 
@@ -195,5 +218,12 @@ def validate_table_def(table: TableDef) -> None:
                     f"索引 {idx.name} 引用了不存在的列 {cname!r}"
                 )
 
+    for name in table.checks:
+        if name in table.indexes:
+            raise NotSupportedError(
+                f"CHECK 约束名 {name!r} 与索引/约束名冲突",
+                hint="给 CHECK 换一个名字",
+            )
 
-__all__ = ["Column", "IndexDef", "TableDef", "validate_table_def"]
+
+__all__ = ["CheckDef", "Column", "IndexDef", "TableDef", "validate_table_def"]

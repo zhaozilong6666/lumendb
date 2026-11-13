@@ -125,6 +125,15 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 主键列的 `NOT NULL` 由写路径先行拒绝。多个主键、列级与表级主键混用、以及
 自动索引名与显式约束名碰撞都会在 DDL 阶段报错，避免 `Catalog` 静默覆盖索引。
 
+`CHECK` 不建索引，而是 `TableDef.checks` 里的独立 `CheckDef` 对象：表达式以
+token 切片持久化，重开数据库后重新解析 AST、再经 Binder 绑定成谓词，避免把
+内存中的闭包写进目录。写路径在 `_check_constraints` 和 `_rewrite_row` 统一调用
+`_check_checks`，因此普通 INSERT、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert
+以及 UPDATE 都会经过同一套校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量的
+`UNKNOWN` 可通过），只有结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 按 SQL 语义视为通过。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
+整个堆表，发现存量违反行就整体失败；带 CHECK 的表暂不支持重命名表/列，因为持久化
+token 里仍保留旧名字，重建 AST 时会绑定失败。
+
 ### 2.9 视图
 
 `CREATE VIEW` 只保存视图定义，不复制基表数据：目录里存的是 `AS` 之后的
@@ -243,7 +252,7 @@ DML 的 `RETURNING` 不另建计划：绑定阶段把表达式编译成闭包，
 DML 求值期间把同一作用域放进 `_active_ctes`，语句结束即丢弃。
 
 所有 `INSERT`（`VALUES` 与 `INSERT ... SELECT`）共用 `_insert_row`：
-NOT NULL、唯一索引检查、`ON CONFLICT` 分派和索引维护都在写堆之前完成。
+NOT NULL、CHECK、唯一索引检查、`ON CONFLICT` 分派和索引维护都在写堆之前完成。
 唯一性查询本身收敛在 `_find_unique_conflict`，INSERT、UPDATE、upsert 和
 `DO NOTHING` 共用同一个"NULL 不进索引 / 忽略当前行 / 目标索引"语义。
 新增插入路径必须复用这个入口，不能绕过去直接写 `HeapFile`，否则会重现

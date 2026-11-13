@@ -329,6 +329,15 @@ class CompoundSelect:
 
 
 @dataclass(frozen=True)
+class CheckSpec:
+    """一条 ``CHECK`` 约束：AST 用于当前语句，token 切片用于目录持久化。"""
+
+    expr: Expr
+    tokens: tuple[tuple[str, str], ...] = ()
+    name: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ColumnDef:
     name: str
     type: TypeSpec
@@ -336,15 +345,17 @@ class ColumnDef:
     primary_key: bool = False
     unique: bool = False
     default: Optional[Expr] = None
+    checks: tuple[CheckSpec, ...] = ()
 
 
 @dataclass(frozen=True)
 class TableConstraint:
-    """表级约束：复合 PRIMARY KEY 或 UNIQUE (col...)。"""
+    """表级约束：复合 PRIMARY KEY、UNIQUE 或 CHECK。"""
 
-    kind: str  # "PRIMARY KEY" 或 "UNIQUE"
+    kind: str  # "PRIMARY KEY" / "UNIQUE" / "CHECK"
     columns: list[str]
     name: Optional[str] = None
+    check: Optional[CheckSpec] = None
 
 
 @dataclass
@@ -600,6 +611,7 @@ __all__ = [
     "TableRef",
     "Select",
     "CompoundSelect",
+    "CheckSpec",
     "ColumnDef",
     "Statement",
     "CreateTable",

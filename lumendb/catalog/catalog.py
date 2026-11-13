@@ -17,7 +17,7 @@ from ..errors import (
 )
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.txn import Transaction
-from .schema import Column, IndexDef, TableDef, validate_table_def
+from .schema import CheckDef, Column, IndexDef, TableDef, validate_table_def
 from .store import CatalogStore
 
 CATALOG_VERSION = 1
@@ -151,6 +151,7 @@ class Catalog:
         name: str,
         columns: list[Column],
         indexes: Optional[list[IndexDef]] = None,
+        checks: Optional[dict[str, CheckDef]] = None,
     ) -> TableDef:
         key = name.lower()
         if key in self.tables or key in self.views:
@@ -167,6 +168,7 @@ class Catalog:
                 )
             idx.table = key
             table.indexes[idx.name] = idx
+        table.checks = dict(checks or {})
         validate_table_def(table)
         self.tables[key] = table
         txn.undo_log.append(lambda: self.tables.pop(key, None))
@@ -318,7 +320,13 @@ class Catalog:
                 f"表 {new_name!r} 已存在",
                 hint="换一个表名，或先 DROP TABLE 旧表",
             )
-        table = self.tables.pop(old_key)
+        table = self.tables[old_key]
+        if table.checks:
+            raise NotSupportedError(
+                f"表 {old_name!r} 有 CHECK 约束，暂不支持重命名",
+                hint="先重建表，或删掉 CHECK 约束后再重命名",
+            )
+        self.tables.pop(old_key)
         table.name = new_key
         for index in table.indexes.values():
             index.table = new_key
@@ -351,6 +359,11 @@ class Catalog:
             raise BinderError(
                 f"列 {new_name!r} 已存在",
                 hint="换一个列名",
+            )
+        if table.checks:
+            raise NotSupportedError(
+                f"表 {table.name!r} 有 CHECK 约束，暂不支持重命名列",
+                hint="先重建表，或删掉 CHECK 约束后再重命名列",
             )
         index = table.column_index(old_key)
         old_column = table.columns[index]

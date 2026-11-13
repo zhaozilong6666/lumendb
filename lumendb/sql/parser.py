@@ -26,6 +26,7 @@ from .ast import (
     CreateTable,
     CreateTableAs,
     CreateView,
+    CheckSpec,
     Cte,
     Delete,
     DefaultValue,
@@ -177,6 +178,13 @@ class Parser:
             raise SQLSyntaxError(f"期望 1 条语句，实际 {len(stmts)} 条")
         return stmts[0]
 
+    def parse_expression(self):
+        """把当前 token 流解析成单个表达式，并要求恰好消费完。"""
+        expr = self._parse_expr()
+        if not self._at_end():
+            raise self._error(f"表达式后出现多余的内容 {self._cur.value!r}")
+        return expr
+
     # ------------------------------------------------------------------
     # 语句
     # ------------------------------------------------------------------
@@ -301,7 +309,7 @@ class Parser:
         self._expect_kw("TABLE")
         table = self._parse_ident("表名")
         if self._match_kw("ADD"):
-            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE"):
+            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK"):
                 constraint = self._parse_table_constraint()
                 return AlterTableAddConstraint(
                     table=table, constraint=constraint
@@ -468,7 +476,7 @@ class Parser:
         columns: list[ColumnDef] = []
         constraints: list[TableConstraint] = []
         while True:
-            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE"):
+            if self._cur.is_keyword("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK"):
                 constraints.append(self._parse_table_constraint())
             else:
                 columns.append(self._parse_column_def())
@@ -491,14 +499,29 @@ class Parser:
             kind = "PRIMARY KEY"
         elif self._match_kw("UNIQUE"):
             kind = "UNIQUE"
+        elif self._match_kw("CHECK"):
+            check = self._parse_check_spec(name)
+            return TableConstraint(
+                kind="CHECK", columns=[], name=name, check=check
+            )
         else:
-            raise self._error("表级约束期望 PRIMARY KEY 或 UNIQUE")
+            raise self._error("表级约束期望 PRIMARY KEY、UNIQUE 或 CHECK")
         self._expect_punct("lparen", "(")
         columns = [self._parse_ident("列名")]
         while self._match_punct("comma"):
             columns.append(self._parse_ident("列名"))
         self._expect_punct("rparen", ")")
         return TableConstraint(kind=kind, columns=columns, name=name)
+
+    def _parse_check_spec(self, name: Optional[str] = None) -> CheckSpec:
+        """解析 ``CHECK (expr)``，同时保存表达式 token 以便目录持久化。"""
+        self._expect_punct("lparen", "(")
+        start = self._i
+        expr = self._parse_expr()
+        end = self._i
+        self._expect_punct("rparen", ")")
+        tokens = tuple((tok.kind, tok.value) for tok in self._tokens[start:end])
+        return CheckSpec(expr=expr, tokens=tokens, name=name)
 
     def _parse_column_def(self) -> ColumnDef:
         name = self._parse_ident("列名")
@@ -507,9 +530,14 @@ class Parser:
         primary_key = False
         unique = False
         default = None
+        checks: list[CheckSpec] = []
 
         while True:
-            if self._match_kw("PRIMARY"):
+            if self._match_kw("CONSTRAINT"):
+                constraint_name = self._parse_ident("约束名")
+                self._expect_kw("CHECK")
+                checks.append(self._parse_check_spec(constraint_name))
+            elif self._match_kw("PRIMARY"):
                 self._expect_kw("KEY")
                 primary_key = True
                 nullable = False
@@ -522,14 +550,14 @@ class Parser:
                 unique = True
             elif self._match_kw("DEFAULT"):
                 default = self._parse_expr()
+            elif self._match_kw("CHECK"):
+                checks.append(self._parse_check_spec())
             elif self._match_kw("REFERENCES"):
                 raise NotSupportedError(
                     "外键约束尚未实现",
                     detail="REFERENCES 会引入跨表级联与延迟检查",
                     hint="在应用层保证引用完整性",
                 )
-            elif self._match_kw("CHECK"):
-                raise NotSupportedError("CHECK 约束尚未实现")
             elif self._cur.is_keyword("COLLATE", "GENERATED", "AUTOINCREMENT", "AUTO_INCREMENT"):
                 raise NotSupportedError(f"{self._cur.value.upper()} 尚未实现")
             else:
@@ -541,6 +569,7 @@ class Parser:
             primary_key=primary_key,
             unique=unique,
             default=default,
+            checks=tuple(checks),
         )
 
     def _parse_type(self) -> TypeSpec:

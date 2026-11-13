@@ -131,6 +131,10 @@ class NotNullViolationError(ConstraintViolationError):
     sqlstate = "23502"
 
 
+class CheckViolationError(ConstraintViolationError):
+    sqlstate = "23514"
+
+
 # ---------------------------------------------------------------------------
 # 存储
 # ---------------------------------------------------------------------------

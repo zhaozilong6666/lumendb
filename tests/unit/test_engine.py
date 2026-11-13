@@ -5,6 +5,7 @@ import pytest
 from lumendb.engine.database import Database
 from lumendb.errors import (
     BinderError,
+    CheckViolationError,
     ColumnNotFoundError,
     DuplicateKeyError,
     IndexAlreadyExistsError,
@@ -1993,6 +1994,132 @@ class TestAlterTable:
         db2.execute_one("VACUUM")
         assert rows(db2, "SELECT age FROM t") == [(7,)]
         db2.close()
+
+
+class TestCheckConstraints:
+    def test_column_check_enforced_on_insert_and_update(self, db):
+        db.execute_one("CREATE TABLE t (a INT CHECK (a > 0), b INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0, 10)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("UPDATE t SET a = -1 WHERE b = 10")
+        db.execute_one("UPDATE t SET a = 2 WHERE b = 10")
+        assert rows(db, "SELECT a FROM t") == [(2,)]
+
+    def test_check_null_is_not_a_violation(self, db):
+        db.execute_one("CREATE TABLE t (a INT CHECK (a > 0), b INT)")
+        db.execute_one("INSERT INTO t VALUES (NULL, 1)")
+        assert rows(db, "SELECT a FROM t") == [(None,)]
+
+    def test_table_check_with_multiple_columns(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT ck CHECK (a < b))"
+        )
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (2, 1)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (2, 2)")
+
+    def test_add_check_scans_existing_rows(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (0)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0)")
+        assert rows(db, "SELECT a FROM t") == [(0,)]
+        db.execute_one("UPDATE t SET a = 1")
+        result = db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0)"
+        )
+        assert "ck" in result.notice
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0)")
+
+    def test_check_survives_reopen(self, tmp_path):
+        path = tmp_path / "check_reopen"
+        db = Database(path)
+        db.execute_one(
+            "CREATE TABLE t (a INT, name TEXT, "
+            "CONSTRAINT ck_a CHECK (a > 0), "
+            "CONSTRAINT ck_name CHECK (name <> ''))"
+        )
+        db.execute_one("INSERT INTO t VALUES (7, 'ok')")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT a, name FROM t") == [(7, "ok")]
+        with pytest.raises(CheckViolationError):
+            db2.execute_one("INSERT INTO t VALUES (0, 'ok')")
+        with pytest.raises(CheckViolationError):
+            db2.execute_one("INSERT INTO t VALUES (1, '')")
+        db2.close()
+
+    def test_add_check_can_rollback(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ADD CHECK (a > 0)")
+        db.execute_one("ROLLBACK")
+        db.execute_one("INSERT INTO t VALUES (-1)")
+        assert rows(db, "SELECT a FROM t") == [(-1,)]
+
+    def test_add_column_check_rejected(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t ADD COLUMN b INT CHECK (b > 0)")
+
+    def test_check_unknown_column_rejected_at_ddl(self, db):
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one(
+                "CREATE TABLE t (a INT, CONSTRAINT ck CHECK (missing > 0))"
+            )
+
+    def test_check_requires_boolean_expression(self, db):
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("CREATE TABLE t (a INT CHECK (a))")
+
+    def test_check_string_and_boolean_expression(self, db):
+        db.execute_one(
+            "CREATE TABLE t (name TEXT CHECK (name <> ''), "
+            "active BOOLEAN CHECK (active OR NOT active))"
+        )
+        db.execute_one("INSERT INTO t VALUES ('a', TRUE)")
+        with pytest.raises(CheckViolationError) as exc:
+            db.execute_one("INSERT INTO t VALUES ('', TRUE)")
+        assert exc.value.sqlstate == "23514"
+        db.execute_one("INSERT INTO t VALUES (NULL, FALSE)")
+
+    def test_duplicate_check_name_rejected_at_ddl(self, db):
+        with pytest.raises(BinderError):
+            db.execute_one(
+                "CREATE TABLE t (a INT CHECK (a > 0), "
+                "CONSTRAINT t_a_check CHECK (a < 100))"
+            )
+
+    def test_check_blocks_rename_without_corrupting_table(self, db):
+        db.execute_one("CREATE TABLE t (a INT, CHECK (a > 0))")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t RENAME TO t2")
+        assert rows(db, "SELECT a FROM t") == [(1,)]
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0)")
+
+        db.execute_one("CREATE TABLE u (a INT, CHECK (a > 0))")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE u RENAME COLUMN a TO b")
+        assert rows(db, "SELECT a FROM u") == []
+
+    def test_check_applies_to_insert_select_and_default_values(self, db):
+        db.execute_one("CREATE TABLE src (a INT)")
+        db.execute_one("INSERT INTO src VALUES (0), (1)")
+        db.execute_one("CREATE TABLE t (a INT CHECK (a > 0))")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t SELECT a FROM src")
+
+        db.execute_one("CREATE TABLE d (a INT DEFAULT 0 CHECK (a > 0))")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO d DEFAULT VALUES")
 
 
 class TestCte:

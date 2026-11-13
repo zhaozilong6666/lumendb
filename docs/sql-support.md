@@ -16,6 +16,12 @@ CREATE TABLE t (
 );
 CREATE TABLE t2 (a INT, b INT, CONSTRAINT uq_ab UNIQUE (a, b));
 CREATE TABLE t3 (a INT, b INT, PRIMARY KEY (a, b));
+CREATE TABLE t4 (
+  a INT CHECK (a > 0),
+  b INT CONSTRAINT b_nonneg CHECK (b >= 0),
+  CONSTRAINT ck_ab CHECK (a < b)
+);
+ALTER TABLE t4 ADD CONSTRAINT ck_extra CHECK (a < 100);
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
 DROP INDEX idx_name;
@@ -46,6 +52,18 @@ DROP TABLE t [CASCADE];
 `UNIQUE (a, b)` 或 `CREATE UNIQUE INDEX`。表级 `PRIMARY KEY (a, b)` 支持复合
 主键，参与列自动变为 `NOT NULL`，并生成一个名为 `<table>_pkey`（或显式约束名）
 的复合唯一索引。
+
+`CHECK` 约束支持列级和表级声明，也支持 `CONSTRAINT name CHECK (...)` 命名。没有
+显式名字时，列级约束自动命名为 `<table>_<column>_check`，表级约束自动命名为
+`<table>_check_N`；自动名冲突会追加 `_2`，显式重名或与索引名冲突会在 DDL 阶段
+报错。约束表达式以 token 切片持久化到目录，重开数据库后重新解析和绑定，不依赖
+进程内缓存。所有 `INSERT`（含 `INSERT ... SELECT`、`DEFAULT VALUES`、`ON CONFLICT`）
+以及 `UPDATE`/upsert 写路径都会统一校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量
+是 `UNKNOWN`，可通过），结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 视为通过，错误
+SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)`
+会先扫描存量行，发现违反行时整体失败、不留下约束；`ADD COLUMN` 暂不支持同时声明
+`CHECK`，带 `CHECK` 的表也暂不支持 `RENAME TO` / `RENAME COLUMN`，避免目录里的
+token 保留旧列名。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须
@@ -251,7 +269,8 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `ADD [CONSTRAINT name] CHECK (expr)` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
