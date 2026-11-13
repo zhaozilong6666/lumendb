@@ -712,6 +712,9 @@ class Executor:
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.query is not None:
             return self._insert_select(stmt, table, heap, txn)
+        if stmt.ctes:
+            # 即使 VALUES 不读表，CTE 里的 SQL 也必须被解析/绑定，不能静默跳过
+            self.binder.bind_ctes(stmt.ctes)
 
         empty_schema = Schema([])
         count = 0

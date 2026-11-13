@@ -648,25 +648,29 @@ class Binder:
 
     # -- SELECT 绑定 -----------------------------------------------------
 
+    def bind_ctes(self, ctes) -> None:
+        """把一个 ``WITH`` 列表按书写顺序绑进当前作用域。"""
+        saved = self.ctes
+        self.ctes = dict(self.ctes)
+        try:
+            for cte in ctes:
+                name = cte.name.lower()
+                if name in self.ctes:
+                    raise BinderError(f"CTE {cte.name!r} 重复定义")
+                node, cols = self.bind_select(cte.query)
+                self.ctes[name] = (node, cols)
+        except Exception:
+            self.ctes = saved
+            raise
+
     def bind_query(self, query) -> tuple[PlanNode, list[OutputColumn]]:
         """绑定一条带 ``WITH`` 的顶层查询。
 
         CTE 注册表在成功后保留，供执行阶段的子查询复用同一个作用域；
         执行器每次执行语句都会新建 Binder，所以不会泄漏到下一条语句。
         """
-        saved = self.ctes
-        self.ctes = dict(self.ctes)
-        try:
-            for cte in query.ctes:
-                name = cte.name.lower()
-                if name in self.ctes:
-                    raise BinderError(f"CTE {cte.name!r} 重复定义")
-                node, cols = self.bind_select(cte.query)
-                self.ctes[name] = (node, cols)
-            return self.bind_select(query.select)
-        except Exception:
-            self.ctes = saved
-            raise
+        self.bind_ctes(query.ctes)
+        return self.bind_select(query.select)
 
     def bind_select(self, select) -> tuple[PlanNode, list[OutputColumn]]:
         if isinstance(select, CompoundSelect):

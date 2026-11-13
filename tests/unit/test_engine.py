@@ -333,6 +333,14 @@ class TestInsert:
         assert result.affected == 1
         assert rows(db, "SELECT id FROM dst") == [(2,)]
 
+    def test_with_insert_values_validates_cte(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        with pytest.raises(TableNotFoundError):
+            db.execute_one(
+                "WITH bad AS (SELECT * FROM no_such_table) "
+                "INSERT INTO t VALUES (1)"
+            )
+
 
 class TestCreateTableAs:
     def test_basic(self, db):
