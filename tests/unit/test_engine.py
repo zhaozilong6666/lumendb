@@ -2063,10 +2063,47 @@ class TestCheckConstraints:
         db.execute_one("INSERT INTO t VALUES (-1)")
         assert rows(db, "SELECT a FROM t") == [(-1,)]
 
-    def test_add_column_check_rejected(self, db):
+    def test_add_column_with_check_validates_existing_rows(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
-        with pytest.raises(NotSupportedError):
-            db.execute_one("ALTER TABLE t ADD COLUMN b INT CHECK (b > 0)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one(
+            "ALTER TABLE t ADD COLUMN b INT DEFAULT 2 CHECK (b > 0)"
+        )
+        assert rows(db, "SELECT a, b FROM t") == [(1, 2)]
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (2, 0)")
+        db.execute_one("INSERT INTO t VALUES (3, 1)")
+        assert rows(db, "SELECT a, b FROM t ORDER BY a") == [
+            (1, 2),
+            (3, 1),
+        ]
+
+    def test_add_column_check_rejects_bad_default_without_mutation(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one(
+                "ALTER TABLE t ADD COLUMN b INT DEFAULT 0 CHECK (b > 0)"
+            )
+        assert rows(db, "SELECT a FROM t") == [(1,)]
+        with pytest.raises(ColumnNotFoundError):
+            db.execute_one("SELECT b FROM t")
+
+    def test_add_column_check_survives_reopen(self, tmp_path):
+        path = tmp_path / "add_column_check_reopen"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one(
+            "ALTER TABLE t ADD COLUMN b INT DEFAULT 2 CHECK (b > 0)"
+        )
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT a, b FROM t") == [(1, 2)]
+        with pytest.raises(CheckViolationError):
+            db2.execute_one("INSERT INTO t VALUES (2, 0)")
+        db2.close()
 
     def test_check_unknown_column_rejected_at_ddl(self, db):
         with pytest.raises(ColumnNotFoundError):

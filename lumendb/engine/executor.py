@@ -887,6 +887,35 @@ class Executor:
             )
         return checks
 
+    def _collect_column_checks(
+        self,
+        table: TableDef,
+        column_name: str,
+        specs,
+    ) -> dict[str, CheckDef]:
+        """为 ADD COLUMN 的列级 CHECK 生成目录对象，复用现有命名空间。"""
+        used = set(table.indexes) | set(table.checks)
+        checks: dict[str, CheckDef] = {}
+        for spec in specs:
+            if not spec.tokens:
+                raise BinderError(
+                    "CHECK 约束缺少表达式 token",
+                    hint="使用 SQL 文本声明 CHECK，而不是手工构造 AST",
+                )
+            explicit = spec.name.lower() if spec.name is not None else None
+            name = explicit or f"{table.name}_{column_name}_check"
+            if explicit is None:
+                while name in used or name in checks:
+                    name += "_2"
+            if name in used or name in checks:
+                raise BinderError(
+                    f"CHECK 约束名重复：{name}",
+                    hint="给 CHECK 指定唯一名称，或避免与索引名冲突",
+                )
+            checks[name] = CheckDef(name=name, tokens=tuple(spec.tokens))
+            used.add(name)
+        return checks
+
     def _validate_check_defs(
         self,
         table_name: str,
@@ -1072,21 +1101,48 @@ class Executor:
                 hint="换一个列名，或先 DROP TABLE 重建",
             )
         column = _to_column(stmt.column)
-        if stmt.column.checks:
-            raise NotSupportedError(
-                "ALTER TABLE ADD COLUMN 暂不支持 CHECK 约束",
-                hint="先加列，再用 ALTER TABLE ADD CONSTRAINT 添加 CHECK",
-            )
         if not column.nullable and column.default is None:
             raise NotSupportedError(
                 "ADD COLUMN NOT NULL 需要提供 DEFAULT",
                 hint="已有行没有这个列的值；先加可空列，再 UPDATE 后改约束",
             )
+        new_checks = self._collect_column_checks(
+            table, column.name, stmt.column.checks
+        )
+        # 先用“旧列 + 新列默认值”拼出存量行的完整形状，验证新 CHECK；
+        # 校验失败时不修改目录，避免加列成功但约束没落地的半状态。
+        provisional = TableDef(
+            name=table.name,
+            columns=list(table.columns) + [column],
+            indexes=table.indexes,
+            checks=dict(table.checks, **new_checks),
+        )
+        for check in new_checks.values():
+            self._compile_check(provisional, check)
+        if new_checks:
+            heap = HeapFile(self._bp, table, self._txns)
+            for _rid, values in heap.scan(txn):
+                padded = list(values)
+                while len(padded) < len(provisional.columns):
+                    padded.append(column.default)
+                for check in new_checks.values():
+                    fn = self._compile_check(provisional, check)
+                    result = fn(EvalContext(tuple(padded)))
+                    if result is not None and not bool(result):
+                        raise CheckViolationError(
+                            f"已有行违反 CHECK 约束 {check.name!r}",
+                            detail=f"表 {table.name} 的存量数据不满足新列约束",
+                            hint="换一个默认值，或先 UPDATE 修正存量行",
+                        )
+
         old_columns = list(table.columns)
+        old_checks = dict(table.checks)
         table.columns.append(column)
+        table.checks.update(new_checks)
 
         def undo() -> None:
             table.columns = old_columns
+            table.checks = old_checks
 
         txn.undo_log.append(undo)
         self._catalog.mark_dirty()

@@ -61,11 +61,12 @@ DROP TABLE t [CASCADE];
 进程内缓存。所有 `INSERT`（含 `INSERT ... SELECT`、`DEFAULT VALUES`、`ON CONFLICT`）
 以及 `UPDATE`/upsert 写路径都会统一校验；表达式必须返回 `BOOLEAN`（`NULL` 字面量
 是 `UNKNOWN`，可通过），结果为 `FALSE` 才拒绝，`NULL`/`UNKNOWN` 视为通过，错误
-SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)`
-会先扫描存量行，发现违反行时整体失败、不留下约束；`ADD COLUMN` 暂不支持同时声明
-`CHECK`，带 `CHECK` 的表也暂不支持 `RENAME TO` / `RENAME COLUMN`，避免目录里的
-token 保留旧列名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name` 目前只删除
-CHECK 约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层是索引，请用
+SQLSTATE 为 `23514`。`ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` 会先扫描
+存量行，发现违反行时整体失败、不留下约束；`ADD COLUMN` 可以同时声明 CHECK，执行
+器会把旧行补上默认值后扫描完整行，失败时不修改目录，默认值本身违反约束也会被
+拒绝。带 `CHECK` 的表暂不支持 `RENAME TO` / `RENAME COLUMN`，避免目录里的 token
+保留旧列名。`ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name` 目前只删除 CHECK
+约束，只改目录并登记事务 undo，不重写已有行；唯一/主键约束底层是索引，请用
 `DROP INDEX` 删除。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
