@@ -3426,6 +3426,54 @@ class TestForeignKey:
         db.execute_one("DELETE FROM p WHERE id = 1")
         assert rows(db, "SELECT pid FROM c") == [(None,)]
 
+    def test_on_delete_set_default(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT DEFAULT 2 REFERENCES p(id) "
+            "ON DELETE SET DEFAULT)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1), (2)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(2,)]
+
+    def test_on_delete_set_default_missing_target_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT DEFAULT 9 REFERENCES p(id) "
+            "ON DELETE SET DEFAULT)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+
+    def test_on_update_set_default(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT DEFAULT 2 REFERENCES p(id) "
+            "ON UPDATE SET DEFAULT)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1), (2)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT pid FROM c") == [(2,)]
+
+    def test_on_update_set_default_missing_target_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT DEFAULT 1 REFERENCES p(id) "
+            "ON UPDATE SET DEFAULT)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("UPDATE p SET id = 5 WHERE id = 1")
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+        assert rows(db, "SELECT pid FROM c") == [(1,)]
+
     def test_on_delete_cascade_rollback(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

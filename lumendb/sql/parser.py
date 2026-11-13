@@ -701,10 +701,12 @@ class Parser:
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_delete = "SET NULL"
+                    elif self._match_kw("DEFAULT"):
+                        on_delete = "SET DEFAULT"
                     else:
                         raise NotSupportedError(
-                            "外键 ON DELETE 暂不支持 SET DEFAULT",
-                            hint="只支持 SET NULL",
+                            "外键 ON DELETE 的 SET 动作只支持 SET NULL / SET DEFAULT",
+                            hint="不支持 NO ACTION",
                         )
                 else:
                     raise NotSupportedError(
@@ -719,10 +721,12 @@ class Parser:
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_update = "SET NULL"
+                    elif self._match_kw("DEFAULT"):
+                        on_update = "SET DEFAULT"
                     else:
                         raise NotSupportedError(
-                            "外键 ON UPDATE 暂不支持 SET DEFAULT",
-                            hint="只支持 SET NULL",
+                            "外键 ON UPDATE 的 SET 动作只支持 SET NULL / SET DEFAULT",
+                            hint="不支持 NO ACTION",
                         )
                 else:
                     raise NotSupportedError(

@@ -292,11 +292,11 @@ def validate_table_def(table: TableDef) -> None:
             )
         if not fk.ref_columns:
             raise NotSupportedError(f"外键 {name!r} 没有被引用列")
-        if fk.on_delete not in ("RESTRICT", "CASCADE", "SET NULL"):
+        if fk.on_delete not in ("RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"):
             raise NotSupportedError(
                 f"外键 {name!r} 的删除动作非法：{fk.on_delete!r}"
             )
-        if fk.on_update not in ("RESTRICT", "CASCADE", "SET NULL"):
+        if fk.on_update not in ("RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"):
             raise NotSupportedError(
                 f"外键 {name!r} 的更新动作非法：{fk.on_update!r}"
             )

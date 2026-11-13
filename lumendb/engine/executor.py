@@ -2616,14 +2616,14 @@ class Executor:
                         continue
                     if child_key != old_key:
                         continue
-                    if fk.on_update not in ("CASCADE", "SET NULL"):
+                    if fk.on_update not in ("CASCADE", "SET NULL", "SET DEFAULT"):
                         raise ForeignKeyViolationError(
                             f"外键约束 {fk.name!r} 阻止更新被引用行",
                             detail=(
                                 f"表 {child.name} 中仍有行引用 "
                                 f"{table.name}.{fk.ref_columns} = {old_key}"
                             ),
-                            hint="先 DELETE/UPDATE 引用行，或使用 ON UPDATE CASCADE/SET NULL",
+                            hint="先 DELETE/UPDATE 引用行，或使用 ON UPDATE CASCADE/SET NULL/SET DEFAULT",
                         )
                     entry = pending.get(child_ident)
                     if entry is None:
@@ -2633,11 +2633,15 @@ class Executor:
                     else:
                         child_new = entry[3]
                     for local_name, ref_name in zip(fk.columns, fk.ref_columns):
-                        child_new[child.column_index(local_name)] = (
-                            None
-                            if fk.on_update == "SET NULL"
-                            else new_values[table.column_index(ref_name)]
-                        )
+                        index = child.column_index(local_name)
+                        if fk.on_update == "SET NULL":
+                            child_new[index] = None
+                        elif fk.on_update == "SET DEFAULT":
+                            child_new[index] = child.columns[index].default
+                        else:
+                            child_new[index] = new_values[
+                                table.column_index(ref_name)
+                            ]
         return list(pending.values())
 
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
@@ -2924,6 +2928,9 @@ class Executor:
         deleted = 0
         deleted_rids: set[tuple[str, RID]] = set()
         processing: set[tuple[str, RID]] = set()
+        deferred: dict[
+            tuple[str, RID], tuple[TableDef, RID, list[Any], list[Any]]
+        ] = {}
         for rid, values in heap.scan(txn):
             old_tuple = tuple(values)
             if source_table is None:
@@ -2944,7 +2951,7 @@ class Executor:
                 continue
             processing.add(ident)
             self._cascade_delete_children(
-                table, values, txn, deleted_rids, processing
+                table, values, txn, deleted_rids, processing, deferred
             )
             self._delete_index_entries(table, values, txn, rid)
             if ret_fns:
@@ -2955,6 +2962,20 @@ class Executor:
             processing.discard(ident)
             deleted_rids.add(ident)
             deleted += 1
+
+        for ident, (child, child_rid, child_old, child_new) in deferred.items():
+            if ident in deleted_rids:
+                continue
+            self._snapshot_table_state(child, txn)
+            child_heap = HeapFile(self._bp, child, self._txns)
+            self._rewrite_row(
+                child,
+                child_heap,
+                txn,
+                child_rid,
+                child_old,
+                child_new,
+            )
 
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
@@ -3123,8 +3144,9 @@ class Executor:
         txn: Transaction,
         deleted: set[tuple[str, RID]],
         processing: set[tuple[str, RID]],
+        deferred: dict[tuple[str, RID], tuple[TableDef, RID, list[Any], list[Any]]],
     ) -> None:
-        """按 ON DELETE CASCADE 递归删除子行；RESTRICT 子行会阻止删除。"""
+        """按 ON DELETE 动作递归处理子行；SET DEFAULT 延后到父行删除后执行。"""
         for child in self._catalog.list_tables():
             for fk in child.foreign_keys.values():
                 if fk.ref_table != table.name:
@@ -3169,6 +3191,22 @@ class Executor:
                             _updating=set(processing),
                         )
                     continue
+                if fk.on_delete == "SET DEFAULT":
+                    for child_rid, child_values in matches:
+                        ident = (child.name, child_rid)
+                        if ident in deleted or ident in processing:
+                            continue
+                        entry = deferred.get(ident)
+                        if entry is None:
+                            child_new = list(child_values)
+                            entry = (child, child_rid, child_values, child_new)
+                            deferred[ident] = entry
+                        else:
+                            child_new = entry[3]
+                        for name in fk.columns:
+                            index = child.column_index(name)
+                            child_new[index] = child.columns[index].default
+                    continue
                 if fk.on_delete != "CASCADE":
                     raise ForeignKeyViolationError(
                         f"外键约束 {fk.name!r} 阻止删除被引用行",
@@ -3176,7 +3214,7 @@ class Executor:
                             f"表 {child.name} 中仍有行引用 "
                             f"{table.name}.{fk.ref_columns} = {key}"
                         ),
-                        hint="先 DELETE/UPDATE 引用行，或使用 ON DELETE CASCADE/SET NULL",
+                        hint="先 DELETE/UPDATE 引用行，或使用 ON DELETE CASCADE/SET NULL/SET DEFAULT",
                     )
                 for child_rid, child_values in matches:
                     ident = (child.name, child_rid)
@@ -3185,7 +3223,7 @@ class Executor:
                     processing.add(ident)
                     self._snapshot_table_state(child, txn)
                     self._cascade_delete_children(
-                        child, child_values, txn, deleted, processing
+                        child, child_values, txn, deleted, processing, deferred
                     )
                     self._delete_index_entries(child, child_values, txn, child_rid)
                     child_heap.delete(txn, child_rid)

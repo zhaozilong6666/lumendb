@@ -150,14 +150,25 @@ class TestCreateTable:
         assert update_ref is not None
         assert update_ref.on_update == "SET NULL"
 
-    def test_foreign_key_set_default_rejected(self):
+    def test_foreign_key_set_default(self):
+        delete_stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET DEFAULT)"
+        )
+        delete_ref = delete_stmt.columns[0].references
+        assert delete_ref is not None
+        assert delete_ref.on_delete == "SET DEFAULT"
+
+        update_stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET DEFAULT)"
+        )
+        update_ref = update_stmt.columns[0].references
+        assert update_ref is not None
+        assert update_ref.on_update == "SET DEFAULT"
+
+    def test_foreign_key_set_action_rejected(self):
         with pytest.raises(NotSupportedError):
             parse_statement(
-                "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET DEFAULT)"
-            )
-        with pytest.raises(NotSupportedError):
-            parse_statement(
-                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET DEFAULT)"
+                "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET FOO)"
             )
 
     def test_foreign_key_alter_add_constraint(self):
