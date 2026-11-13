@@ -487,6 +487,19 @@ class TestInsert:
         assert second.execute_one("SELECT x, y FROM v").rows == [(1, "x")]
         second.close()
 
+    def test_view_dependencies_survive_reopen(self, tmp_path):
+        path = tmp_path / "viewdeps"
+        first = Database(path)
+        first.execute_one("CREATE TABLE t (a INT)")
+        first.execute_one("CREATE VIEW v AS SELECT a FROM t")
+        first.close()
+        second = Database(path)
+        with pytest.raises(BinderError):
+            second.execute_one("DROP TABLE t")
+        second.execute_one("DROP VIEW v")
+        second.execute_one("DROP TABLE t")
+        second.close()
+
     def test_create_or_replace_view_swaps_definition(self, db):
         db.execute_one("CREATE TABLE t (a INT, b TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'x')")
