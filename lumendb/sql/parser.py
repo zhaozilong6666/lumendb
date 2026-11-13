@@ -69,6 +69,7 @@ from .ast import (
     AlterTableAddConstraint,
     AlterTableAlterDefault,
     AlterTableAlterNullability,
+    AlterTableAlterType,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
@@ -121,6 +122,13 @@ class Parser:
 
     def _match_kw(self, *names: str) -> Optional[Token]:
         if self._cur.is_keyword(*names):
+            return self._advance()
+        return None
+
+    def _match_word(self, *names: str) -> Optional[Token]:
+        """匹配非保留关键字（例如类型名 TYPE/DATA），大小写不敏感。"""
+        tok = self._cur
+        if tok.kind in ("ident", "keyword") and tok.value.upper() in names:
             return self._advance()
         return None
 
@@ -348,7 +356,29 @@ class Parser:
         if self._match_kw("ALTER"):
             self._match_kw("COLUMN")
             column = self._parse_ident("列名")
+            if self._match_word("TYPE"):
+                type_spec = self._parse_type()
+                if self._match_word("USING"):
+                    raise NotSupportedError(
+                        "ALTER COLUMN TYPE 暂不支持 USING 表达式",
+                        hint="只支持可隐式转换的类型，或先 UPDATE 数据",
+                    )
+                return AlterTableAlterType(
+                    table=table, column=column, type=type_spec
+                )
             if self._match_kw("SET"):
+                if self._match_word("DATA"):
+                    if not self._match_word("TYPE"):
+                        raise self._error("SET DATA 之后期望 TYPE")
+                    type_spec = self._parse_type()
+                    if self._match_word("USING"):
+                        raise NotSupportedError(
+                            "ALTER COLUMN TYPE 暂不支持 USING 表达式",
+                            hint="只支持可隐式转换的类型，或先 UPDATE 数据",
+                        )
+                    return AlterTableAlterType(
+                        table=table, column=column, type=type_spec
+                    )
                 if self._match_kw("NOT"):
                     self._expect_kw("NULL")
                     return AlterTableAlterNullability(
@@ -370,7 +400,7 @@ class Parser:
                     table=table, column=column, default=None
                 )
             raise self._error(
-                "ALTER COLUMN 之后期望 SET/DROP DEFAULT 或 SET/DROP NOT NULL"
+                "ALTER COLUMN 之后期望 TYPE、SET DATA TYPE、SET/DROP DEFAULT 或 SET/DROP NOT NULL"
             )
 
         if self._match_kw("RENAME"):
@@ -398,7 +428,8 @@ class Parser:
         raise NotSupportedError(
             "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN、RENAME 和 DROP CONSTRAINT",
             hint=(
-                "支持 ADD [COLUMN] / ALTER [COLUMN] SET|DROP DEFAULT|NOT NULL / "
+                "支持 ADD [COLUMN] / ALTER [COLUMN] TYPE / SET DATA TYPE / "
+                "SET|DROP DEFAULT|NOT NULL / "
                 "DROP CONSTRAINT [IF EXISTS] name / "
                 "RENAME TO / RENAME [COLUMN] old TO new"
             ),

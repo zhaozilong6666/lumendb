@@ -462,6 +462,13 @@ class AlterTableAlterNullability(Statement):
 
 
 @dataclass
+class AlterTableAlterType(Statement):
+    table: str
+    column: str
+    type: TypeSpec
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
@@ -627,6 +634,7 @@ __all__ = [
     "CreateIndex",
     "AlterTableAddColumn",
     "AlterTableDropConstraint",
+    "AlterTableAlterType",
     "DropIndex",
     "Insert",
     "Update",

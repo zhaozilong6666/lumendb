@@ -1996,6 +1996,108 @@ class TestAlterTable:
         db2.close()
 
 
+class TestAlterColumnType:
+    def test_int_to_bigint_rewrites_rows_and_indexes(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT CHECK (a > 0))"
+        )
+        db.execute_one("CREATE UNIQUE INDEX uq_a ON t (a)")
+        db.execute_one("INSERT INTO t VALUES (1, 1), (2, 2)")
+        result = db.execute_one(
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT"
+        )
+        assert "重写 2 行" in result.notice
+        db.execute_one("INSERT INTO t VALUES (3, 3000000000)")
+        assert rows(
+            db, "SELECT id FROM t WHERE a = 3000000000"
+        ) == [(3,)]
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (4, 1)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (5, 0)")
+
+    def test_text_to_int_conversion_and_failure_without_mutation(self, db):
+        db.execute_one("CREATE TABLE t (a TEXT)")
+        db.execute_one("INSERT INTO t VALUES ('123')")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a SET DATA TYPE INT")
+        db.execute_one("INSERT INTO t VALUES (4)")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [(4,), (123,)]
+
+        db.execute_one("CREATE TABLE u (a TEXT)")
+        db.execute_one("INSERT INTO u VALUES ('not-a-number')")
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("ALTER TABLE u ALTER COLUMN a TYPE INT")
+        assert rows(db, "SELECT a FROM u") == [("not-a-number",)]
+        db.execute_one("INSERT INTO u VALUES ('still-text')")
+
+    def test_type_change_rollback_and_reopen(self, tmp_path):
+        path = tmp_path / "alter_type"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a TYPE BIGINT")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(TypeMismatchError):
+            db.execute_one("INSERT INTO t VALUES (2147483648)")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a TYPE BIGINT")
+        db.close()
+
+        db2 = Database(path)
+        assert rows(db2, "SELECT a FROM t") == [(1,)]
+        db2.execute_one("INSERT INTO t VALUES (2147483648)")
+        assert rows(db2, "SELECT a FROM t ORDER BY a") == [
+            (1,),
+            (2147483648,),
+        ]
+        db2.close()
+
+    def test_type_change_primary_key_is_rebuilt(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, note TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a')")
+        db.execute_one("ALTER TABLE t ALTER COLUMN id TYPE BIGINT")
+        db.execute_one("INSERT INTO t VALUES (3000000000, 'b')")
+        assert rows(db, "SELECT note FROM t WHERE id = 3000000000") == [
+            ("b",)
+        ]
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 'dup')")
+        with pytest.raises(NotNullViolationError):
+            db.execute_one("INSERT INTO t VALUES (NULL, 'null')")
+
+    def test_type_change_unique_conflict_rolls_back(self, db):
+        db.execute_one("CREATE TABLE t (a TEXT)")
+        db.execute_one("CREATE UNIQUE INDEX uq_a ON t (a)")
+        db.execute_one("INSERT INTO t VALUES ('1'), ('01')")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("ALTER TABLE t ALTER COLUMN a TYPE INT")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [("01",), ("1",)]
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES ('1')")
+        db.execute_one("INSERT INTO t VALUES ('2')")
+
+    def test_type_change_converts_default_and_preserves_check(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT DEFAULT 7 CHECK (a > 0))"
+        )
+        db.execute_one("INSERT INTO t DEFAULT VALUES")
+        db.execute_one("ALTER TABLE t ALTER COLUMN a TYPE BIGINT")
+        db.execute_one("INSERT INTO t DEFAULT VALUES")
+        assert rows(db, "SELECT a FROM t ORDER BY a") == [(7,), (7,)]
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (0)")
+
+    def test_varchar_shrink_is_validated_before_mutation(self, db):
+        db.execute_one("CREATE TABLE t (a VARCHAR(5))")
+        db.execute_one("INSERT INTO t VALUES ('abc')")
+        with pytest.raises(TypeMismatchError):
+            db.execute_one(
+                "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(2)"
+            )
+        assert rows(db, "SELECT a FROM t") == [("abc",)]
+        db.execute_one("INSERT INTO t VALUES ('abcd')")
+
+
 class TestCheckConstraints:
     def test_column_check_enforced_on_insert_and_update(self, db):
         db.execute_one("CREATE TABLE t (a INT CHECK (a > 0), b INT)")

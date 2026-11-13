@@ -33,6 +33,8 @@ ALTER TABLE t ALTER [COLUMN] age SET DEFAULT 21;
 ALTER TABLE t ALTER [COLUMN] age DROP DEFAULT;
 ALTER TABLE t ALTER [COLUMN] age SET NOT NULL;
 ALTER TABLE t ALTER [COLUMN] age DROP NOT NULL;
+ALTER TABLE t ALTER [COLUMN] age TYPE BIGINT;
+ALTER TABLE t ALTER [COLUMN] age SET DATA TYPE TEXT;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
@@ -84,6 +86,17 @@ EXISTS` 遇到同名列会跳过并返回 notice，不会比较新定义的类�
 `ALTER [COLUMN] ... SET NOT NULL` 会先扫描堆表确认该列没有 `NULL`，校验通过后只修改
 目录约束并登记事务 undo；`DROP NOT NULL` 直接解除约束。两者都不重写已有行。主键列
 天然要求 `NOT NULL`，因此主键列上的 `DROP NOT NULL` 会被拒绝。
+
+`ALTER [COLUMN] ... TYPE target_type`（等价写法 `SET DATA TYPE target_type`）是完整
+的表重写：先物化全部旧行，逐行用目标类型的 `coerce` 做预校验，同时转换列默认值并
+用临时表定义编译/校验所有 CHECK；预校验通过后才修改目录、登记 undo，并逐行重写堆
+记录。受影响索引在重写期间暂时移除，完成后再按新列类型从堆表整体重建——索引键的
+编码依赖列类型，不能直接用新 codec 删除旧键。转换失败、默认值不兼容、CHECK 违反或
+重建唯一索引时发现重复，整个语句失败并回滚，目录/堆/索引都保持原样。只支持
+`TypeSpec.coerce` 能隐式完成的转换（如 INT→BIGINT/FLOAT、BIGINT→INT 且值在范围内、
+可解析字符串→数值、TEXT↔VARCHAR 长度检查）；`USING` 表达式明确报
+`NotSupportedError`。这是 O(n) 操作，不适合在线大表；`NULL`/`NOT NULL`、`DEFAULT`
+与 CHECK 约束都会保留。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
 同步更新所有索引的列引用与 CHECK token 里的标识符，不重写堆记录。重命名后旧名字
@@ -273,7 +286,8 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 
 | 语法 | 原因 |
 |---|---|
-| `ALTER TABLE` 的其它动作（`DROP COLUMN`、改列类型） | 只实现了 `ADD COLUMN` / `ALTER [COLUMN] ... SET/DROP DEFAULT` / `SET/DROP NOT NULL` / `ADD [CONSTRAINT name] CHECK (expr)` / `DROP CONSTRAINT [IF EXISTS] name` / `RENAME TO` / `RENAME [COLUMN] old TO new` |
+| `ALTER TABLE ... DROP COLUMN` | 记录头保存列数，直接删列会让旧记录无法解码；需要先设计行重写/软删除方案 |
+| `ALTER COLUMN TYPE ... USING` | 只支持 `TypeSpec.coerce` 的隐式转换，不执行任意表达式 |
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
 | 外键约束 | 需要跨表级联与延迟检查 |
 | 触发器 / 存储过程 | 未实现 |

@@ -32,6 +32,7 @@ from ..sql.ast import (
     AlterTableAddConstraint,
     AlterTableAlterDefault,
     AlterTableAlterNullability,
+    AlterTableAlterType,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
     AlterTableRenameTable,
@@ -174,6 +175,8 @@ class Executor:
                 return self._alter_default(stmt, txn)
             if isinstance(stmt, AlterTableAlterNullability):
                 return self._alter_nullability(stmt, txn)
+            if isinstance(stmt, AlterTableAlterType):
+                return self._alter_type(stmt, txn)
             if isinstance(stmt, AlterTableRenameTable):
                 self._catalog.rename_table(txn, stmt.table, stmt.new_name)
                 return Result(
@@ -929,8 +932,13 @@ class Executor:
             self._compile_check(table, check)
 
     def _compile_check(self, table: TableDef, check: CheckDef) -> Any:
-        """从持久化 token 重建 CHECK 谓词；结果按 (表, 名, token) 缓存。"""
-        key = (table.name, check.name, check.tokens)
+        """从持久化 token 重建 CHECK 谓词；结果按 (表, 名, token, 列类型) 缓存。"""
+        key = (
+            table.name,
+            check.name,
+            check.tokens,
+            tuple((col.name, col.type) for col in table.columns),
+        )
         cached = self._check_cache.get(key)
         if cached is not None:
             return cached
@@ -1238,6 +1246,115 @@ class Executor:
         if not stmt.nullable:
             notice += f"；已校验 {checked} 行"
         return Result(tag="ALTER TABLE", notice=notice)
+
+    def _alter_type(
+        self, stmt: AlterTableAlterType, txn: Transaction
+    ) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        index = table.column_index(stmt.column)
+        old_column = table.columns[index]
+        new_type = stmt.type
+        if new_type == old_column.type:
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"列 {old_column.name} 的类型已经是 {new_type.name}",
+            )
+
+        # 先物化旧行：类型一旦改变，后续 scan 会按新类型解码旧记录。
+        heap = HeapFile(self._bp, table, self._txns)
+        source_rows = [
+            (rid, list(values)) for rid, values in heap.scan(txn)
+        ]
+        converted: list[tuple[Any, list[Any], list[Any]]] = []
+        for rid, values in source_rows:
+            new_values = list(values)
+            try:
+                new_values[index] = new_type.coerce(values[index])
+            except TypeMismatchError as exc:
+                raise TypeMismatchError(
+                    f"列 {old_column.name} 无法从 {old_column.type.name} "
+                    f"转换为 {new_type.name}",
+                    detail=f"行 {rid}：{exc}",
+                    hint="先 UPDATE 修正不兼容的值，或改用可转换的目标类型",
+                ) from exc
+            converted.append((rid, values, new_values))
+
+        new_default = old_column.default
+        if new_default is not None:
+            try:
+                new_default = new_type.coerce(new_default)
+            except TypeMismatchError as exc:
+                raise TypeMismatchError(
+                    f"列 {old_column.name} 的默认值无法转换为 {new_type.name}",
+                    detail=str(exc),
+                    hint="先用 ALTER COLUMN ... DROP DEFAULT 清除默认值",
+                ) from exc
+
+        new_columns = list(table.columns)
+        new_columns[index] = replace(
+            old_column, type=new_type, default=new_default
+        )
+        provisional = TableDef(
+            name=table.name,
+            columns=new_columns,
+            indexes=table.indexes,
+            checks=table.checks,
+        )
+        for check in table.checks.values():
+            self._compile_check(provisional, check)
+        for _rid, _old_values, new_values in converted:
+            self._check_checks(provisional, new_values)
+
+        old_columns = list(table.columns)
+        old_indexes = dict(table.indexes)
+        self._snapshot_table_state(table, txn)
+
+        def undo_indexes() -> None:
+            table.indexes = old_indexes
+
+        txn.undo_log.append(undo_indexes)
+        affected_names = {
+            name
+            for name, idx in old_indexes.items()
+            if old_column.name in idx.columns
+        }
+        # 索引键的编码依赖列类型。先移除受影响索引，避免用新类型 codec
+        # 去删除旧 key 造成悬挂条目；行重写完成后再从堆表整体重建。
+        for name in affected_names:
+            table.indexes.pop(name, None)
+        table.columns = new_columns
+
+        def undo() -> None:
+            table.columns = old_columns
+
+        txn.undo_log.append(undo)
+        for rid, old_values, new_values in converted:
+            self._rewrite_row(
+                table,
+                heap,
+                txn,
+                rid,
+                old_values,
+                new_values,
+            )
+
+        table.indexes = old_indexes
+        rebuilt = 0
+        if affected_names:
+            rebuilt, _entries = self._rebuild_indexes(table, txn)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        index_note = (
+            f"；重建 {rebuilt} 个索引" if rebuilt else ""
+        )
+        return Result(
+            tag="ALTER TABLE",
+            notice=(
+                f"已把列 {old_column.name} 的类型从 {old_column.type.name} "
+                f"改为 {new_type.name}；重写 {len(converted)} 行"
+                f"{index_note}"
+            ),
+        )
 
     def _alter_add_constraint(
         self, stmt: AlterTableAddConstraint, txn: Transaction
