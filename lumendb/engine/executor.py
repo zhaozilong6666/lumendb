@@ -36,6 +36,7 @@ from ..sql.ast import (
     AlterTableDropColumn,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
+    AlterTableRenameConstraint,
     AlterTableRenameTable,
     CreateIndex,
     CreateTable,
@@ -197,6 +198,8 @@ class Executor:
                         f"{stmt.new_name.lower()}"
                     ),
                 )
+            if isinstance(stmt, AlterTableRenameConstraint):
+                return self._alter_rename_constraint(stmt, txn)
             if isinstance(stmt, DropTable):
                 return self._drop_table(stmt, txn)
             if isinstance(stmt, CreateIndex):
@@ -1465,6 +1468,64 @@ class Executor:
                 f"已删除列 {column.name}；重写 {len(new_rows)} 行"
                 f"{index_note}"
             ),
+        )
+
+    def _alter_rename_constraint(
+        self, stmt: AlterTableRenameConstraint, txn: Transaction
+    ) -> Result:
+        table = self._catalog.get_table(stmt.table)
+        old_key = stmt.old_name.lower()
+        new_key = stmt.new_name.lower()
+        if old_key not in table.checks and old_key not in table.indexes:
+            raise BinderError(
+                f"表 {table.name} 没有约束 {stmt.old_name!r}",
+                hint="约束名可由 SHOW CREATE TABLE 或 \\d 查看",
+            )
+        if new_key in table.checks or new_key in table.indexes:
+            if new_key != old_key:
+                raise BinderError(
+                    f"约束名 {stmt.new_name!r} 已被占用",
+                    hint="同一张表内约束/索引名必须唯一",
+                )
+        if old_key == new_key:
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"约束名已经是 {new_key}",
+            )
+
+        if old_key in table.checks:
+            check = table.checks[old_key]
+            new_check = replace(check, name=new_key)
+            table.checks.pop(old_key)
+            table.checks[new_key] = new_check
+
+            def undo() -> None:
+                table.checks.pop(new_key, None)
+                table.checks[old_key] = check
+
+            txn.undo_log.append(undo)
+        else:
+            idx = table.indexes[old_key]
+            if idx.constraint_kind is None:
+                raise NotSupportedError(
+                    f"{old_key!r} 是普通索引，不是表约束",
+                    hint="普通索引请使用 CREATE INDEX / DROP INDEX 管理",
+                )
+            new_idx = replace(idx, name=new_key)
+            table.indexes.pop(old_key)
+            table.indexes[new_key] = new_idx
+
+            def undo() -> None:
+                table.indexes.pop(new_key, None)
+                table.indexes[old_key] = idx
+
+            txn.undo_log.append(undo)
+
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"约束 {old_key} 已重命名为 {new_key}",
         )
 
     def _alter_add_constraint(

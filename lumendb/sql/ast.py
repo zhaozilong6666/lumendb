@@ -478,6 +478,13 @@ class AlterTableDropColumn(Statement):
 
 
 @dataclass
+class AlterTableRenameConstraint(Statement):
+    table: str
+    old_name: str
+    new_name: str
+
+
+@dataclass
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
@@ -649,6 +656,7 @@ __all__ = [
     "AlterTableDropConstraint",
     "AlterTableAlterType",
     "AlterTableDropColumn",
+    "AlterTableRenameConstraint",
     "DropIndex",
     "Insert",
     "Update",

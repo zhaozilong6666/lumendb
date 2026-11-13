@@ -878,6 +878,16 @@ class TestAlterTable:
         stmt = parse_statement("ALTER TABLE users RENAME name TO label")
         assert isinstance(stmt, AlterTableRenameColumn)
 
+    def test_rename_constraint(self):
+        from lumendb.sql.ast import AlterTableRenameConstraint
+
+        stmt = parse_statement(
+            "ALTER TABLE users RENAME CONSTRAINT uq_old TO uq_new"
+        )
+        assert isinstance(stmt, AlterTableRenameConstraint)
+        assert stmt.old_name == "uq_old"
+        assert stmt.new_name == "uq_new"
+
 
 class TestMultipleStatements:
     def test_two_statements(self):

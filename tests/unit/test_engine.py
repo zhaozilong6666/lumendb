@@ -1875,6 +1875,43 @@ class TestAlterTable:
         assert rows(db, "SELECT id FROM t WHERE age = 10 ORDER BY id") == [(1,)]
         assert rows(db, "SELECT id FROM t WHERE age = 20 ORDER BY id") == [(2,)]
 
+    def test_rename_constraint(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT uq UNIQUE (a), "
+            "CONSTRAINT ck CHECK (b > 0), CONSTRAINT ck_other CHECK (b < 100))"
+        )
+        db.execute_one("CREATE INDEX idx_b ON t (b)")
+        db.execute_one("INSERT INTO t VALUES (1, 1)")
+        db.execute_one("ALTER TABLE t RENAME CONSTRAINT uq TO uq2")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1, 2)")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT uq2")
+        db.execute_one("INSERT INTO t VALUES (1, 2)")
+
+        db.execute_one("ALTER TABLE t RENAME CONSTRAINT ck TO ck2")
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t RENAME CONSTRAINT ck2 TO ck_other")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT ck2")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT ck_other")
+        db.execute_one("INSERT INTO t VALUES (3, 0)")
+
+        with pytest.raises(NotSupportedError):
+            db.execute_one("ALTER TABLE t RENAME CONSTRAINT idx_b TO idx_c")
+        with pytest.raises(BinderError):
+            db.execute_one("ALTER TABLE t RENAME CONSTRAINT missing TO x")
+
+    def test_rename_constraint_rollback(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, CONSTRAINT uq UNIQUE (a))"
+        )
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t RENAME CONSTRAINT uq TO uq2")
+        db.execute_one("ROLLBACK")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (2)")
+
     def test_rename_table_and_column(self, db):
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")

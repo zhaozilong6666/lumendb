@@ -73,6 +73,7 @@ from .ast import (
     AlterTableDropColumn,
     AlterTableDropConstraint,
     AlterTableRenameColumn,
+    AlterTableRenameConstraint,
     AlterTableRenameTable,
 )
 from .lexer import RESERVED, Token, tokenize
@@ -406,6 +407,13 @@ class Parser:
             )
 
         if self._match_kw("RENAME"):
+            if self._match_kw("CONSTRAINT"):
+                old_name = self._parse_ident("旧约束名")
+                self._expect_kw("TO")
+                new_name = self._parse_ident("新约束名")
+                return AlterTableRenameConstraint(
+                    table=table, old_name=old_name, new_name=new_name
+                )
             if self._match_kw("TABLE"):
                 self._expect_kw("TO")
                 new_name = self._parse_ident("新表名")
@@ -433,7 +441,8 @@ class Parser:
                 "支持 ADD [COLUMN] / ALTER [COLUMN] TYPE / SET DATA TYPE / "
                 "SET|DROP DEFAULT|NOT NULL / DROP [COLUMN] [IF EXISTS] name / "
                 "DROP CONSTRAINT [IF EXISTS] name / "
-                "RENAME TO / RENAME [COLUMN] old TO new"
+                "RENAME TO / RENAME [COLUMN] old TO new / "
+                "RENAME CONSTRAINT old TO new"
             ),
         )
 

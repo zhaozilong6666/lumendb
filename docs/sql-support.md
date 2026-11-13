@@ -39,6 +39,7 @@ ALTER TABLE t DROP [COLUMN] note;
 ALTER TABLE t DROP [COLUMN] IF EXISTS note;
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t2 RENAME [COLUMN] name TO label;
+ALTER TABLE t2 RENAME CONSTRAINT uq_old TO uq_new;
 CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 CREATE VIEW v AS SELECT id, name FROM t WHERE age >= 18;
 CREATE VIEW v2 (user_id, user_name) AS SELECT id, name FROM t;
@@ -116,7 +117,10 @@ BIGINT→INT 且值在范围内、可解析字符串→数值、TEXT↔VARCHAR �
 不追踪；删除被视图引用的列后，查询该视图会在绑定阶段报列不存在，需先删除/重建视图。
 
 `RENAME TO` 只改目录中的表名，不搬移数据页；`RENAME [COLUMN] old TO new` 只改列名，
-同步更新所有索引的列引用与 CHECK token 里的标识符，不重写堆记录。重命名后旧名字
+同步更新所有索引的列引用与 CHECK token 里的标识符，不重写堆记录。`RENAME CONSTRAINT
+old TO new` 可以重命名 CHECK 约束或由 UNIQUE/PRIMARY KEY 创建的约束索引；普通
+`CREATE INDEX` 建的索引不是表约束，会拒绝并提示使用索引管理接口。新名字在同一张
+表的约束/索引命名空间内必须唯一；重命名只改目录，事务回滚恢复旧名字。重命名后旧名字
 立即失效；客户端需要重新解析 SQL（已准备的语句不会自动改写）。表/列名冲突会明确报错。
 
 `CREATE VIEW` 创建只读视图，视图不物化数据，也不占数据页；每次查询时按目录里保存的
