@@ -126,6 +126,9 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 `INNER JOIN` / `LEFT JOIN` 的顶层 `AND` 等值条件走 **hash join**：右侧建哈希表，
 左侧流式探测；没有等值键（逗号连接、`OR` 条件）时退回 nested loop。`NULL` 键
 按 SQL 语义不参与匹配，重复键会展开成多行，剩余谓词仍由完整的 `ON` 复核。
+`RIGHT JOIN` / `FULL JOIN` 统一用 nested loop：右表做外层，`FULL` 额外记录右表
+哪些行被匹配过，最后补出未匹配的右行；两者都按 left+right 的列顺序输出，未匹配
+的一侧填 `NULL`。`CROSS JOIN` 是 `ON` 为真的 `INNER JOIN`。
 连接顺序枚举与代价模型仍未实现——`EXPLAIN` 输出的是真实执行的计划，不是理想计划。
 
 ## 4. 执行
@@ -136,7 +139,8 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - `Scan` / `IndexLookup`：堆表顺序扫描 / 索引点查；
 - `Filter`：谓词为真才放行（`NULL` 视为假）；
 - `Join`：有等值键时 `HashJoin`（右侧物化建哈希表，左侧流式探测）；否则
-  nested loop（右侧物化，左侧流式）。`LEFT JOIN` 无匹配时补 NULL；
+  nested loop（右侧物化，左侧流式）。`LEFT JOIN` 无匹配时补 NULL；`RIGHT` /
+  `FULL` 走 nested loop，`FULL` 两侧未匹配行都补 NULL；
 - `Aggregate`：无 `GROUP BY` 时输出一行（空表也输出 `COUNT=0`）；
 - `Project`：求值输出列，可附加 ORDER BY 需要的隐藏列；
 - `Distinct`：按前 N 列去重（隐藏列不参与）；

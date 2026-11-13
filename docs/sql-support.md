@@ -50,7 +50,7 @@ DELETE FROM t WHERE age < 0;
 ```sql
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [alias] [, t2 ...]
-  [INNER | LEFT] JOIN t2 ON cond
+  [INNER | LEFT | RIGHT | FULL | CROSS] JOIN t2 ON cond
 WHERE cond
 GROUP BY expr [, expr...]        -- 列引用或任意标量表达式，同形表达式可直接用于 SELECT
 HAVING cond
@@ -142,7 +142,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 窗口函数 | 未实现 |
 | 递归 CTE | 只实现了非递归 `WITH` |
 | `EXCEPT` / `INTERSECT` | 只实现了 `UNION` / `UNION ALL`，其余集合运算未实现 |
-| `RIGHT JOIN` / `FULL JOIN` / `CROSS JOIN` | 可用 `LEFT JOIN` 或逗号连接等价改写 |
+| `RIGHT JOIN` / `FULL JOIN` / `CROSS JOIN` | 已支持；`RIGHT`/`FULL` 用嵌套循环，未匹配侧补 `NULL` |
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
@@ -161,7 +161,8 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 - 单列等值条件与单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）在列上有索引时
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。
-- `LEFT JOIN` 的右侧无匹配时补 `NULL`。
+- `LEFT JOIN` 的右侧无匹配时补 `NULL`；`RIGHT JOIN` 的左侧、`FULL JOIN` 的两侧同理。
+- `CROSS JOIN` 与逗号连接等价，不写 `ON`。
 - `HAVING` 作用在聚合输出行上：分组键与聚合结果之外的原表列不可见。
 - `GROUP BY` 表达式按语法树同形匹配：`SELECT id % 2 ... GROUP BY id % 2` 合法；
   `GROUP BY id % 2` 与 `GROUP BY id%2` 视为同一个表达式。

@@ -786,6 +786,42 @@ class TestJoin:
         self.setup(db)
         assert rows(db, "SELECT COUNT(*) FROM a, b") == [(6,)]
 
+    def test_right_join(self, db):
+        self.setup(db)
+        db.execute_one("INSERT INTO b VALUES (4, 'b4')")
+        assert rows(
+            db,
+            "SELECT a.id, b.id, b.y FROM a RIGHT JOIN b ON a.id = b.id "
+            "ORDER BY b.id",
+        ) == [(1, 1, "b1"), (3, 3, "b3"), (None, 4, "b4")]
+
+    def test_full_join(self, db):
+        self.setup(db)
+        db.execute_one("INSERT INTO b VALUES (4, 'b4')")
+        result = rows(
+            db,
+            "SELECT a.id, b.id, b.y FROM a FULL JOIN b ON a.id = b.id",
+        )
+        assert set(result) == {
+            (1, 1, "b1"),
+            (2, None, None),
+            (3, 3, "b3"),
+            (None, 4, "b4"),
+        }
+
+    def test_cross_join(self, db):
+        self.setup(db)
+        assert rows(db, "SELECT COUNT(*) FROM a CROSS JOIN b") == [(6,)]
+
+    def test_right_join_null_key_does_not_match(self, db):
+        db.execute_one("CREATE TABLE l (id INT)")
+        db.execute_one("CREATE TABLE r (id INT)")
+        db.execute_one("INSERT INTO l VALUES (1), (NULL)")
+        db.execute_one("INSERT INTO r VALUES (1), (NULL)")
+        assert rows(
+            db, "SELECT l.id, r.id FROM l RIGHT JOIN r ON l.id = r.id ORDER BY r.id"
+        ) == [(1, 1), (None, None)]
+
     def test_ambiguous_column(self, db):
         self.setup(db)
         with pytest.raises(Exception):

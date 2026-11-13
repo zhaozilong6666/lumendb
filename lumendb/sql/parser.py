@@ -609,6 +609,7 @@ class Parser:
 
         while True:
             kind: Optional[str] = None
+            cross = False
             if self._match_kw("JOIN"):
                 kind = "INNER"
             elif self._match_kw("INNER"):
@@ -618,16 +619,18 @@ class Parser:
                 self._match_kw("OUTER")
                 self._expect_kw("JOIN")
                 kind = "LEFT"
-            elif self._cur.is_keyword("RIGHT", "FULL"):
-                raise NotSupportedError(
-                    f"{self._cur.value.upper()} JOIN 尚未实现",
-                    hint="可以交换左右表并用 LEFT JOIN，或改写为子查询",
-                )
-            elif self._cur.is_keyword("CROSS"):
-                raise NotSupportedError(
-                    "CROSS JOIN 尚未实现",
-                    hint="可以用 FROM a, b 表达笛卡尔积",
-                )
+            elif self._match_kw("RIGHT"):
+                self._match_kw("OUTER")
+                self._expect_kw("JOIN")
+                kind = "RIGHT"
+            elif self._match_kw("FULL"):
+                self._match_kw("OUTER")
+                self._expect_kw("JOIN")
+                kind = "FULL"
+            elif self._match_kw("CROSS"):
+                self._expect_kw("JOIN")
+                kind = "INNER"
+                cross = True
             if kind is None:
                 return ref
             right = TableRef(name=self._parse_ident("表名"), alias=None)
@@ -636,10 +639,12 @@ class Parser:
             elif self._cur.kind == "ident":
                 right.alias = self._advance().value
             on = None
-            if self._match_kw("ON"):
+            if cross:
+                pass
+            elif self._match_kw("ON"):
                 on = self._parse_expr()
-            elif kind == "LEFT":
-                raise self._error("LEFT JOIN 必须带 ON 条件")
+            elif kind in ("LEFT", "RIGHT", "FULL"):
+                raise self._error(f"{kind} JOIN 必须带 ON 条件")
             ref.joins.append(Join(kind=kind, table=right, on=on))
 
     # ------------------------------------------------------------------

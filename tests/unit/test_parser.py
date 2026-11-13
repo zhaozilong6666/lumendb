@@ -191,13 +191,18 @@ class TestSelect:
         stmt = parse_statement("SELECT * FROM a LEFT JOIN b ON a.id = b.id")
         assert stmt.select.from_[0].joins[0].kind == "LEFT"
 
-    def test_right_join_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("SELECT * FROM a RIGHT JOIN b ON a.id = b.id")
+    def test_right_join(self):
+        stmt = parse_statement("SELECT * FROM a RIGHT JOIN b ON a.id = b.id")
+        assert stmt.select.from_[0].joins[0].kind == "RIGHT"
 
-    def test_full_join_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("SELECT * FROM a FULL JOIN b ON a.id = b.id")
+    def test_full_join(self):
+        stmt = parse_statement("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id")
+        assert stmt.select.from_[0].joins[0].kind == "FULL"
+
+    def test_cross_join(self):
+        stmt = parse_statement("SELECT * FROM a CROSS JOIN b")
+        assert stmt.select.from_[0].joins[0].kind == "INNER"
+        assert stmt.select.from_[0].joins[0].on is None
 
     def test_left_join_requires_on(self):
         with pytest.raises(SQLSyntaxError):

@@ -353,6 +353,9 @@ class Executor:
 
     def _join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
+        if node.kind in ("RIGHT", "FULL"):
+            yield from self._outer_join(node, txn)
+            return
         if node.hash_keys and node.kind in ("INNER", "LEFT"):
             yield from self._hash_join(node, txn)
             return
@@ -367,6 +370,46 @@ class Executor:
                     yield combined
             if node.kind == "LEFT" and not matched:
                 yield tuple(left) + (None,) * right_width
+
+    def _outer_join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
+        """RIGHT / FULL JOIN 的通用实现。
+
+        RIGHT 以右表为外层；FULL 还要记录右表中哪些行被匹配过，最后补出
+        未匹配的右行。两者都按 left+right 的列顺序输出。这里不建哈希表，
+        因为外连接的“未匹配行”需要逐行判断，nested loop 的语义最直接。
+        """
+        assert node.left is not None and node.right is not None
+        left_rows = [tuple(row) for row in self._execute(node.left, txn)]
+        right_rows = [tuple(row) for row in self._execute(node.right, txn)]
+        left_width = len(node.left.columns)
+        right_width = len(node.right.columns)
+
+        if node.kind == "RIGHT":
+            for right in right_rows:
+                matched = False
+                for left in left_rows:
+                    combined = left + right
+                    if node.on is None or _truthy(node.on(EvalContext(combined))):
+                        matched = True
+                        yield combined
+                if not matched:
+                    yield (None,) * left_width + right
+            return
+
+        right_matched = [False] * len(right_rows)
+        for left in left_rows:
+            matched = False
+            for j, right in enumerate(right_rows):
+                combined = left + right
+                if node.on is None or _truthy(node.on(EvalContext(combined))):
+                    matched = True
+                    right_matched[j] = True
+                    yield combined
+            if not matched:
+                yield left + (None,) * right_width
+        for j, right in enumerate(right_rows):
+            if not right_matched[j]:
+                yield (None,) * left_width + right
 
     def _hash_join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
