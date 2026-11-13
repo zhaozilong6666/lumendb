@@ -2085,6 +2085,14 @@ class TestExpressions:
         db.execute_one("INSERT INTO t VALUES (1), (NULL)")
         assert rows(db, "SELECT COUNT(*) FROM t WHERE a IS NULL") == [(1,)]
 
+    def test_is_distinct_from(self, db):
+        assert rows(
+            db,
+            "SELECT NULL IS DISTINCT FROM 1, "
+            "NULL IS NOT DISTINCT FROM NULL, "
+            "1 IS DISTINCT FROM 1, 1 IS NOT DISTINCT FROM 2",
+        ) == [(True, True, False, False)]
+
     def test_not(self, db):
         setup_users(db)
         assert rows(db, "SELECT COUNT(*) FROM users WHERE NOT age > 26") == [(1,)]

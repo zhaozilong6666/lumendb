@@ -41,6 +41,7 @@ from ..sql.ast import (
     FunctionCall,
     InList,
     InSubquery,
+    IsDistinct,
     IsNull,
     Like,
     Literal,
@@ -431,6 +432,20 @@ class Binder:
         return (lambda ctx: (fn(ctx) is not None) if negated else (fn(ctx) is None)), TypeSpec(
             DataType.BOOLEAN
         )
+
+    def _is_distinct(self, expr: IsDistinct, schema, allow_agg):
+        left_fn, _ = self.compile(expr.left, schema, allow_agg=allow_agg)
+        right_fn, _ = self.compile(expr.right, schema, allow_agg=allow_agg)
+        negated = expr.negated
+
+        def _distinct(ctx):
+            left = left_fn(ctx)
+            right = right_fn(ctx)
+            # IS NOT DISTINCT FROM 把两个 NULL 视为相等；IS DISTINCT FROM 反之。
+            equal = left == right
+            return equal if negated else not equal
+
+        return _distinct, TypeSpec(DataType.BOOLEAN)
 
     def _in_list(self, expr: InList, schema, allow_agg):
         fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
@@ -1561,6 +1576,8 @@ def _children(expr: Expr) -> list[Expr]:
         return [expr.left, expr.right]
     if isinstance(expr, IsNull):
         return [expr.operand]
+    if isinstance(expr, IsDistinct):
+        return [expr.left, expr.right]
     if isinstance(expr, InList):
         return [expr.operand, *expr.items]
     if isinstance(expr, Between):
@@ -1720,6 +1737,7 @@ _DISPATCH = {
     UnaryOp: Binder._unary,
     BinaryOp: Binder._binary,
     IsNull: Binder._is_null,
+    IsDistinct: Binder._is_distinct,
     InList: Binder._in_list,
     InSubquery: Binder._in_subquery,
     Between: Binder._between,

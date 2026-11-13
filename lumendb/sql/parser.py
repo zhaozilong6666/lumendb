@@ -37,6 +37,7 @@ from .ast import (
     InList,
     InSubquery,
     Insert,
+    IsDistinct,
     IsNull,
     Join,
     Like,
@@ -948,6 +949,11 @@ class Parser:
             if tok.is_keyword("IS"):
                 self._advance()
                 negated = self._match_kw("NOT") is not None
+                if self._match_kw("DISTINCT"):
+                    self._expect_kw("FROM")
+                    right = self._parse_additive()
+                    left = IsDistinct(left, right, negated=negated)
+                    continue
                 self._expect_kw("NULL")
                 left = IsNull(left, negated=negated)
                 continue

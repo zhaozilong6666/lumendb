@@ -100,6 +100,19 @@ class IsNull(Expr):
 
 
 @dataclass(frozen=True)
+class IsDistinct(Expr):
+    left: Expr
+    right: Expr
+    negated: bool = False
+
+    def render(self) -> str:
+        return (
+            f"({self.left.render()} IS {'NOT ' if self.negated else ''}"
+            f"DISTINCT FROM {self.right.render()})"
+        )
+
+
+@dataclass(frozen=True)
 class InList(Expr):
     operand: Expr
     items: tuple[Expr, ...]

@@ -376,6 +376,18 @@ class TestExpressions:
         expr = parse_statement("SELECT 1 WHERE a IS NOT NULL").select.where
         assert isinstance(expr, IsNull) and expr.negated
 
+    def test_is_distinct_from(self):
+        from lumendb.sql.ast import IsDistinct
+
+        expr = parse_statement(
+            "SELECT 1 WHERE a IS DISTINCT FROM b"
+        ).select.where
+        assert isinstance(expr, IsDistinct) and not expr.negated
+        expr = parse_statement(
+            "SELECT 1 WHERE a IS NOT DISTINCT FROM b"
+        ).select.where
+        assert isinstance(expr, IsDistinct) and expr.negated
+
     def test_in_list(self):
         expr = parse_statement("SELECT 1 WHERE a IN (1, 2, 3)").select.where
         assert isinstance(expr, InList) and len(expr.items) == 3
