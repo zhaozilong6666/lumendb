@@ -596,19 +596,35 @@ class Binder:
         之前这里固定返回 TEXT，导致 ``id = (SELECT 2)`` 被误判为
         INT 与 TEXT 比较；类型必须来自子查询的真实输出列。
         """
+        return self._subquery_column_type(query, "标量子查询")
+
+    def _subquery_column_type(self, query, label: str) -> TypeSpec:
         binder = Binder(self.catalog, self.params)
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)
         _, cols = binder.bind_select(query)
         if len(cols) != 1:
             raise BinderError(
-                "标量子查询只能返回一列",
+                f"{label}只能返回一列",
                 detail=f"实际返回 {len(cols)} 列",
             )
         return cols[0].type
 
     def _in_subquery(self, expr: InSubquery, schema, allow_agg):
-        fn, _ = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        fn, operand_type = self.compile(expr.operand, schema, allow_agg=allow_agg)
+        # IN (SELECT ...) 的输出列类型必须和左侧操作数兼容；只做运行时
+        # 比较会让 INT IN (SELECT '1') 静默返回空结果，也会让多列子查询
+        # 悄悄忽略后面的列。
+        sub_type = self._subquery_column_type(expr.query, "IN 子查询")
+        if not _comparable_types(operand_type, sub_type):
+            raise TypeMismatchError(
+                "IN 左侧与子查询列类型不兼容",
+                detail=(
+                    f"左侧 {operand_type.sql}，"
+                    f"子查询 {sub_type.sql}"
+                ),
+                hint="用 CAST 显式转换，或改写成 JOIN",
+            )
         runner = self.subquery_runner
         if runner is None:
             raise NotSupportedError("子查询在当前上下文不可用")

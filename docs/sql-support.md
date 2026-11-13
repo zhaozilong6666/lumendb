@@ -111,6 +111,8 @@ CASE expr WHEN value THEN result [...] [ELSE result] END
 就是常见的条件计数写法。
 
 子查询：标量子查询、`IN (SELECT ...)`、`EXISTS (SELECT ...)`。
+`IN` 子查询必须返回一列，且列类型与左侧操作数兼容（否则在绑定阶段报错，
+不会静默返回空结果）。
 
 ### 参数占位符
 

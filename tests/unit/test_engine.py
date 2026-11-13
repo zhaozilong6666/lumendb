@@ -1300,6 +1300,16 @@ class TestSubquery:
             (3,),
         ]
 
+    def test_in_subquery_checks_output_type(self, db):
+        setup_users(db)
+        with pytest.raises(TypeMismatchError):
+            rows(db, "SELECT id FROM users WHERE id IN (SELECT '1')")
+
+    def test_in_subquery_rejects_multiple_columns(self, db):
+        setup_users(db)
+        with pytest.raises(BinderError):
+            rows(db, "SELECT id FROM users WHERE id IN (SELECT 1, 2)")
+
     def test_exists(self, db):
         setup_users(db)
         assert rows(db, "SELECT EXISTS (SELECT 1 FROM users)") == [(True,)]
