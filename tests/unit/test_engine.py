@@ -3242,6 +3242,88 @@ class TestForeignKey:
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("DELETE FROM p WHERE a = 1 AND b = 2")
 
+    def test_on_delete_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("CREATE INDEX idx_c_pid ON c(pid)")
+        db.execute_one("INSERT INTO p VALUES (1), (2)")
+        db.execute_one("INSERT INTO c VALUES (10, 1), (20, 2)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT id, pid FROM c ORDER BY id") == [(20, 2)]
+        assert rows(db, "SELECT id FROM c WHERE pid = 1") == []
+        db.execute_one("DELETE FROM p WHERE id = 2")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+
+    def test_on_delete_cascade_multi_level(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one(
+            "CREATE TABLE g (id INT PRIMARY KEY, cid INT, "
+            "FOREIGN KEY (cid) REFERENCES c(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (10, 1)")
+        db.execute_one("INSERT INTO g VALUES (100, 10)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM g") == [(0,)]
+
+    def test_on_delete_cascade_restrict_sibling_rolls_back(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one(
+            "CREATE TABLE d (pid INT REFERENCES p(id) ON DELETE RESTRICT)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("INSERT INTO d VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+        assert rows(db, "SELECT COUNT(*) FROM d") == [(1,)]
+
+    def test_on_delete_cascade_self_reference_chain(self, db):
+        db.execute_one(
+            "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT, "
+            "FOREIGN KEY (parent_id) REFERENCES node(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO node VALUES (1, NULL), (2, 1), (3, 2)")
+        db.execute_one("DELETE FROM node WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM node") == [(0,)]
+
+    def test_on_delete_cascade_rollback(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_alter_add_on_delete_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+
     def test_rename_foreign_key_constraint(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(
@@ -3276,6 +3358,22 @@ class TestForeignKey:
             db.execute_one("INSERT INTO c VALUES (2)")
         db.execute_one("INSERT INTO p VALUES (2)")
         db.execute_one("INSERT INTO c VALUES (2)")
+
+    def test_persisted_on_delete_cascade(self, tmp_path):
+        path = tmp_path / "fk_cascade"
+        db = Database(path)
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.close()
+
+        db2 = Database(path)
+        db2.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db2, "SELECT COUNT(*) FROM c") == [(0,)]
+        db2.close()
 
     def test_persisted_foreign_key(self, tmp_path):
         path = tmp_path / "fk"

@@ -112,6 +112,27 @@ class TestCreateTable:
         assert fk.ref_table == "other"
         assert fk.ref_columns == ["x", "y"]
 
+    def test_foreign_key_on_delete_cascade(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE CASCADE)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.on_delete == "CASCADE"
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES other(id) "
+            "ON DELETE RESTRICT ON UPDATE RESTRICT)"
+        )
+        fk = next(c for c in stmt.constraints if c.kind == "FOREIGN KEY")
+        assert fk.on_delete == "RESTRICT"
+
+    def test_foreign_key_on_update_cascade_rejected(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE CASCADE)"
+            )
+
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
 

@@ -1013,6 +1013,7 @@ class Executor:
                 columns=local_columns,
                 ref_table=ref_table,
                 ref_columns=ref_columns,
+                on_delete=spec.on_delete,
             )
             used.add(name)
 
@@ -1028,6 +1029,7 @@ class Executor:
                     ref_table=constraint.ref_table or "",
                     ref_columns=list(constraint.ref_columns),
                     name=constraint.name,
+                    on_delete=constraint.on_delete,
                 ),
                 list(constraint.columns),
             )
@@ -1831,6 +1833,7 @@ class Executor:
                 columns=names,
                 ref_table=ref_name,
                 ref_columns=ref_columns,
+                on_delete=constraint.on_delete,
             )
             provisional = TableDef(
                 name=table.name,
@@ -2836,6 +2839,8 @@ class Executor:
         )
         returned: list[tuple] = []
         deleted = 0
+        deleted_rids: set[tuple[str, RID]] = set()
+        processing: set[tuple[str, RID]] = set()
         for rid, values in heap.scan(txn):
             old_tuple = tuple(values)
             if source_table is None:
@@ -2851,18 +2856,21 @@ class Executor:
                         break
                 if not matched:
                     continue
-            for idx in table.indexes.values():
-                key = self._key_for(table, idx, values)
-                if key is not None:
-                    self._tree_for(table, idx).delete(txn, key, rid)
+            ident = (table.name, rid)
+            if ident in deleted_rids or ident in processing:
+                continue
+            processing.add(ident)
+            self._cascade_delete_children(
+                table, values, txn, deleted_rids, processing
+            )
+            self._delete_index_entries(table, values, txn, rid)
             if ret_fns:
                 returned.append(
                     tuple(fn(EvalContext(old_tuple)) for fn in ret_fns)
                 )
-            self._check_referenced_by(
-                table, values, txn, skip_rid=rid
-            )
             heap.delete(txn, rid)
+            processing.discard(ident)
+            deleted_rids.add(ident)
             deleted += 1
 
         self._catalog.mark_dirty()
@@ -3016,6 +3024,71 @@ class Executor:
                     ),
                     hint="先插入/更新被引用行，或检查外键列的值",
                 )
+
+    def _delete_index_entries(
+        self, table: TableDef, values: list[Any], txn: Transaction, rid: RID
+    ) -> None:
+        for idx in table.indexes.values():
+            key = self._key_for(table, idx, values)
+            if key is not None:
+                self._tree_for(table, idx).delete(txn, key, rid)
+
+    def _cascade_delete_children(
+        self,
+        table: TableDef,
+        values: list[Any],
+        txn: Transaction,
+        deleted: set[tuple[str, RID]],
+        processing: set[tuple[str, RID]],
+    ) -> None:
+        """按 ON DELETE CASCADE 递归删除子行；RESTRICT 子行会阻止删除。"""
+        for child in self._catalog.list_tables():
+            for fk in child.foreign_keys.values():
+                if fk.ref_table != table.name:
+                    continue
+                key = tuple(
+                    values[table.column_index(name)] for name in fk.ref_columns
+                )
+                if any(value is None for value in key):
+                    continue
+                child_heap = HeapFile(self._bp, child, self._txns)
+                matches: list[tuple[RID, list[Any]]] = []
+                for rid, child_values in child_heap.scan(txn):
+                    ident = (child.name, rid)
+                    if ident in deleted or ident in processing:
+                        continue
+                    child_key = tuple(
+                        child_values[child.column_index(name)]
+                        for name in fk.columns
+                    )
+                    if any(value is None for value in child_key):
+                        continue
+                    if child_key == key:
+                        matches.append((rid, child_values))
+                if not matches:
+                    continue
+                if fk.on_delete != "CASCADE":
+                    raise ForeignKeyViolationError(
+                        f"外键约束 {fk.name!r} 阻止删除被引用行",
+                        detail=(
+                            f"表 {child.name} 中仍有行引用 "
+                            f"{table.name}.{fk.ref_columns} = {key}"
+                        ),
+                        hint="先 DELETE/UPDATE 引用行，或使用 ON DELETE CASCADE",
+                    )
+                for child_rid, child_values in matches:
+                    ident = (child.name, child_rid)
+                    if ident in deleted or ident in processing:
+                        continue
+                    processing.add(ident)
+                    self._snapshot_table_state(child, txn)
+                    self._cascade_delete_children(
+                        child, child_values, txn, deleted, processing
+                    )
+                    self._delete_index_entries(child, child_values, txn, child_rid)
+                    child_heap.delete(txn, child_rid)
+                    processing.discard(ident)
+                    deleted.add(ident)
 
     def _check_referenced_by(
         self,

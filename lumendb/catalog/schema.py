@@ -106,12 +106,13 @@ class CheckDef:
 
 @dataclass(frozen=True)
 class ForeignKeyDef:
-    """引用另一张表（或自身）的外键约束；只做 RESTRICT，不做级联。"""
+    """引用另一张表（或自身）的外键约束；删除动作支持 RESTRICT / CASCADE。"""
 
     name: str
     columns: tuple[str, ...]
     ref_table: str
     ref_columns: tuple[str, ...]
+    on_delete: str = "RESTRICT"
 
     def to_json(self) -> dict:
         return {
@@ -119,6 +120,7 @@ class ForeignKeyDef:
             "columns": list(self.columns),
             "ref_table": self.ref_table,
             "ref_columns": list(self.ref_columns),
+            "on_delete": self.on_delete,
         }
 
     @classmethod
@@ -128,6 +130,7 @@ class ForeignKeyDef:
             columns=tuple(data["columns"]),
             ref_table=data["ref_table"],
             ref_columns=tuple(data["ref_columns"]),
+            on_delete=data.get("on_delete", "RESTRICT"),
         )
 
 
@@ -286,6 +289,10 @@ def validate_table_def(table: TableDef) -> None:
             )
         if not fk.ref_columns:
             raise NotSupportedError(f"外键 {name!r} 没有被引用列")
+        if fk.on_delete not in ("RESTRICT", "CASCADE"):
+            raise NotSupportedError(
+                f"外键 {name!r} 的删除动作非法：{fk.on_delete!r}"
+            )
         for cname in fk.columns:
             if not table.has_column(cname):
                 raise ColumnNotFoundError(

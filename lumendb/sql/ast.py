@@ -345,6 +345,7 @@ class ForeignKeySpec:
     ref_table: str
     ref_columns: list[str] = field(default_factory=list)
     name: Optional[str] = None
+    on_delete: str = "RESTRICT"
 
 
 @dataclass(frozen=True)
@@ -369,6 +370,7 @@ class TableConstraint:
     check: Optional[CheckSpec] = None
     ref_table: Optional[str] = None
     ref_columns: list[str] = field(default_factory=list)
+    on_delete: str = "RESTRICT"
 
 
 @dataclass

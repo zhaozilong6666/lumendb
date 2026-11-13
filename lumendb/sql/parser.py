@@ -582,12 +582,14 @@ class Parser:
                 while self._match_punct("comma"):
                     ref_columns.append(self._parse_ident("被引用列名"))
                 self._expect_punct("rparen", ")")
+            on_delete = self._parse_fk_actions()
             return TableConstraint(
                 kind="FOREIGN KEY",
                 columns=fk_columns,
                 name=name,
                 ref_table=ref_table,
                 ref_columns=ref_columns,
+                on_delete=on_delete,
             )
         else:
             raise self._error(
@@ -675,12 +677,40 @@ class Parser:
             while self._match_punct("comma"):
                 ref_columns.append(self._parse_ident("被引用列名"))
             self._expect_punct("rparen", ")")
+        on_delete = self._parse_fk_actions()
         return ForeignKeySpec(
             columns=columns,
             ref_table=ref_table,
             ref_columns=ref_columns,
             name=name,
+            on_delete=on_delete,
         )
+
+    def _parse_fk_actions(self) -> str:
+        """解析外键 ON DELETE/UPDATE 动作；当前只实现 ON DELETE CASCADE/RESTRICT。"""
+        on_delete = "RESTRICT"
+        while self._match_kw("ON"):
+            if self._match_kw("DELETE"):
+                if self._match_kw("CASCADE"):
+                    on_delete = "CASCADE"
+                elif self._match_kw("RESTRICT"):
+                    on_delete = "RESTRICT"
+                else:
+                    raise NotSupportedError(
+                        "外键 ON DELETE 仅支持 CASCADE 或 RESTRICT",
+                        hint="暂不支持 SET NULL / SET DEFAULT / NO ACTION",
+                    )
+            elif self._match_kw("UPDATE"):
+                if self._match_kw("RESTRICT"):
+                    pass
+                else:
+                    raise NotSupportedError(
+                        "暂不支持 ON UPDATE CASCADE/SET NULL",
+                        hint="被引用键更新仍按 RESTRICT 处理",
+                    )
+            else:
+                raise self._error("ON 之后期望 DELETE 或 UPDATE")
+        return on_delete
 
     def _parse_type(self) -> TypeSpec:
         tok = self._cur

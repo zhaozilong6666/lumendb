@@ -164,15 +164,18 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 （SQLSTATE `23503`）。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
 `UPDATE` 都走同一入口；`UPDATE` 改被引用键、`DELETE` 删被引用行时，再由
 `_check_referenced_by` 扫描所有引用表（自引用时跳过当前 RID）执行 `RESTRICT`。
+`ON DELETE CASCADE` 则由 `_cascade_delete_children` 递归处理：先收集匹配子行，
+`RESTRICT` 子行立即报错，`CASCADE` 子行递归删除其子行后再删索引项和堆版本；
+临时 `processing` / `deleted` 集合用于打断自引用环，事务 abort 会恢复所有页和目录。
 实现是逐表扫描而非依赖索引定位，正确性优先，规模上仍是 O(子表行数)。
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
 拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 拒绝删除支撑外键的唯一键；
 `DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 拒绝被引用的表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
-`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前不支持
-`ON DELETE/UPDATE CASCADE`、`SET NULL`、`DEFERRABLE`、`MATCH FULL/PARTIAL`，也不支持
-`ADD COLUMN ... REFERENCES`。
+`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前
+`ON UPDATE` 只支持 `RESTRICT`，不支持 `SET NULL`、`SET DEFAULT`、`DEFERRABLE`、
+`MATCH FULL/PARTIAL`，也不支持 `ADD COLUMN ... REFERENCES`。
 
 ### 2.10 视图
 
