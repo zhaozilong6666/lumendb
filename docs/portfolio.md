@@ -53,7 +53,7 @@
 >   heap，被索引/约束引用的列要求先删除依赖；`UPDATE ... FROM` 支持单源表连接更新，
 >   `DELETE ... USING` 支持单源表连接删除；`RENAME CONSTRAINT` 可改 CHECK/UNIQUE/
 >   主键约束名；列级 `REFERENCES` / 表级 `FOREIGN KEY` 支持复合键、自引用和默认
->   取主键，`MATCH SIMPLE` NULL 跳过，支持 `ON DELETE/UPDATE CASCADE` 递归处理、
+>   取主键，`MATCH SIMPLE/FULL` NULL 语义，支持 `ON DELETE/UPDATE CASCADE` 递归处理、
 >   `SET NULL` 置空、`SET DEFAULT` 回填默认值与默认 `RESTRICT`，写入/更新/删除统一
 >   校验并在目录中持久化，同时保护
 >   DROP COLUMN / ALTER TYPE / DROP TABLE / TRUNCATE 等依赖路径；
@@ -64,7 +64,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 834 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 837 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -123,8 +123,8 @@
 >   `DELETE ... USING` supports one source table for joined deletes;
 >   `RENAME CONSTRAINT` renames CHECK/UNIQUE/primary-key constraints;
 >   column-level `REFERENCES` and table-level `FOREIGN KEY` constraints support
->   composite keys, self-references and implicit primary-key targets, enforce
->   `MATCH SIMPLE` NULL semantics, support `ON DELETE/UPDATE CASCADE`,
+>   composite keys, self-references and implicit primary-key targets, support
+>   `MATCH SIMPLE/FULL` NULL semantics, `ON DELETE/UPDATE CASCADE`,
 >   `SET NULL`, `SET DEFAULT` and the default `RESTRICT` on writes, updates and deletes,
 >   persist in the catalog, and guard `DROP COLUMN` / `ALTER TYPE` / `DROP TABLE`
 >   / `TRUNCATE` dependency paths;
@@ -139,7 +139,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 834 automated tests including crash-injection and a 20-seed randomized
+> - 837 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

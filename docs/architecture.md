@@ -159,9 +159,10 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 一致，并生成 `<table>_<cols>_fkey` 默认名（冲突追加 `_2`）。被引用唯一索引可以来自
 主键、UNIQUE 约束或普通 `CREATE UNIQUE INDEX`，只要索引键完全匹配。
 
-写入路径在 `_check_foreign_keys` 中按 `MATCH SIMPLE` 检查：本地键任一列为 `NULL`
-就跳过，否则扫描被引用表，找不到完整匹配行就抛 `ForeignKeyViolationError`
-（SQLSTATE `23503`）。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
+写入路径在 `_check_foreign_keys` 中按外键的 `MATCH` 模式检查：`SIMPLE` 下本地键
+任一列为 `NULL` 就跳过；`FULL` 下要么全为 `NULL`，要么全部非 `NULL`，部分 `NULL`
+直接抛 `ForeignKeyViolationError`（SQLSTATE `23503`）；否则扫描被引用表，找不到
+完整匹配行也抛 `ForeignKeyViolationError`。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
 `UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 扫描所有
 引用表（自引用时跳过当前 RID）：`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
 `SET NULL` 收集并将匹配外键列置空，`SET DEFAULT` 收集并写入列默认值，在父行写堆后
@@ -179,7 +180,7 @@ DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / 
 拒绝被引用的表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
 `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前
 `ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`，
-不支持 `NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；`ADD COLUMN ... REFERENCES`
+`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`、`NO ACTION`、`DEFERRABLE`；`ADD COLUMN ... REFERENCES`
 复用 `ADD CONSTRAINT FOREIGN KEY` 的存量行校验路径，先加列再原子建立外键，失败时
 整条语句回滚。
 

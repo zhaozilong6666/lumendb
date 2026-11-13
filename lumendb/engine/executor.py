@@ -1016,6 +1016,7 @@ class Executor:
                 ref_columns=ref_columns,
                 on_delete=spec.on_delete,
                 on_update=spec.on_update,
+                match_type=spec.match_type,
             )
             used.add(name)
 
@@ -1033,6 +1034,7 @@ class Executor:
                     name=constraint.name,
                     on_delete=constraint.on_delete,
                     on_update=constraint.on_update,
+                    match_type=constraint.match_type,
                 ),
                 list(constraint.columns),
             )
@@ -1320,6 +1322,7 @@ class Executor:
                         ref_columns=list(ref.ref_columns),
                         on_delete=ref.on_delete,
                         on_update=ref.on_update,
+                        match_type=ref.match_type,
                     ),
                 ),
                 txn,
@@ -1849,6 +1852,7 @@ class Executor:
                 ref_columns=ref_columns,
                 on_delete=constraint.on_delete,
                 on_update=constraint.on_update,
+                match_type=constraint.match_type,
             )
             provisional = TableDef(
                 name=table.name,
@@ -3094,12 +3098,24 @@ class Executor:
     def _check_foreign_keys(
         self, table: TableDef, values: list[Any], txn: Transaction
     ) -> None:
-        """MATCH SIMPLE：任一本地列为 NULL 就跳过；否则被引用行必须存在。"""
+        """MATCH SIMPLE：任一本地列为 NULL 就跳过；MATCH FULL 要求全空或全非空。"""
         for fk in table.foreign_keys.values():
             local_key = tuple(
                 values[table.column_index(name)] for name in fk.columns
             )
-            if any(value is None for value in local_key):
+            if fk.match_type == "FULL":
+                if all(value is None for value in local_key):
+                    continue
+                if any(value is None for value in local_key):
+                    raise ForeignKeyViolationError(
+                        f"外键约束 {fk.name!r} 的 MATCH FULL 不允许部分 NULL",
+                        detail=(
+                            f"表 {table.name} 的 {fk.columns} 要么全为 NULL，"
+                            "要么全部非 NULL"
+                        ),
+                        hint="补齐所有外键列，或将它们全部置为 NULL",
+                    )
+            elif any(value is None for value in local_key):
                 continue
             ref_table = self._catalog.get_table(fk.ref_table)
             ref_positions = [ref_table.column_index(name) for name in fk.ref_columns]

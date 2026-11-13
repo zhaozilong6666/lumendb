@@ -12,6 +12,7 @@
 | 列级 `REFERENCES` / 表级 `FOREIGN KEY` | 完成 | 支持复合键、自引用、省略被引用列（取主键） |
 | 写入引用完整性 | 完成 | `INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert、`UPDATE` 统一校验；SQLSTATE `23503` |
 | `MATCH SIMPLE` | 完成 | 本地键任一列为 `NULL` 时跳过检查 |
+| `MATCH FULL` | 完成 | 复合本地键必须全 `NULL` 或全非 `NULL`，部分 `NULL` 报错 |
 | `ON DELETE RESTRICT` | 完成 | 默认动作，阻止删除仍被引用的父行 |
 | `ON DELETE CASCADE` | 完成 | 递归删除子行，维护子表索引，支持多级链与自引用链 |
 | `ON DELETE SET NULL` | 完成 | 将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
@@ -42,9 +43,11 @@ on_update: str = "RESTRICT"
 
 ### 2.2 插入与更新校验
 
-`_check_foreign_keys` 按 `MATCH SIMPLE` 扫描被引用表：
+`_check_foreign_keys` 按外键的 `MATCH` 模式扫描被引用表：
 
-- 本地键任一列为 `NULL`：跳过；
+- `MATCH SIMPLE`：本地键任一列为 `NULL`：跳过；
+- `MATCH FULL`：本地键全为 `NULL`：跳过；部分 `NULL`：直接报错；全非 `NULL`：
+  继续查找完整匹配行；
 - 否则必须在被引用表中找到完整匹配行；
 - 找不到抛 `ForeignKeyViolationError`。
 
@@ -91,7 +94,7 @@ on_update: str = "RESTRICT"
 
 ## 3. 测试与验证
 
-- 全量测试：**834 passed**（`python -m pytest tests -q`，约 36 秒）
+- 全量测试：**837 passed**（`python -m pytest tests -q`，约 36 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -99,6 +102,7 @@ on_update: str = "RESTRICT"
   - `ON DELETE CASCADE` 单级/多级/自引用链、索引维护、事务回滚；
   - `ON UPDATE CASCADE` 单级/多级/自引用链、事务回滚；
   - `ON DELETE SET NULL` / `ON UPDATE SET NULL`、`NOT NULL` 冲突回滚；
+  - `MATCH FULL` 全空/全非空/部分 NULL 拒绝；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -138,8 +142,9 @@ CI：
 
 ## 5. 遗留风险与未实现项
 
-1. **动作子集仍有限**：未实现 `NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL`；
-   当前已支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`。
+1. **动作子集仍有限**：未实现 `NO ACTION`、`DEFERRABLE`、`MATCH PARTIAL`；
+   当前已支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和
+   `MATCH SIMPLE` / `MATCH FULL`。
 2. **外键检查是全表扫描**：`_check_foreign_keys` 和级联收集都逐表扫描，
    复杂度与子表行数线性相关，未利用唯一索引点查；数据量大时需要索引定位优化。
 3. **复杂循环图**：`_updating` / `processing` 能打断常见自引用环，但菱形依赖、
@@ -160,4 +165,5 @@ CI：
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
 索引维护、事务回滚、持久化和文档均已落地；全量 822 个测试通过，最新代码提交
 `9cc420f` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
-`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 子集。
+`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 与
+`MATCH SIMPLE` / `MATCH FULL` 子集。

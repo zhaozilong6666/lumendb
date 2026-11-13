@@ -171,6 +171,28 @@ class TestCreateTable:
                 "CREATE TABLE t (a INT REFERENCES other(id) ON DELETE SET FOO)"
             )
 
+    def test_foreign_key_match_full(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES other(x, y) MATCH FULL)"
+        )
+        fk = next(c for c in stmt.constraints if c.kind == "FOREIGN KEY")
+        assert fk.match_type == "FULL"
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) MATCH SIMPLE)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.match_type == "SIMPLE"
+
+    def test_foreign_key_match_partial_rejected(self):
+        with pytest.raises(NotSupportedError):
+            parse_statement(
+                "CREATE TABLE t (a INT, b INT, "
+                "FOREIGN KEY (a, b) REFERENCES other(x, y) MATCH PARTIAL)"
+            )
+
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
 

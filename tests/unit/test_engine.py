@@ -3242,6 +3242,21 @@ class TestForeignKey:
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("DELETE FROM p WHERE a = 1 AND b = 2")
 
+    def test_match_full_allows_all_null_or_full_key(self, db):
+        db.execute_one(
+            "CREATE TABLE p (x INT, y INT, PRIMARY KEY (x, y))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(x, y) MATCH FULL)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2), (NULL, NULL)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1, NULL)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("UPDATE c SET b = NULL WHERE a = 1")
+
     def test_on_delete_cascade(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

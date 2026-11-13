@@ -139,8 +139,10 @@ ALTER TABLE child ADD CONSTRAINT fk_child_parent2
 
 列级 `REFERENCES` 可省略被引用列（`pid INT REFERENCES parent`），此时取被引用表的
 主键；表级约束也遵循同样规则。被引用列必须存在，并且上有 `UNIQUE` 或 `PRIMARY KEY`
-索引；引用列与被引用列数量、顺序一致，类型必须完全相同。外键按 SQL 的 `MATCH
-SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查。删除动作默认
+索引；引用列与被引用列数量、顺序一致，类型必须完全相同。外键默认按 `MATCH
+SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显式 `MATCH FULL`
+则要求复合本地键全为 `NULL` 或全非 `NULL`，部分 `NULL` 直接抛
+`ForeignKeyViolationError`（SQLSTATE `23503`）。`MATCH PARTIAL` 暂不支持。删除动作默认
 `RESTRICT`，支持 `ON DELETE CASCADE` 递归删除子行、`ON DELETE SET NULL`
 将匹配子行的外键列置为 `NULL`，以及 `ON DELETE SET DEFAULT` 将匹配子行的外键列
 置为列默认值；更新被引用键默认 `RESTRICT`，支持 `ON UPDATE CASCADE` 递归同步
@@ -366,7 +368,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`；不支持 `NO ACTION`、`DEFERRABLE`、`MATCH FULL/PARTIAL` |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；不支持 `NO ACTION`、`DEFERRABLE` |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

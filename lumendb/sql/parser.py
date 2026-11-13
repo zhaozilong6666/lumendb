@@ -582,6 +582,7 @@ class Parser:
                 while self._match_punct("comma"):
                     ref_columns.append(self._parse_ident("被引用列名"))
                 self._expect_punct("rparen", ")")
+            match_type = self._parse_fk_match()
             on_delete, on_update = self._parse_fk_actions()
             return TableConstraint(
                 kind="FOREIGN KEY",
@@ -591,6 +592,7 @@ class Parser:
                 ref_columns=ref_columns,
                 on_delete=on_delete,
                 on_update=on_update,
+                match_type=match_type,
             )
         else:
             raise self._error(
@@ -678,6 +680,7 @@ class Parser:
             while self._match_punct("comma"):
                 ref_columns.append(self._parse_ident("被引用列名"))
             self._expect_punct("rparen", ")")
+        match_type = self._parse_fk_match()
         on_delete, on_update = self._parse_fk_actions()
         return ForeignKeySpec(
             columns=columns,
@@ -686,6 +689,20 @@ class Parser:
             name=name,
             on_delete=on_delete,
             on_update=on_update,
+            match_type=match_type,
+        )
+
+    def _parse_fk_match(self) -> str:
+        """解析可选 ``MATCH FULL`` / ``MATCH SIMPLE``；PARTIAL 暂不支持。"""
+        if not self._match_kw("MATCH"):
+            return "SIMPLE"
+        if self._match_kw("FULL"):
+            return "FULL"
+        if self._match_kw("SIMPLE"):
+            return "SIMPLE"
+        raise NotSupportedError(
+            "外键 MATCH 只支持 SIMPLE 或 FULL",
+            hint="MATCH PARTIAL 暂不支持",
         )
 
     def _parse_fk_actions(self) -> tuple[str, str]:
