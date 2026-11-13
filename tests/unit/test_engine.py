@@ -376,6 +376,20 @@ class TestInsert:
         second.execute_one("INSERT INTO t VALUES (1, 3)")
         second.close()
 
+    def test_table_constraints_reject_bad_ddl(self, db):
+        with pytest.raises(BinderError):
+            db.execute_one(
+                "CREATE TABLE t1 (a INT, b INT, UNIQUE (a, missing))"
+            )
+        with pytest.raises(NotSupportedError):
+            db.execute_one(
+                "CREATE TABLE t2 (a INT PRIMARY KEY, b INT, PRIMARY KEY (a, b))"
+            )
+        with pytest.raises(NotSupportedError):
+            db.execute_one(
+                "CREATE TABLE t3 (a INT, b INT, PRIMARY KEY (a), PRIMARY KEY (b))"
+            )
+
     def test_on_conflict_do_update_uses_target_index(self, db):
         db.execute_one("CREATE TABLE t (id INT, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a')")

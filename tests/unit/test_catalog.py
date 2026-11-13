@@ -75,6 +75,17 @@ class TestSchemaPersistence:
             cat.create_table(txn, "users", users_columns())
         txns.abort(txn)
 
+    def test_duplicate_index_name_rejected(self, env):
+        cat, txns, bp, dm, wal = env
+        txn = txns.begin()
+        indexes = [
+            IndexDef(name="idx_dup", table="users", columns=("name",), unique=True),
+            IndexDef(name="idx_dup", table="users", columns=("age",), unique=True),
+        ]
+        with pytest.raises(IndexAlreadyExistsError):
+            cat.create_table(txn, "users", users_columns(), indexes)
+        txns.abort(txn)
+
     def test_drop_table(self, env):
         cat, txns, bp, dm, wal = env
         txn = txns.begin()

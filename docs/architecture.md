@@ -104,6 +104,20 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 里的名字并同步索引列引用，不搬页也不重写记录；真正需要行格式迁移的删列、改类型
 仍未实现。
 
+### 2.8 表级约束
+
+列级 `PRIMARY KEY` / `UNIQUE` 之外，`CREATE TABLE` 也接受表级
+`PRIMARY KEY (a, b)` 和 `UNIQUE (a, b)`，可带 `CONSTRAINT name`。执行器把
+表级约束落成**一个复合唯一 B+ 索引**：复合主键参与列在目录里被标记为
+`primary_key=True, nullable=False`，索引名默认 `<table>_pkey`；复合唯一约束默认
+`<table>_<col...>_key`。约束名不是独立目录对象，而是索引名，因此
+`ON CONFLICT ON CONSTRAINT name` 与 `CREATE UNIQUE INDEX name` 共用同一条解析
+路径，不会出现“约束存在但冲突检测看不到”的分裂状态。
+
+复合主键的 `_check_constraints` 仍走统一唯一键入口；`NULL` 不进入唯一索引，
+主键列的 `NOT NULL` 由写路径先行拒绝。多个主键、列级与表级主键混用、以及
+自动索引名与显式约束名碰撞都会在 DDL 阶段报错，避免 `Catalog` 静默覆盖索引。
+
 ## 3. SQL 与计划
 
 ### 3.1 解析

@@ -114,6 +114,11 @@ class Catalog:
             )
         table = TableDef(name=key, columns=columns)
         for idx in indexes or []:
+            if idx.name in table.indexes:
+                raise IndexAlreadyExistsError(
+                    f"索引/约束名重复：{idx.name}",
+                    hint="同一张表内索引名必须唯一",
+                )
             idx.table = key
             table.indexes[idx.name] = idx
         validate_table_def(table)
