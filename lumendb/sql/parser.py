@@ -490,21 +490,31 @@ class Parser:
             raise self._error("INSERT 之后期望 VALUES 或 SELECT")
 
         on_conflict_nothing = False
+        conflict_columns = None
+        on_conflict_update = None
         if self._match_kw("ON"):
             self._expect_kw("CONFLICT")
             if self._match_punct("lparen"):
-                self._parse_ident("列名")
+                conflict_columns = [self._parse_ident("列名")]
                 while self._match_punct("comma"):
-                    self._parse_ident("列名")
+                    conflict_columns.append(self._parse_ident("列名"))
                 self._expect_punct("rparen", ")")
             self._expect_kw("DO")
             if self._match_kw("NOTHING"):
                 on_conflict_nothing = True
             else:
-                raise NotSupportedError(
-                    "ON CONFLICT DO UPDATE 尚未实现",
-                    hint="当前只支持 ON CONFLICT DO NOTHING",
-                )
+                self._expect_kw("UPDATE")
+                self._expect_kw("SET")
+                on_conflict_update = []
+                while True:
+                    col = self._parse_ident("列名")
+                    if self._cur.is_op("="):
+                        self._advance()
+                    else:
+                        raise self._error("赋值处期望 =")
+                    on_conflict_update.append((col, self._parse_expr()))
+                    if not self._match_punct("comma"):
+                        break
         returning = self._parse_returning()
         return Insert(
             table=table,
@@ -512,6 +522,8 @@ class Parser:
             rows=rows,
             query=query,
             on_conflict_nothing=on_conflict_nothing,
+            conflict_columns=conflict_columns,
+            on_conflict_update=on_conflict_update,
             returning=returning,
         )
 

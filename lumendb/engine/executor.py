@@ -35,6 +35,7 @@ from ..sql.ast import (
     Delete,
     DropIndex,
     DropTable,
+    Expr,
     Explain,
     Insert,
     Query,
@@ -50,6 +51,7 @@ from ..storage.btree import BPlusTree, KeyCodec
 from ..storage.bufferpool import BufferPoolManager
 from ..storage.heap import HeapFile
 from ..storage.page import INVALID_PAGE_ID
+from ..storage.record import RID
 from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
@@ -909,6 +911,16 @@ class Executor:
             [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
         )
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        conflict_index = (
+            self._conflict_index_for(table, stmt.conflict_columns)
+            if stmt.on_conflict_update
+            else None
+        )
+        assignment_fns = (
+            self._compile_conflict_assignments(table, stmt.on_conflict_update)
+            if stmt.on_conflict_update
+            else []
+        )
         returned: list[tuple] = []
         count = 0
 
@@ -919,15 +931,35 @@ class Executor:
                 values.append(fn(EvalContext(())))
 
             prepared = self._prepare_values(table, stmt.columns, values)
-            self._check_constraints(
-                table, prepared, txn, skip_unique=stmt.on_conflict_nothing
-            )
-
-            if stmt.on_conflict_nothing and self._has_unique_conflict(
-                table, prepared, txn
-            ):
-                # 先查再写：这样跳过冲突行不会在堆里留下一条死版本
-                continue
+            if stmt.on_conflict_nothing:
+                self._check_constraints(
+                    table, prepared, txn, skip_unique=True
+                )
+                if self._has_unique_conflict(table, prepared, txn):
+                    continue
+            elif stmt.on_conflict_update:
+                rid = self._find_conflict_rid(
+                    table, prepared, txn, conflict_index
+                )
+                old_values = heap.get(txn, rid) if rid is not None else None
+                if old_values is not None:
+                    prepared = self._apply_conflict_update(
+                        table, heap, txn, rid, old_values, assignment_fns
+                    )
+                    if ret_fns:
+                        returned.append(
+                            tuple(
+                                fn(EvalContext(tuple(prepared)))
+                                for fn in ret_fns
+                            )
+                        )
+                    count += 1
+                    continue
+                # 冲突目标上没有找到可更新行，按普通插入处理，
+                # 其它唯一索引的冲突会在下面报出来。
+                self._check_constraints(table, prepared, txn)
+            else:
+                self._check_constraints(table, prepared, txn)
 
             rid = heap.insert(txn, prepared)
             for idx in table.indexes.values():
@@ -953,6 +985,104 @@ class Executor:
             tag=f"INSERT {count}",
         )
 
+    def _conflict_index_for(
+        self, table: TableDef, columns: Optional[list[str]]
+    ) -> Optional[IndexDef]:
+        """把 ``ON CONFLICT (col, ...)`` 映射到唯一索引。"""
+        if columns is None:
+            return None
+        wanted = list(columns)
+        for idx in table.indexes.values():
+            if idx.unique and list(idx.columns) == wanted:
+                for name in wanted:
+                    table.column_index(name)
+                return idx
+        raise BinderError(
+            "ON CONFLICT 的目标没有匹配的唯一索引",
+            detail=f"目标列：{', '.join(wanted)}",
+            hint="先在该列组合上建 UNIQUE 索引，或省略冲突目标",
+        )
+
+    def _find_conflict_rid(
+        self,
+        table: TableDef,
+        values: list[Any],
+        txn: Transaction,
+        conflict_index: Optional[IndexDef] = None,
+    ) -> Optional[RID]:
+        """返回与插入值冲突的已存在根 RID。"""
+        indexes = (
+            [conflict_index]
+            if conflict_index is not None
+            else list(table.indexes.values())
+        )
+        for idx in indexes:
+            if not idx.unique:
+                continue
+            key = self._key_for(table, idx, values)
+            if key is None:
+                continue
+            rid = self._tree_for(table, idx).lookup_one(txn, key)
+            if rid is not None:
+                return rid
+        return None
+
+    def _compile_conflict_assignments(
+        self,
+        table: TableDef,
+        assignments: Optional[list[tuple[str, Expr]]],
+    ) -> list[tuple[int, Any]]:
+        if assignments is None:
+            return []
+        schema = Schema(
+            [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
+        )
+        compiled: list[tuple[int, Any]] = []
+        for name, expr in assignments:
+            index = table.column_index(name)
+            fn, _ = self.binder.compile(expr, schema, allow_agg=False)
+            compiled.append((index, fn))
+        return compiled
+
+    def _apply_conflict_update(
+        self,
+        table: TableDef,
+        heap: HeapFile,
+        txn: Transaction,
+        rid: RID,
+        old_values: list[Any],
+        assignment_fns: list[tuple[int, Any]],
+    ) -> list[Any]:
+        old_tuple = tuple(old_values)
+        ctx = EvalContext(old_tuple)
+        new_values = list(old_tuple)
+        for index, fn in assignment_fns:
+            new_values[index] = fn(ctx)
+        prepared = self._prepare_values(table, None, new_values)
+
+        changed_indexes = [
+            idx
+            for idx in table.indexes.values()
+            if self._key_for(table, idx, old_tuple)
+            != self._key_for(table, idx, prepared)
+        ]
+        for idx in changed_indexes:
+            self._check_update_unique(table, idx, old_tuple, prepared, txn, rid)
+        for idx in changed_indexes:
+            old_key = self._key_for(table, idx, old_tuple)
+            if old_key is not None:
+                self._tree_for(table, idx).delete(txn, old_key, rid)
+
+        heap.update(txn, rid, prepared)
+
+        for idx in changed_indexes:
+            tree = self._tree_for(table, idx)
+            new_key = self._key_for(table, idx, prepared)
+            if new_key is not None:
+                tree.insert(txn, new_key, rid)
+            idx.root_page = tree.root_page
+        return prepared
+
     def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
         if stmt.ctes:
             plan, out_cols = self.binder.bind_query(
@@ -977,17 +1107,47 @@ class Executor:
             [SchemaColumn(table.name, c.name, c.type) for c in table.columns]
         )
         ret_fns, ret_cols = self.binder.bind_returning(stmt.returning, schema)
+        conflict_index = (
+            self._conflict_index_for(table, stmt.conflict_columns)
+            if stmt.on_conflict_update
+            else None
+        )
+        assignment_fns = (
+            self._compile_conflict_assignments(table, stmt.on_conflict_update)
+            if stmt.on_conflict_update
+            else []
+        )
         returned: list[tuple] = []
         count = 0
         for values in source_rows:
             prepared = self._prepare_values(table, stmt.columns, list(values))
-            self._check_constraints(
-                table, prepared, txn, skip_unique=stmt.on_conflict_nothing
-            )
-            if stmt.on_conflict_nothing and self._has_unique_conflict(
-                table, prepared, txn
-            ):
-                continue
+            if stmt.on_conflict_nothing:
+                self._check_constraints(
+                    table, prepared, txn, skip_unique=True
+                )
+                if self._has_unique_conflict(table, prepared, txn):
+                    continue
+            elif stmt.on_conflict_update:
+                rid = self._find_conflict_rid(
+                    table, prepared, txn, conflict_index
+                )
+                old_values = heap.get(txn, rid) if rid is not None else None
+                if old_values is not None:
+                    prepared = self._apply_conflict_update(
+                        table, heap, txn, rid, old_values, assignment_fns
+                    )
+                    if ret_fns:
+                        returned.append(
+                            tuple(
+                                fn(EvalContext(tuple(prepared)))
+                                for fn in ret_fns
+                            )
+                        )
+                    count += 1
+                    continue
+                self._check_constraints(table, prepared, txn)
+            else:
+                self._check_constraints(table, prepared, txn)
 
             rid = heap.insert(txn, prepared)
             for idx in table.indexes.values():
@@ -1069,6 +1229,10 @@ class Executor:
                 for idx in table.indexes.values()
                 if self._key_for(table, idx, old_tuple) != self._key_for(table, idx, prepared)
             ]
+            for idx in changed_indexes:
+                self._check_update_unique(
+                    table, idx, old_tuple, prepared, txn, rid
+                )
             for idx in changed_indexes:
                 old_key = self._key_for(table, idx, old_tuple)
                 if old_key is not None:
@@ -1188,6 +1352,29 @@ class Executor:
             coerced = col.type.coerce(value)
             prepared.append(coerced)
         return prepared
+
+    def _check_update_unique(
+        self,
+        table: TableDef,
+        idx: IndexDef,
+        old_values: Iterable[Any],
+        new_values: Iterable[Any],
+        txn: Transaction,
+        rid: RID,
+    ) -> None:
+        """UPDATE/upsert 改变唯一索引键时，先查新键是否被别的行占用。"""
+        if not idx.unique:
+            return
+        old_key = self._key_for(table, idx, old_values)
+        new_key = self._key_for(table, idx, new_values)
+        if new_key is None or old_key == new_key:
+            return
+        existing = self._tree_for(table, idx).lookup_one(txn, new_key)
+        if existing is not None and existing != rid:
+            raise DuplicateKeyError(
+                f"唯一约束冲突：索引 {idx.name}",
+                detail=f"列 {', '.join(idx.columns)} 上已存在相同的值",
+            )
 
     def _check_constraints(
         self,

@@ -42,6 +42,8 @@ CREATE TABLE t AS SELECT id, name FROM src WHERE age >= 18;
 INSERT INTO t VALUES (1, 'a', 3), (2, 'b', 4);
 INSERT INTO t (id, name) VALUES (1, 'a');
 INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING;  -- 唯一键冲突时跳过该行
+INSERT INTO t VALUES (1, 'a') ON CONFLICT (id)
+  DO UPDATE SET name = 'updated';                      -- 冲突时更新已有行
 INSERT INTO t (id, name) SELECT id, name FROM src WHERE age >= 18;
 UPDATE t SET age = age + 1 WHERE id = 1 RETURNING id, age;
 DELETE FROM t WHERE age < 0 RETURNING id, name;
@@ -52,6 +54,10 @@ WITH old AS (SELECT id FROM t WHERE age < 0) DELETE FROM t
 `RETURNING` 支持 `*` 和任意表达式，可带 `AS` 别名；INSERT/UPDATE 在**新行**上求值，
 DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此未知列的 `RETURNING`
 不会先写入再报错。`ON CONFLICT DO NOTHING` 跳过的行不会出现在返回结果里。
+`ON CONFLICT DO UPDATE` 会把冲突行更新为新值，`RETURNING` 返回更新后的行；
+不带冲突目标时取第一个命中的唯一索引，带 `(col, ...)` 时要求存在完全匹配的
+唯一索引。赋值表达式可以引用旧行当前列，但不支持 `excluded.col` 和
+`ON CONFLICT ... DO UPDATE ... WHERE`。
 `WITH` 后面除 SELECT/INSERT 外也接受 UPDATE/DELETE；CTE 只在当前语句内可见。
 
 `INSERT ... SELECT` 的列数必须与目标列一致（有列清单时按列清单算），绑定阶段就会
@@ -167,7 +173,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
 | **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
-| `ON CONFLICT DO UPDATE` / 指定冲突目标 | 只支持 `ON CONFLICT DO NOTHING`，且按"任意唯一索引冲突"跳过 |
+| `ON CONFLICT` 的 `excluded` 列、`DO UPDATE ... WHERE`、`ON CONFLICT ON CONSTRAINT` | 支持 `DO NOTHING` / `DO UPDATE SET`，冲突目标必须是唯一索引的列组合 |
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
@@ -182,6 +188,9 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 - `SAVEPOINT` 是事务内保存点：`ROLLBACK TO` 会撤销保存点之后的页写入
   和 DDL/目录对象变更，事务继续保持活动；`RELEASE` 连同它之后建立的
   保存点一起释放。保存点不写 WAL、不跨连接持久化。
+- `ON CONFLICT DO NOTHING` 目前会把任意唯一索引冲突都当作"跳过"，
+  `(col, ...)` 目标只对 `DO UPDATE` 做精确匹配；`excluded.col` 和
+  `DO UPDATE ... WHERE` 尚未实现。
 - 单列等值条件与单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）在列上有索引时
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。

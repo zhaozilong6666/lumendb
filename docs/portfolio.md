@@ -37,6 +37,8 @@
 >   `INSERT ... SELECT` 先物化来源再批量写入（避免自插入无限增长），
 >   `CREATE TABLE AS SELECT` 从查询输出推断列名/类型并落表，
 >   `INSERT` / `UPDATE` / `DELETE` 支持 `RETURNING`（新行/旧行语义、`*` 展开），
+>   `INSERT ... ON CONFLICT DO UPDATE` 支持冲突目标匹配唯一索引并在旧行上
+>   计算赋值、同步索引，
 >   `EXCEPT` / `INTERSECT` 支持集合差与交集（`INTERSECT` 优先级更高），
 >   `ALTER TABLE ADD COLUMN` 走目录升级 + 旧记录读时补齐（不重写堆页），
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` 只改目录并同步索引列引用；
@@ -44,7 +46,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 632 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 639 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -78,6 +80,8 @@
 >   `CREATE TABLE AS SELECT` infers column names/types and creates a plain table;
 >   `INSERT` / `UPDATE` / `DELETE` support `RETURNING` (new-row/old-row semantics
 >   and `*` expansion);
+>   `INSERT ... ON CONFLICT DO UPDATE` matches unique-index conflict targets,
+>   evaluates assignments on the old row and maintains indexes;
 >   `EXCEPT` / `INTERSECT` implement set difference and intersection;
 >   `ALTER TABLE ADD COLUMN` upgrades
 >   the catalog and pads old records at read time instead of rewriting the heap;
@@ -89,7 +93,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 632 automated tests including crash-injection and a 20-seed randomized
+> - 639 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

@@ -378,6 +378,10 @@ class Insert(Statement):
     ctes: list["Cte"] = field(default_factory=list)
     #: ``ON CONFLICT DO NOTHING``：唯一键冲突时跳过该行而不是报错
     on_conflict_nothing: bool = False
+    #: ``ON CONFLICT (col, ...)`` 的冲突目标；为 None 时匹配任意唯一索引
+    conflict_columns: Optional[list[str]] = None
+    #: ``ON CONFLICT DO UPDATE SET ...`` 的赋值；为 None 时不是 DO UPDATE
+    on_conflict_update: Optional[list[tuple[str, Expr]]] = None
     #: ``RETURNING`` 表达式及其可选别名；为 None 时不返回行
     returning: Optional[list["SelectItem"]] = None
 

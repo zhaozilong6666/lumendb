@@ -314,6 +314,72 @@ class TestInsert:
         assert result.affected == 2
         assert rows(db, "SELECT COUNT(*) FROM dst") == [(2,)]
 
+    def test_on_conflict_do_update_existing_row(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 10)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (1, 20) "
+            "ON CONFLICT DO UPDATE SET n = n + 5 RETURNING id, n"
+        )
+        assert result.affected == 1
+        assert result.rows == [(1, 15)]
+        assert rows(db, "SELECT id, n FROM t") == [(1, 15)]
+
+    def test_on_conflict_do_update_uses_target_index(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a')")
+        db.execute_one("CREATE UNIQUE INDEX u_name ON t (name)")
+        db.execute_one(
+            "INSERT INTO t VALUES (2, 'a') "
+            "ON CONFLICT (name) DO UPDATE SET id = 2"
+        )
+        assert rows(db, "SELECT id, name FROM t") == [(2, "a")]
+
+    def test_on_conflict_do_update_inserts_when_no_conflict(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        result = db.execute_one(
+            "INSERT INTO t VALUES (2, 20) ON CONFLICT DO UPDATE SET n = 99"
+        )
+        assert result.affected == 1
+        assert rows(db, "SELECT * FROM t") == [(2, 20)]
+
+    def test_on_conflict_do_update_requires_matching_unique_index(self, db):
+        db.execute_one("CREATE TABLE t (id INT, name TEXT)")
+        with pytest.raises(BinderError):
+            db.execute_one(
+                "INSERT INTO t VALUES (1, 'a') "
+                "ON CONFLICT (name) DO UPDATE SET id = 2"
+            )
+
+    def test_on_conflict_do_update_aborts_on_other_unique_conflict(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("CREATE UNIQUE INDEX u_name ON t (name)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one(
+                "INSERT INTO t VALUES (1, 'b') "
+                "ON CONFLICT (id) DO UPDATE SET name = 'b'"
+            )
+        assert rows(db, "SELECT id, name FROM t ORDER BY id") == [
+            (1, "a"),
+            (2, "b"),
+        ]
+
+    def test_insert_select_on_conflict_do_update(self, db):
+        db.execute_one("CREATE TABLE src (id INT)")
+        db.execute_one("INSERT INTO src VALUES (1), (2)")
+        db.execute_one("CREATE TABLE dst (id INT PRIMARY KEY, seen INT)")
+        db.execute_one("INSERT INTO dst VALUES (1, 0)")
+        result = db.execute_one(
+            "INSERT INTO dst SELECT id, id FROM src "
+            "ON CONFLICT DO UPDATE SET seen = 1"
+        )
+        assert result.affected == 2
+        assert rows(db, "SELECT id, seen FROM dst ORDER BY id") == [
+            (1, 1),
+            (2, 2),
+        ]
+
     def test_insert_select_with_param(self, db):
         db.execute_one("CREATE TABLE src (id INT)")
         db.execute_one("INSERT INTO src VALUES (1), (2)")
@@ -755,6 +821,17 @@ class TestUpdateDelete:
         setup_users(db)
         db.execute_one("UPDATE users SET age = 50")
         assert rows(db, "SELECT COUNT(*) FROM users") == [(3,)]
+
+    def test_update_unique_conflict_aborts(self, db):
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        db.execute_one("CREATE UNIQUE INDEX u_name ON t (name)")
+        db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("UPDATE t SET name = 'b' WHERE id = 1")
+        assert rows(db, "SELECT id, name FROM t ORDER BY id") == [
+            (1, "a"),
+            (2, "b"),
+        ]
 
     def test_update_multi_page_does_not_self_feed(self, db):
         """回归：跨页 UPDATE 曾经边扫边写，把新版本又当成待更新行，无限增长。"""

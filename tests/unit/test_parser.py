@@ -419,11 +419,13 @@ class TestInsertConflict:
         )
         assert stmt.on_conflict_nothing is True
 
-    def test_do_update_not_supported(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement(
-                "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 2"
-            )
+    def test_do_update(self):
+        stmt = parse_statement(
+            "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 2"
+        )
+        assert stmt.on_conflict_update is not None
+        assert stmt.on_conflict_update[0][0] == "a"
+        assert isinstance(stmt.on_conflict_update[0][1], Literal)
 
 
 class TestParameters:
