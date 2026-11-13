@@ -567,6 +567,34 @@ class TestInsert:
         )
         assert rows(db, "SELECT * FROM v") == [(2,)]
 
+    def test_recursive_cte_generates_sequence(self, db):
+        result = rows(
+            db,
+            "WITH RECURSIVE c AS ("
+            "SELECT 1 AS n UNION ALL "
+            "SELECT n + 1 FROM c WHERE n < 5"
+            ") SELECT n FROM c",
+        )
+        assert result == [(1,), (2,), (3,), (4,), (5,)]
+
+    def test_recursive_cte_union_deduplicates(self, db):
+        result = rows(
+            db,
+            "WITH RECURSIVE c AS ("
+            "SELECT 1 AS n UNION "
+            "SELECT n + 1 FROM c WHERE n < 3"
+            ") SELECT n FROM c",
+        )
+        assert result == [(1,), (2,), (3,)]
+
+    def test_view_definition_can_use_recursive_cte(self, db):
+        db.execute_one(
+            "CREATE VIEW v AS WITH RECURSIVE c AS ("
+            "SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3"
+            ") SELECT n FROM c"
+        )
+        assert rows(db, "SELECT * FROM v") == [(1,), (2,), (3,)]
+
     def test_drop_table_blocked_by_view_dependency(self, db):
         db.execute_one("CREATE TABLE t (a INT)")
         db.execute_one("CREATE VIEW v AS SELECT a FROM t")

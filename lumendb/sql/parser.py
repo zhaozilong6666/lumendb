@@ -338,11 +338,7 @@ class Parser:
 
     def _parse_with(self) -> Statement:
         self._expect_kw("WITH")
-        if self._match_kw("RECURSIVE") is not None:
-            raise NotSupportedError(
-                "递归 CTE 尚未实现",
-                hint="当前只支持非递归 WITH",
-            )
+        recursive = self._match_kw("RECURSIVE") is not None
         ctes: list[Cte] = []
         while True:
             name = self._parse_ident("CTE 名")
@@ -354,7 +350,16 @@ class Parser:
             if not self._match_punct("comma"):
                 break
         if self._cur.is_keyword("SELECT"):
-            return Query(select=self._parse_query_expression(), ctes=ctes)
+            return Query(
+                select=self._parse_query_expression(),
+                ctes=ctes,
+                recursive=recursive,
+            )
+        if recursive:
+            raise NotSupportedError(
+                "递归 WITH 后面只支持 SELECT",
+                hint="当前递归 CTE 只用于查询",
+            )
         if self._cur.is_keyword("INSERT"):
             stmt = self._parse_insert()
             stmt.ctes = ctes

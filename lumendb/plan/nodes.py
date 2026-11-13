@@ -107,12 +107,31 @@ class CteScan(PlanNode):
     """``WITH ...`` 定义的命名子查询；child 是已经绑定好的计划。"""
 
     child: Optional[PlanNode] = None
+    #: 递归 CTE 的工作表引用；执行时从执行器的递归上下文取当前轮的行。
+    recursive: bool = False
+    name: str = ""
 
     def children(self):
         return [self.child] if self.child else []
 
     def describe(self) -> str:
         return "CteScan"
+
+
+@dataclass
+class RecursiveCte(PlanNode):
+    """递归 CTE：先产出 seed，再反复执行 recursive 直到没有新行。"""
+
+    name: str = ""
+    seed: Optional[PlanNode] = None
+    recursive: Optional[PlanNode] = None
+    union_all: bool = False
+
+    def children(self):
+        return [c for c in (self.seed, self.recursive) if c is not None]
+
+    def describe(self) -> str:
+        return f"RecursiveCte {self.name}"
 
 
 @dataclass

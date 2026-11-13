@@ -58,9 +58,9 @@ UNIQUE (col...)` / `PRIMARY KEY (col...)` 或 `CREATE UNIQUE INDEX`。`ALTER TAB
 视图引用该视图也会报错，`ALTER TABLE ... RENAME` 同样会拒绝重命名被视图引用的表，
 避免留下悬空定义。视图可以带显式列名清单，例如
 `CREATE VIEW v (x, y) AS SELECT a, b FROM t`；列名数量
-必须与查询输出一致，且列名不能重复，否则在建视图阶段报错。视图定义也支持非递归
-`WITH`（CTE），例如 `CREATE VIEW v AS WITH x AS (SELECT ...) SELECT * FROM x`；
-递归 CTE 和 `WITH ... INSERT/UPDATE/DELETE` 仍不支持。视图不能直接
+必须与查询输出一致，且列名不能重复，否则在建视图阶段报错。视图定义也支持非递归 `WITH` 和递归 CTE，例如
+`CREATE VIEW v AS WITH x AS (SELECT ...) SELECT * FROM x`；
+`WITH ... INSERT/UPDATE/DELETE` 不能作为视图定义。视图不能直接
 `INSERT`/`UPDATE`/`DELETE`；对视图执行 DML 会得到“表不存在”类错误。
 `CREATE OR REPLACE VIEW` 会先完整绑定新定义，成功后再原子替换旧定义；绑定失败时旧视图
 保持不变。`DROP VIEW` 只删除目录定义，不影响基表数据；但若其他视图依赖它，会明确报错，
@@ -123,7 +123,7 @@ SELECT ... UNION ALL SELECT ... ORDER BY 1 LIMIT 5
 类型要兼容，输出列名取第一个 `SELECT`。`ORDER BY` / `LIMIT` / `OFFSET` 作用于
 整个集合结果，排序键只支持输出列名或从 1 开始的列序号。
 
-公共表表达式（非递归 CTE）：
+公共表表达式（CTE）：
 
 ```sql
 WITH adults AS (
@@ -132,11 +132,21 @@ WITH adults AS (
   SELECT id, name FROM adults
 )
 SELECT * FROM names;
+
+WITH RECURSIVE c AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM c WHERE n < 5
+)
+SELECT n FROM c;
 ```
 
 CTE 按书写顺序绑定：后面的 CTE 和主查询都可以引用前面的 CTE；同名的 CTE 会遮蔽
-真实表。`WITH ... INSERT ... SELECT` 同样可用。没有实现递归 `WITH RECURSIVE`，
-也不支持 `WITH x(a, b) AS (...)` 这种列别名清单。
+真实表。`WITH ... INSERT ... SELECT` 同样可用。`WITH RECURSIVE` 支持
+`seed UNION [ALL] recursive` 两部分定义：`UNION ALL` 保留重复，`UNION` 去重；
+递归项引用自身时读取上一轮工作表中的行，直到没有新行；超过 10000 轮会明确报错。
+不支持 `WITH x(a, b) AS (...)` 这种列别名清单，也不支持把递归 CTE 放在
+`WITH ... INSERT/UPDATE/DELETE` 之后。
 
 聚合：`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`，参数可以是任意表达式；支持 `COUNT(DISTINCT x)` / `SUM(DISTINCT x)` / `AVG(DISTINCT x)`。
 

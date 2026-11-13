@@ -75,6 +75,7 @@ from ..plan.nodes import (
     Limit,
     PlanNode,
     Project,
+    RecursiveCte,
     Scan,
     SetOp,
     Sort,
@@ -118,6 +119,8 @@ class Executor:
         self._params: list[Any] = []
         #: 当前语句的 CTE 作用域；子查询执行时复用
         self._active_ctes: dict[str, Any] = {}
+        #: 递归 CTE 当前轮的工作表，只在执行递归节点期间有值
+        self._recursive_rows: dict[str, list[tuple]] = {}
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
@@ -132,6 +135,7 @@ class Executor:
     ) -> Result:
         self._txn = txn
         self._params = list(params) if params else []
+        self._recursive_rows = {}
         # Binder 保存 CTE 作用域和参数；每条语句必须从干净的作用域开始，
         # 否则上一条 WITH 的 CTE 会泄漏到下一句（曾经确实泄漏过）。
         self.binder = self._new_binder()
@@ -328,7 +332,14 @@ class Executor:
             yield from node.rows
             return
         if isinstance(node, CteScan):
-            yield from self._execute(node.child, txn)
+            if node.recursive:
+                yield from self._recursive_rows.get(node.name, [])
+            else:
+                assert node.child is not None
+                yield from self._execute(node.child, txn)
+            return
+        if isinstance(node, RecursiveCte):
+            yield from self._recursive_cte(node, txn)
             return
         if isinstance(node, Scan):
             yield from self._scan(node, txn)
@@ -430,6 +441,50 @@ class Executor:
         heap = HeapFile(self._bp, table, self._txns)
         for _rid, values in heap.scan(txn):
             yield tuple(values)
+
+    def _recursive_cte(
+        self, node: RecursiveCte, txn: Transaction
+    ) -> Iterator[tuple]:
+        """执行 seed，然后反复执行 recursive 项，直到没有新行。"""
+        assert node.seed is not None and node.recursive is not None
+        saved = self._recursive_rows.get(node.name)
+        seen: Optional[set] = None if node.union_all else set()
+        output: list[tuple] = []
+        working: list[tuple] = []
+        try:
+            for row in self._execute(node.seed, txn):
+                key = tuple(row)
+                if seen is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                output.append(row)
+                working.append(row)
+            rounds = 0
+            while working:
+                rounds += 1
+                if rounds > 10000:
+                    raise NotSupportedError(
+                        f"递归 CTE {node.name!r} 超过 10000 轮",
+                        hint="检查递归终止条件，或改用显式迭代",
+                    )
+                self._recursive_rows[node.name] = working
+                next_rows: list[tuple] = []
+                for row in self._execute(node.recursive, txn):
+                    key = tuple(row)
+                    if seen is not None:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    output.append(row)
+                    next_rows.append(row)
+                working = next_rows
+        finally:
+            if saved is None:
+                self._recursive_rows.pop(node.name, None)
+            else:
+                self._recursive_rows[node.name] = saved
+        yield from output
 
     def _set_op(self, node: SetOp, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None

@@ -300,9 +300,15 @@ class TestSelect:
         )
         assert [c.name for c in stmt.ctes] == ["a", "b"]
 
-    def test_recursive_cte_rejected(self):
-        with pytest.raises(NotSupportedError):
-            parse_statement("WITH RECURSIVE x AS (SELECT 1) SELECT * FROM x")
+    def test_recursive_cte(self):
+        from lumendb.sql.ast import Query
+
+        stmt = parse_statement(
+            "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM x"
+        )
+        assert isinstance(stmt, Query)
+        assert stmt.recursive
+        assert len(stmt.ctes) == 1
 
 
 class TestExpressions:

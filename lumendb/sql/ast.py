@@ -444,6 +444,7 @@ class Delete(Statement):
 class Query(Statement):
     select: Select
     ctes: list["Cte"] = field(default_factory=list)
+    recursive: bool = False
 
 
 @dataclass

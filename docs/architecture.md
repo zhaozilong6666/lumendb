@@ -126,8 +126,9 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 解析一次（只在绑定阶段发生，不重复执行基表扫描）。
 
 Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先解析 token，
-再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。视图定义可以带非递归
-`WITH`，此时 token 重新解析为 `Query` 并走 `bind_query`；普通定义仍走 `bind_select`。
+再用独立 Binder 绑定基表查询，最后把结果列挂到视图名/别名下。视图定义可以带
+`WITH`（普通 CTE 或递归 CTE），此时 token 重新解析为 `Query` 并走 `bind_query`；
+普通定义仍走 `bind_select`。
 若视图带显式列名清单，
 目录会在 `view_columns` 里保存别名，Binder 用别名覆盖输出列名并校验列数/重复名。
 `view_stack` 记录正在展开的视图，检测 `A -> B -> A` 的循环引用；Binder 同时把
@@ -203,10 +204,13 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 - `Distinct`：按前 N 列去重（隐藏列不参与）；
 - `SetOp`：`UNION` / `UNION ALL`，逐行拼接；`UNION` 用集合去重，
   `UNION ALL` 保留重复，`ORDER BY` / `LIMIT` 由外层节点处理；
-- `CteScan`：非递归 `WITH` 的命名子查询。绑定阶段先按书写顺序把每个 CTE
+- `CteScan`：普通 `WITH` 的命名子查询。绑定阶段先按书写顺序把每个 CTE
   绑成独立计划并放进作用域，主查询里的 `FROM cte_name` 直接引用它；
   `WITH ... INSERT ... SELECT` 也走同一套作用域；同一个 CTE 被引用两次会
   执行两次（没有做物化缓存）；
+- `RecursiveCte`：`seed UNION [ALL] recursive` 的递归 CTE。`CteScan(recursive=True)`
+  在递归项里读取执行器保存的“上一轮工作表”，每一轮把新行加入结果并作为下一轮输入，
+  直到没有新行；`UNION` 用哈希集合去重，`UNION ALL` 保留重复，超过 10000 轮报错；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；
 - `Limit`：跳 `offset`，取 `limit`。
 

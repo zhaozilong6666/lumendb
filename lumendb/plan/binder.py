@@ -66,6 +66,7 @@ from .nodes import (
     OutputColumn,
     PlanNode,
     Project,
+    RecursiveCte,
     Scan,
     SetOp,
     Sort,
@@ -720,7 +721,7 @@ class Binder:
 
     # -- SELECT 绑定 -----------------------------------------------------
 
-    def bind_ctes(self, ctes) -> None:
+    def bind_ctes(self, ctes, recursive: bool = False) -> None:
         """把一个 ``WITH`` 列表按书写顺序绑进当前作用域。"""
         saved = self.ctes
         self.ctes = dict(self.ctes)
@@ -729,11 +730,51 @@ class Binder:
                 name = cte.name.lower()
                 if name in self.ctes:
                     raise BinderError(f"CTE {cte.name!r} 重复定义")
-                node, cols = self.bind_select(cte.query)
+                if recursive and isinstance(cte.query, CompoundSelect):
+                    node, cols = self._bind_recursive_cte(cte, name)
+                else:
+                    node, cols = self.bind_select(cte.query)
                 self.ctes[name] = (node, cols)
         except Exception:
             self.ctes = saved
             raise
+
+    def _bind_recursive_cte(self, cte, name: str) -> tuple[PlanNode, list[OutputColumn]]:
+        query = cte.query
+        if (
+            len(query.parts) != 2
+            or not query.ops
+            or query.ops[0] not in ("UNION", "UNION ALL")
+        ):
+            raise BinderError(
+                f"递归 CTE {cte.name!r} 必须是 seed UNION [ALL] recursive",
+                hint="当前只支持两部分的 UNION / UNION ALL 递归定义",
+            )
+        seed_node, seed_cols = self.bind_select(query.parts[0])
+        placeholder = CteScan(
+            columns=list(seed_cols),
+            recursive=True,
+            name=name,
+        )
+        self.ctes[name] = (placeholder, list(seed_cols))
+        try:
+            recursive_node, recursive_cols = self.bind_select(query.parts[1])
+        except Exception:
+            self.ctes.pop(name, None)
+            raise
+        if len(recursive_cols) != len(seed_cols):
+            raise BinderError(
+                f"递归 CTE {cte.name!r} 的 seed/recursive 列数不一致",
+                hint=f"{len(seed_cols)} vs {len(recursive_cols)}",
+            )
+        plan = RecursiveCte(
+            name=name,
+            seed=seed_node,
+            recursive=recursive_node,
+            columns=list(seed_cols),
+            union_all=query.all_flags[0],
+        )
+        return plan, list(seed_cols)
 
     def bind_query(self, query) -> tuple[PlanNode, list[OutputColumn]]:
         """绑定一条带 ``WITH`` 的顶层查询。
@@ -741,7 +782,7 @@ class Binder:
         CTE 注册表在成功后保留，供执行阶段的子查询复用同一个作用域；
         执行器每次执行语句都会新建 Binder，所以不会泄漏到下一条语句。
         """
-        self.bind_ctes(query.ctes)
+        self.bind_ctes(query.ctes, recursive=query.recursive)
         return self.bind_select(query.select)
 
     def bind_returning(self, items, schema) -> tuple[list, list[OutputColumn]]:

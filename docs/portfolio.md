@@ -34,6 +34,7 @@
 >   等值连接生成哈希连接（NULL 键不匹配、重复键展开、剩余谓词复核），
 >   支持 `UNION` / `UNION ALL` 集合算子与整体排序/限量，非递归 `WITH`（CTE）
 >   按书写顺序绑定并可在 `FROM` 中当作表引用，也支持 `WITH ... INSERT ... SELECT`，
+>   `WITH RECURSIVE` 用 seed + 递归项逐轮迭代（`UNION ALL` 保留重复、`UNION` 去重），
 >   `INSERT ... SELECT` 先物化来源再批量写入（避免自插入无限增长），
 >   `CREATE TABLE AS SELECT` 从查询输出推断列名/类型并落表，
 >   `INSERT` / `UPDATE` / `DELETE` 支持 `RETURNING`（新行/旧行语义、`*` 展开），
@@ -49,7 +50,7 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 688 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 691 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -86,6 +87,8 @@
 >   `INSERT ... ON CONFLICT DO UPDATE` matches unique-index conflict targets,
 >   evaluates assignments on the old row and maintains indexes;
 >   `EXCEPT` / `INTERSECT` implement set difference and intersection;
+>   `WITH RECURSIVE` iterates seed + recursive term round by round
+>   (`UNION ALL` keeps duplicates, `UNION` deduplicates);
 >   `ALTER TABLE ADD COLUMN` upgrades
 >   the catalog and pads old records at read time instead of rewriting the heap;
 >   `ALTER TABLE RENAME TO` / `RENAME COLUMN` update catalog metadata and
@@ -101,7 +104,7 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 688 automated tests including crash-injection and a 20-seed randomized
+> - 691 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
