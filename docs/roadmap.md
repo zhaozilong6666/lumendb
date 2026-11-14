@@ -1,4 +1,4 @@
-# LumenDB 路线图
+﻿# LumenDB 路线图
 
 LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → 存储/复制”分层，
 每一层都必须先具备可验证的输入、明确的完成标准和回退路径，避免出现功能
@@ -6,14 +6,15 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1017 passed。
+- 全量测试：1032 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
 - 组提交已落地：WAL 追加/刷盘线程安全，提交 leader 合并刷盘，单提交语义
   不变。
-- 自动 checkpoint 已落地：WAL 增长超过 `checkpoint_wal_bytes` 时刷脏页、
-  写 CHECKPOINT 并前移 `checkpoint_lsn`；手动 `CHECKPOINT` 保留。
+- 自动 checkpoint 已落地：WAL 增长超过 `checkpoint_wal_bytes` 或累计提交数
+  达到 `checkpoint_every_commits` 时刷脏页、写 CHECKPOINT 并前移
+  `checkpoint_lsn`；手动 `CHECKPOINT` 保留。
 - WAL 分段回收已落地：新库使用分段 WAL，checkpoint 后按安全 LSN 删除旧段，
   活跃事务的 BEGIN 之前的历史不会被回收。
 - 物理复制垂直切片已落地：新页首次修改时写 `PAGE_IMAGE`，主库通过 TCP
@@ -56,12 +57,15 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 1. 只对纯 `INNER JOIN` / 逗号连接枚举顺序；`LEFT` / `RIGHT` / `FULL` 保持
    原顺序。
-   - **已完成（逗号连接）**：3–8 个无显式 `JOIN` 的 `FROM` 源用左深动态
-     规划选择顺序；显式 `JOIN` 链和外连接仍保持原序。
-2. 从 `WHERE` 中提取跨数据源的等值谓词，转成连接键；其余谓词保留在
+   - **已完成（逗号连接 + 纯 INNER 显式链）**：3–8 个源用左深动态规划
+     选择顺序；纯 `INNER` 的显式 `JOIN` 链会先展开为源集合再枚举，外连接/
+     混合 `JOIN` 仍保持原序。
+2. 从 `WHERE` 中提取跨数据源的等值谓词，转成连接键；其余谓词下推或保留在
    `Filter`。
-   - **已完成**：逗号连接的跨源 `列 = 列` 会附加到 `Join` 的哈希键；完整
-     `WHERE` 仍保留为 `Filter`，残余谓词不会漏判。
+   - **已完成（等值键 + 单源下推）**：跨源 `列 = 列` 附加到 `Join` 的哈希键；
+     只引用一个数据源的合取项会下推到该扫描之上（`Filter`），完整 `WHERE`
+     仍保留为最终兜底 `Filter`，残余谓词不会漏判。显式外连接/混合 JOIN 不做
+     下推。
 3. 用动态规划枚举左深连接树，代价取 `rows + cpu` 加权和；源数量超过阈值
    （例如 8）时回退原序，避免指数爆炸。
    - **已完成（DP 版）**：在 3–8 个源内对“已选源集合”做左深动态规划，
@@ -73,6 +77,10 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 完成标准：TPC-H 风格的小型固定数据集上，连接顺序与代价符合预期；全量测试
 通过；EXPLAIN 能显示估算行数与选择理由。
+
+**验收补充**：`tests/unit/test_optimizer_acceptance.py` 用三表固定数据集锁定
+“SQL 书写顺序不是最优时重排、输出列还原、`NULL` 行保留”；EXPLAIN 现在同时
+输出 DP 搜索过的状态数 `[candidates=N]`。
 
 ### 第 3 层：存储耐久性
 
@@ -89,9 +97,10 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
      最老 BEGIN LSN；没有活跃事务时取 `checkpoint_lsn`。旧单文件库继续走
      兼容路径。
 3. **CHECKPOINT 策略**：按 WAL 大小或提交数触发，保留手动 `CHECKPOINT`。
-   - **已完成（按 WAL 大小）**：`Database(checkpoint_wal_bytes=...)` 在每次
-     提交后检查 WAL 增长，超过阈值自动调用 `RecoveryManager.checkpoint`；
-     按提交数触发暂未实现，手动 `CHECKPOINT` 保留。
+   - **已完成**：`Database(checkpoint_wal_bytes=...)` 在每次提交后检查 WAL
+     增长，超过阈值自动调用 `RecoveryManager.checkpoint`；
+     `Database(checkpoint_every_commits=...)` 按累计提交数触发，二者可单独
+     或同时启用，0 表示关闭，手动 `CHECKPOINT` 保留。
 
 完成标准：崩溃注入测试覆盖“提交后、checkpoint 中、WAL 轮转后”三个时点；
 恢复结果与未崩溃基线一致。
@@ -134,23 +143,34 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 **自动提升 MVP**：`ReplicationMonitor` 每轮先检查 `status` 再拉一批 WAL；
 连续网络失败达到 `max_failures` 后调用同一个 `promote(fence_path=...)`。
-逻辑错误（槽位已回收）返回 `needs_attention`，不会自动提升。没有心跳
+逻辑错误（槽位已回收）先尝试 `rebase_from_server` 页级增量重建，成功
+返回 `rebuilt`，失败才返回 `needs_attention`，不会自动提升。没有心跳
 租约和客户端重定向，网络分区下仍要求共享 fence。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
 - 自动故障切换的 **MVP 已做**（`ReplicationMonitor` 连续网络失败后自动
-  `promote` + 共享 fence），但客户端重定向、租约/仲裁和网络分区下的
-  双写防护仍未完成。
+  `promote` + 共享 fence），客户端重定向 MVP 已做（`WALServer(redirect_to=...)` + `RedirectError`，
+  `ReplicationMonitor` 会跟随最多 3 次），租约/仲裁和网络分区下的双写防护
+  仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
-  - **认证已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)` 在每条
-    请求上校验共享 token；TLS 仍未做，token 在明文 JSON 里传输。
+  - **认证/压缩/TLS 已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)`
+    在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
+    zlib 压缩；`WALServer(ssl_context=...)` / `WALClient(ssl_context=...)`
+    可以走标准库 TLS；服务端 `SSLContext.verify_mode = CERT_REQUIRED` + 客户端
+    证书即双向认证，已有测试覆盖。证书分发、轮换和主机名校验策略仍需部署层补齐。
 - 副本查询与 apply 的并发调度；当前是单线程应用。
-- 复制槽只能在一个主库数据目录上持久化 `confirmed_lsn`；启动顺序已由
-  `Database(wal_retain_lsn=read_slot(...))` 覆盖：在恢复和自动 checkpoint 之前
-  就恢复保留点。仍只支持单副本。
+- 多副本槽位已做 MVP：`WALServer(slot_dir=...)` 每个 `replica_id` 一个
+  `<id>.confirmed`，主库保留点取所有槽位的最小确认 LSN；`Replica` 在
+  bootstrap 后先 ack 基准备份 LSN，避免新副本把保留点钉在 0。槽位仍保存在
+  单个主库数据目录里，没有跨节点槽位目录或槽位复制；`WALServer.list_slots()`
+  和 `drop_slot(replica_id)` 支持副本退役后回收保留点。
+- `Database(wal_retain_lsn=read_slot(...))` 覆盖启动顺序：在恢复和自动
+  checkpoint 之前恢复保留点；多副本场景需要把最小确认 LSN 传给这个参数。
 - 基准备份已改为 `snapshot_file` + `backup_stream` 分块传输，不再把整个
-  数据文件读成 bytes；仍未做增量/压缩基准备份。
+  数据文件读成 bytes；页级增量基准备份已做：`snapshot_pages(base_lsn)`
+  只导出 pageLSN 大于基础 LSN 的页，副本可在 WAL 已回收时重建文件。
+  基准备份内容本身的压缩仍未做。
 - 基准备份的写冻结依赖 `Database._write_lock`；它把主库写语句串行化，
   读查询仍可并发。跨进程/绕过 Database 的直接磁盘写不受保护。
 
@@ -160,9 +180,9 @@ fencing。
 
 **当前状态**：上述三条已补齐；延迟/吞吐与丢失窗口的实测见
 [`docs/replication-bench.md`](replication-bench.md)，多区间页 diff 已把同一
-场景的副本延迟从 13.9 MB 降到 1.1 MB。TLS、压缩、客户端重定向、租约/仲裁、
-增量基准备份和副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP 验收”，
-不能标“生产就绪”。
+场景的副本延迟从 13.9 MB 降到 1.1 MB，响应行压缩和标准库 TLS 已作为可选
+传输层落地。租约/仲裁和副本查询/apply 并发仍未完成（客户端重定向、增量基准备份
+已做 MVP），因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
 

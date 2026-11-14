@@ -201,6 +201,8 @@ class Join(PlanNode):
     build_left: bool = False
     #: 连接顺序的来源；``dp`` 表示绑定阶段重排过，空表示按 SQL 书写顺序
     order_reason: str = ""
+    #: 动态规划搜索过的状态数；0 表示没有走连接顺序枚举
+    dp_candidates: int = 0
 
     def children(self):
         return [c for c in (self.left, self.right) if c is not None]
@@ -212,6 +214,8 @@ class Join(PlanNode):
             suffix = f" [build={build}]"
             if self.order_reason:
                 suffix += f" [order={self.order_reason}]"
+            if self.dp_candidates:
+                suffix += f" [candidates={self.dp_candidates}]"
             return f"HashJoin ({self.kind}) on {keys}{suffix}"
         return f"{self.kind} Join"
 

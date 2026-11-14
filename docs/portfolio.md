@@ -72,7 +72,7 @@
 >   在语句入口拒绝写入，`lag_lsn` 量化延迟；基准备份用 `Database.snapshot`
 >   冻结写路径、先 checkpoint 再读数据文件，手动提升用共享 `PromotionFence`
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
-> - 1014 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 1032 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -158,7 +158,7 @@
 >   with `Database.snapshot`, and manual promotion uses a shared
 >   `PromotionFence` marker to stop the old primary from writing;
 >   `ReplicationMonitor` promotes after consecutive network failures.
-> - 1014 automated tests including crash-injection and a 20-seed randomized
+> - 1032 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
@@ -177,7 +177,8 @@
 才变成 `COMMITTED`。WAL 增长超过 `checkpoint_wal_bytes` 时还会自动
 checkpoint（刷脏页 + 写 CHECKPOINT + 前移 `checkpoint_lsn`）。日志按
 `wal-<first_lsn>.log` 分段，checkpoint 后只回收不再被活跃事务引用的旧段。
-还可以继续做的是把整页日志改成"页内 delta"、按提交数触发 checkpoint。
+还可以继续做的是把整页日志改成"页内 delta"；按提交数触发的 checkpoint
+已经作为 `checkpoint_every_commits` 落地。
 
 ### 2. 一个真实的 B+ 树坑：键里多塞了 RID
 

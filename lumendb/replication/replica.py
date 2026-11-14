@@ -7,8 +7,8 @@ MVCC 可见性。记录可以直接来自同进程的 ``primary.wal``，也可�
 
 当前约束：
 - 基准备份要求主库没有活跃事务；否则复制到的是包含未提交版本的数据文件。
-- 基准备份没有冻结并发写；调用方应在主库静默时备份，或接受“流会补偿”
-  的窗口。
+- 基准备份在 ``Database.snapshot`` / ``snapshot_file`` 的写锁内 checkpoint，
+  写语句被串行化，读查询可继续。
 - 副本假设单线程应用 WAL；查询与 apply 不应并发。
 - 主库 WAL 的保留依赖 ``SegmentedWAL.retain_lsn``；旧单文件 WAL 没有该
   属性，只能用于测试或手动控制 checkpoint。
@@ -17,6 +17,8 @@ MVCC 可见性。记录可以直接来自同进程的 ``primary.wal``，也可�
 from __future__ import annotations
 
 import os
+import shutil
+import ssl
 import threading
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from ..engine.database import Database
 from ..errors import StorageError, TransactionError
 from ..storage.txn import TxnState
 from ..storage.page import PageType
+from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
 from .fence import PromotionFence
 
@@ -90,6 +93,9 @@ class Replica:
         *,
         timeout: float = 10.0,
         token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        replica_id: str | None = None,
     ) -> "Replica":
         """通过 TCP 拉取主库基准备份并打开副本。"""
         from .wal_stream import WALClient
@@ -102,9 +108,13 @@ class Replica:
                 "副本目录已经有数据文件",
                 hint="换一个空目录，或先手动确认旧副本可以删除",
             )
-        base_lsn = WALClient(
-            host, port, timeout=timeout, token=token
-        ).backup_to(data_path)
+        client = WALClient(
+            host, port, timeout=timeout, token=token, compress=compress,
+            ssl_context=ssl_context, replica_id=replica_id,
+        )
+        base_lsn = client.backup_to(data_path)
+        if replica_id is not None:
+            client.ack(base_lsn)
         return cls(target, applied_lsn=base_lsn)
 
     # ------------------------------------------------------------------
@@ -128,12 +138,18 @@ class Replica:
         *,
         timeout: float = 10.0,
         token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        replica_id: str | None = None,
     ) -> int:
         """通过 TCP 读取主库当前 LSN，计算尚未应用的字节数。"""
         from .wal_stream import WALClient
 
         with self._lock:
-            status = WALClient(host, port, timeout=timeout, token=token).status()
+            status = WALClient(
+                host, port, timeout=timeout, token=token, compress=compress,
+                ssl_context=ssl_context, replica_id=replica_id,
+            ).status()
             lag = status["current_lsn"] - self._applied_lsn
             return max(0, lag)
 
@@ -157,12 +173,18 @@ class Replica:
         max_records: int = 1000,
         timeout: float = 10.0,
         token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        replica_id: str | None = None,
     ) -> int:
         """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
         with self._lock:
             from .wal_stream import WALClient
 
-            client = WALClient(host, port, timeout=timeout, token=token)
+            client = WALClient(
+                host, port, timeout=timeout, token=token, compress=compress,
+                ssl_context=ssl_context, replica_id=replica_id,
+            )
             records = client.fetch(self._applied_lsn, max_records=max_records)
             applied = self.apply(records, primary=None)
             if applied:
@@ -248,6 +270,92 @@ class Replica:
     def execute_one(self, sql: str, params=None):
         with self._lock:
             return self.db.execute_one(sql, params)
+
+    def rebase_from_server(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float = 10.0,
+        token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        replica_id: str | None = None,
+    ) -> int:
+        """用主库的页级增量备份重建数据文件，并返回新的基础 LSN。
+
+        这用于副本落后于已回收 WAL、但仍持有旧基准备份的场景：主库只发送
+        pageLSN 大于本地 ``applied_lsn`` 的页，副本关掉只读句柄、逐页写回
+        数据文件、重新打开，再从新的 checkpoint 继续追 WAL。比全量基准备份
+        少传大量未变化页；如果本地文件损坏，仍应重新 bootstrap。
+        """
+        with self._lock:
+            from .wal_stream import WALClient
+
+            self.db.close()
+            temp = self.path / "incremental-pages.tmp"
+            if temp.exists():
+                for path in temp.glob("*"):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                try:
+                    temp.rmdir()
+                except OSError:
+                    pass
+            try:
+                client = WALClient(
+                    host, port, timeout=timeout, token=token, compress=compress,
+                    ssl_context=ssl_context, replica_id=replica_id,
+                )
+                checkpoint_lsn, _count = client.incremental_to(
+                    temp, self._applied_lsn
+                )
+                if checkpoint_lsn < self._applied_lsn:
+                    raise StorageError(
+                        "主库 checkpoint 落后于副本 applied_lsn",
+                        detail=(
+                            f"checkpoint={checkpoint_lsn} "
+                            f"applied={self._applied_lsn}"
+                        ),
+                    )
+                data_path = self.path / "lumendb.data"
+                staged_path = self.path / "lumendb.data.rebase.tmp"
+                shutil.copyfile(data_path, staged_path)
+                disk = DiskManager(staged_path)
+                try:
+                    for path in sorted(temp.glob("*.page")):
+                        page_id = int(path.stem)
+                        disk.write_page_bytes(page_id, path.read_bytes())
+                finally:
+                    disk.close()
+                os.replace(staged_path, data_path)
+                self.db = Database(
+                    self.path, read_only=True, checkpoint_wal_bytes=0
+                )
+                self._applied_lsn = checkpoint_lsn
+                self._write_marker()
+                if replica_id is not None:
+                    client.ack(checkpoint_lsn)
+                return checkpoint_lsn
+            except BaseException:
+                # 网络或页传输失败时，副本句柄不能留在已关闭状态。
+                if getattr(self.db, "disk", None) is None or self.db.disk._fh.closed:
+                    self.db = Database(
+                        self.path, read_only=True, checkpoint_wal_bytes=0
+                    )
+                raise
+            finally:
+                for path in list(temp.glob("*")):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                try:
+                    temp.rmdir()
+                except OSError:
+                    pass
 
     def promote(
         self,

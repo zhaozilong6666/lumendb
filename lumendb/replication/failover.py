@@ -14,9 +14,10 @@ fence 文件，仍可能双写，部署时必须明确这一点。
 
 from __future__ import annotations
 
+import ssl
 from pathlib import Path
 
-from ..errors import StorageError
+from ..errors import RedirectError, StorageError
 from .replica import Replica
 from .wal_stream import WALClient
 
@@ -34,11 +35,19 @@ class ReplicationMonitor:
         timeout: float = 5.0,
         max_records: int = 1000,
         token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        replica_id: str | None = None,
+        auto_rebase: bool = True,
     ) -> None:
         self.replica = replica
         self.host = host
         self.port = port
         self.token = token
+        self.compress = compress
+        self.ssl_context = ssl_context
+        self.replica_id = replica_id
+        self.auto_rebase = auto_rebase
         self.fence_path = Path(fence_path) if fence_path is not None else None
         self.node_id = node_id
         self.max_failures = max(1, int(max_failures))
@@ -47,6 +56,7 @@ class ReplicationMonitor:
         self.failures = 0
         self.promoted = False
         self.last_error: str | None = None
+        self.redirects = 0
 
     def poll(self) -> str:
         """执行一轮跟随；返回 ``healthy`` / ``degraded`` / ``promoted`` / ``needs_attention``。"""
@@ -54,7 +64,13 @@ class ReplicationMonitor:
             return "promoted"
         try:
             WALClient(
-                self.host, self.port, timeout=self.timeout, token=self.token
+                self.host,
+                self.port,
+                timeout=self.timeout,
+                token=self.token,
+                compress=self.compress,
+                ssl_context=self.ssl_context,
+                replica_id=self.replica_id,
             ).status()
             self.replica.replicate_from_server(
                 self.host,
@@ -62,13 +78,41 @@ class ReplicationMonitor:
                 max_records=self.max_records,
                 timeout=self.timeout,
                 token=self.token,
+                compress=self.compress,
+                ssl_context=self.ssl_context,
+                replica_id=self.replica_id,
             )
             self.failures = 0
             self.last_error = None
             return "healthy"
-        except StorageError as exc:
-            # 槽位已被回收等逻辑错误：继续重试没有意义，也不应该自动提升。
+        except RedirectError as exc:
+            self.redirects += 1
+            if self.redirects <= 3:
+                self.host = exc.host
+                self.port = exc.port
+                return self.poll()
             self.last_error = str(exc)
+            return "needs_attention"
+        except StorageError as exc:
+            # 槽位被回收时 WAL 已经断开，但旧基准备份仍可能有效；先尝试
+            # 页级增量重建，成功就继续追，失败才交给人工判断。
+            self.last_error = str(exc)
+            if self.auto_rebase:
+                try:
+                    self.replica.rebase_from_server(
+                        self.host,
+                        self.port,
+                        timeout=self.timeout,
+                        token=self.token,
+                        compress=self.compress,
+                        ssl_context=self.ssl_context,
+                        replica_id=self.replica_id,
+                    )
+                    self.failures = 0
+                    self.last_error = None
+                    return "rebuilt"
+                except (OSError, StorageError):
+                    pass
             return "needs_attention"
         except OSError as exc:
             self.failures += 1

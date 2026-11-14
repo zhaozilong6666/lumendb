@@ -35,7 +35,7 @@ import zlib
 from pathlib import Path
 from typing import Iterable
 
-from ..errors import StorageError, TransactionError
+from ..errors import RedirectError, StorageError, TransactionError
 from ..storage.wal import LogRecord
 
 
@@ -107,12 +107,14 @@ class WALServer:
         slot_dir: str | Path | None = None,
         token: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
+        redirect_to: tuple[str, int] | None = None,
     ) -> None:
         if slot_path is not None and slot_dir is not None:
             raise ValueError("slot_path 与 slot_dir 只能配置一个")
         self.primary = primary
         self.token = token
         self.ssl_context = ssl_context
+        self.redirect_to = redirect_to
         self.slot_path = Path(slot_path) if slot_path is not None else None
         self.slot_dir = Path(slot_dir) if slot_dir is not None else None
         self._confirmed_lsn = 0
@@ -161,6 +163,28 @@ class WALServer:
         with self._slot_lock:
             if self._replica_slots:
                 self.primary.wal.retain_lsn = min(self._replica_slots.values())
+            else:
+                self.primary.wal.retain_lsn = 0
+
+    def list_slots(self) -> dict[str, int]:
+        with self._slot_lock:
+            return dict(self._replica_slots)
+
+    def drop_slot(self, replica_id: str) -> bool:
+        """删除一个确认槽位；副本退役时使用，调用方自行确认它不再需要 WAL。"""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", replica_id):
+            raise StorageError("replica_id 只能包含字母、数字、下划线、点和短横线")
+        with self._slot_lock:
+            existed = replica_id in self._replica_slots
+            self._replica_slots.pop(replica_id, None)
+            path = self.slot_dir / f"{replica_id}.confirmed" if self.slot_dir else None
+        if path is not None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        self._refresh_retain()
+        return existed
 
     def _persist_replica_slot(self, replica_id: str, lsn: int) -> None:
         if self.slot_dir is None:
@@ -169,6 +193,15 @@ class WALServer:
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(str(lsn), encoding="utf-8")
         os.replace(tmp, target)
+
+    def _record_replica_ack(self, replica_id: str, lsn: int) -> int:
+        lsn = max(0, int(lsn))
+        with self._slot_lock:
+            if lsn > self._replica_slots.get(replica_id, 0):
+                self._replica_slots[replica_id] = lsn
+                self._persist_replica_slot(replica_id, lsn)
+        self._refresh_retain()
+        return self._slot_confirm(replica_id)
 
     def start(self) -> "WALServer":
         self._thread = threading.Thread(
@@ -214,11 +247,24 @@ class WALServer:
                     compress=compress,
                 )
                 return
+            if self.redirect_to is not None:
+                _send_line(
+                    conn,
+                    {
+                        "type": "redirect",
+                        "host": self.redirect_to[0],
+                        "port": int(self.redirect_to[1]),
+                    },
+                    compress=compress,
+                )
+                return
             kind = request.get("type")
             if kind == "backup":
                 self._handle_backup(conn, request)
             elif kind == "backup_stream":
                 self._handle_backup_stream(conn, request)
+            elif kind == "incremental":
+                self._handle_incremental(conn, request)
             elif kind == "replicate":
                 self._handle_replicate(conn, request)
             elif kind == "ack":
@@ -251,6 +297,9 @@ class WALServer:
         except TransactionError as exc:
             _send_line(conn, {"type": "error", "message": str(exc)}, compress=compress)
             return
+        replica_id = self._replica_id(request)
+        if replica_id is not None:
+            self._record_replica_ack(replica_id, checkpoint_lsn)
         retain = getattr(self.primary.wal, "retain_lsn", None)
         if retain is not None and self.slot_dir is None:
             self.primary.wal.retain_lsn = checkpoint_lsn
@@ -276,6 +325,9 @@ class WALServer:
             except TransactionError as exc:
                 _send_line(conn, {"type": "error", "message": str(exc)}, compress=compress)
                 return
+            replica_id = self._replica_id(request)
+            if replica_id is not None:
+                self._record_replica_ack(replica_id, checkpoint_lsn)
             retain = getattr(self.primary.wal, "retain_lsn", None)
             if retain is not None and self.slot_dir is None:
                 self.primary.wal.retain_lsn = checkpoint_lsn
@@ -300,6 +352,62 @@ class WALServer:
         finally:
             try:
                 temp_path.unlink()
+            except OSError:
+                pass
+
+    def _handle_incremental(self, conn: socket.socket, request: dict) -> None:
+        """页级增量基准备份：只传 pageLSN > base_lsn 的页。"""
+        compress = bool(request.get("compress"))
+        base_lsn = max(0, int(request.get("base_lsn", 0)))
+        fd, temp_name = tempfile.mkstemp(prefix="lumendb-pages-", suffix="")
+        os.close(fd)
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        temp_dir = Path(temp_name + ".dir")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            try:
+                checkpoint_lsn, count = self.primary.snapshot_pages(
+                    base_lsn, temp_dir
+                )
+            except TransactionError as exc:
+                _send_line(conn, {"type": "error", "message": str(exc)}, compress=compress)
+                return
+            _send_line(
+                conn,
+                {
+                    "type": "incremental_begin",
+                    "checkpoint_lsn": checkpoint_lsn,
+                    "page_count": count,
+                },
+                compress=compress,
+            )
+            for path in sorted(temp_dir.glob("*.page")):
+                page_id = int(path.stem)
+                _send_line(
+                    conn,
+                    {
+                        "type": "page",
+                        "page_id": page_id,
+                        "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    },
+                    compress=compress,
+                )
+            _send_line(
+                conn,
+                {"type": "incremental_end", "checkpoint_lsn": checkpoint_lsn},
+                compress=compress,
+            )
+        finally:
+            for path in list(temp_dir.glob("*")):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            try:
+                temp_dir.rmdir()
             except OSError:
                 pass
 
@@ -366,12 +474,7 @@ class WALServer:
                     os.replace(tmp, self.slot_path)
             confirmed = self._confirmed_lsn
         else:
-            with self._slot_lock:
-                if lsn > self._replica_slots.get(replica_id, 0):
-                    self._replica_slots[replica_id] = lsn
-                    self._persist_replica_slot(replica_id, lsn)
-            self._refresh_retain()
-            confirmed = self._slot_confirm(replica_id)
+            confirmed = self._record_replica_ack(replica_id, lsn)
         _send_line(
             conn,
             {"type": "ack", "confirmed_lsn": confirmed, "replica_id": replica_id},
@@ -433,6 +536,10 @@ class WALClient:
                 data = _decode_line(line)
                 if data.get("type") == "error":
                     raise StorageError(data.get("message", "复制请求失败"))
+                if data.get("type") == "redirect":
+                    raise RedirectError(
+                        str(data.get("host", "")), int(data.get("port", 0))
+                    )
                 yield data
         finally:
             try:
@@ -466,6 +573,43 @@ class WALClient:
             except FileNotFoundError:
                 pass
             raise
+
+    def incremental_to(
+        self, target_dir: str | Path, base_lsn: int
+    ) -> tuple[int, int]:
+        """接收页级增量备份，返回 ``(checkpoint_lsn, page_count)``。
+
+        只写回传输来的页文件；调用方负责在副本数据库关闭时把它们落回
+        数据文件，然后重新打开数据库。
+        """
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        checkpoint_lsn = None
+        expected_count = None
+        page_count = 0
+        for data in self._request(
+            {"type": "incremental", "base_lsn": int(base_lsn)}
+        ):
+            if data.get("type") == "incremental_begin":
+                checkpoint_lsn = int(data["checkpoint_lsn"])
+                expected_count = int(data.get("page_count", 0))
+            elif data.get("type") == "page":
+                page_id = int(data["page_id"])
+                (target / f"{page_id:08d}.page").write_bytes(
+                    base64.b64decode(data["data"])
+                )
+                page_count += 1
+            elif data.get("type") == "incremental_end":
+                checkpoint_lsn = int(data["checkpoint_lsn"])
+                break
+        if checkpoint_lsn is None:
+            raise StorageError("增量基准备份缺少结束标记")
+        if expected_count is not None and page_count != expected_count:
+            raise StorageError(
+                "增量基准备份页数不完整",
+                detail=f"收到 {page_count} 页，期望 {expected_count} 页",
+            )
+        return checkpoint_lsn, page_count
 
     def backup(self) -> tuple[bytes, int]:
         for data in self._request({"type": "backup"}):

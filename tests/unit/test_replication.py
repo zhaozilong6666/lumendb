@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import NotSupportedError, StorageError, TransactionError
+from lumendb.errors import NotSupportedError, RedirectError, StorageError, TransactionError
 from lumendb.replication import (
     PromotionFence,
     Replica,
@@ -107,6 +107,177 @@ class TestReplica:
             server.stop()
             primary.close()
 
+    def test_redirect_points_client_to_new_primary(self, tmp_path):
+        primary_one = make_primary(tmp_path)
+        primary_two = Database(tmp_path / "primary2", checkpoint_wal_bytes=0)
+        primary_two.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary_two.execute_one("INSERT INTO t VALUES (1)")
+        target = WALServer(primary_two).start()
+        redirect = WALServer(
+            primary_one, redirect_to=(target.host, target.port)
+        ).start()
+        try:
+            with pytest.raises(RedirectError) as caught:
+                WALClient(redirect.host, redirect.port).status()
+            assert (caught.value.host, caught.value.port) == (
+                target.host,
+                target.port,
+            )
+            status = WALClient(target.host, target.port).status()
+            assert status["current_lsn"] > 0
+        finally:
+            redirect.stop()
+            target.stop()
+            primary_one.close()
+            primary_two.close()
+
+    def test_backup_stream_auto_acks_new_slot(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary.execute_one("INSERT INTO t VALUES (1)")
+        slots = tmp_path / "slots"
+        server = WALServer(primary, slot_dir=slots).start()
+        try:
+            from lumendb.replication.wal_stream import WALClient
+
+            base = WALClient(
+                server.host, server.port, replica_id="new-replica"
+            ).backup_to(tmp_path / "base.data")
+            assert (slots / "new-replica.confirmed").exists()
+            assert primary.wal.retain_lsn == base
+        finally:
+            server.stop()
+            primary.close()
+
+    def test_incremental_rebase_after_wal_gap(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        for i in range(100):
+            primary.execute_one(f"INSERT INTO t VALUES ({i})")
+        server = WALServer(primary, slot_dir=tmp_path / "slots").start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica", replica_id="r1"
+            )
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(100,)]
+            base = replica.applied_lsn
+            for i in range(100, 120):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            replica.replicate_from_server(server.host, server.port, replica_id="r1")
+            for i in range(120, 140):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            checkpoint_lsn = replica.rebase_from_server(
+                server.host, server.port, replica_id="r1"
+            )
+            assert checkpoint_lsn > base
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(140,)]
+            for i in range(140, 150):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            replica.replicate_from_server(server.host, server.port, replica_id="r1")
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(150,)]
+        finally:
+            if replica is not None:
+                replica.db.close()
+            server.stop()
+            primary.close()
+
+    def test_drop_replica_slot_recomputes_retain(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary.execute_one("INSERT INTO t VALUES (1)")
+        slots = tmp_path / "slots"
+        server = WALServer(primary, slot_dir=slots).start()
+        try:
+            from lumendb.replication.wal_stream import WALClient
+
+            first = WALClient(
+                server.host, server.port, replica_id="first"
+            ).backup_to(tmp_path / "first.data")
+            second = WALClient(
+                server.host, server.port, replica_id="second"
+            ).backup_to(tmp_path / "second.data")
+            assert server.list_slots() == {"first": first, "second": second}
+            assert primary.wal.retain_lsn == min(first, second)
+            assert server.drop_slot("first") is True
+            assert primary.wal.retain_lsn == second
+            assert not (slots / "first.confirmed").exists()
+            assert server.drop_slot("second") is True
+            assert primary.wal.retain_lsn == 0
+        finally:
+            server.stop()
+            primary.close()
+
+    def test_multiple_replica_slots_retain_minimum(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        slots = tmp_path / "slots"
+        server = WALServer(primary, slot_dir=slots).start()
+        r1 = r2 = None
+        try:
+            r1 = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "r1", replica_id="r1"
+            )
+            r2 = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "r2", replica_id="r2"
+            )
+            for i in range(20):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            r1.replicate_from_server(server.host, server.port, replica_id="r1")
+            r2.replicate_from_server(
+                server.host, server.port, replica_id="r2", max_records=1000
+            )
+            assert r1.execute_one("SELECT COUNT(*) FROM t").rows == [(20,)]
+            assert r2.execute_one("SELECT COUNT(*) FROM t").rows == [(20,)]
+            assert primary.wal.retain_lsn == min(
+                r1.applied_lsn, r2.applied_lsn
+            )
+            assert (slots / "r1.confirmed").exists()
+            assert (slots / "r2.confirmed").exists()
+        finally:
+            for replica in (r1, r2):
+                if replica is not None:
+                    replica.db.close()
+            server.stop()
+            primary.close()
+
+        reopened = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+        try:
+            server = WALServer(reopened, slot_dir=slots)
+            try:
+                assert set(server._replica_slots) == {"r1", "r2"}
+                assert reopened.wal.retain_lsn == min(server._replica_slots.values())
+            finally:
+                server.stop()
+        finally:
+            reopened.close()
+
+    def test_compressed_stream_roundtrip(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        for i in range(50):
+            primary.execute_one(f"INSERT INTO t VALUES ({i}, 'row-{i}')")
+        server = WALServer(primary).start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica", compress=True
+            )
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(50,)]
+            primary.execute_one("INSERT INTO t VALUES (50, 'net')")
+            assert (
+                replica.replicate_from_server(
+                    server.host, server.port, compress=True
+                )
+                > 0
+            )
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(51,)]
+        finally:
+            if replica is not None:
+                replica.db.close()
+            server.stop()
+            primary.close()
+
     def test_tcp_backup_and_wal_stream_apply(self, tmp_path):
         primary = make_primary(tmp_path)
         primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
@@ -154,6 +325,62 @@ class TestReplica:
         assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
         primary.close()
         replica.db.close()
+
+    def test_monitor_follows_redirect(self, tmp_path):
+        primary_one = make_primary(tmp_path)
+        primary_two = Database(tmp_path / "primary2", checkpoint_wal_bytes=0)
+        primary_two.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary_two.execute_one("INSERT INTO t VALUES (1)")
+        target = WALServer(primary_two).start()
+        redirect = WALServer(
+            primary_one, redirect_to=(target.host, target.port)
+        ).start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                target.host, target.port, tmp_path / "replica"
+            )
+            monitor = ReplicationMonitor(replica, redirect.host, redirect.port)
+            assert monitor.poll() == "healthy"
+            assert monitor.host == target.host
+            assert monitor.port == target.port
+        finally:
+            if replica is not None:
+                replica.db.close()
+            redirect.stop()
+            target.stop()
+            primary_one.close()
+            primary_two.close()
+
+    def test_monitor_rebuilds_after_wal_gap(self, tmp_path, monkeypatch):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        server = WALServer(primary).start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica"
+            )
+            calls = []
+
+            def fail_replicate(*args, **kwargs):
+                raise StorageError("需要重新基准备份")
+
+            def rebuild(*args, **kwargs):
+                calls.append(1)
+                return 1
+
+            monkeypatch.setattr(replica, "replicate_from_server", fail_replicate)
+            monkeypatch.setattr(replica, "rebase_from_server", rebuild)
+            monitor = ReplicationMonitor(replica, server.host, server.port)
+            assert monitor.poll() == "rebuilt"
+            assert monitor.poll() == "rebuilt"
+            assert len(calls) == 2
+        finally:
+            if replica is not None:
+                replica.db.close()
+            server.stop()
+            primary.close()
 
     def test_monitor_promotes_after_network_failures(self, tmp_path):
         fence_path = tmp_path / "promotion.fence"

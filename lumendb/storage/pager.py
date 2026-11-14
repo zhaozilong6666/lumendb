@@ -262,6 +262,18 @@ class DiskManager:
         self._fh.flush()
         shutil.copyfile(self.path, Path(target))
 
+    def write_page_bytes(self, page_id: int, data: bytes) -> None:
+        """把一页原始字节写回数据文件；用于增量基准备份的页级恢复。
+
+        调用方负责保证没有并发读写；副本在重放线程之外执行这个操作。
+        """
+        if len(data) != PAGE_SIZE:
+            raise ValueError(f"页大小必须是 {PAGE_SIZE}，收到 {len(data)}")
+        with self._lock:
+            self._fh.seek(page_id * PAGE_SIZE)
+            self._fh.write(data)
+            self._fh.flush()
+
     def close(self) -> None:
         if not self._fh.closed:
             self._persist_meta()

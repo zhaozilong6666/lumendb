@@ -148,6 +148,15 @@ class StorageError(LumenError):
     sqlstate = "58000"
 
 
+class RedirectError(StorageError):
+    """复制流目标已迁移；调用方应连接新的 host/port。"""
+
+    def __init__(self, host: str, port: int) -> None:
+        super().__init__(f"复制流已重定向到 {host}:{port}")
+        self.host = host
+        self.port = int(port)
+
+
 class PageNotFoundError(StorageError):
     sqlstate = "58030"
 

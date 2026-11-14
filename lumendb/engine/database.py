@@ -261,6 +261,36 @@ class Database:
             self.disk.copy_to(target)
             return self.disk.meta.checkpoint_lsn
 
+    def snapshot_pages(
+        self, base_lsn: int, target_dir: str | Path
+    ) -> tuple[int, int]:
+        """导出页级增量基准备份：只写 pageLSN > base_lsn 的页。
+
+        返回 ``(checkpoint_lsn, page_count)``。页 0 总是包含，因为元数据页
+        保存文件头、checkpoint LSN 和目录指针。调用方在拿到页文件后自行
+        传输；写锁只覆盖 checkpoint 和页扫描，不覆盖网络发送。
+        """
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        base_lsn = max(0, int(base_lsn))
+        with self._write_lock:
+            if self.txns.active_xids:
+                raise TransactionError(
+                    "增量基准备份要求主库没有活跃事务",
+                    hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和扫描页",
+                )
+            self.recovery.checkpoint()
+            self._commits_since_checkpoint = 0
+            checkpoint_lsn = self.disk.meta.checkpoint_lsn
+            count = 0
+            for page_id in range(self.disk.num_pages):
+                data = self.disk.read_page(page_id)
+                page_lsn = int.from_bytes(data[24:32], "little")
+                if page_id == 0 or page_lsn > base_lsn:
+                    (target / f"{page_id:08d}.page").write_bytes(data)
+                    count += 1
+        return checkpoint_lsn, count
+
     def _maybe_checkpoint(self) -> None:
         """按 WAL 字节或累计提交数自动落一次 checkpoint。
 

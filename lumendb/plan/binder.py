@@ -109,6 +109,28 @@ class SchemaColumn:
     source_table: Optional[str] = None
 
 
+def _expr_column_refs(expr) -> Optional[list[ColumnRef]]:
+    """收集表达式里的列引用；包含子查询时返回 None（不做下推）。"""
+    refs: list[ColumnRef] = []
+    stack = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ColumnRef):
+            refs.append(node)
+        elif isinstance(node, (Query, CompoundSelect, ScalarSubquery, Exists, InSubquery)):
+            return None
+        elif dataclasses.is_dataclass(node):
+            for item in dataclasses.fields(node):
+                value = getattr(node, item.name, None)
+                if isinstance(value, list):
+                    stack.extend(value)
+                elif isinstance(value, tuple):
+                    stack.extend(value)
+                elif dataclasses.is_dataclass(value):
+                    stack.append(value)
+    return refs
+
+
 class Schema:
     """一行数据的列布局，用于把名字解析成下标。"""
 
@@ -1501,13 +1523,14 @@ class Binder:
         return found
 
     def _join_edges(
-        self, where, schemas: list[Schema]
+        self, where, schemas: list[Schema], extra_conditions=()
     ) -> set[tuple[int, int]]:
-        """收集 ``WHERE`` 顶层 AND 中跨数据源的等值边。"""
+        """收集 ``WHERE`` / ``ON`` 顶层 AND 中跨数据源的等值边。"""
         edges: set[tuple[int, int]] = set()
-        if where is None:
-            return edges
-        for expr in _conjuncts(where):
+        conditions = list(_conjuncts(where)) if where is not None else []
+        for extra in extra_conditions:
+            conditions.extend(_conjuncts(extra))
+        for expr in conditions:
             if not isinstance(expr, BinaryOp) or expr.op != "=":
                 continue
             if not isinstance(expr.left, ColumnRef) or not isinstance(
@@ -1522,21 +1545,23 @@ class Binder:
         return edges
 
     def _choose_join_order(
-        self, bindings: list[tuple[PlanNode, Schema]], where
-    ) -> Optional[list[int]]:
-        """用左深动态规划选择连接顺序；不满足条件时返回 ``None``。
+        self, bindings: list[tuple[PlanNode, Schema]], where,
+        extra_conditions=(),
+    ) -> tuple[Optional[list[int]], int]:
+        """用左深动态规划选择连接顺序；不满足条件时返回 ``(None, 0)``。
 
-        只对没有显式 ``JOIN`` 的 ``FROM`` 列表生效。状态是“已选源集合”的最优
+        对隐式逗号连接和纯 INNER 显式 JOIN 链生效；外连接/混合 JOIN 仍按原序。
+        状态是“已选源集合”的最优
         左深顺序；每一步把一个新的源接到左侧，代价取 ``rows + cpu``。源数超过
         8 时直接回退原序，避免为小收益引入指数级状态。
         """
         n = len(bindings)
         if n < 3 or n > 8:
-            return None
+            return None, 0
         schemas = [schema for _node, schema in bindings]
-        edges = self._join_edges(where, schemas)
+        edges = self._join_edges(where, schemas, extra_conditions)
         if not edges:
-            return None
+            return None, 0
 
         # mask -> (估算, 顺序, 该顺序拼接出的 schema)
         best: dict[int, tuple[CostEstimate, tuple[int, ...], Schema]] = {}
@@ -1584,7 +1609,8 @@ class Binder:
                     )
                     if rank < current_rank:
                         best[mask] = (est, order, merged)
-        return list(best[(1 << n) - 1][1])
+        final = best[(1 << n) - 1]
+        return list(final[1]), len(best)
 
     def _restore_output_order(
         self,
@@ -1629,13 +1655,54 @@ class Binder:
         if not refs:
             return Values(rows=[()], columns=[]), Schema([])
 
-        bindings = [self._bind_table_ref(ref) for ref in refs]
-        order: list[int] = list(range(len(refs)))
-        if all(not getattr(ref, "joins", ()) for ref in refs):
-            chosen = self._choose_join_order(bindings, where)
-            if chosen is not None:
+        explicit_chain = None
+        if (
+            len(refs) == 1
+            and getattr(refs[0], "joins", ())
+            and all(
+                join.kind == "INNER" and not getattr(join.table, "joins", ())
+                for join in refs[0].joins
+            )
+        ):
+            ref = refs[0]
+            bindings = [self._bind_relation(ref)] + [
+                self._bind_relation(join.table) for join in ref.joins
+            ]
+            ons = [join.on for join in ref.joins if join.on is not None]
+            explicit_chain = (bindings, ons)
+            conditions = list(_conjuncts(where)) if where is not None else []
+            conditions.extend(ons)
+            combined_where = None
+            for term in conditions:
+                combined_where = term if combined_where is None else BinaryOp(
+                    op="AND", left=combined_where, right=term
+                )
+            chosen, dp_candidates = self._choose_join_order(
+                bindings, combined_where
+            )
+            if chosen is not None and chosen != list(range(len(bindings))):
                 order = chosen
-        reordered = order != list(range(len(refs)))
+                where = combined_where
+            else:
+                explicit_chain = None
+        if explicit_chain is None:
+            bindings = [self._bind_table_ref(ref) for ref in refs]
+            order = list(range(len(refs)))
+            dp_candidates = 0
+            if all(not getattr(ref, "joins", ()) for ref in refs):
+                chosen, dp_candidates = self._choose_join_order(bindings, where)
+                if chosen is not None:
+                    order = chosen
+        reordered = order != list(range(len(bindings)))
+        dp_candidates = dp_candidates if reordered else 0
+
+        # 逗号连接和纯 INNER 链都是内连接，单源谓词下推不改变结果；
+        # 显式外连接/混合 JOIN 仍走 _bind_table_ref，不做这一步。
+        if len(bindings) > 1 and (
+            explicit_chain is not None
+            or all(not getattr(ref, "joins", ()) for ref in refs)
+        ):
+            bindings = self._pushdown_filters(bindings, where)
 
         node, schema = bindings[order[0]]
         for index in order[1:]:
@@ -1664,15 +1731,74 @@ class Binder:
                     and choose_build_side(left_est, right_est) == "left"
                 ),
                 order_reason="dp" if reordered else "",
+                dp_candidates=dp_candidates,
                 estimated=join_estimate(
                     left_est, right_est, equi_keys=len(hash_keys)
                 ),
             )
             schema = merged
 
+        if reordered and explicit_chain is not None:
+            ons = explicit_chain[1]
+            if ons:
+                predicates = []
+                for on in ons:
+                    fn, _ = self.compile(on, schema, allow_agg=False)
+                    predicates.append(fn)
+                funcs = tuple(predicates)
+                node = Filter(
+                    child=node,
+                    predicate=lambda ctx: all(fn(ctx) for fn in funcs),
+                    columns=node.columns,
+                    estimated=self._node_estimate(node),
+                )
         if reordered:
             return self._restore_output_order(node, bindings, order)
         return node, schema
+
+    def _pushdown_filters(
+        self, bindings: list[tuple[PlanNode, Schema]], where
+    ) -> list[tuple[PlanNode, Schema]]:
+        """把只引用单个数据源的 WHERE 合取项下推到扫描之上。"""
+        if where is None:
+            return bindings
+        schemas = [schema for _node, schema in bindings]
+        by_source: dict[int, list] = {}
+        for expr in _conjuncts(where):
+            refs = _expr_column_refs(expr)
+            if not refs:
+                continue
+            source: Optional[int] = None
+            for ref in refs:
+                index = self._source_index(schemas, ref)
+                if index is None or (source is not None and source != index):
+                    source = None
+                    break
+                source = index
+            if source is not None:
+                by_source.setdefault(source, []).append(expr)
+        if not by_source:
+            return bindings
+        result = list(bindings)
+        for source, exprs in by_source.items():
+            node, schema = result[source]
+            combined = exprs[0]
+            for expr in exprs[1:]:
+                combined = BinaryOp(op="AND", left=combined, right=expr)
+            predicate, _ = self.compile(combined, schema, allow_agg=False)
+            result[source] = (
+                Filter(
+                    child=node,
+                    predicate=predicate,
+                    columns=node.columns,
+                    estimated=filter_estimate(
+                        self._node_estimate(node),
+                        self._predicate_selectivity(combined),
+                    ),
+                ),
+                schema,
+            )
+        return result
 
     def _source_for(
         self, name: str, alias: Optional[str]

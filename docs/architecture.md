@@ -73,9 +73,10 @@ checkpoint 落盘后回收旧段；恢复只读取保留下来的段，仍然从
 
 **自动 checkpoint**：`Database(checkpoint_wal_bytes=...)` 在每次提交后比较
 `WAL.next_lsn` 与元数据中的 `checkpoint_lsn`，超过阈值就调用
-`RecoveryManager.checkpoint`。checkpoint 先刷所有脏页，再写 CHECKPOINT 日志并
-更新元数据；因为 `checkpoint_lsn` 随之前移，后续提交不会在同一阈值上重复触发。
-手动 `CHECKPOINT` 语句保留。
+`RecoveryManager.checkpoint`；`Database(checkpoint_every_commits=...)` 则按
+累计提交数触发，两个阈值可以单独或同时使用（0 表示关闭）。checkpoint 先刷
+所有脏页，再写 CHECKPOINT 日志并更新元数据；因为 `checkpoint_lsn` 随之前移，
+后续提交不会在同一阈值上重复触发。手动 `CHECKPOINT` 语句保留。
 
 ### 2.5 事务与并发
 
@@ -279,15 +280,37 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 在语句入口拒绝写操作，只允许 `SELECT`/`EXPLAIN`/`SHOW`/事务控制。
 
 传输层是 `WALServer` + `WALClient`：换行分隔 JSON，二进制内容 base64；
-`backup` 返回主库 checkpoint 后的数据文件，`replicate` 从请求的
-`start_lsn` 起按上限返回记录。主库 `SegmentedWAL.retain_lsn` 按副本请求的
-起点保留 WAL；`WALServer` 可配置一个 `slot_path`，客户端 `ack` 后把
-`confirmed_lsn` 原子写盘，服务重启时重新装载并恢复保留点。若起点已经落在
-已回收段之前，服务端返回明确错误，要求重新基准备份，避免静默丢段。
+`WALClient(compress=True)` 会把响应行变成 `z<base64(zlib(json))>`，客户端按
+首字节区分压缩与明文，请求本身仍保持明文。`backup` 返回主库 checkpoint
+后的数据文件，`replicate` 从请求的 `start_lsn` 起按上限返回记录。主库
+`SegmentedWAL.retain_lsn` 按副本请求的起点保留 WAL；`WALServer` 可配置一个
+`slot_path`，客户端 `ack` 后把 `confirmed_lsn` 原子写盘，服务重启时重新装载
+并恢复保留点。若起点已经落在已回收段之前，服务端返回明确错误，要求重新
+基准备份，避免静默丢段。
+
+多副本用 `WALServer(slot_dir=...)`：每个请求携带 `replica_id`，确认 LSN 写到
+`<id>.confirmed`；服务端把保留点刷新为所有已知槽位的最小值，慢副本不会被
+快副本的 ack 提前截断。`Replica.bootstrap_from_server(replica_id=...)` 在拉完
+基准备份后立即 ack 基准备份 LSN；服务端收到带 `replica_id` 的基准备份请求时
+也会自动 ack 该 base LSN。新副本不会以 0 确认把整段 WAL 钉住；
+`replicate_from_server` / `lag_from_server` / `ReplicationMonitor` 都透传
+`replica_id`；监控器遇到 WAL 断档会先尝试页级增量重建。`WALServer(redirect_to=...)`
+对请求返回 `redirect`；`WALClient` 抛 `RedirectError`，`ReplicationMonitor`
+会更新目标并最多跟随 3 次，不做 DNS 发现或自动选举。槽位目录仍只属于一个主库数据目录。
+
+页级增量基准备份走 `incremental` 请求：主库在写锁内 checkpoint 后扫描
+pageLSN 大于 `base_lsn` 的页（页 0 总是包含），只发送这些 4096B 页；副本
+关闭只读句柄、逐页写回数据文件再重开，从新的 checkpoint 继续追 WAL。
+它能覆盖“副本有旧基准备份但 WAL 已回收”的窗口，不替代完整 bootstrap；
+页文件损坏时仍应重新全量备份。
+
 `status` 请求返回 `last_lsn` / `base_lsn` / `confirmed_lsn`；`last_lsn` 是最后
 一条记录自身的 LSN，不是 `next_lsn` 字节偏移，副本的 `lag_from_server` 用它
 计算真实落后量。`WALServer(token=...)` 开启后，所有请求必须携带同一个
-token；这是共享密钥认证，不是 TLS。
+token；这是共享密钥认证，TLS 需要另配 `ssl_context`。`WALServer` 接受连接后
+先做 TLS 握手再读取请求；`WALClient(ssl_context=...)` 在 TCP 连接上做客户端
+握手，`server_hostname` 默认取主机名。测试用自签名证书覆盖握手、基准备份和
+WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 主库重启时应在打开 `Database` 前读槽位，并用
 `Database(wal_retain_lsn=read_slot(slot_path))` 把保留点放回 WAL；这比“先开库、
 再启动 WALServer”更安全。
@@ -311,15 +334,19 @@ token；这是共享密钥认证，不是 TLS。
 
 当前边界（也是下一步）：
 
-- 复制槽只覆盖单个副本；主库重启时用 `Database(wal_retain_lsn=read_slot(...))`
-  在恢复和自动 checkpoint 之前恢复保留点，避免启动顺序造成误回收；
-- 基准备份已分块传输，但仍是完整全量拷贝；没有增量/压缩备份；
+- 复制槽支持多个副本（`slot_dir` + `replica_id`，保留点取最小确认 LSN），
+  但槽位目录只属于一个主库数据目录，没有跨节点槽位复制；主库重启时用
+  `Database(wal_retain_lsn=min_slot(...))` 在恢复和自动 checkpoint 之前
+  恢复保留点，避免启动顺序造成误回收；
+- 基准备份已分块传输，但仍是完整全量拷贝；没有增量/压缩基准备份
+  （WAL 响应行支持可选 zlib 压缩，基准备份内容本身未做增量）；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - 自动提升只有连续失败阈值，没有心跳租约/仲裁和客户端重定向；fencing 依赖
   共享 marker，网络分区时仍可能双写；
-- 复制连接支持可选共享 token 校验，但没有 TLS，token 在明文 JSON 中传输；
-  默认只应监听本机或可信网络；
+- 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
+  设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
+  JSON 中传输，默认只应监听本机或可信网络；
 - 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 只覆盖
   共享 marker，没有自动租约。
 

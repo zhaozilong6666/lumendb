@@ -1808,6 +1808,7 @@ class TestJoin:
         )
         assert "Project" in plan
         assert "[order=dp]" in plan
+        assert "[candidates=" in plan
         assert plan.index("SeqScan small") < plan.index("SeqScan mid")
         assert plan.index("SeqScan mid") < plan.index("SeqScan big")
         assert rows(
@@ -1940,6 +1941,26 @@ class TestJoin:
             db,
             "SELECT a.id FROM a JOIN b ON a.id = b.id AND a.x < b.y ORDER BY a.id",
         ) == [(1,)]
+
+    def test_explicit_inner_join_chain_reorders(self, db):
+        db.execute_one("CREATE TABLE big (id INT)")
+        db.execute_one("CREATE TABLE small (id INT)")
+        db.execute_one("CREATE TABLE mid (id INT)")
+        for i in range(1, 11):
+            db.execute_one(f"INSERT INTO big VALUES ({i})")
+        db.execute_one("INSERT INTO small VALUES (1), (2)")
+        db.execute_one("INSERT INTO mid VALUES (1), (2), (3)")
+        sql = (
+            "SELECT * FROM big JOIN small ON big.id = small.id "
+            "JOIN mid ON small.id = mid.id"
+        )
+        plan = "\n".join(r[0] for r in rows(db, "EXPLAIN " + sql))
+        assert "[order=dp]" in plan
+        assert plan.index("SeqScan small") < plan.index("SeqScan big")
+        assert rows(db, sql + " ORDER BY big.id") == [
+            (1, 1, 1),
+            (2, 2, 2),
+        ]
 
     def test_three_way_hash_join(self, db):
         self.setup(db)
