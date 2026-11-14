@@ -4320,6 +4320,33 @@ class TestForeignKey:
         with pytest.raises(DuplicateKeyError):
             db.execute_one("INSERT INTO t VALUES (1)")
 
+    def test_drop_table_clears_constraint_modes(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS t_id_key DEFERRED")
+        db.execute_one("DROP TABLE t")
+        db.execute_one("CREATE TABLE t (id INT UNIQUE)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ROLLBACK")
+
+    def test_drop_column_cascade_clears_constraint_modes(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE, note TEXT)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS t_id_key DEFERRED")
+        db.execute_one("ALTER TABLE t DROP COLUMN id CASCADE")
+        db.execute_one("ALTER TABLE t ADD COLUMN id INT")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT t_id_key UNIQUE (id)"
+        )
+        db.execute_one("INSERT INTO t VALUES ('a', 1)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES ('b', 1)")
+        db.execute_one("ROLLBACK")
+
     def test_rename_constraint_transfers_deferred_mode(self, db):
         db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
         db.execute_one("BEGIN")

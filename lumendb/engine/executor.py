@@ -1702,6 +1702,11 @@ class Executor:
             idx for idx in table.indexes.values()
             if column.name in idx.columns
         ]
+        removed_constraints = (
+            {fk.name for fk in own_fk_dependents}
+            | {fk.name for _other, fk in ext_fk_dependents}
+            | {idx.name for idx in index_dependents}
+        )
 
         def check_uses_column(check: CheckDef) -> bool:
             tokens = list(check.tokens)
@@ -1840,6 +1845,19 @@ class Executor:
             rebuilt, _entries = self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        old_modes = {
+            name: txn.constraint_modes[name]
+            for name in removed_constraints
+            if name in txn.constraint_modes
+        }
+        for name in old_modes:
+            txn.constraint_modes.pop(name, None)
+        if old_modes:
+
+            def undo_modes() -> None:
+                txn.constraint_modes.update(old_modes)
+
+            txn.undo_log.append(undo_modes)
         index_note = f"；重建 {rebuilt} 个索引" if rebuilt else ""
         cascade_parts: list[str] = []
         if stmt.cascade:
@@ -2485,14 +2503,39 @@ class Executor:
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:
         views = 0
         foreign_keys = 0
+        removed_constraints: set[str] = set()
         for name in stmt.names:
             if not self._catalog.has_table(name):
                 if stmt.if_exists:
                     continue
                 raise TableNotFoundError(f"表 {name!r} 不存在")
+            target = self._catalog.get_table(name)
+            removed_constraints.update(target.foreign_keys)
+            removed_constraints.update(target.indexes)
+            # CASCADE 会删除其他表上引用该表的外键；这些约束的
+            # SET CONSTRAINTS 覆盖也必须一起清掉，避免同名重建后继承旧模式。
+            for other in self._catalog.list_tables():
+                if other.name == target.name:
+                    continue
+                for fk in other.foreign_keys.values():
+                    if fk.ref_table == target.name:
+                        removed_constraints.add(fk.name)
             v, f = self._catalog.drop_table(txn, name, stmt.cascade)
             views += v
             foreign_keys += f
+        old_modes = {
+            name: txn.constraint_modes[name]
+            for name in removed_constraints
+            if name in txn.constraint_modes
+        }
+        for name in old_modes:
+            txn.constraint_modes.pop(name, None)
+        if old_modes:
+
+            def undo_modes() -> None:
+                txn.constraint_modes.update(old_modes)
+
+            txn.undo_log.append(undo_modes)
         notice = ""
         if stmt.cascade and (views or foreign_keys):
             notice = f"级联删除 {views} 个视图、{foreign_keys} 个外键"

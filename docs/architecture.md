@@ -189,6 +189,10 @@ DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行�
 `executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
 被引用键是否已恢复或子行是否已清理；失败则 `abort`，WAL/页 undo 恢复。`RESTRICT`
 始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
+`DROP TABLE` / `ALTER TABLE ... DROP COLUMN ... CASCADE` 在删除外键或约束索引时
+同步清理 `constraint_modes`，避免同一事务内同名重建的约束继承旧覆盖；事务回滚
+时 undo 恢复这些模式。`ALTER TABLE ... ALTER CONSTRAINT` 修改外键延迟属性时
+也会清理该约束的旧覆盖。
 
 `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` 只跳过存量行扫描，
 新写入仍走 `_check_foreign_keys`；CHECK 的 `NOT VALID` 同样跳过存量扫描，新写入仍走
