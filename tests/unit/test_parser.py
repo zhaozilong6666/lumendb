@@ -314,6 +314,10 @@ class TestCreateTable:
         assert isinstance(stmt, AlterTableDropConstraint)
         assert stmt.name == "ck"
         assert stmt.if_exists is True
+        assert stmt.cascade is False
+
+        stmt = parse_statement("ALTER TABLE t DROP CONSTRAINT ck CASCADE")
+        assert stmt.cascade is True
 
     def test_alter_column_type(self):
         from lumendb.sql.ast import AlterTableAlterType

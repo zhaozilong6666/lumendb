@@ -2103,16 +2103,35 @@ class Executor:
                     raise NotSupportedError(
                         f"不支持的约束索引类型：{index.constraint_kind!r}"
                     )
+                dependents: list[tuple[TableDef, str]] = []
                 for other in self._catalog.list_tables():
                     for fk in other.foreign_keys.values():
                         if (
                             fk.ref_table == table.name
                             and tuple(fk.ref_columns) == tuple(index.columns)
                         ):
-                            raise NotSupportedError(
-                                f"约束 {name!r} 仍被外键 {fk.name!r} 依赖",
-                                hint="先删除引用该唯一键的外键约束",
-                            )
+                            dependents.append((other, fk.name))
+                if dependents and not stmt.cascade:
+                    raise NotSupportedError(
+                        f"约束 {name!r} 仍被外键 {dependents[0][1]!r} 依赖",
+                        hint="先删除引用该唯一键的外键约束，或使用 DROP CONSTRAINT ... CASCADE",
+                    )
+                old_fk_maps = {
+                    other.name: (other, dict(other.foreign_keys))
+                    for other, _fk_name in dependents
+                }
+                for other, fk_name in dependents:
+                    del other.foreign_keys[fk_name]
+                if dependents:
+                    cascade_note = f"（级联删除 {len(dependents)} 个外键）"
+
+                    def undo_dependent_fks() -> None:
+                        for _table, old_map in old_fk_maps.values():
+                            _table.foreign_keys = old_map
+
+                    txn.undo_log.append(undo_dependent_fks)
+                else:
+                    cascade_note = ""
                 old_columns = list(table.columns)
                 self._catalog.drop_index(txn, name)
                 if index.constraint_kind == "PRIMARY":
@@ -2131,11 +2150,11 @@ class Executor:
                     self._catalog.persist(txn)
                     return Result(
                         tag="ALTER TABLE",
-                        notice=f"已删除主键约束 {name}",
+                        notice=f"已删除主键约束 {name}{cascade_note}",
                     )
                 return Result(
                     tag="ALTER TABLE",
-                    notice=f"已删除唯一约束 {name}",
+                    notice=f"已删除唯一约束 {name}{cascade_note}",
                 )
             if stmt.if_exists:
                 return Result(

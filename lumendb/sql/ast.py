@@ -457,6 +457,8 @@ class AlterTableDropConstraint(Statement):
     table: str
     name: str
     if_exists: bool = False
+    #: DROP CONSTRAINT ... CASCADE：同时删除依赖该唯一键的外键。
+    cascade: bool = False
 
 
 @dataclass

@@ -373,8 +373,16 @@ class Parser:
                     self._expect_kw("EXISTS")
                     if_exists = True
                 name = self._parse_ident("约束名")
+                cascade = False
+                if self._match_kw("CASCADE"):
+                    cascade = True
+                else:
+                    self._match_kw("RESTRICT")
                 return AlterTableDropConstraint(
-                    table=table, name=name, if_exists=if_exists
+                    table=table,
+                    name=name,
+                    if_exists=if_exists,
+                    cascade=cascade,
                 )
             self._match_kw("COLUMN")
             if_exists = False
