@@ -14,6 +14,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Repair payload typo
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.lumendb/drop-cascade.patch.gz.b64')
+          s = p.read_text().strip()
+          s = s[:737] + 'V' + s[738:]
+          p.write_text(s, encoding='utf-8')
+          PY
+          base64 -d .lumendb/drop-cascade.patch.gz.b64 | gzip -t
       - name: Decode patch
         run: base64 -d .lumendb/drop-cascade.patch.gz.b64 | gunzip > /tmp/apply.patch
       - name: Apply patch
