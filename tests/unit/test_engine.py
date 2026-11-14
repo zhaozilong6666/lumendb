@@ -3472,6 +3472,18 @@ class TestTransactions:
 
 
 class TestPersistence:
+    def test_wal_retain_lsn_survives_startup(self, tmp_path):
+        path = tmp_path / "db"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.close()
+
+        db2 = Database(path, wal_retain_lsn=db.wal.next_lsn - 1)
+        try:
+            assert db2.wal.retain_lsn == db.wal.next_lsn - 1
+        finally:
+            db2.close()
+
     def test_data_survives_reopen(self, tmp_path):
         path = tmp_path / "db"
         db = Database(path)

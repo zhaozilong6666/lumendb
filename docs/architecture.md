@@ -284,6 +284,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 起点保留 WAL；`WALServer` 可配置一个 `slot_path`，客户端 `ack` 后把
 `confirmed_lsn` 原子写盘，服务重启时重新装载并恢复保留点。若起点已经落在
 已回收段之前，服务端返回明确错误，要求重新基准备份，避免静默丢段。
+主库重启时应在打开 `Database` 前读槽位，并用
+`Database(wal_retain_lsn=read_slot(slot_path))` 把保留点放回 WAL；这比“先开库、
+再启动 WALServer”更安全。
 
 **基准备份写冻结**：`Database.snapshot()` 用 `_write_lock` 阻止新的写语句
 进入，要求 `txns.active_xids` 为空，然后先 checkpoint、再读取数据文件。读
@@ -297,8 +300,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 当前边界（也是下一步）：
 
-- 复制槽只覆盖单个副本；主库重启后若在复制服务启动前自动 checkpoint，
-  仍可能回收槽位之前的段，需要启动顺序约束；
+- 复制槽只覆盖单个副本；主库重启时用 `Database(wal_retain_lsn=read_slot(...))`
+  在恢复和自动 checkpoint 之前恢复保留点，避免启动顺序造成误回收；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - fencing 依赖共享 marker，自动故障切换、客户端重定向和租约都没有实现；

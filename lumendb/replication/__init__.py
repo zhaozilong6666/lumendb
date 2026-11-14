@@ -2,7 +2,7 @@
 
 from .fence import PromotionFence
 from .replica import Replica
-from .wal_stream import WALClient, WALServer
+from .wal_stream import WALClient, WALServer, read_slot
 
-__all__ = ["PromotionFence", "Replica", "WALClient", "WALServer"]
+__all__ = ["PromotionFence", "Replica", "WALClient", "WALServer", "read_slot"]
 

@@ -44,6 +44,17 @@ def _record_to_json(record: LogRecord) -> dict:
     }
 
 
+def read_slot(path: str | Path) -> int:
+    """读取复制槽的 ``confirmed_lsn``；不存在或损坏时返回 0。"""
+    slot = Path(path)
+    if not slot.exists():
+        return 0
+    try:
+        return int(slot.read_text().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
 def _record_from_json(data: dict) -> LogRecord:
     return LogRecord(
         lsn=int(data["lsn"]),
@@ -67,10 +78,10 @@ class WALServer:
         self.primary = primary
         self.slot_path = Path(slot_path) if slot_path is not None else None
         self._confirmed_lsn = 0
-        if self.slot_path is not None and self.slot_path.exists():
-            self._confirmed_lsn = int(self.slot_path.read_text().strip() or "0")
+        if self.slot_path is not None:
+            self._confirmed_lsn = read_slot(self.slot_path)
             retain = getattr(primary.wal, "retain_lsn", None)
-            if retain is not None:
+            if retain is not None and self._confirmed_lsn:
                 primary.wal.retain_lsn = self._confirmed_lsn
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

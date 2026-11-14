@@ -64,6 +64,7 @@ class Database:
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
         write_fence: Optional[Callable[[], None]] = None,
+        wal_retain_lsn: int = 0,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
@@ -81,6 +82,10 @@ class Database:
             self.wal = SegmentedWAL(
                 self.path / "wal", segment_bytes=wal_segment_bytes
             )
+        # 复制槽的启动顺序：在恢复和任何自动 checkpoint 之前就恢复保留点，
+        # 否则主库重启后的第一次 checkpoint 可能把槽位之前的段回收掉。
+        if wal_retain_lsn > 0 and isinstance(self.wal, SegmentedWAL):
+            self.wal.retain_lsn = wal_retain_lsn
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
         self.txns = TransactionManager(self.disk, self.wal, self.bp)
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
