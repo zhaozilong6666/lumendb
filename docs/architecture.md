@@ -198,7 +198,7 @@ CHECK 重新编译谓词后扫描全部可见行，成功后才把 `validated` �
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
 拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 默认拒绝删除支撑外键的唯一键，
-`DROP CONSTRAINT ... CASCADE` 会显式删除依赖外键；`DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
+`DROP CONSTRAINT ... CASCADE` / `DROP INDEX ... CASCADE` 会显式删除依赖外键；`DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 默认拒绝被引用的表；`TRUNCATE a, b` 允许同一列表内的相互依赖，但漏掉任一引用表
 仍拒绝，`TRUNCATE ... CASCADE` 递归清空直接/间接引用它的子表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
 `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 默认先扫描存量行，再原子写入目录（即使约束

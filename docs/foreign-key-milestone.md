@@ -27,7 +27,7 @@
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
 | `NOT VALID` / `VALIDATE CONSTRAINT` | 完成 | 外键与 CHECK 均支持：`NOT VALID` 只跳过存量行、新写入仍立即检查；`VALIDATE` 只读扫描全部可见行，成功后才把 `validated` 置为真 |
 | 保存点与延迟状态 | 完成 | `SAVEPOINT` 同时快照 `deferred_fk_rows` / `deferred_ref_checks` / `constraint_modes`，`ROLLBACK TO` 一并恢复 |
-| 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护；`DROP CONSTRAINT ... CASCADE` 可显式删除依赖外键 |
+| 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护；`DROP CONSTRAINT ... CASCADE` / `DROP INDEX ... CASCADE` 可显式删除依赖外键 |
 | 元数据持久化 | 完成 | `ForeignKeyDef` 的列、引用表/列、`on_delete`、`on_update`、`deferrable`、`validated` 全部写入目录 JSON，兼容旧目录缺省值 |
 | 事务回滚 | 完成 | 删除级联、更新级联、加列建外键失败均可回滚到语句前状态 |
 
@@ -115,13 +115,13 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
   任一步失败整条语句回滚（测试覆盖“列已加、外键校验失败”场景）。
 - `DROP TABLE ... CASCADE`：删除其他表上引用该表的外键约束，不删除子表数据。
 - `DROP COLUMN` / `ALTER COLUMN TYPE`：目标列仍被本地或外部外键使用时拒绝。
-- `DROP INDEX` / `DROP CONSTRAINT`：删除支撑外键的唯一键时保守拒绝；`DROP CONSTRAINT ... CASCADE` 显式删除依赖外键。
+- `DROP INDEX` / `DROP CONSTRAINT`：删除支撑外键的唯一键时保守拒绝；两者的 `CASCADE` 可显式删除依赖外键。
 - `RENAME TABLE` / `RENAME COLUMN` / `RENAME CONSTRAINT`：同步外键元数据。
 - `TRUNCATE`：默认拒绝被外键引用的表；`TRUNCATE a, b` 在同一列表中允许一起清空相互依赖的表，未列入的引用表仍拒绝；`TRUNCATE ... CASCADE` 递归清空直接/间接子表。
 
 ## 3. 测试与验证
 
-- 全量测试：**880 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**882 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -210,7 +210,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 880 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 882 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

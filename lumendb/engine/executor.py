@@ -2240,31 +2240,65 @@ class Executor:
 
     def _drop_index(self, stmt: DropIndex, txn: Transaction) -> Result:
         name = stmt.name.lower()
-        for table in self._catalog.list_tables():
-            idx = table.indexes.get(name)
-            if idx is not None and idx.constraint_kind is not None:
+        table: Optional[TableDef] = None
+        idx: Optional[IndexDef] = None
+        for candidate in self._catalog.list_tables():
+            found = candidate.indexes.get(name)
+            if found is not None:
+                table = candidate
+                idx = found
+                break
+        if idx is not None and idx.constraint_kind is not None:
+            raise NotSupportedError(
+                f"索引 {name!r} 由表约束创建，不能直接 DROP INDEX",
+                hint="使用 ALTER TABLE ... DROP CONSTRAINT 删除约束",
+            )
+
+        dependents: list[tuple[TableDef, str]] = []
+        if idx is not None and idx.unique:
+            assert table is not None
+            for other in self._catalog.list_tables():
+                for fk in other.foreign_keys.values():
+                    if (
+                        fk.ref_table == table.name
+                        and tuple(fk.ref_columns) == tuple(idx.columns)
+                    ):
+                        dependents.append((other, fk.name))
+            if dependents and not stmt.cascade:
                 raise NotSupportedError(
-                    f"索引 {name!r} 由表约束创建，不能直接 DROP INDEX",
-                    hint="使用 ALTER TABLE ... DROP CONSTRAINT 删除约束",
+                    f"索引 {name!r} 仍被外键 {dependents[0][1]!r} 依赖",
+                    hint="先删除引用该唯一键的外键约束，或使用 DROP INDEX ... CASCADE",
                 )
-            if idx is not None and idx.unique:
-                for other in self._catalog.list_tables():
-                    for fk in other.foreign_keys.values():
-                        if (
-                            fk.ref_table == table.name
-                            and tuple(fk.ref_columns) == tuple(idx.columns)
-                        ):
-                            raise NotSupportedError(
-                                f"索引 {name!r} 仍被外键 {fk.name!r} 依赖",
-                                hint="先删除引用该唯一键的外键约束",
-                            )
+
+        old_fk_maps = {
+            other.name: (other, dict(other.foreign_keys))
+            for other, _fk_name in dependents
+        }
+        for other, fk_name in dependents:
+            del other.foreign_keys[fk_name]
+        if dependents:
+
+            def undo_dependent_fks() -> None:
+                for _table, old_map in old_fk_maps.values():
+                    _table.foreign_keys = old_map
+
+            txn.undo_log.append(undo_dependent_fks)
+
         try:
             self._catalog.drop_index(txn, name)
         except Exception:
+            if dependents:
+                for _table, old_map in old_fk_maps.values():
+                    _table.foreign_keys = old_map
             if stmt.if_exists:
                 return Result(tag="DROP INDEX", notice="索引不存在，已跳过")
             raise
-        return Result(tag="DROP INDEX")
+        notice = (
+            f"已级联删除 {len(dependents)} 个外键"
+            if dependents
+            else ""
+        )
+        return Result(tag="DROP INDEX", notice=notice)
 
     def _snapshot_table_state(self, table, txn: Transaction) -> None:
         """登记 DML 对表/索引根页号的逆操作。

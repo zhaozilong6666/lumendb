@@ -928,7 +928,17 @@ class Parser:
             if self._match_kw("IF"):
                 self._expect_kw("EXISTS")
                 if_exists = True
-            return DropIndex(name=self._parse_ident("索引名"), if_exists=if_exists)
+            name = self._parse_ident("索引名")
+            cascade = False
+            if self._match_kw("CASCADE"):
+                cascade = True
+            else:
+                self._match_kw("RESTRICT")
+            return DropIndex(
+                name=name,
+                if_exists=if_exists,
+                cascade=cascade,
+            )
         if self._match_kw("VIEW"):
             if_exists = False
             if self._match_kw("IF"):

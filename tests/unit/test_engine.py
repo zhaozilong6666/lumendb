@@ -2407,6 +2407,29 @@ class TestDropConstraintIndexes:
         assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
         assert "g_pid_fkey" not in db.catalog.get_table("g").foreign_keys
 
+    def test_drop_unique_index_cascade_removes_dependent_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT)")
+        db.execute_one("CREATE UNIQUE INDEX p_id_uq ON p (id)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        with pytest.raises(NotSupportedError, match="仍被外键"):
+            db.execute_one("DROP INDEX p_id_uq")
+        result = db.execute_one("DROP INDEX p_id_uq CASCADE")
+        assert "级联删除 1 个外键" in result.notice
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        db.execute_one("INSERT INTO c VALUES (99)")
+
+    def test_drop_index_cascade_rollback_restores_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT)")
+        db.execute_one("CREATE UNIQUE INDEX p_id_uq ON p (id)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("BEGIN")
+        db.execute_one("DROP INDEX p_id_uq CASCADE")
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        db.execute_one("ROLLBACK")
+        assert "c_pid_fkey" in db.catalog.get_table("c").foreign_keys
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (99)")
+
     def test_drop_table_level_and_added_unique_constraints(self, db):
         db.execute_one(
             "CREATE TABLE t (a INT, b INT, UNIQUE (a, b))"

@@ -26,7 +26,7 @@ ALTER TABLE t4 DROP CONSTRAINT IF EXISTS ck_extra;
 -- DROP CONSTRAINT ... CASCADE 可同时删除依赖该唯一键的外键
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON t (col [, col...]);
 DROP TABLE [IF EXISTS] t;
-DROP INDEX idx_name;
+DROP INDEX [IF EXISTS] idx_name [CASCADE];
 ALTER TABLE t ADD [COLUMN] note TEXT;
 ALTER TABLE t ADD [COLUMN] IF NOT EXISTS note TEXT;
 ALTER TABLE t ADD COLUMN age INT DEFAULT 18;
@@ -79,7 +79,8 @@ PostgreSQL 一致）。事务 undo 会恢复 CHECK 字典、索引定义和主�
 `CREATE INDEX` 的 `constraint_kind` 为 `None`，`DROP CONSTRAINT` 会拒绝并提示改用
 `DROP INDEX`；反过来 `DROP INDEX` 也拒绝约束索引，必须用 `DROP CONSTRAINT`。
 `DROP CONSTRAINT ... CASCADE` 只级联删除依赖该 UNIQUE / PRIMARY KEY 的外键约束，
-不会删除子表数据；省略 `CASCADE` 时仍保守拒绝。
+不会删除子表数据；`DROP INDEX ... CASCADE` 同理处理普通唯一索引。省略 `CASCADE`
+时仍保守拒绝。
 
 `ADD COLUMN` 不重写堆页：目录里增加列定义，旧记录读取时按 `DEFAULT`（没有默认值
 则为 `NULL`）补齐，后续 `UPDATE`/`VACUUM` 会把该行写成新格式。`NOT NULL` 新列必须

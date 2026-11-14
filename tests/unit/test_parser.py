@@ -438,6 +438,9 @@ class TestCreateIndex:
 
     def test_drop_index(self):
         assert parse_statement("DROP INDEX i").name == "i"
+        stmt = parse_statement("DROP INDEX IF EXISTS i CASCADE")
+        assert stmt.if_exists is True
+        assert stmt.cascade is True
 
     def test_drop_table_if_exists(self):
         stmt = parse_statement("DROP TABLE IF EXISTS a, b")

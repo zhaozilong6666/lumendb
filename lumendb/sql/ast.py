@@ -525,6 +525,8 @@ class AlterTableRenameConstraint(Statement):
 class DropIndex(Statement):
     name: str
     if_exists: bool = False
+    #: DROP INDEX ... CASCADE：同时删除依赖该唯一索引的外键。
+    cascade: bool = False
 
 
 @dataclass
