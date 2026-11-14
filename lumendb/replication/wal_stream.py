@@ -13,7 +13,12 @@
     {"type": "error", "message": "..."}
 
 这是可替换的传输层：``Replica`` 只依赖“按 LSN 递增拿到 LogRecord”的语义，
-以后换成二进制帧、压缩或 TLS 都不需要改物理重放逻辑。
+以后换成二进制帧或 TLS 都不需要改物理重放逻辑。
+
+``WALClient(compress=True)`` 会让请求带 ``compress`` 标志；服务端把每一行
+响应变成 ``z<base64(zlib(json))>``，客户端按首字节（``{`` 或 ``z``）解码。
+压缩只作用于响应，请求仍然很小；它减少基准备份和 WAL 页数据的网络字节，
+不改变 LSN/记录语义。
 """
 
 from __future__ import annotations
@@ -21,9 +26,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
+import ssl
 import tempfile
 import threading
+import zlib
 from pathlib import Path
 from typing import Iterable
 
@@ -31,8 +39,29 @@ from ..errors import StorageError, TransactionError
 from ..storage.wal import LogRecord
 
 
-def _send_line(sock: socket.socket, payload: dict) -> None:
-    sock.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+def _encode_line(payload: dict, compress: bool = False) -> bytes:
+    raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+    if not compress:
+        return raw
+    # 压缩行以 ``z`` 开头；未压缩行以 ``{`` 开头，客户端据首字节区分。
+    body = base64.b64encode(zlib.compress(raw[:-1])).decode("ascii")
+    return ("z" + body + "\n").encode("ascii")
+
+
+def _decode_line(line: bytes) -> dict:
+    line = line.strip()
+    if line.startswith(b"{"):
+        return json.loads(line.decode("utf-8"))
+    if line.startswith(b"z"):
+        raw = zlib.decompress(base64.b64decode(line[1:]))
+        return json.loads(raw.decode("utf-8"))
+    raise ValueError("无法识别的复制流行格式")
+
+
+def _send_line(
+    sock: socket.socket, payload: dict, *, compress: bool = False
+) -> None:
+    sock.sendall(_encode_line(payload, compress=compress))
 
 
 def _record_to_json(record: LogRecord) -> dict:
@@ -75,12 +104,25 @@ class WALServer:
         port: int = 0,
         *,
         slot_path: str | Path | None = None,
+        slot_dir: str | Path | None = None,
         token: str | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        if slot_path is not None and slot_dir is not None:
+            raise ValueError("slot_path 与 slot_dir 只能配置一个")
         self.primary = primary
         self.token = token
+        self.ssl_context = ssl_context
         self.slot_path = Path(slot_path) if slot_path is not None else None
+        self.slot_dir = Path(slot_dir) if slot_dir is not None else None
         self._confirmed_lsn = 0
+        self._replica_slots: dict[str, int] = {}
+        self._slot_lock = threading.Lock()
+        if self.slot_dir is not None:
+            self.slot_dir.mkdir(parents=True, exist_ok=True)
+            for path in self.slot_dir.glob("*.confirmed"):
+                self._replica_slots[path.name[: -len(".confirmed")]] = read_slot(path)
+            self._refresh_retain()
         if self.slot_path is not None:
             self._confirmed_lsn = read_slot(self.slot_path)
             retain = getattr(primary.wal, "retain_lsn", None)
@@ -95,6 +137,38 @@ class WALServer:
         self.host, self.port = self._sock.getsockname()
         self._thread: threading.Thread | None = None
         self._handlers: list[threading.Thread] = []
+
+    def _replica_id(self, request: dict) -> str | None:
+        raw = request.get("replica_id")
+        if raw is None:
+            return None
+        replica_id = str(raw)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", replica_id):
+            raise StorageError("replica_id 只能包含字母、数字、下划线、点和短横线")
+        return replica_id
+
+    def _slot_confirm(self, replica_id: str | None) -> int:
+        if replica_id is None:
+            return self._confirmed_lsn
+        with self._slot_lock:
+            return self._replica_slots.get(replica_id, 0)
+
+    def _refresh_retain(self) -> None:
+        """多副本时保留点取所有已知槽位确认 LSN 的最小值。"""
+        retain = getattr(self.primary.wal, "retain_lsn", None)
+        if retain is None:
+            return
+        with self._slot_lock:
+            if self._replica_slots:
+                self.primary.wal.retain_lsn = min(self._replica_slots.values())
+
+    def _persist_replica_slot(self, replica_id: str, lsn: int) -> None:
+        if self.slot_dir is None:
+            return
+        target = self.slot_dir / f"{replica_id}.confirmed"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(str(lsn), encoding="utf-8")
+        os.replace(tmp, target)
 
     def start(self) -> "WALServer":
         self._thread = threading.Thread(
@@ -111,23 +185,38 @@ class WALServer:
                 continue
             except OSError:
                 break
+            if self.ssl_context is not None:
+                try:
+                    conn = self.ssl_context.wrap_socket(conn, server_side=True)
+                except (ssl.SSLError, OSError):
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
             conn.settimeout(10)
             handler = threading.Thread(target=self._handle, args=(conn,), daemon=True)
             self._handlers.append(handler)
             handler.start()
 
     def _handle(self, conn: socket.socket) -> None:
+        compress = False
         try:
             line = conn.makefile("rb").readline()
             if not line:
                 return
-            request = json.loads(line.decode("utf-8"))
+            request = _decode_line(line)
+            compress = bool(request.get("compress"))
             if self.token is not None and request.get("token") != self.token:
-                _send_line(conn, {"type": "error", "message": "复制流认证失败"})
+                _send_line(
+                    conn,
+                    {"type": "error", "message": "复制流认证失败"},
+                    compress=compress,
+                )
                 return
             kind = request.get("type")
             if kind == "backup":
-                self._handle_backup(conn)
+                self._handle_backup(conn, request)
             elif kind == "backup_stream":
                 self._handle_backup_stream(conn, request)
             elif kind == "replicate":
@@ -135,12 +224,18 @@ class WALServer:
             elif kind == "ack":
                 self._handle_ack(conn, request)
             elif kind == "status":
-                self._handle_status(conn)
+                self._handle_status(conn, request)
             else:
-                _send_line(conn, {"type": "error", "message": "未知复制请求"})
+                _send_line(
+                    conn,
+                    {"type": "error", "message": "未知复制请求"},
+                    compress=compress,
+                )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             try:
-                _send_line(conn, {"type": "error", "message": str(exc)})
+                _send_line(
+                    conn, {"type": "error", "message": str(exc)}, compress=compress
+                )
             except OSError:
                 pass
         finally:
@@ -149,14 +244,15 @@ class WALServer:
             except OSError:
                 pass
 
-    def _handle_backup(self, conn: socket.socket) -> None:
+    def _handle_backup(self, conn: socket.socket, request: dict) -> None:
+        compress = bool(request.get("compress"))
         try:
             data, checkpoint_lsn = self.primary.snapshot()
         except TransactionError as exc:
-            _send_line(conn, {"type": "error", "message": str(exc)})
+            _send_line(conn, {"type": "error", "message": str(exc)}, compress=compress)
             return
         retain = getattr(self.primary.wal, "retain_lsn", None)
-        if retain is not None:
+        if retain is not None and self.slot_dir is None:
             self.primary.wal.retain_lsn = checkpoint_lsn
         _send_line(
             conn,
@@ -165,9 +261,11 @@ class WALServer:
                 "checkpoint_lsn": checkpoint_lsn,
                 "data": base64.b64encode(data).decode("ascii"),
             },
+            compress=compress,
         )
 
     def _handle_backup_stream(self, conn: socket.socket, request: dict) -> None:
+        compress = bool(request.get("compress"))
         chunk_size = max(4096, min(int(request.get("chunk_size", 256 * 1024)), 8 * 1024 * 1024))
         fd, temp_name = tempfile.mkstemp(prefix="lumendb-backup-", suffix=".data")
         os.close(fd)
@@ -176,10 +274,10 @@ class WALServer:
             try:
                 checkpoint_lsn = self.primary.snapshot_file(temp_path)
             except TransactionError as exc:
-                _send_line(conn, {"type": "error", "message": str(exc)})
+                _send_line(conn, {"type": "error", "message": str(exc)}, compress=compress)
                 return
             retain = getattr(self.primary.wal, "retain_lsn", None)
-            if retain is not None:
+            if retain is not None and self.slot_dir is None:
                 self.primary.wal.retain_lsn = checkpoint_lsn
             with open(temp_path, "rb") as fh:
                 while True:
@@ -192,9 +290,12 @@ class WALServer:
                             "type": "backup_chunk",
                             "data": base64.b64encode(chunk).decode("ascii"),
                         },
+                        compress=compress,
                     )
             _send_line(
-                conn, {"type": "backup_end", "checkpoint_lsn": checkpoint_lsn}
+                conn,
+                {"type": "backup_end", "checkpoint_lsn": checkpoint_lsn},
+                compress=compress,
             )
         finally:
             try:
@@ -203,6 +304,7 @@ class WALServer:
                 pass
 
     def _handle_replicate(self, conn: socket.socket, request: dict) -> None:
+        compress = bool(request.get("compress"))
         start_lsn = int(request.get("start_lsn", 0))
         max_records = max(0, int(request.get("max_records", 1000)))
         base_lsn = getattr(self.primary.wal, "base_lsn", 0)
@@ -213,44 +315,68 @@ class WALServer:
                     "type": "error",
                     "message": "副本落后于主库已回收的 WAL，需要重新基准备份",
                 },
+                compress=compress,
             )
             return
         retain = getattr(self.primary.wal, "retain_lsn", None)
-        if retain is not None and start_lsn > 0:
+        if retain is not None and self.slot_dir is None and start_lsn > 0:
             self.primary.wal.retain_lsn = start_lsn
+        self._refresh_retain()
 
         count = 0
         for record in self.primary.wal.iter_records(start_lsn + 1):
-            _send_line(conn, _record_to_json(record))
+            _send_line(conn, _record_to_json(record), compress=compress)
             count += 1
             if max_records and count >= max_records:
                 break
-        _send_line(conn, {"type": "end", "next_lsn": self.primary.wal.next_lsn})
+        _send_line(
+            conn,
+            {"type": "end", "next_lsn": self.primary.wal.next_lsn},
+            compress=compress,
+        )
 
-    def _handle_status(self, conn: socket.socket) -> None:
+    def _handle_status(self, conn: socket.socket, request: dict) -> None:
         wal = self.primary.wal
+        replica_id = self._replica_id(request)
         _send_line(
             conn,
             {
                 "type": "status",
                 "current_lsn": int(getattr(wal, "last_lsn", 0)),
                 "base_lsn": getattr(wal, "base_lsn", 0),
-                "confirmed_lsn": self._confirmed_lsn,
+                "confirmed_lsn": self._slot_confirm(replica_id),
+                "replica_id": replica_id,
             },
+            compress=bool(request.get("compress")),
         )
 
     def _handle_ack(self, conn: socket.socket, request: dict) -> None:
+        compress = bool(request.get("compress"))
+        replica_id = self._replica_id(request)
         lsn = max(0, int(request.get("lsn", 0)))
-        if lsn > self._confirmed_lsn:
-            self._confirmed_lsn = lsn
-            retain = getattr(self.primary.wal, "retain_lsn", None)
-            if retain is not None:
-                self.primary.wal.retain_lsn = lsn
-            if self.slot_path is not None:
-                tmp = self.slot_path.with_name(self.slot_path.name + ".tmp")
-                tmp.write_text(str(lsn), encoding="utf-8")
-                os.replace(tmp, self.slot_path)
-        _send_line(conn, {"type": "ack", "confirmed_lsn": self._confirmed_lsn})
+        if replica_id is None:
+            if lsn > self._confirmed_lsn:
+                self._confirmed_lsn = lsn
+                retain = getattr(self.primary.wal, "retain_lsn", None)
+                if retain is not None:
+                    self.primary.wal.retain_lsn = lsn
+                if self.slot_path is not None:
+                    tmp = self.slot_path.with_name(self.slot_path.name + ".tmp")
+                    tmp.write_text(str(lsn), encoding="utf-8")
+                    os.replace(tmp, self.slot_path)
+            confirmed = self._confirmed_lsn
+        else:
+            with self._slot_lock:
+                if lsn > self._replica_slots.get(replica_id, 0):
+                    self._replica_slots[replica_id] = lsn
+                    self._persist_replica_slot(replica_id, lsn)
+            self._refresh_retain()
+            confirmed = self._slot_confirm(replica_id)
+        _send_line(
+            conn,
+            {"type": "ack", "confirmed_lsn": confirmed, "replica_id": replica_id},
+            compress=compress,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -272,23 +398,39 @@ class WALClient:
         timeout: float = 10.0,
         *,
         token: str | None = None,
+        compress: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        replica_id: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.token = token
+        self.compress = compress
+        self.ssl_context = ssl_context
+        self.server_hostname = server_hostname or host
+        self.replica_id = replica_id
 
     def _request(self, payload: dict) -> Iterable[dict]:
+        payload = dict(payload)
         if self.token is not None:
-            payload = dict(payload)
             payload["token"] = self.token
+        if self.compress:
+            payload["compress"] = True
+        if self.replica_id is not None:
+            payload["replica_id"] = self.replica_id
         sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         try:
+            if self.ssl_context is not None:
+                sock = self.ssl_context.wrap_socket(
+                    sock, server_hostname=self.server_hostname
+                )
             sock.settimeout(self.timeout)
             _send_line(sock, payload)
             file = sock.makefile("rb")
             for line in file:
-                data = json.loads(line.decode("utf-8"))
+                data = _decode_line(line)
                 if data.get("type") == "error":
                     raise StorageError(data.get("message", "复制请求失败"))
                 yield data
