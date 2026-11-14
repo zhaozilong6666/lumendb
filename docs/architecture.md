@@ -286,7 +286,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 已回收段之前，服务端返回明确错误，要求重新基准备份，避免静默丢段。
 `status` 请求返回 `last_lsn` / `base_lsn` / `confirmed_lsn`；`last_lsn` 是最后
 一条记录自身的 LSN，不是 `next_lsn` 字节偏移，副本的 `lag_from_server` 用它
-计算真实落后量。
+计算真实落后量。`WALServer(token=...)` 开启后，所有请求必须携带同一个
+token；这是共享密钥认证，不是 TLS。
 主库重启时应在打开 `Database` 前读槽位，并用
 `Database(wal_retain_lsn=read_slot(slot_path))` 把保留点放回 WAL；这比“先开库、
 再启动 WALServer”更安全。
@@ -317,7 +318,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - 自动提升只有连续失败阈值，没有心跳租约/仲裁和客户端重定向；fencing 依赖
   共享 marker，网络分区时仍可能双写；
-- 复制连接没有认证/TLS，默认只应监听本机或可信网络；
+- 复制连接支持可选共享 token 校验，但没有 TLS，token 在明文 JSON 中传输；
+  默认只应监听本机或可信网络；
 - 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 只覆盖
   共享 marker，没有自动租约。
 

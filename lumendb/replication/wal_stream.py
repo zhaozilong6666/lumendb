@@ -75,8 +75,10 @@ class WALServer:
         port: int = 0,
         *,
         slot_path: str | Path | None = None,
+        token: str | None = None,
     ) -> None:
         self.primary = primary
+        self.token = token
         self.slot_path = Path(slot_path) if slot_path is not None else None
         self._confirmed_lsn = 0
         if self.slot_path is not None:
@@ -120,6 +122,9 @@ class WALServer:
             if not line:
                 return
             request = json.loads(line.decode("utf-8"))
+            if self.token is not None and request.get("token") != self.token:
+                _send_line(conn, {"type": "error", "message": "复制流认证失败"})
+                return
             kind = request.get("type")
             if kind == "backup":
                 self._handle_backup(conn)
@@ -260,12 +265,23 @@ class WALServer:
 
 
 class WALClient:
-    def __init__(self, host: str, port: int, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 10.0,
+        *,
+        token: str | None = None,
+    ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.token = token
 
     def _request(self, payload: dict) -> Iterable[dict]:
+        if self.token is not None:
+            payload = dict(payload)
+            payload["token"] = self.token
         sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         try:
             sock.settimeout(self.timeout)

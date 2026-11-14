@@ -89,6 +89,7 @@ class Replica:
         path: str | Path,
         *,
         timeout: float = 10.0,
+        token: str | None = None,
     ) -> "Replica":
         """通过 TCP 拉取主库基准备份并打开副本。"""
         from .wal_stream import WALClient
@@ -101,7 +102,9 @@ class Replica:
                 "副本目录已经有数据文件",
                 hint="换一个空目录，或先手动确认旧副本可以删除",
             )
-        base_lsn = WALClient(host, port, timeout=timeout).backup_to(data_path)
+        base_lsn = WALClient(
+            host, port, timeout=timeout, token=token
+        ).backup_to(data_path)
         return cls(target, applied_lsn=base_lsn)
 
     # ------------------------------------------------------------------
@@ -119,13 +122,18 @@ class Replica:
             return max(1, primary.wal.next_lsn - self._applied_lsn)
 
     def lag_from_server(
-        self, host: str, port: int, *, timeout: float = 10.0
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float = 10.0,
+        token: str | None = None,
     ) -> int:
         """通过 TCP 读取主库当前 LSN，计算尚未应用的字节数。"""
         from .wal_stream import WALClient
 
         with self._lock:
-            status = WALClient(host, port, timeout=timeout).status()
+            status = WALClient(host, port, timeout=timeout, token=token).status()
             lag = status["current_lsn"] - self._applied_lsn
             return max(0, lag)
 
@@ -148,17 +156,17 @@ class Replica:
         *,
         max_records: int = 1000,
         timeout: float = 10.0,
+        token: str | None = None,
     ) -> int:
         """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
         with self._lock:
             from .wal_stream import WALClient
 
-            records = WALClient(host, port, timeout=timeout).fetch(
-                self._applied_lsn, max_records=max_records
-            )
+            client = WALClient(host, port, timeout=timeout, token=token)
+            records = client.fetch(self._applied_lsn, max_records=max_records)
             applied = self.apply(records, primary=None)
             if applied:
-                WALClient(host, port, timeout=timeout).ack(self._applied_lsn)
+                client.ack(self._applied_lsn)
             return applied
 
     def apply(self, records, *, primary: Database | None = None) -> int:

@@ -24,7 +24,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 | 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
 | 查询执行 | 火山模型算子 + 哈希连接 + 等值/范围索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
 | 协议 | PostgreSQL v3 wire protocol（simple + extended query，支持 `$1` 参数绑定） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
-| 复制 | TCP 物理 WAL 流、分块基准备份、只读副本、LSN 延迟、手动提升 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
+| 复制 | TCP 物理 WAL 流、分块基准备份、token 认证、只读副本、LSN 延迟、手动/自动提升 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
 | 进程模型 | 数据目录独占锁（OS 级字节锁），拒绝双开 | `tests/unit/test_filelock.py`：第二个打开者必须失败 |
 
 ## 架构
@@ -219,7 +219,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1013 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1014 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

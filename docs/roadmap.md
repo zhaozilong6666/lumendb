@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1013 passed。
+- 全量测试：1014 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -143,6 +143,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
   `promote` + 共享 fence），但客户端重定向、租约/仲裁和网络分区下的
   双写防护仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
+  - **认证已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)` 在每条
+    请求上校验共享 token；TLS 仍未做，token 在明文 JSON 里传输。
 - 副本查询与 apply 的并发调度；当前是单线程应用。
 - 复制槽只能在一个主库数据目录上持久化 `confirmed_lsn`；启动顺序已由
   `Database(wal_retain_lsn=read_slot(...))` 覆盖：在恢复和自动 checkpoint 之前

@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import NotSupportedError, TransactionError
+from lumendb.errors import NotSupportedError, StorageError, TransactionError
 from lumendb.replication import (
     PromotionFence,
     Replica,
@@ -79,6 +79,33 @@ class TestReplica:
         assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(120,)]
         primary.close()
         replica.db.close()
+
+    def test_replication_stream_requires_token(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        server = WALServer(primary, token="s3cret").start()
+        replica = None
+        try:
+            with pytest.raises(StorageError, match="认证"):
+                WALClient(server.host, server.port).status()
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica", token="s3cret"
+            )
+            primary.execute_one("INSERT INTO t VALUES (1)")
+            assert (
+                replica.replicate_from_server(
+                    server.host,
+                    server.port,
+                    token="s3cret",
+                )
+                > 0
+            )
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            if replica is not None:
+                replica.db.close()
+            server.stop()
+            primary.close()
 
     def test_tcp_backup_and_wal_stream_apply(self, tmp_path):
         primary = make_primary(tmp_path)

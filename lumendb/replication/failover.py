@@ -33,10 +33,12 @@ class ReplicationMonitor:
         max_failures: int = 3,
         timeout: float = 5.0,
         max_records: int = 1000,
+        token: str | None = None,
     ) -> None:
         self.replica = replica
         self.host = host
         self.port = port
+        self.token = token
         self.fence_path = Path(fence_path) if fence_path is not None else None
         self.node_id = node_id
         self.max_failures = max(1, int(max_failures))
@@ -51,12 +53,15 @@ class ReplicationMonitor:
         if self.promoted:
             return "promoted"
         try:
-            WALClient(self.host, self.port, timeout=self.timeout).status()
+            WALClient(
+                self.host, self.port, timeout=self.timeout, token=self.token
+            ).status()
             self.replica.replicate_from_server(
                 self.host,
                 self.port,
                 max_records=self.max_records,
                 timeout=self.timeout,
+                token=self.token,
             )
             self.failures = 0
             self.last_error = None
