@@ -12,6 +12,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
   标注；已接入 3–8 个逗号连接源的左深动态规划。
 - 组提交已落地：WAL 追加/刷盘线程安全，提交 leader 合并刷盘，单提交语义
   不变。
+- 自动 checkpoint 已落地：WAL 增长超过 `checkpoint_wal_bytes` 时刷脏页、
+  写 CHECKPOINT 并前移 `checkpoint_lsn`；手动 `CHECKPOINT` 保留。
 - 外键主线已闭环：引用完整性、级联动作、DDL、延迟约束、`NOT VALID` /
   `VALIDATE`、`TRUNCATE` 依赖、依赖删除 `CASCADE`。
 - SQL 查询：相关子查询（单层/多层）、FROM 派生表、列别名列表、派生表内部
