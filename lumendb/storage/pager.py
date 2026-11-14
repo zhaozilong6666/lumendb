@@ -248,6 +248,14 @@ class DiskManager:
         self._fh.flush()
         os.fsync(self._fh.fileno())
 
+    def snapshot_bytes(self) -> bytes:
+        """读取当前数据文件的完整快照。
+
+        调用方负责保证没有并发写；``Database.snapshot`` 会用写锁做这件事。
+        """
+        self._fh.flush()
+        return self.path.read_bytes()
+
     def close(self) -> None:
         if not self._fh.closed:
             self._persist_meta()

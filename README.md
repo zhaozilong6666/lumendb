@@ -209,7 +209,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **1009 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1010 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -255,9 +255,9 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 自动 CHECKPOINT：WAL 自上次 checkpoint 增长超过阈值时触发，保留手动 `CHECKPOINT`
 - [x] WAL 分段回收：新库使用 `wal-<first_lsn>.log` 分段，checkpoint 后按安全 LSN 删除旧段，活跃事务 BEGIN 之前的历史保留
 - [ ] 按提交数触发的 checkpoint 策略
-- [x] 复制 / 只读副本（MVP）：TCP 物理 WAL 流、基准备份、只读拒绝写入、LSN 延迟、手动提升
+- [x] 复制 / 只读副本（MVP）：TCP 物理 WAL 流、基准备份写冻结、只读拒绝写入、LSN 延迟、手动提升
 - [x] 复制槽：副本 ack 的 `confirmed_lsn` 原子持久化，服务重启恢复 WAL 保留点
-- [ ] 写冻结基准备份、提升 fencing 与自动故障切换
+- [ ] 提升 fencing 与自动故障切换
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。

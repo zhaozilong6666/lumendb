@@ -129,15 +129,14 @@ class WALServer:
                 pass
 
     def _handle_backup(self, conn: socket.socket) -> None:
-        if self.primary.txns.active_xids:
-            _send_line(conn, {"type": "error", "message": "基准备份要求主库没有活跃事务"})
+        try:
+            data, checkpoint_lsn = self.primary.snapshot()
+        except TransactionError as exc:
+            _send_line(conn, {"type": "error", "message": str(exc)})
             return
-        self.primary.checkpoint()
-        checkpoint_lsn = self.primary.disk.meta.checkpoint_lsn
         retain = getattr(self.primary.wal, "retain_lsn", None)
         if retain is not None:
             self.primary.wal.retain_lsn = checkpoint_lsn
-        data = self.primary.disk.path.read_bytes()
         _send_line(
             conn,
             {

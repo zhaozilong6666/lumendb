@@ -70,7 +70,7 @@
 >   `WALServer` 通过 TCP 提供基准备份和增量 WAL 流，`Replica` 按 LSN 重放页更新
 >   与事务状态、以 pageLSN 幂等、用 `replica.lsn` 断点续传，只读 `Database`
 >   在语句入口拒绝写入，`lag_lsn` 量化延迟，并支持手动提升；
-> - 1009 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 1010 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -153,7 +153,7 @@
 >   updates and transaction states in LSN order with pageLSN idempotence,
 >   resumes from an atomic `replica.lsn` marker, rejects writes at statement
 >   entry, quantifies lag with `lag_lsn`, and supports manual promotion.
-> - 1009 automated tests including crash-injection and a 20-seed randomized
+> - 1010 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from lumendb.engine.database import Database
@@ -113,6 +115,38 @@ class TestReplica:
         assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
         primary.close()
         replica.db.close()
+
+    def test_snapshot_freezes_concurrent_writes(self, tmp_path, monkeypatch):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        entered = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+
+        original = primary.disk.snapshot_bytes
+
+        def slow_snapshot():
+            entered.set()
+            assert release.wait(2)
+            return original()
+
+        monkeypatch.setattr(primary.disk, "snapshot_bytes", slow_snapshot)
+
+        def writer():
+            primary.execute_one("INSERT INTO t VALUES (1)")
+            done.set()
+
+        snapshot_thread = threading.Thread(target=primary.snapshot)
+        snapshot_thread.start()
+        assert entered.wait(2)
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert not done.is_set()
+        release.set()
+        snapshot_thread.join(2)
+        thread.join(2)
+        assert done.is_set()
+        primary.close()
 
     def test_replica_restart_resumes_from_marker(self, tmp_path):
         primary = make_primary(tmp_path)

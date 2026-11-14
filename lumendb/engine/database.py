@@ -5,6 +5,7 @@ CLI 与 PostgreSQL 协议服务端都只依赖这一层，它们不需要知道�
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -50,6 +51,9 @@ def _is_read_only_statement(statement: object) -> bool:
     return type(statement).__name__ in _READ_ONLY_STATEMENTS
 
 
+_PURE_READ_STATEMENTS = {"Query", "Select", "Explain", "ShowTables", "ShowViews"}
+
+
 class Database:
     def __init__(
         self,
@@ -63,6 +67,8 @@ class Database:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        # 写路径串行化：既保护单文件 DiskManager，也作为基准备份的写冻结门。
+        self._write_lock = threading.RLock()
         self.disk = DiskManager(self.path / "lumendb.data")
         # 兼容旧库：如果已有单文件 WAL，继续用它；新库默认使用分段 WAL，
         # 这样 checkpoint 后可以回收旧段。
@@ -119,6 +125,14 @@ class Database:
                 "只读副本拒绝写入",
                 hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
             )
+        if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+            with self._write_lock:
+                return self._run_unlocked(statement, params)
+        return self._run_unlocked(statement, params)
+
+    def _run_unlocked(
+        self, statement, params: Optional[list[Any]] = None
+    ) -> Result:
         if isinstance(statement, Begin):
             if self._txn is not None:
                 raise TransactionError(
@@ -193,7 +207,24 @@ class Database:
     # ------------------------------------------------------------------
 
     def checkpoint(self) -> None:
-        self.recovery.checkpoint()
+        with self._write_lock:
+            self.recovery.checkpoint()
+
+    def snapshot(self) -> tuple[bytes, int]:
+        """冻结写、做一次 checkpoint，然后返回数据文件快照和基础 LSN。
+
+        写锁会阻止新的 ``Database._run`` 写语句进入；已经开启的活跃事务会被
+        拒绝（基准备份不能包含未提交版本）。读查询仍可继续，因为快照只读
+        数据文件，不改变 Buffer Pool。
+        """
+        with self._write_lock:
+            if self.txns.active_xids:
+                raise TransactionError(
+                    "基准备份要求主库没有活跃事务",
+                    hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和复制",
+                )
+            self.recovery.checkpoint()
+            return self.disk.snapshot_bytes(), self.disk.meta.checkpoint_lsn
 
     def _maybe_checkpoint(self) -> None:
         """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。

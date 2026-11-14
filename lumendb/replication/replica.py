@@ -17,7 +17,6 @@ MVCC 可见性。记录可以直接来自同进程的 ``primary.wal``，也可�
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 from ..engine.database import Database
@@ -63,8 +62,7 @@ class Replica:
                 "基准备份要求主库没有活跃事务",
                 hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和复制",
             )
-        primary.checkpoint()
-        base_lsn = primary.disk.meta.checkpoint_lsn
+        data, base_lsn = primary.snapshot()
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
         data_path = target / "lumendb.data"
@@ -73,7 +71,7 @@ class Replica:
                 "副本目录已经有数据文件",
                 hint="换一个空目录，或先手动确认旧副本可以删除",
             )
-        shutil.copy2(primary.disk.path, data_path)
+        data_path.write_bytes(data)
         retain = getattr(primary.wal, "retain_lsn", None)
         if retain is not None:
             primary.wal.retain_lsn = base_lsn
