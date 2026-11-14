@@ -1450,23 +1450,64 @@ class Executor:
                 tag="ALTER TABLE",
                 notice=f"列 {old_column.name} 的类型已经是 {new_type.name}",
             )
-        for fk in table.foreign_keys.values():
-            if old_column.name in fk.columns:
+        own_fk_dependents = [
+            fk for fk in table.foreign_keys.values()
+            if old_column.name in fk.columns
+        ]
+        ext_fk_dependents = [
+            (other, fk)
+            for other in self._catalog.list_tables()
+            if other is not table
+            for fk in other.foreign_keys.values()
+            if (
+                fk.ref_table == table.name
+                and old_column.name in fk.ref_columns
+            )
+        ]
+        if not stmt.cascade:
+            if own_fk_dependents:
+                fk = own_fk_dependents[0]
                 raise NotSupportedError(
                     f"列 {old_column.name!r} 被外键约束 {fk.name!r} 引用",
                     hint="先删除外键约束，再修改列类型",
                 )
-        for other in self._catalog.list_tables():
-            for fk in other.foreign_keys.values():
-                if (
-                    fk.ref_table == table.name
-                    and old_column.name in fk.ref_columns
-                ):
-                    raise NotSupportedError(
-                        f"列 {old_column.name!r} 被表 {other.name} 的外键 "
-                        f"{fk.name!r} 引用",
-                        hint="先删除外键约束，再修改列类型",
+            if ext_fk_dependents:
+                other, fk = ext_fk_dependents[0]
+                raise NotSupportedError(
+                    f"列 {old_column.name!r} 被表 {other.name} 的外键 "
+                    f"{fk.name!r} 引用",
+                    hint="先删除外键约束，再修改列类型",
+                )
+        else:
+            fk_holders: dict[str, tuple[TableDef, dict[str, ForeignKeyDef]]] = {}
+            if own_fk_dependents:
+                fk_holders[table.name] = (table, dict(table.foreign_keys))
+            for other, _fk in ext_fk_dependents:
+                if other.name not in fk_holders:
+                    fk_holders[other.name] = (
+                        other,
+                        dict(other.foreign_keys),
                     )
+            for holder, old_map in fk_holders.values():
+                holder.foreign_keys = {
+                    name: fk
+                    for name, fk in holder.foreign_keys.items()
+                    if not (
+                        (holder is table and old_column.name in fk.columns)
+                        or (
+                            fk.ref_table == table.name
+                            and old_column.name in fk.ref_columns
+                        )
+                    )
+                }
+
+            if fk_holders:
+
+                def undo_cascade_fks() -> None:
+                    for holder, old_map in fk_holders.values():
+                        holder.foreign_keys = old_map
+
+                txn.undo_log.append(undo_cascade_fks)
         # 先物化旧行：类型一旦改变，后续 scan 会按新类型解码旧记录。
         heap = HeapFile(self._bp, table, self._txns)
         source_rows = [
@@ -1562,12 +1603,16 @@ class Executor:
         index_note = (
             f"；重建 {rebuilt} 个索引" if rebuilt else ""
         )
+        cascade_note = ""
+        fk_count = len(own_fk_dependents) + len(ext_fk_dependents)
+        if stmt.cascade and fk_count:
+            cascade_note = f"；级联删除 {fk_count} 个外键"
         return Result(
             tag="ALTER TABLE",
             notice=(
                 f"已把列 {old_column.name} 的类型从 {old_column.type.name} "
                 f"改为 {new_type.name}；重写 {len(converted)} 行"
-                f"{index_note}"
+                f"{index_note}{cascade_note}"
             ),
         )
 

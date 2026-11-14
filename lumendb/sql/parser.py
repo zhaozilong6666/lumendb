@@ -433,8 +433,13 @@ class Parser:
                 using = None
                 if self._match_word("USING"):
                     using = self._parse_expr()
+                cascade = self._match_kw("CASCADE") is not None
                 return AlterTableAlterType(
-                    table=table, column=column, type=type_spec, using=using
+                    table=table,
+                    column=column,
+                    type=type_spec,
+                    using=using,
+                    cascade=cascade,
                 )
             if self._match_kw("SET"):
                 if self._match_word("DATA"):
@@ -444,8 +449,13 @@ class Parser:
                     using = None
                     if self._match_word("USING"):
                         using = self._parse_expr()
+                    cascade = self._match_kw("CASCADE") is not None
                     return AlterTableAlterType(
-                        table=table, column=column, type=type_spec, using=using
+                        table=table,
+                        column=column,
+                        type=type_spec,
+                        using=using,
+                        cascade=cascade,
                     )
                 if self._match_kw("NOT"):
                     self._expect_kw("NULL")

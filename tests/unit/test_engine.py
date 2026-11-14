@@ -3515,6 +3515,41 @@ class TestForeignKey:
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("INSERT INTO c VALUES (3)")
 
+    def test_alter_type_cascade_removes_dependent_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY, note TEXT)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        with pytest.raises(NotSupportedError, match="外键"):
+            db.execute_one("ALTER TABLE p ALTER COLUMN id TYPE BIGINT")
+        result = db.execute_one(
+            "ALTER TABLE p ALTER COLUMN id TYPE BIGINT CASCADE"
+        )
+        assert "级联删除 1 个外键" in result.notice
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        assert db.catalog.get_table("p").column("id").type.name == "BIGINT"
+        db.execute_one("INSERT INTO c VALUES (99)")
+
+    def test_alter_type_cascade_removes_local_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id), note TEXT)")
+        result = db.execute_one(
+            "ALTER TABLE c ALTER COLUMN pid TYPE BIGINT CASCADE"
+        )
+        assert "级联删除 1 个外键" in result.notice
+        assert db.catalog.get_table("c").foreign_keys == {}
+
+    def test_alter_type_cascade_rollback_restores_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY, note TEXT)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE p ALTER COLUMN id TYPE BIGINT CASCADE")
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        db.execute_one("ROLLBACK")
+        assert "c_pid_fkey" in db.catalog.get_table("c").foreign_keys
+        assert db.catalog.get_table("p").column("id").type.name == "INT"
+        db.execute_one("INSERT INTO p VALUES (1, 'x')")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+
     def test_drop_column_and_type_rejected_for_fk(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")

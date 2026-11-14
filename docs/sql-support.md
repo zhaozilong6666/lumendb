@@ -184,7 +184,7 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 `ADD CONSTRAINT FOREIGN KEY` 的存量行回填与校验路径，先加列再原子建立外键，任一步
 失败整条语句回滚；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
 `ALTER COLUMN TYPE` 会拒绝，`DROP COLUMN ... CASCADE` 会一并删除依赖该列的外键、
-索引与 CHECK 约束；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
+索引与 CHECK 约束，`ALTER COLUMN TYPE ... CASCADE` 会删除依赖该列的外键；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
 CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 默认拒绝被外键引用的表；`TRUNCATE a, b` 在同一个列表中允许一起清空相互依赖的表，但任何未列入列表的引用表仍会被拒绝；`TRUNCATE ... CASCADE` 递归清空直接/间接引用它的子表；
 删除支撑外键的唯一索引/唯一约束前，必须先删除外键。`RENAME TO` / `RENAME COLUMN`
 会同步更新其它表外键中的 `ref_table` / `ref_columns`，以及本表外键的本地列引用。

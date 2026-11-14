@@ -505,6 +505,8 @@ class AlterTableAlterType(Statement):
     type: TypeSpec
     #: 可选的 USING 表达式；为 None 时按目标类型做隐式 coerce。
     using: Optional[Expr] = None
+    #: ALTER COLUMN ... TYPE ... CASCADE：同时删除依赖该列的外键。
+    cascade: bool = False
 
 
 @dataclass

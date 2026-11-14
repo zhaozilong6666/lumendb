@@ -196,7 +196,7 @@ DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行�
 CHECK 重新编译谓词后扫描全部可见行，成功后才把 `validated` 从 `False` 改为 `True`。
 因此大表可以先上线约束、再择机校验，失败时约束仍保持 `NOT VALID`。
 
-DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN`（可 `CASCADE` 清理依赖） / `ALTER COLUMN TYPE`
+DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`（均可 `CASCADE` 清理依赖外键）
 拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 默认拒绝删除支撑外键的唯一键，
 `DROP CONSTRAINT ... CASCADE` / `DROP INDEX ... CASCADE` 会显式删除依赖外键；`DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 默认拒绝被引用的表；`TRUNCATE a, b` 允许同一列表内的相互依赖，但漏掉任一引用表

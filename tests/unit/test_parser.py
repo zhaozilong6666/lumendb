@@ -329,6 +329,11 @@ class TestCreateTable:
         assert stmt.type.kind == DataType.BIGINT
 
         stmt = parse_statement(
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT CASCADE"
+        )
+        assert stmt.cascade is True
+
+        stmt = parse_statement(
             "ALTER TABLE t ALTER a SET DATA TYPE VARCHAR(10)"
         )
         assert stmt.type.kind == DataType.VARCHAR
