@@ -58,7 +58,10 @@ DROP TABLE t [CASCADE];
 的唯一列建一个唯一索引（`NULL` 不参与唯一性比较）；复合唯一约束请用表级
 `UNIQUE (a, b)` 或 `CREATE UNIQUE INDEX`。表级 `PRIMARY KEY (a, b)` 支持复合
 主键，参与列自动变为 `NOT NULL`，并生成一个名为 `<table>_pkey`（或显式约束名）
-的复合唯一索引。
+的复合唯一索引。`UNIQUE` / `PRIMARY KEY` 都可声明 `DEFERRABLE [INITIALLY DEFERRED]`：
+延迟唯一索引在事务内允许暂时出现重复键，由 `COMMIT` 或
+`SET CONSTRAINTS ... IMMEDIATE` 扫描当前可见行统一校验，冲突时报
+`DuplicateKeyError`；`NULL` 仍按 PostgreSQL 默认语义不参与唯一性比较。
 
 `CHECK` 约束支持列级和表级声明，也支持 `CONSTRAINT name CHECK (...)` 命名。没有
 显式名字时，列级约束自动命名为 `<table>_<column>_check`，表级约束自动命名为
@@ -159,8 +162,9 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 `CASCADE` / `SET NULL` / `SET DEFAULT` 动作也始终立即执行。显式事务内可用
 `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` 覆盖当前事务的
 检查时机：`DEFERRED` 让后续 DML 跟踪待检行，`IMMEDIATE` 会在语句结束时立即补检
-已积压的行；`ALL` 只作用于所有 `DEFERRABLE` 外键，按名称指定非 `DEFERRABLE`
-约束会明确报错。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
+已积压的行；`ALL` 作用于所有 `DEFERRABLE` 外键以及 `DEFERRABLE` 的
+UNIQUE/PRIMARY KEY 约束，按名称指定非 `DEFERRABLE` 约束会明确报错。
+延迟唯一约束的积压重复键也由同一入口补检，错误为 `DuplicateKeyError`。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
 更新被引用键时只要还有子行
 引用旧键就拒绝；`CASCADE` / `SET NULL` / `SET DEFAULT` 会按依赖顺序递归处理，
 并同步维护子表索引。`ON DELETE` / `ON UPDATE` 的 `SET NULL` / `SET DEFAULT`
@@ -396,6 +400,7 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
+| 唯一/主键延迟 | `UNIQUE` / `PRIMARY KEY` 支持 `DEFERRABLE` / `INITIALLY DEFERRED`；事务内允许暂存重复键，提交或 `SET CONSTRAINTS ... IMMEDIATE` 时统一校验，`NULL` 不参与唯一性比较 |
 | 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查；`SET NULL` / `SET DEFAULT` 支持列级 `(col...)`；`ADD CONSTRAINT ... NOT VALID`（外键与 CHECK）+ `VALIDATE CONSTRAINT` 支持分批校验存量行 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |

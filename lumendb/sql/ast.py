@@ -367,6 +367,10 @@ class ColumnDef:
     default: Optional[Expr] = None
     checks: tuple[CheckSpec, ...] = ()
     references: Optional[ForeignKeySpec] = None
+    primary_deferrable: bool = False
+    primary_initially_deferred: bool = False
+    unique_deferrable: bool = False
+    unique_initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -376,6 +380,9 @@ class TableConstraint:
     kind: str  # "PRIMARY KEY" / "UNIQUE" / "CHECK" / "FOREIGN KEY"
     columns: list[str]
     name: Optional[str] = None
+    #: PRIMARY KEY / UNIQUE 也可声明延迟检查。
+    deferrable: bool = False
+    initially_deferred: bool = False
     check: Optional[CheckSpec] = None
     ref_table: Optional[str] = None
     ref_columns: list[str] = field(default_factory=list)

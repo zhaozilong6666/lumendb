@@ -748,7 +748,9 @@ class Executor:
         columns = [_to_column(c) for c in stmt.columns]
         by_name = {c.name: c for c in columns}
 
-        table_primary: list[tuple[tuple[str, ...], Optional[str]]] = []
+        table_primary: list[
+            tuple[tuple[str, ...], Optional[str], bool, bool]
+        ] = []
         for constraint in stmt.constraints:
             if constraint.kind != "PRIMARY KEY":
                 continue
@@ -764,7 +766,12 @@ class Executor:
                         f"表级主键引用了不存在的列 {name!r}"
                     )
             table_primary.append(
-                (names, constraint.name.lower() if constraint.name else None)
+                (
+                    names,
+                    constraint.name.lower() if constraint.name else None,
+                    constraint.deferrable,
+                    constraint.initially_deferred,
+                )
             )
 
         column_primary = [c for c in columns if c.primary_key]
@@ -780,8 +787,15 @@ class Executor:
             )
 
         primary_name: Optional[str] = None
+        primary_deferrable = False
+        primary_initially_deferred = False
         if table_primary:
-            primary_columns, primary_name = table_primary[0]
+            (
+                primary_columns,
+                primary_name,
+                primary_deferrable,
+                primary_initially_deferred,
+            ) = table_primary[0]
             # 表级复合主键把参与列标记为 NOT NULL + primary_key，
             # 列级读取和目录展示仍然看到完整的主键信息。
             columns = [
@@ -796,6 +810,15 @@ class Executor:
             ]
         elif column_primary:
             primary_columns = (column_primary[0].name,)
+            primary_def = next(
+                col_def
+                for col_def in stmt.columns
+                if col_def.name.lower() == primary_columns[0]
+            )
+            primary_deferrable = primary_def.primary_deferrable
+            primary_initially_deferred = (
+                primary_def.primary_initially_deferred
+            )
         else:
             primary_columns = ()
 
@@ -808,6 +831,8 @@ class Executor:
                     columns=primary_columns,
                     unique=True,
                     constraint_kind="PRIMARY",
+                    deferrable=primary_deferrable,
+                    initially_deferred=primary_initially_deferred,
                 )
             )
 
@@ -823,6 +848,8 @@ class Executor:
                     columns=(col.name,),
                     unique=True,
                     constraint_kind="UNIQUE",
+                    deferrable=col_def.unique_deferrable,
+                    initially_deferred=col_def.unique_initially_deferred,
                 )
             )
 
@@ -852,6 +879,8 @@ class Executor:
                     columns=names,
                     unique=True,
                     constraint_kind="UNIQUE",
+                    deferrable=constraint.deferrable,
+                    initially_deferred=constraint.initially_deferred,
                 )
             )
 
@@ -2084,6 +2113,8 @@ class Executor:
                 ),
                 txn,
                 constraint_kind="UNIQUE",
+                deferrable=constraint.deferrable,
+                initially_deferred=constraint.initially_deferred,
             )
             return Result(
                 tag="ALTER TABLE",
@@ -2121,6 +2152,8 @@ class Executor:
                 ),
                 txn,
                 constraint_kind="PRIMARY",
+                deferrable=constraint.deferrable,
+                initially_deferred=constraint.initially_deferred,
             )
             old_columns = list(table.columns)
             table.columns = [
@@ -2359,6 +2392,8 @@ class Executor:
         txn: Transaction,
         *,
         constraint_kind: Optional[str] = None,
+        deferrable: bool = False,
+        initially_deferred: bool = False,
     ) -> Result:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
@@ -2378,6 +2413,8 @@ class Executor:
             columns=tuple(c.lower() for c in stmt.columns),
             unique=stmt.unique,
             constraint_kind=constraint_kind,
+            deferrable=deferrable,
+            initially_deferred=initially_deferred,
         )
         self._catalog.create_index(txn, table.name, idx)
 
@@ -2388,7 +2425,7 @@ class Executor:
             key = self._key_for(table, idx, values)
             if key is None:
                 continue
-            if idx.unique and tree.lookup_one(txn, key) is not None:
+            if idx.unique and tree.lookup(txn, key):
                 raise DuplicateKeyError(
                     f"无法创建唯一索引 {stmt.name!r}",
                     detail=f"列 {', '.join(idx.columns)} 上存在重复值",
@@ -3461,10 +3498,17 @@ class Executor:
         for idx in candidates:
             if not idx.unique:
                 continue
+            if self._index_is_deferred(idx, txn):
+                continue
             key = self._key_for(table, idx, values)
             if key is None:
                 continue
-            rid = self._tree_for(table, idx).lookup_one(txn, key)
+            tree = self._tree_for(table, idx)
+            if idx.deferrable:
+                hits = tree.lookup(txn, key)
+                rid = hits[0] if hits else None
+            else:
+                rid = tree.lookup_one(txn, key)
             if rid is not None and rid != ignore_rid:
                 return idx, rid
         return None
@@ -3509,6 +3553,15 @@ class Executor:
             return mode == "DEFERRED"
         return fk.initially_deferred
 
+    def _index_is_deferred(self, idx: IndexDef, txn: Transaction) -> bool:
+        if not idx.deferrable:
+            return False
+        mode = txn.constraint_modes.get(idx.name)
+        if mode is not None:
+            return mode == "DEFERRED"
+        return idx.initially_deferred
+
+
     def _set_constraints(
         self, stmt: SetConstraints, txn: Transaction
     ) -> Result:
@@ -3517,25 +3570,48 @@ class Executor:
             for table in self._catalog.tables.values()
             for fk in table.foreign_keys.values()
         ]
+        all_indexes = [
+            idx
+            for table in self._catalog.tables.values()
+            for idx in table.indexes.values()
+            if idx.constraint_kind is not None
+        ]
         if stmt.all_constraints:
-            targets = [fk for fk in all_fks if fk.deferrable]
-            names = {fk.name for fk in targets}
+            fk_targets = [fk for fk in all_fks if fk.deferrable]
+            index_targets = [idx for idx in all_indexes if idx.deferrable]
+            names = {fk.name for fk in fk_targets} | {
+                idx.name for idx in index_targets
+            }
             only_names = None
         else:
             names = {name.lower() for name in stmt.names}
-            targets = [fk for fk in all_fks if fk.name in names]
-            missing = names - {fk.name for fk in targets}
+            fk_targets = [fk for fk in all_fks if fk.name in names]
+            index_targets = [
+                idx for idx in all_indexes if idx.name in names
+            ]
+            found = {fk.name for fk in fk_targets} | {
+                idx.name for idx in index_targets
+            }
+            missing = names - found
             if missing:
+                available = sorted(
+                    {fk.name for fk in all_fks}
+                    | {idx.name for idx in all_indexes}
+                )
                 raise BinderError(
                     f"约束 {sorted(missing)[0]!r} 不存在",
-                    hint="可用外键约束："
-                    + (", ".join(sorted(fk.name for fk in all_fks)) or "（空）"),
+                    hint="可用约束："
+                    + (", ".join(available) or "（空）"),
                 )
-            non_deferrable = [fk for fk in targets if not fk.deferrable]
+            non_deferrable = [
+                fk for fk in fk_targets if not fk.deferrable
+            ] + [
+                idx for idx in index_targets if not idx.deferrable
+            ]
             if non_deferrable:
                 raise NotSupportedError(
                     f"约束 {non_deferrable[0].name!r} 不是 DEFERRABLE",
-                    hint="只有声明 DEFERRABLE 的外键可以切换检查时机",
+                    hint="只有声明 DEFERRABLE 的约束可以切换检查时机",
                 )
             only_names = names
 
@@ -3543,13 +3619,21 @@ class Executor:
             self.validate_deferred_foreign_keys(
                 txn, only_names=only_names
             )
+            self.validate_deferred_unique_constraints(
+                txn, only_names=only_names
+            )
 
         mode = "DEFERRED" if stmt.deferred else "IMMEDIATE"
-        for fk in targets:
+        for fk in fk_targets:
             txn.constraint_modes[fk.name] = mode
+        for idx in index_targets:
+            txn.constraint_modes[idx.name] = mode
         return Result(
             tag="SET CONSTRAINTS",
-            notice=f"已将 {len(targets)} 个外键约束设为 {mode}",
+            notice=(
+                f"已将 {len(fk_targets) + len(index_targets)} 个约束"
+                f"设为 {mode}"
+            ),
         )
 
     def _track_deferred_fk_row(
@@ -3595,6 +3679,37 @@ class Executor:
             ):
                 return True
         return False
+
+    def validate_deferred_unique_constraints(
+        self, txn: Transaction, *, only_names: Optional[set[str]] = None
+    ) -> None:
+        """提交前补检延迟 UNIQUE / PRIMARY KEY，失败由事务层 abort。"""
+        for table in self._catalog.list_tables():
+            deferred = [
+                idx
+                for idx in table.indexes.values()
+                if idx.deferrable
+                and self._index_is_deferred(idx, txn)
+                and (only_names is None or idx.name in only_names)
+            ]
+            if not deferred:
+                continue
+            heap = HeapFile(self._bp, table, self._txns)
+            seen: dict[str, set[tuple]] = {
+                idx.name: set() for idx in deferred
+            }
+            for _rid, values in heap.scan(txn):
+                for idx in deferred:
+                    key = self._key_for(table, idx, values)
+                    if key is None:
+                        continue
+                    normalized = tuple(key)
+                    if normalized in seen[idx.name]:
+                        raise DuplicateKeyError(
+                            f"延迟唯一约束 {idx.name!r} 在提交时仍有重复值",
+                            detail=f"列 {', '.join(idx.columns)}",
+                        )
+                    seen[idx.name].add(normalized)
 
     def validate_deferred_foreign_keys(
         self, txn: Transaction, *, only_names: Optional[set[str]] = None
@@ -3947,7 +4062,9 @@ class Executor:
             self._bp,
             KeyCodec(specs),
             idx.root_page,
-            unique=idx.unique,
+            # 延迟唯一索引在事务内可能暂时容纳重复键，由提交前扫描校验；
+            # 普通唯一索引继续由 B+ 树在插入时立刻拒绝重复。
+            unique=idx.unique and not idx.deferrable,
             name=idx.name,
         )
 

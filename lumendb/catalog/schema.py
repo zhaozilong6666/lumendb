@@ -63,6 +63,9 @@ class IndexDef:
     root_page: int = INVALID_PAGE_ID
     #: "PRIMARY" / "UNIQUE" 表示由表约束创建的索引；普通 CREATE INDEX 为 None。
     constraint_kind: Optional[str] = None
+    #: PRIMARY KEY / UNIQUE 约束的延迟检查；普通 CREATE INDEX 恒为 False。
+    deferrable: bool = False
+    initially_deferred: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -72,6 +75,8 @@ class IndexDef:
             "unique": self.unique,
             "root_page": self.root_page,
             "constraint_kind": self.constraint_kind,
+            "deferrable": self.deferrable,
+            "initially_deferred": self.initially_deferred,
         }
 
     @classmethod
@@ -83,6 +88,8 @@ class IndexDef:
             unique=data.get("unique", False),
             root_page=data.get("root_page", INVALID_PAGE_ID),
             constraint_kind=data.get("constraint_kind"),
+            deferrable=bool(data.get("deferrable", False)),
+            initially_deferred=bool(data.get("initially_deferred", False)),
         )
 
 
@@ -297,6 +304,14 @@ def validate_table_def(table: TableDef) -> None:
         if idx.constraint_kind is not None and not idx.unique:
             raise NotSupportedError(
                 f"约束索引 {idx.name} 必须是唯一索引"
+            )
+        if idx.initially_deferred and not idx.deferrable:
+            raise NotSupportedError(
+                f"索引 {idx.name} 的 INITIALLY DEFERRED 需要 DEFERRABLE"
+            )
+        if idx.deferrable and idx.constraint_kind not in ("PRIMARY", "UNIQUE"):
+            raise NotSupportedError(
+                f"索引 {idx.name} 不是 UNIQUE/PRIMARY 约束，不能声明 DEFERRABLE"
             )
 
     for name in table.checks:

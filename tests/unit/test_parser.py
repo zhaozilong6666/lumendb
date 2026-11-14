@@ -159,6 +159,32 @@ class TestCreateTable:
         assert delete_ref is not None
         assert delete_ref.on_delete == "SET DEFAULT"
 
+    def test_deferrable_unique_column(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        column = stmt.columns[0]
+        assert column.unique is True
+        assert column.unique_deferrable is True
+        assert column.unique_initially_deferred is True
+
+    def test_deferrable_primary_key_table_constraint(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, b INT, "
+            "PRIMARY KEY (a, b) DEFERRABLE)"
+        )
+        constraint = stmt.constraints[0]
+        assert constraint.deferrable is True
+        assert constraint.initially_deferred is False
+
+    def test_deferrable_unique_table_constraint(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)"
+        )
+        constraint = stmt.constraints[0]
+        assert constraint.deferrable is True
+        assert constraint.initially_deferred is True
+
     def test_foreign_key_action_column_list(self):
         from lumendb.errors import BinderError
 

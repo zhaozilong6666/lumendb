@@ -90,6 +90,7 @@ class Database:
             self._txn = None
             try:
                 self.executor.validate_deferred_foreign_keys(txn)
+                self.executor.validate_deferred_unique_constraints(txn)
             except BaseException:
                 self.txns.abort(txn)
                 raise
@@ -135,6 +136,7 @@ class Database:
         try:
             result = self.executor.run(statement, txn, params)
             self.executor.validate_deferred_foreign_keys(txn)
+            self.executor.validate_deferred_unique_constraints(txn)
         except BaseException:
             self.txns.abort(txn)
             raise

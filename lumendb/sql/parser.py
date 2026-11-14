@@ -693,7 +693,14 @@ class Parser:
         while self._match_punct("comma"):
             columns.append(self._parse_ident("列名"))
         self._expect_punct("rparen", ")")
-        return TableConstraint(kind=kind, columns=columns, name=name)
+        deferrable, initially_deferred = self._parse_fk_deferrability()
+        return TableConstraint(
+            kind=kind,
+            columns=columns,
+            name=name,
+            deferrable=deferrable,
+            initially_deferred=initially_deferred,
+        )
 
     def _parse_check_spec(self, name: Optional[str] = None) -> CheckSpec:
         """解析 ``CHECK (expr)``，同时保存表达式 token 以便目录持久化。"""
@@ -714,6 +721,10 @@ class Parser:
         default = None
         checks: list[CheckSpec] = []
         references = None
+        primary_deferrable = False
+        primary_initially_deferred = False
+        unique_deferrable = False
+        unique_initially_deferred = False
 
         while True:
             if self._match_kw("CONSTRAINT"):
@@ -732,6 +743,10 @@ class Parser:
                 self._expect_kw("KEY")
                 primary_key = True
                 nullable = False
+                (
+                    primary_deferrable,
+                    primary_initially_deferred,
+                ) = self._parse_fk_deferrability()
             elif self._match_kw("NOT"):
                 self._expect_kw("NULL")
                 nullable = False
@@ -739,6 +754,10 @@ class Parser:
                 nullable = True
             elif self._match_kw("UNIQUE"):
                 unique = True
+                (
+                    unique_deferrable,
+                    unique_initially_deferred,
+                ) = self._parse_fk_deferrability()
             elif self._match_kw("DEFAULT"):
                 default = self._parse_expr()
             elif self._match_kw("CHECK"):
@@ -758,6 +777,10 @@ class Parser:
             default=default,
             checks=tuple(checks),
             references=references,
+            primary_deferrable=primary_deferrable,
+            primary_initially_deferred=primary_initially_deferred,
+            unique_deferrable=unique_deferrable,
+            unique_initially_deferred=unique_initially_deferred,
         )
 
     def _parse_references(

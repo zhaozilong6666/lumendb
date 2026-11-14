@@ -77,7 +77,8 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 `DEFERRABLE INITIALLY IMMEDIATE` 仍走语句内检查；`RESTRICT`、`CASCADE`、
 `SET NULL`、`SET DEFAULT` 动作始终立即执行。显式事务内可用
-`SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` 覆盖检查时机：
+`SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` 覆盖检查时机
+（外键与延迟 UNIQUE/PRIMARY KEY 共用）：
 `DEFERRED` 影响后续 DML，`IMMEDIATE` 先补检已积压项；`ALL` 只作用于所有
 `DEFERRABLE` 外键，按名称指定非 `DEFERRABLE` 约束会报错。
 
@@ -119,9 +120,25 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 - `RENAME TABLE` / `RENAME COLUMN` / `RENAME CONSTRAINT`：同步外键元数据。
 - `TRUNCATE`：默认拒绝被外键引用的表；`TRUNCATE a, b` 在同一列表中允许一起清空相互依赖的表，未列入的引用表仍拒绝；`TRUNCATE ... CASCADE` 递归清空直接/间接子表。
 
-## 3. 测试与验证
+## 3. 延迟唯一约束
 
-- 全量测试：**909 passed**（`python -m pytest tests -q`，约 35 秒）
+`UNIQUE` / `PRIMARY KEY` 现在也支持 `DEFERRABLE [INITIALLY DEFERRED]`，补齐
+外键延迟能力的另一半：
+
+- 目录 `IndexDef` 新增 `deferrable` / `initially_deferred`，旧目录缺字段默认
+  `False`；`PRIMARY` / `UNIQUE` 约束索引才会持久化这两个标志。
+- 延迟唯一索引在 B+ 树层按非唯一索引存储，允许事务内暂时出现重复键；普通
+  `UNIQUE` 仍在插入时由 B+ 树立即拒绝。
+- 提交前 `validate_deferred_unique_constraints` 扫描当前可见行，按索引列重建
+  键集合并检测重复；`SET CONSTRAINTS ... IMMEDIATE` 会先补检再切换模式。
+- `SAVEPOINT` 回滚恢复 `constraint_modes`；延迟唯一索引与延迟外键共享同一份
+  事务覆盖状态。
+- `NULL` 仍按 PostgreSQL 默认语义不参与唯一性比较；复合唯一约束、保存点回滚、
+  重开目录后的标志恢复均有测试覆盖。
+
+## 4. 测试与验证
+
+- 全量测试：**923 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -164,7 +181,7 @@ CI：
 - `852641b`：success
 - `1f4337f`：success（TRUNCATE CASCADE 的远端代码树）
 
-## 4. 基准（2000 行）
+## 5. 基准（2000 行）
 
 本机实测，结果在 `bench/results/benchmark.md`：
 
@@ -184,7 +201,7 @@ CI：
 | 等值连接（2000 × 1000，哈希） | 0.201 | 0.230 | 9950 |
 | 外键子表插入（每行唯一索引点查） | 2.147 | 3.135 | 931 |
 
-## 5. 遗留风险与未实现项
+## 6. 遗留风险与未实现项
 
 1. **动作子集仍有限**：未实现 `MATCH PARTIAL`；当前支持
    `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
@@ -207,10 +224,10 @@ CI：
 7. **基准是合成负载**：只覆盖单机、小规模、固定行数，不能代表真实并发和
    大数据量表现。
 
-## 6. 验收结论
+## 7. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 909 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 923 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

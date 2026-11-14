@@ -4177,6 +4177,134 @@ class TestForeignKey:
         assert db.catalog.get_table("c1").foreign_keys == {}
         assert db.catalog.get_table("c2").foreign_keys == {}
 
+    def test_deferrable_unique_initially_deferred(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(0,)]
+
+    def test_deferrable_unique_case_pk_commit(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_set_constraints_named_deferrable_unique(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("SET CONSTRAINTS t_id_key DEFERRED")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_set_constraints_all_immediate_unique(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("SET CONSTRAINTS ALL IMMEDIATE")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(0,)]
+
+    def test_deferrable_unique_delete_before_commit(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("DELETE FROM t WHERE id = 1")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(0,)]
+
+    def test_alter_add_deferrable_unique(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT uq_t UNIQUE (id) "
+            "DEFERRABLE INITIALLY DEFERRED"
+        )
+        idx = db.catalog.get_table("t").indexes["uq_t"]
+        assert idx.deferrable is True
+        assert idx.initially_deferred is True
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_alter_add_deferrable_primary_key(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT pk_t PRIMARY KEY (id) "
+            "DEFERRABLE INITIALLY DEFERRED"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_set_constraints_all_deferred_unique(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_deferrable_unique_savepoint_rollback(self, db):
+        db.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        db.execute_one("INSERT INTO t VALUES (2)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,), (2,)]
+
+    def test_deferrable_unique_composite(self, db):
+        db.execute_one(
+            "CREATE TABLE t (a INT, b INT, "
+            "UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO t VALUES (1, 1), (1, 1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(0,)]
+
+    def test_deferrable_unique_flags_persist(self, tmp_path):
+        path = tmp_path / "deferrable_unique"
+        database = Database(path)
+        database.execute_one(
+            "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        )
+        database.close()
+        reopened = Database(path)
+        try:
+            idx = reopened.catalog.get_table("t").indexes["t_id_key"]
+            assert idx.deferrable is True
+            assert idx.initially_deferred is True
+        finally:
+            reopened.close()
+
     def test_on_delete_cascade_self_cycle(self, db):
         db.execute_one(
             "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT "
