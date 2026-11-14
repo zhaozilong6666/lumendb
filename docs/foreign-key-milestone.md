@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 范围：LumenDB 外键约束、删除/更新动作、`ALTER TABLE` 外键 DDL、测试与文档
 - 基线：`8da5a63`（`ON DELETE CASCADE`）
-- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`7d809b7`、`326edbb`、`8f37f76`
+- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`7d809b7`、`326edbb`、`8f37f76`、`02e9c68`
 
 ## 1. 成果清单
 
@@ -146,6 +146,10 @@ CI：
 - `42627d8`：success
 - `9039add`：success
 - `5c3dd00`：success
+- `7d809b7`：success
+- `326edbb`：success（其代码树由 `8f37f76` 覆盖）
+- `8f37f76`：success
+- `02e9c68`：success
 
 ## 4. 基准（2000 行）
 
@@ -194,6 +198,6 @@ CI：
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
 索引点查、事务回滚、持久化和文档均已落地；全量 845 个测试通过，最新已推送代码提交
-`8f37f76` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
+`02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。
