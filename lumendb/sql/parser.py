@@ -610,8 +610,16 @@ class Parser:
             kind = "UNIQUE"
         elif self._match_kw("CHECK"):
             check = self._parse_check_spec(name)
+            not_valid = False
+            if self._match_kw("NOT"):
+                self._expect_kw("VALID")
+                not_valid = True
             return TableConstraint(
-                kind="CHECK", columns=[], name=name, check=check
+                kind="CHECK",
+                columns=[],
+                name=name,
+                check=check,
+                not_valid=not_valid,
             )
         elif self._match_kw("FOREIGN"):
             self._expect_kw("KEY")

@@ -58,7 +58,11 @@ def _rewrite_check_tokens(
             if not qualifier_only and next_is_dot:
                 continue
             tokens[i] = (kind, new_name.lower())
-        rewritten[key] = CheckDef(name=check.name, tokens=tuple(tokens))
+        rewritten[key] = CheckDef(
+            name=check.name,
+            tokens=tuple(tokens),
+            validated=check.validated,
+        )
     return rewritten
 
 

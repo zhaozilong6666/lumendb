@@ -92,15 +92,22 @@ class CheckDef:
 
     name: str
     tokens: tuple[tuple[str, str], ...]
+    #: ALTER TABLE ADD CONSTRAINT ... NOT VALID 时只检查新行，存量行等待 VALIDATE。
+    validated: bool = True
 
     def to_json(self) -> dict:
-        return {"name": self.name, "tokens": [list(t) for t in self.tokens]}
+        return {
+            "name": self.name,
+            "tokens": [list(t) for t in self.tokens],
+            "validated": self.validated,
+        }
 
     @classmethod
     def from_json(cls, data: dict) -> "CheckDef":
         return cls(
             name=data["name"],
             tokens=tuple((kind, value) for kind, value in data.get("tokens", [])),
+            validated=data.get("validated", True),
         )
 
 

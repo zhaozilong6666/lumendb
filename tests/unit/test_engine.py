@@ -3339,6 +3339,63 @@ class TestForeignKey:
                 "FOREIGN KEY (pid) REFERENCES p(id) NOT VALID)"
             )
 
+    def test_alter_add_check_not_valid_then_validate(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (-1)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0) NOT VALID"
+        )
+        check = db.catalog.get_table("t").checks["ck"]
+        assert check.validated is False
+        # NOT VALID 只跳过存量行；新写入仍然立即检查。
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (-2)")
+        with pytest.raises(CheckViolationError):
+            db.execute_one("ALTER TABLE t VALIDATE CONSTRAINT ck")
+        assert db.catalog.get_table("t").checks["ck"].validated is False
+        db.execute_one("UPDATE t SET a = 1 WHERE a = -1")
+        db.execute_one("ALTER TABLE t VALIDATE CONSTRAINT ck")
+        assert db.catalog.get_table("t").checks["ck"].validated is True
+        with pytest.raises(CheckViolationError):
+            db.execute_one("INSERT INTO t VALUES (-2)")
+
+    def test_check_not_valid_survives_reopen(self, tmp_path):
+        path = tmp_path / "check_not_valid"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (-1)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0) NOT VALID"
+        )
+        db.close()
+
+        db2 = Database(path)
+        check = db2.catalog.get_table("t").checks["ck"]
+        assert check.validated is False
+        db2.execute_one("UPDATE t SET a = 1 WHERE a = -1")
+        db2.execute_one("ALTER TABLE t VALIDATE CONSTRAINT ck")
+        assert db2.catalog.get_table("t").checks["ck"].validated is True
+        db2.close()
+
+    def test_validate_check_rollback_restores_not_valid(self, db):
+        db.execute_one("CREATE TABLE t (a INT)")
+        db.execute_one("INSERT INTO t VALUES (-1)")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0) NOT VALID"
+        )
+        db.execute_one("UPDATE t SET a = 1 WHERE a = -1")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t VALIDATE CONSTRAINT ck")
+        assert db.catalog.get_table("t").checks["ck"].validated is True
+        db.execute_one("ROLLBACK")
+        assert db.catalog.get_table("t").checks["ck"].validated is False
+
+    def test_create_table_rejects_not_valid_check(self, db):
+        with pytest.raises(NotSupportedError):
+            db.execute_one(
+                "CREATE TABLE t (a INT, CONSTRAINT ck CHECK (a > 0) NOT VALID)"
+            )
+
     def test_drop_table_requires_cascade(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")

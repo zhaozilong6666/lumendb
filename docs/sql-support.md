@@ -170,11 +170,11 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 约束则整条 `ALTER TABLE` 失败并回滚，不会留下半成品外键。
 
 `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` 跳过存量行扫描，只立即
-约束之后的新写入；目录中的 `validated` 置为 `False`。随后
+约束之后的新写入；目录中的 `validated` 置为 `False`。`ALTER TABLE ... ADD CONSTRAINT
+... CHECK (expr) NOT VALID` 同理：存量行暂不校验，新写入仍执行 CHECK。随后
 `ALTER TABLE ... VALIDATE CONSTRAINT name` 对全部可见行执行一次只读校验，成功后把
 `validated` 置为 `True`；校验失败时约束保持 `NOT VALID`，事务可修正数据后重试。
-`CREATE TABLE` 不接受 `NOT VALID`（PostgreSQL 也只允许在 `ALTER TABLE` 上加），
-`CHECK ... NOT VALID` 暂未实现。
+`CREATE TABLE` 不接受 `NOT VALID`（PostgreSQL 也只允许在 `ALTER TABLE` 上加）。
 
 为避免悬空引用，DDL 还有以下保护：`ADD COLUMN ... REFERENCES` 复用
 `ADD CONSTRAINT FOREIGN KEY` 的存量行回填与校验路径，先加列再原子建立外键，任一步
@@ -386,7 +386,7 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查；`ADD CONSTRAINT ... NOT VALID` + `VALIDATE CONSTRAINT` 支持分批校验存量行 |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查；`ADD CONSTRAINT ... NOT VALID`（外键与 CHECK）+ `VALIDATE CONSTRAINT` 支持分批校验存量行 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

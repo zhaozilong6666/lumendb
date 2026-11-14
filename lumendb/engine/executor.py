@@ -910,6 +910,11 @@ class Executor:
             if constraint.kind != "CHECK":
                 continue
             assert constraint.check is not None
+            if constraint.not_valid:
+                raise NotSupportedError(
+                    "CREATE TABLE 不支持 NOT VALID CHECK",
+                    hint="先建表，再 ALTER TABLE ... ADD CONSTRAINT ... NOT VALID",
+                )
             add(
                 constraint.check,
                 f"{table_name}_check_{len(checks) + 1}",
@@ -1779,17 +1784,22 @@ class Executor:
                     f"CHECK 约束名重复：{name}",
                     hint="给 CHECK 指定唯一名称，或避免与索引名冲突",
                 )
-            check = CheckDef(name=name, tokens=tuple(spec.tokens))
+            check = CheckDef(
+                name=name,
+                tokens=tuple(spec.tokens),
+                validated=not constraint.not_valid,
+            )
             fn = self._compile_check(table, check)
-            heap = HeapFile(self._bp, table, self._txns)
-            for _rid, values in heap.scan(txn):
-                result = fn(EvalContext(tuple(values)))
-                if result is not None and not bool(result):
-                    raise CheckViolationError(
-                        f"已有行违反 CHECK 约束 {name!r}",
-                        detail=f"表 {table.name} 的存量数据不满足约束条件",
-                        hint="先 UPDATE 修正存量行，再添加约束",
-                    )
+            if not constraint.not_valid:
+                heap = HeapFile(self._bp, table, self._txns)
+                for _rid, values in heap.scan(txn):
+                    result = fn(EvalContext(tuple(values)))
+                    if result is not None and not bool(result):
+                        raise CheckViolationError(
+                            f"已有行违反 CHECK 约束 {name!r}",
+                            detail=f"表 {table.name} 的存量数据不满足约束条件",
+                            hint="先 UPDATE 修正存量行，再添加约束",
+                        )
             old_checks = dict(table.checks)
             table.checks[name] = check
 
@@ -1801,7 +1811,11 @@ class Executor:
             self._catalog.persist(txn)
             return Result(
                 tag="ALTER TABLE",
-                notice=f"已添加 CHECK 约束 {name}",
+                notice=(
+                    f"已添加 CHECK 约束 {name}（NOT VALID）"
+                    if constraint.not_valid
+                    else f"已添加 CHECK 约束 {name}"
+                ),
             )
         if constraint.kind == "FOREIGN KEY":
             if constraint.ref_table is None:
@@ -1984,7 +1998,7 @@ class Executor:
     def _alter_validate_constraint(
         self, stmt: AlterTableValidateConstraint, txn: Transaction
     ) -> Result:
-        """校验 NOT VALID 外键的存量行；成功后才把 validated 置为 True。
+        """校验 NOT VALID 外键或 CHECK 的存量行，成功后才置 validated=True。
 
         PostgreSQL 的 VALIDATE CONSTRAINT 只读扫描、不等待延迟队列；这里同样
         用 force=True 立即检查，扫描失败时约束保持 NOT VALID，事务可继续修复
@@ -1993,17 +2007,46 @@ class Executor:
         table = self._catalog.get_table(stmt.table)
         name = stmt.name.lower()
         fk = table.foreign_keys.get(name)
-        if fk is None:
-            if name in table.checks:
-                return Result(
-                    tag="ALTER TABLE",
-                    notice=f"约束 {name} 已处于校验状态",
-                )
+        check = table.checks.get(name)
+        if fk is None and check is None:
+            available = sorted(table.foreign_keys) + sorted(table.checks)
             raise BinderError(
                 f"约束 {name!r} 不存在",
-                hint="可用外键约束："
-                + (", ".join(sorted(table.foreign_keys)) or "（空）"),
+                hint="可用约束："
+                + (", ".join(available) or "（空）"),
             )
+
+        if check is not None:
+            if check.validated:
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"CHECK 约束 {name} 已处于校验状态",
+                )
+            fn = self._compile_check(table, check)
+            heap = HeapFile(self._bp, table, self._txns)
+            for _rid, values in heap.scan(txn):
+                result = fn(EvalContext(tuple(values)))
+                if result is not None and not bool(result):
+                    raise CheckViolationError(
+                        f"已有行违反 CHECK 约束 {name!r}",
+                        detail=f"表 {table.name} 的存量数据不满足约束条件",
+                        hint="先 UPDATE 修正存量行，再执行 VALIDATE CONSTRAINT",
+                    )
+            old_check = check
+            table.checks[name] = replace(check, validated=True)
+
+            def undo_check_validated() -> None:
+                table.checks[name] = old_check
+
+            txn.undo_log.append(undo_check_validated)
+            self._catalog.mark_dirty()
+            self._catalog.persist(txn)
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"已校验 CHECK 约束 {name}",
+            )
+
+        assert fk is not None
         if fk.validated:
             return Result(
                 tag="ALTER TABLE",

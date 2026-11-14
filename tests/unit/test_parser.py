@@ -257,6 +257,17 @@ class TestCreateTable:
         assert stmt.table == "t"
         assert stmt.name == "fk"
 
+    def test_check_not_valid(self):
+        from lumendb.sql.ast import AlterTableAddConstraint
+
+        stmt = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0) NOT VALID"
+        )
+        assert isinstance(stmt, AlterTableAddConstraint)
+        assert stmt.constraint.kind == "CHECK"
+        assert stmt.constraint.not_valid is True
+        assert stmt.constraint.check is not None
+
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
 

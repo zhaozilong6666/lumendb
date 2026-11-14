@@ -191,8 +191,9 @@ DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行�
 始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
 
 `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` 只跳过存量行扫描，
-新写入仍走 `_check_foreign_keys`；`VALIDATE CONSTRAINT` 用同一检查函数对全部可见行
-做一次 `force=True` 的只读扫描，成功后才把 `validated` 从 `False` 改为 `True`。
+新写入仍走 `_check_foreign_keys`；CHECK 的 `NOT VALID` 同样跳过存量扫描，新写入仍走
+行级 CHECK 谓词。`VALIDATE CONSTRAINT` 按名称分派：外键用 `force=True` 重跑引用检查，
+CHECK 重新编译谓词后扫描全部可见行，成功后才把 `validated` 从 `False` 改为 `True`。
 因此大表可以先上线约束、再择机校验，失败时约束仍保持 `NOT VALID`。
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
