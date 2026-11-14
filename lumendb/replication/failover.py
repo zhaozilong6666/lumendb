@@ -15,6 +15,8 @@ fence 文件，仍可能双写，部署时必须明确这一点。
 from __future__ import annotations
 
 import ssl
+import threading
+import time
 from pathlib import Path
 
 from ..errors import RedirectError, StorageError
@@ -39,6 +41,7 @@ class ReplicationMonitor:
         ssl_context: ssl.SSLContext | None = None,
         replica_id: str | None = None,
         auto_rebase: bool = True,
+        poll_interval: float = 1.0,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -48,6 +51,9 @@ class ReplicationMonitor:
         self.ssl_context = ssl_context
         self.replica_id = replica_id
         self.auto_rebase = auto_rebase
+        self.poll_interval = max(0.05, float(poll_interval))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
         self.fence_path = Path(fence_path) if fence_path is not None else None
         self.node_id = node_id
         self.max_failures = max(1, int(max_failures))
@@ -121,6 +127,32 @@ class ReplicationMonitor:
                 self._promote()
                 return "promoted"
             return "degraded"
+
+    def start(self, interval: float | None = None) -> "ReplicationMonitor":
+        """在后台线程里周期执行 :meth:`poll`，直到 :meth:`stop`。"""
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        if interval is not None:
+            self.poll_interval = max(0.05, float(interval))
+        self._stop.clear()
+
+        def loop() -> None:
+            while not self._stop.wait(self.poll_interval):
+                status = self.poll()
+                if status in ("promoted", "needs_attention"):
+                    break
+
+        self._thread = threading.Thread(
+            target=loop, name="lumendb-replication-monitor", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
 
     def _promote(self) -> None:
         self.replica.promote(

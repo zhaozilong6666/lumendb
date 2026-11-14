@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1032 passed。
+- 全量测试：1033 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -144,7 +144,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 **自动提升 MVP**：`ReplicationMonitor` 每轮先检查 `status` 再拉一批 WAL；
 连续网络失败达到 `max_failures` 后调用同一个 `promote(fence_path=...)`。
 逻辑错误（槽位已回收）先尝试 `rebase_from_server` 页级增量重建，成功
-返回 `rebuilt`，失败才返回 `needs_attention`，不会自动提升。没有心跳
+返回 `rebuilt`，失败才返回 `needs_attention`，不会自动提升。
+`ReplicationMonitor.start()` 可在后台线程按 `poll_interval` 周期跟随，
+`stop()` 停止；`promoted` / `needs_attention` 会让后台循环退出。没有心跳
 租约和客户端重定向，网络分区下仍要求共享 fence。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：

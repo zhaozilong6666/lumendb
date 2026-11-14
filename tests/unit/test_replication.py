@@ -352,6 +352,36 @@ class TestReplica:
             primary_one.close()
             primary_two.close()
 
+    def test_monitor_background_thread_catches_up(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary.execute_one("INSERT INTO t VALUES (1)")
+        server = WALServer(primary).start()
+        replica = None
+        monitor = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica"
+            )
+            monitor = ReplicationMonitor(
+                replica, server.host, server.port, poll_interval=0.1
+            ).start(interval=0.1)
+            primary.execute_one("INSERT INTO t VALUES (2)")
+            deadline = 3.0
+            while deadline > 0:
+                if replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]:
+                    break
+                threading.Event().wait(0.05)
+                deadline -= 0.05
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
+        finally:
+            if monitor is not None:
+                monitor.stop()
+            if replica is not None:
+                replica.db.close()
+            server.stop()
+            primary.close()
+
     def test_monitor_rebuilds_after_wal_gap(self, tmp_path, monkeypatch):
         primary = make_primary(tmp_path)
         primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
