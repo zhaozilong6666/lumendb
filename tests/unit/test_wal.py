@@ -6,9 +6,14 @@ WAL 的正确性靠三条可断言的性质支撑：
 3. 记录边界在被截断时能识别残尾而不抛错。
 """
 
+import threading
+import time
+
 import pytest
 
 from lumendb.storage.page import PAGE_SIZE
+from lumendb.storage.pager import DiskManager
+from lumendb.storage.txn import TransactionManager, TxnState
 from lumendb.storage.wal import (
     HEADER_SIZE,
     LogType,
@@ -138,4 +143,70 @@ class TestWalRuleSupport:
         lsns = [wal.append(i, LogType.BEGIN) for i in range(1, 6)]
         assert lsns == sorted(lsns)
         assert len(set(lsns)) == 5
+        wal.close()
+
+    def test_concurrent_appends_keep_every_record(self, wal_path):
+        wal = WAL(wal_path)
+        barrier = threading.Barrier(8)
+        threads: list[threading.Thread] = []
+
+        def worker(worker_id: int) -> None:
+            barrier.wait()
+            for i in range(25):
+                wal.append(worker_id * 100 + i, LogType.BEGIN)
+
+        for worker_id in range(8):
+            thread = threading.Thread(target=worker, args=(worker_id,))
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wal.flush()
+        records = wal.read_all()
+        assert len(records) == 200
+        assert len({record.lsn for record in records}) == 200
+        wal.close()
+
+
+class TestGroupCommit:
+    def test_concurrent_commits_share_a_flush(
+        self, tmp_path, wal_path, monkeypatch
+    ):
+        dm = DiskManager(tmp_path / "data.db")
+        wal = WAL(wal_path)
+        txns = TransactionManager(dm, wal)
+        original_flush = wal.flush
+        flush_calls: list[int] = []
+
+        def slow_flush():
+            flush_calls.append(1)
+            time.sleep(0.01)
+            return original_flush()
+
+        monkeypatch.setattr(wal, "flush", slow_flush)
+
+        barrier = threading.Barrier(8)
+        threads: list[threading.Thread] = []
+        committed = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            txn = txns.begin()
+            txns.commit(txn)
+            with lock:
+                committed.append(txn)
+
+        for _ in range(8):
+            thread = threading.Thread(target=worker)
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(committed) == 8
+        assert all(txn.state is TxnState.COMMITTED for txn in committed)
+        # 一个 leader 的慢刷盘窗口足够收集其余提交；强断言少于提交数。
+        assert len(flush_calls) < 8
+        dm.close()
         wal.close()

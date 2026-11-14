@@ -104,6 +104,12 @@ class TransactionManager:
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
         self._current: Optional[Transaction] = None
+        # 组提交：提交记录先入队，由一个 leader 统一刷盘；其余提交等待
+        # durable_lsn 覆盖自己的目标 LSN 后再标记为 COMMITTED。
+        self._commit_condition = threading.Condition(self._lock)
+        self._commit_queue: list[tuple[Transaction, int]] = []
+        self._commit_leader = False
+        self._commit_error: Optional[BaseException] = None
         self._xid_ceiling = max(disk.meta.next_xid, 1)
         self._next_xid = self._xid_ceiling
 
@@ -139,18 +145,69 @@ class TransactionManager:
         with self._lock:
             txn.require_active()
             txn.last_lsn = self._wal.commit(txn.xid)
-            # 提交必须落盘：否则"已提交"的承诺会在崩溃时失效
-            self._wal.flush()
-            txn.state = TxnState.COMMITTED
-            self._states[txn.xid] = TxnState.COMMITTED
-            self._active.discard(txn.xid)
-            if self._bp is not None:
-                self._bp.clear_undo(txn.xid)
-            # DDL 的内存撤销信息在提交后不再需要。
-            txn.undo_log.clear()
-            txn.savepoints.clear()
-            if self._current is txn:
-                self._current = None
+            self._commit_queue.append((txn, txn.last_lsn))
+            if self._commit_leader:
+                # 已有 leader 在刷盘；等它覆盖到自己的 LSN。
+                while txn.state is TxnState.ACTIVE:
+                    self._commit_condition.wait()
+                    if self._commit_error is not None:
+                        raise TransactionError(
+                            f"事务 {txn.xid} 提交失败：WAL 刷盘错误"
+                        ) from self._commit_error
+                return
+            self._commit_leader = True
+
+        try:
+            self._run_commit_group()
+        except BaseException as exc:
+            with self._lock:
+                self._commit_error = exc
+                self._commit_leader = False
+                self._commit_condition.notify_all()
+            raise
+
+    def _run_commit_group(self) -> None:
+        """leader 循环：把当前队列里的提交合并成一次 WAL 刷盘。
+
+        新提交可能在前一次 ``flush`` 之后才追加，所以队列非空时继续循环；
+        每个被覆盖的提交立即标记为 COMMITTED 并唤醒等待者。
+        """
+        while True:
+            with self._lock:
+                batch = self._commit_queue
+                self._commit_queue = []
+            durable = self._wal.flush()
+            with self._lock:
+                committed_any = False
+                remaining: list[tuple[Transaction, int]] = []
+                for pending, target in batch:
+                    if pending.state is not TxnState.ACTIVE:
+                        continue
+                    if target <= durable:
+                        self._mark_committed(pending)
+                        committed_any = True
+                    else:
+                        remaining.append((pending, target))
+                if remaining:
+                    self._commit_queue.extend(remaining)
+                if self._commit_queue:
+                    if committed_any:
+                        self._commit_condition.notify_all()
+                    continue
+                self._commit_leader = False
+                self._commit_condition.notify_all()
+                return
+
+    def _mark_committed(self, txn: Transaction) -> None:
+        txn.state = TxnState.COMMITTED
+        self._states[txn.xid] = TxnState.COMMITTED
+        self._active.discard(txn.xid)
+        if self._bp is not None:
+            self._bp.clear_undo(txn.xid)
+        txn.undo_log.clear()
+        txn.savepoints.clear()
+        if self._current is txn:
+            self._current = None
 
     def abort(self, txn: Transaction) -> None:
         with self._lock:

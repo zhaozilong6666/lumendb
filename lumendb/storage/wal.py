@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -132,27 +133,32 @@ class WAL:
         self._size = os.path.getsize(self.path) if existed else 0
         self._pending = bytearray()
         self._next_lsn = self._size + 1
+        # 多个提交线程可能同时追加；文件写入与 pending 必须成组保护。
+        self._lock = threading.RLock()
 
     # -- 属性 ---------------------------------------------------------------
 
     @property
     def next_lsn(self) -> int:
-        return self._next_lsn
+        with self._lock:
+            return self._next_lsn
 
     @property
     def durable_lsn(self) -> int:
         """已经落盘的最后一条记录的 lsn（0 表示日志为空）。"""
-        return self._size if self._size else 0
+        with self._lock:
+            return self._size if self._size else 0
 
     # -- 追加 ---------------------------------------------------------------
 
     def append(self, xid: int, rtype: int, payload: bytes = b"") -> int:
-        lsn = self._next_lsn
-        rec = LogRecord(lsn, xid, int(rtype), payload)
-        data = rec.encode()
-        self._pending += data
-        self._next_lsn += len(data)
-        return lsn
+        with self._lock:
+            lsn = self._next_lsn
+            rec = LogRecord(lsn, xid, int(rtype), payload)
+            data = rec.encode()
+            self._pending += data
+            self._next_lsn += len(data)
+            return lsn
 
     def begin(self, xid: int) -> int:
         return self.append(xid, LogType.BEGIN)
@@ -185,33 +191,38 @@ class WAL:
         """把内存中的日志写入文件并 fsync，返回已持久化的最后 lsn。
 
         这是"WAL 规则"的执行点：Buffer Pool 在写任何脏页之前必须调用它。
+        多个调用者可以安全并发；只有真正有 pending 的调用会做一次 ``fsync``，
+        这使后到的提交可以搭上前一次刷盘的顺风车。
         """
-        if self._pending:
-            self._fh.write(self._pending)
-            self._pending.clear()
-            self._fh.flush()
-            os.fsync(self._fh.fileno())
-            self._size = self._next_lsn - 1
-        else:
-            # 即使没有新日志，也可能需要把之前的写刷下去
-            self._fh.flush()
-        return self._size
+        with self._lock:
+            if self._pending:
+                self._fh.write(self._pending)
+                self._pending.clear()
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._size = self._next_lsn - 1
+            else:
+                # 即使没有新日志，也可能需要把之前的写刷下去
+                self._fh.flush()
+            return self._size
 
     def flush_upto(self, lsn: int) -> None:
         """确保所有 lsn <= 目标值的记录都已落盘。"""
         if lsn <= 0:
             return
-        if lsn <= self._size:
-            return
-        self.flush()
+        with self._lock:
+            if lsn <= self._size:
+                return
+            self.flush()
 
     # -- 读取 ---------------------------------------------------------------
 
     def iter_records(self, start_lsn: int = 1) -> Iterator[LogRecord]:
         """从 start_lsn 开始顺序读取日志。会先把 pending 刷盘，保证视图一致。"""
-        self.flush()
-        with open(self.path, "rb") as fh:
-            buf = fh.read()
+        with self._lock:
+            self.flush()
+            with open(self.path, "rb") as fh:
+                buf = fh.read()
         pos = 0
         while pos + HEADER_SIZE <= len(buf):
             try:
@@ -227,9 +238,10 @@ class WAL:
         return list(self.iter_records(1))
 
     def close(self) -> None:
-        self.flush()
-        if not self._fh.closed:
-            self._fh.close()
+        with self._lock:
+            self.flush()
+            if not self._fh.closed:
+                self._fh.close()
 
     def __enter__(self) -> "WAL":
         return self

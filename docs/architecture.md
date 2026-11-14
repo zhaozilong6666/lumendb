@@ -40,7 +40,13 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - undo 不需要反向推导 SQL 语义；
 - 恢复正确性可以用 before/after image 直接断言。
 
-代价是日志体积大，组提交与分段回收留作后续优化（见 roadmap）。
+代价是日志体积大，分段回收仍留作后续优化（见 roadmap）。
+
+**组提交**：`WAL` 的追加与刷盘都持同一把锁；`TransactionManager.commit` 先把
+COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可以覆盖多个
+目标 LSN。其余提交在条件变量上等待，只有自己的 COMMIT 记录持久化后才被标记
+为 `COMMITTED`；因此“已提交”仍然等于“崩溃后可见”。单提交路径语义不变，
+并发提交测试会断言刷盘次数少于提交次数。
 
 ### 2.4 恢复
 
