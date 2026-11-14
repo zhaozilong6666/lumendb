@@ -268,8 +268,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 计划节点带有 `estimated` 字段（`plan/cost.py` 的 `CostEstimate`）：扫描用堆表
 维护的 `row_count_hint`，过滤按等值/范围/其他谓词的选择率估算，连接按等值键
-数量估算并区分哈希与嵌套循环。`EXPLAIN` 会把 `rows≈N cpu≈M confidence=...`
-标在节点后面；`EXPLAIN ANALYZE` 再追加实际耗时、行数与循环次数。
+数量估算并区分哈希与嵌套循环，投影/聚合/排序/去重/集合/`LIMIT` 继续向上
+传播估算。`EXPLAIN` 会把 `rows≈N cpu≈M confidence=...` 标在节点后面；
+`EXPLAIN ANALYZE` 再追加实际耗时、行数与循环次数。
 
 这些估算目前只用于观测，不改变执行顺序。索引选择仍是两条规则：
 

@@ -7,11 +7,17 @@ import pytest
 from lumendb.plan.cost import (
     DEFAULT_ROWS,
     MIN_SELECTIVITY,
+    aggregate_estimate,
     choose_build_side,
+    distinct_estimate,
     equality_selectivity,
     filter_estimate,
     join_estimate,
+    limit_estimate,
+    project_estimate,
     scan_estimate,
+    setop_estimate,
+    sort_estimate,
     unknown_estimate,
 )
 
@@ -63,3 +69,40 @@ def test_choose_build_side_prefers_smaller_left():
     assert choose_build_side(scan_estimate(5), scan_estimate(50)) == "left"
     assert choose_build_side(scan_estimate(50), scan_estimate(5)) == "right"
     assert choose_build_side(scan_estimate(5), scan_estimate(5)) == "right"
+
+
+def test_project_and_sort_preserve_rows():
+    child = scan_estimate(100)
+    projected = project_estimate(child, width=3)
+    sorted_est = sort_estimate(projected, keys=2)
+    assert projected.rows == 100
+    assert sorted_est.rows == 100
+    assert projected.cpu > child.cpu
+    assert sorted_est.cpu > projected.cpu
+
+
+def test_limit_estimate_handles_offset_and_zero():
+    child = scan_estimate(100)
+    assert limit_estimate(child, limit=10).rows == 10
+    assert limit_estimate(child, limit=10, offset=2).rows == 10
+    assert limit_estimate(child, limit=100, offset=2).rows == 98
+    assert limit_estimate(child, limit=None, offset=98).rows == 2
+    assert limit_estimate(child, limit=0).rows == 0
+    assert limit_estimate(child, limit=None, offset=150).rows == 0
+
+
+def test_aggregate_estimate_uses_group_count():
+    child = scan_estimate(100)
+    assert aggregate_estimate(child).rows == 1
+    assert aggregate_estimate(child).confidence == "stats"
+    assert aggregate_estimate(child, groups=4).rows == pytest.approx(10)
+    assert aggregate_estimate(child, groups=4).confidence == "derived"
+
+
+def test_distinct_and_setop_estimates():
+    child = scan_estimate(100)
+    assert distinct_estimate(child).rows == 90
+    left = scan_estimate(10)
+    right = scan_estimate(20)
+    assert setop_estimate(left, right).rows == 30
+    assert setop_estimate(left, right, distinct=True).rows == pytest.approx(27)

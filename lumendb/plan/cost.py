@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Optional
 
 #: 没有任何统计时的默认基数。派生表、未分析的 CTE 先用这个值。
 DEFAULT_ROWS = 100.0
@@ -82,6 +84,85 @@ def equality_selectivity(keys: int) -> float:
     if keys <= 0:
         return 1.0
     return max(MIN_SELECTIVITY, EQ_SELECTIVITY**keys)
+
+
+def project_estimate(child: CostEstimate, *, width: int = 1) -> CostEstimate:
+    """投影/表达式求值估算；行数不变，CPU 按输出宽度增加。"""
+    return CostEstimate(
+        rows=child.rows,
+        cpu=child.cpu + child.rows * max(1, width) * 0.1,
+        confidence=child.confidence,
+        algorithm="project",
+    )
+
+
+def sort_estimate(child: CostEstimate, *, keys: int = 1) -> CostEstimate:
+    """排序估算；CPU 按 ``n log n`` 增长，行数不变。"""
+    rows = child.rows
+    # rows 为 0 时 log 无意义；用 2 作为下限只影响空输入的 CPU 估算。
+    comparisons = rows * math.log2(max(rows, 2.0)) * max(1, keys)
+    return CostEstimate(
+        rows=rows,
+        cpu=child.cpu + comparisons,
+        confidence=child.confidence,
+        algorithm="sort",
+    )
+
+
+def limit_estimate(
+    child: CostEstimate, *, limit: Optional[int], offset: int = 0
+) -> CostEstimate:
+    """LIMIT/OFFSET 估算；输出行数允许为 0，但不会为负。"""
+    available = max(0.0, child.rows - max(0, offset))
+    rows = available if limit is None else min(available, max(0, limit))
+    return CostEstimate(
+        rows=max(0.0, rows),
+        cpu=child.cpu + rows,
+        confidence=child.confidence,
+        algorithm="limit",
+    )
+
+
+def aggregate_estimate(child: CostEstimate, *, groups: int = 1) -> CostEstimate:
+    """聚合估算。
+
+    无分组时固定输出 1 行；有分组时没有列统计，使用 ``sqrt(输入行数)``
+    作为分组数的保守估计。CPU 至少覆盖扫描输入的代价。
+    """
+    rows = 1.0 if groups <= 1 else max(1.0, math.sqrt(child.rows))
+    return CostEstimate(
+        rows=rows,
+        cpu=child.cpu + child.rows,
+        confidence=child.confidence if groups <= 1 else "derived",
+        algorithm="aggregate",
+    )
+
+
+def distinct_estimate(child: CostEstimate) -> CostEstimate:
+    """去重估算；没有列统计时按 90% 输入行数保守估计。"""
+    return CostEstimate(
+        rows=max(1.0, child.rows * 0.9),
+        cpu=child.cpu + child.rows,
+        confidence=child.confidence,
+        algorithm="distinct",
+    )
+
+
+def setop_estimate(
+    left: CostEstimate, right: CostEstimate, *, distinct: bool = False
+) -> CostEstimate:
+    """集合运算估算；``UNION ALL`` 直接相加，去重形态再乘 0.9。"""
+    rows = left.rows + right.rows
+    if distinct:
+        rows *= 0.9
+    return CostEstimate(
+        rows=max(1.0, rows),
+        cpu=left.cpu + right.cpu + rows,
+        confidence=(
+            left.confidence if left.confidence == right.confidence else "derived"
+        ),
+        algorithm="setop",
+    )
 
 
 def join_estimate(

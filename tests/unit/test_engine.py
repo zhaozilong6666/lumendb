@@ -1320,6 +1320,30 @@ class TestExplainAnalyze:
         )
         assert "rows≈1" in plan
 
+    def test_explain_estimate_survives_projection(self, db):
+        setup_users(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT id FROM users")
+        )
+        first = plan.splitlines()[0]
+        assert "Project" in first
+        assert "rows≈3" in first
+
+    def test_explain_estimate_reaches_aggregate_and_limit(self, db):
+        setup_users(db)
+        agg_plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT COUNT(*) FROM users")
+        )
+        assert "rows≈1" in agg_plan.splitlines()[0]
+        limit_plan = "\n".join(
+            r[0]
+            for r in rows(
+                db, "EXPLAIN SELECT id FROM users ORDER BY id LIMIT 1"
+            )
+        )
+        assert "Limit" in limit_plan.splitlines()[0]
+        assert "rows≈1" in limit_plan.splitlines()[0]
+
     def test_query_still_works_after_analyze(self, db):
         setup_users(db)
         rows(db, "EXPLAIN ANALYZE SELECT id FROM users")

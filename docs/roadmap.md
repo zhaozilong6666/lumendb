@@ -6,9 +6,10 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：971 passed。
-- 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接的基数与 CPU 估算，
-  并已接入 `EXPLAIN` 的 `rows≈/cpu≈` 标注；尚未接入连接顺序枚举。
+- 全量测试：977 passed。
+- 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
+  集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
+  标注；尚未接入连接顺序枚举。
 - 外键主线已闭环：引用完整性、级联动作、DDL、延迟约束、`NOT VALID` /
   `VALIDATE`、`TRUNCATE` 依赖、依赖删除 `CASCADE`。
 - SQL 查询：相关子查询（单层/多层）、FROM 派生表、列别名列表、派生表内部

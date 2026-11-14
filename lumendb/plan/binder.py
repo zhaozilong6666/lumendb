@@ -58,9 +58,15 @@ from .cost import (
     EQ_SELECTIVITY,
     OTHER_SELECTIVITY,
     RANGE_SELECTIVITY,
+    aggregate_estimate,
+    distinct_estimate,
     filter_estimate,
     join_estimate,
+    limit_estimate,
+    project_estimate,
     scan_estimate,
+    setop_estimate,
+    sort_estimate,
     unknown_estimate,
 )
 from .nodes import (
@@ -1123,14 +1129,29 @@ class Binder:
             exprs=proj_fns + extra_fns,
             columns=proj_cols
             + [OutputColumn(f"$sort{i}", TypeSpec(DataType.TEXT)) for i in range(len(extra_fns))],
+            estimated=project_estimate(
+                self._node_estimate(node), width=len(proj_cols) + len(extra_fns)
+            ),
         )
         node = project
 
         if select.distinct:
-            node = Distinct(child=node, columns=proj_cols, limit_columns=len(proj_cols))
+            node = Distinct(
+                child=node,
+                columns=proj_cols,
+                limit_columns=len(proj_cols),
+                estimated=distinct_estimate(self._node_estimate(project)),
+            )
 
         if sort_keys:
-            node = Sort(child=node, keys=sort_keys, columns=node.columns)
+            node = Sort(
+                child=node,
+                keys=sort_keys,
+                columns=node.columns,
+                estimated=sort_estimate(
+                    self._node_estimate(node), keys=len(sort_keys)
+                ),
+            )
 
         limit_value = self._limit_value(select.limit, "LIMIT")
         offset_value = self._limit_value(select.offset, "OFFSET")
@@ -1142,6 +1163,11 @@ class Binder:
                 with_ties=select.with_ties,
                 tie_keys=[fn for fn, _descending, _nulls_first in sort_keys],
                 columns=node.columns,
+                estimated=limit_estimate(
+                    self._node_estimate(node),
+                    limit=limit_value,
+                    offset=offset_value or 0,
+                ),
             )
 
         return node, proj_cols
@@ -1177,6 +1203,11 @@ class Binder:
                 op=op,
                 all=select.all_flags[i],
                 columns=list(out_cols),
+                estimated=setop_estimate(
+                    self._node_estimate(node),
+                    self._node_estimate(right_node),
+                    distinct=not select.all_flags[i],
+                ),
             )
 
         sort_keys = []
@@ -1204,7 +1235,14 @@ class Binder:
                         item.nulls_first,
                     )
                 )
-            node = Sort(child=node, keys=sort_keys, columns=node.columns)
+            node = Sort(
+                child=node,
+                keys=sort_keys,
+                columns=node.columns,
+                estimated=sort_estimate(
+                    self._node_estimate(node), keys=len(sort_keys)
+                ),
+            )
 
         limit_value = self._limit_value(select.limit, "LIMIT")
         offset_value = self._limit_value(select.offset, "OFFSET")
@@ -1216,6 +1254,11 @@ class Binder:
                 with_ties=select.with_ties,
                 tie_keys=[fn for fn, _descending, _nulls_first in sort_keys],
                 columns=node.columns,
+                estimated=limit_estimate(
+                    self._node_estimate(node),
+                    limit=limit_value,
+                    offset=offset_value or 0,
+                ),
             )
         return node, out_cols
 
@@ -1732,6 +1775,9 @@ class Binder:
             aggs=list(self.agg_specs),
             columns=[OutputColumn(c.name, c.type) for c in group_cols]
             + [OutputColumn(f"$agg{i}", s.result_type) for i, s in enumerate(self.agg_specs)],
+            estimated=aggregate_estimate(
+                self._node_estimate(child), groups=len(group_cols)
+            ),
         )
         return agg_node, agg_schema, (column_group, expr_group)
 
