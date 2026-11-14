@@ -1901,10 +1901,13 @@ class Executor:
             new_check = replace(check, name=new_key)
             table.checks.pop(old_key)
             table.checks[new_key] = new_check
+            old_mode = txn.constraint_modes.pop(old_key, None)
 
             def undo() -> None:
                 table.checks.pop(new_key, None)
                 table.checks[old_key] = check
+                if old_mode is not None:
+                    txn.constraint_modes[old_key] = old_mode
 
             txn.undo_log.append(undo)
         elif old_key in table.foreign_keys:
@@ -1912,10 +1915,16 @@ class Executor:
             new_fk = replace(fk, name=new_key)
             table.foreign_keys.pop(old_key)
             table.foreign_keys[new_key] = new_fk
+            old_mode = txn.constraint_modes.pop(old_key, None)
+            if old_mode is not None:
+                txn.constraint_modes[new_key] = old_mode
 
             def undo() -> None:
                 table.foreign_keys.pop(new_key, None)
                 table.foreign_keys[old_key] = fk
+                if old_mode is not None:
+                    txn.constraint_modes.pop(new_key, None)
+                    txn.constraint_modes[old_key] = old_mode
 
             txn.undo_log.append(undo)
         else:
@@ -1928,10 +1937,16 @@ class Executor:
             new_idx = replace(idx, name=new_key)
             table.indexes.pop(old_key)
             table.indexes[new_key] = new_idx
+            old_mode = txn.constraint_modes.pop(old_key, None)
+            if old_mode is not None:
+                txn.constraint_modes[new_key] = old_mode
 
             def undo() -> None:
                 table.indexes.pop(new_key, None)
                 table.indexes[old_key] = idx
+                if old_mode is not None:
+                    txn.constraint_modes.pop(new_key, None)
+                    txn.constraint_modes[old_key] = old_mode
 
             txn.undo_log.append(undo)
 
@@ -2348,10 +2363,13 @@ class Executor:
         name = stmt.name.lower()
         if name in table.foreign_keys:
             old_fks = dict(table.foreign_keys)
+            old_mode = txn.constraint_modes.pop(name, None)
             del table.foreign_keys[name]
 
             def undo_fk() -> None:
                 table.foreign_keys = old_fks
+                if old_mode is not None:
+                    txn.constraint_modes[name] = old_mode
 
             txn.undo_log.append(undo_fk)
             self._catalog.mark_dirty()
@@ -2402,7 +2420,15 @@ class Executor:
                 else:
                     cascade_note = ""
                 old_columns = list(table.columns)
+                old_mode = txn.constraint_modes.get(name)
                 self._catalog.drop_index(txn, name)
+                txn.constraint_modes.pop(name, None)
+
+                def undo_mode() -> None:
+                    if old_mode is not None:
+                        txn.constraint_modes[name] = old_mode
+
+                txn.undo_log.append(undo_mode)
                 if index.constraint_kind == "PRIMARY":
                     table.columns = [
                         replace(col, primary_key=False)
@@ -2440,10 +2466,13 @@ class Executor:
                 ),
             )
         old_checks = dict(table.checks)
+        old_mode = txn.constraint_modes.pop(name, None)
         del table.checks[name]
 
         def undo_check() -> None:
             table.checks = old_checks
+            if old_mode is not None:
+                txn.constraint_modes[name] = old_mode
 
         txn.undo_log.append(undo_check)
         self._catalog.mark_dirty()

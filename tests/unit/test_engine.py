@@ -4308,6 +4308,55 @@ class TestForeignKey:
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("INSERT INTO c VALUES (1)")
 
+    def test_drop_recreate_unique_resets_constraint_mode(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS t_id_key DEFERRED")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_id_key")
+        db.execute_one(
+            "ALTER TABLE t ADD CONSTRAINT t_id_key UNIQUE (id)"
+        )
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO t VALUES (1)")
+
+    def test_rename_constraint_transfers_deferred_mode(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS t_id_key DEFERRED")
+        db.execute_one(
+            "ALTER TABLE t RENAME CONSTRAINT t_id_key TO uq_id"
+        )
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
+            db.execute_one("COMMIT")
+
+    def test_alter_add_deferrable_unique_backfill_rejects_duplicates(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1), (1)")
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one(
+                "ALTER TABLE t ADD CONSTRAINT uq_t UNIQUE (id) "
+                "DEFERRABLE INITIALLY DEFERRED"
+            )
+        assert "uq_t" not in db.catalog.get_table("t").indexes
+
+    def test_alter_constraint_rollback_restores_definition(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one(
+            "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey NOT DEFERRABLE"
+        )
+        db.execute_one("ROLLBACK")
+        fk = db.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+        assert fk.deferrable is True
+        assert fk.initially_deferred is True
+
     def test_alter_constraint_flags_persist_and_reopen(self, tmp_path):
         path = tmp_path / "alter_fk_deferrable"
         first = Database(path)
