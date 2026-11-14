@@ -175,18 +175,27 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 删索引项和堆版本，`SET NULL` 子行通过 `_rewrite_row` 将外键列置空，`SET DEFAULT`
 子行延后到父行删除完成后再写入默认值（避免默认值恰好等于旧父键时留下悬空引用）；
 临时 `processing` / `deleted` 集合用于打断自引用环，事务 abort 会恢复所有页和目录。
-实现是逐表扫描而非依赖索引定位，正确性优先，规模上仍是 O(子表行数)。
+子表外键列有精确索引时走点查，没有索引时退回逐表扫描，规模上最坏仍是 O(子表行数)。
+
+`ForeignKeyDef` 还保存 `deferrable` / `initially_deferred`。`DEFERRABLE INITIALLY
+DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行器把 `(表, RID)`
+放进 `Transaction.deferred_fk_rows`；`NO ACTION` 删除/更新被引用键时把旧键放进
+`Transaction.deferred_ref_checks`。`Database` 在 `COMMIT`（以及自动提交语句的提交点）
+调用 `executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
+被引用键是否已恢复或子行是否已清理；失败则 `abort`，WAL/页 undo 恢复。`RESTRICT`
+始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
 拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 拒绝删除支撑外键的唯一键；
 `DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 拒绝被引用的表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
-`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录。当前
+`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录（即使约束
+声明为延迟，也先校验存量数据）。当前
 `ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` /
-`NO ACTION`（立即语义，等价 `RESTRICT`），`MATCH` 支持 `SIMPLE` / `FULL`，不支持
-`PARTIAL`、`DEFERRABLE`；`ADD COLUMN ... REFERENCES`
+`NO ACTION`（显式 `NO ACTION` 保留；`DEFERRABLE` 可让它提交时检查），`MATCH` 支持
+`SIMPLE` / `FULL`，不支持 `PARTIAL`；`ADD COLUMN ... REFERENCES`
 复用 `ADD CONSTRAINT FOREIGN KEY` 的存量行校验路径，先加列再原子建立外键，失败时
-整条语句回滚。
+整条语句回滚。`SET CONSTRAINTS` 动态切换未实现。
 
 ### 2.10 视图
 

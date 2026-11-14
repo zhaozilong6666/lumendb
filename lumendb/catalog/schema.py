@@ -115,6 +115,8 @@ class ForeignKeyDef:
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
     match_type: str = "SIMPLE"
+    deferrable: bool = False
+    initially_deferred: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -125,6 +127,8 @@ class ForeignKeyDef:
             "on_delete": self.on_delete,
             "on_update": self.on_update,
             "match_type": self.match_type,
+            "deferrable": self.deferrable,
+            "initially_deferred": self.initially_deferred,
         }
 
     @classmethod
@@ -137,6 +141,8 @@ class ForeignKeyDef:
             on_delete=data.get("on_delete", "RESTRICT"),
             on_update=data.get("on_update", "RESTRICT"),
             match_type=data.get("match_type", "SIMPLE"),
+            deferrable=bool(data.get("deferrable", False)),
+            initially_deferred=bool(data.get("initially_deferred", False)),
         )
 
 
@@ -295,17 +301,33 @@ def validate_table_def(table: TableDef) -> None:
             )
         if not fk.ref_columns:
             raise NotSupportedError(f"外键 {name!r} 没有被引用列")
-        if fk.on_delete not in ("RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"):
+        if fk.on_delete not in (
+            "RESTRICT",
+            "NO ACTION",
+            "CASCADE",
+            "SET NULL",
+            "SET DEFAULT",
+        ):
             raise NotSupportedError(
                 f"外键 {name!r} 的删除动作非法：{fk.on_delete!r}"
             )
-        if fk.on_update not in ("RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"):
+        if fk.on_update not in (
+            "RESTRICT",
+            "NO ACTION",
+            "CASCADE",
+            "SET NULL",
+            "SET DEFAULT",
+        ):
             raise NotSupportedError(
                 f"外键 {name!r} 的更新动作非法：{fk.on_update!r}"
             )
         if fk.match_type not in ("SIMPLE", "FULL"):
             raise NotSupportedError(
                 f"外键 {name!r} 的 MATCH 类型非法：{fk.match_type!r}"
+            )
+        if fk.initially_deferred and not fk.deferrable:
+            raise NotSupportedError(
+                f"外键 {name!r} 的 INITIALLY DEFERRED 需要 DEFERRABLE"
             )
         for cname in fk.columns:
             if not table.has_column(cname):

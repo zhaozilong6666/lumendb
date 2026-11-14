@@ -348,6 +348,8 @@ class ForeignKeySpec:
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
     match_type: str = "SIMPLE"
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,6 +377,8 @@ class TableConstraint:
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
     match_type: str = "SIMPLE"
+    deferrable: bool = False
+    initially_deferred: bool = False
 
 
 @dataclass

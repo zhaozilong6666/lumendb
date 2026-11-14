@@ -87,6 +87,11 @@ class Database:
                 raise TransactionError("没有活动事务")
             txn = self._txn
             self._txn = None
+            try:
+                self.executor.validate_deferred_foreign_keys(txn)
+            except BaseException:
+                self.txns.abort(txn)
+                raise
             self.txns.commit(txn)
             return Result(tag="COMMIT")
 
@@ -122,6 +127,7 @@ class Database:
         txn = self.txns.begin()
         try:
             result = self.executor.run(statement, txn, params)
+            self.executor.validate_deferred_foreign_keys(txn)
         except BaseException:
             self.txns.abort(txn)
             raise

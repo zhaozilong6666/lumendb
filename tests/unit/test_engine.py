@@ -3269,6 +3269,73 @@ class TestForeignKey:
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("UPDATE c SET b = NULL WHERE a = 1")
 
+    def test_deferred_fk_insert_child_then_parent(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (1, 1)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT id, pid FROM c") == [(1, 1)]
+
+    def test_deferred_fk_commit_failure(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+
+    def test_deferred_fk_update_then_parent(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("UPDATE c SET pid = 2")
+        db.execute_one("INSERT INTO p VALUES (2)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT pid FROM c") == [(2,)]
+
+    def test_deferred_no_action_delete_then_restore(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_deferred_no_action_delete_without_restore(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
+
     def test_on_delete_cascade(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

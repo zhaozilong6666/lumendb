@@ -584,6 +584,7 @@ class Parser:
                 self._expect_punct("rparen", ")")
             match_type = self._parse_fk_match()
             on_delete, on_update = self._parse_fk_actions()
+            deferrable, initially_deferred = self._parse_fk_deferrability()
             return TableConstraint(
                 kind="FOREIGN KEY",
                 columns=fk_columns,
@@ -593,6 +594,8 @@ class Parser:
                 on_delete=on_delete,
                 on_update=on_update,
                 match_type=match_type,
+                deferrable=deferrable,
+                initially_deferred=initially_deferred,
             )
         else:
             raise self._error(
@@ -682,6 +685,7 @@ class Parser:
             self._expect_punct("rparen", ")")
         match_type = self._parse_fk_match()
         on_delete, on_update = self._parse_fk_actions()
+        deferrable, initially_deferred = self._parse_fk_deferrability()
         return ForeignKeySpec(
             columns=columns,
             ref_table=ref_table,
@@ -690,6 +694,8 @@ class Parser:
             on_delete=on_delete,
             on_update=on_update,
             match_type=match_type,
+            deferrable=deferrable,
+            initially_deferred=initially_deferred,
         )
 
     def _parse_fk_match(self) -> str:
@@ -717,7 +723,7 @@ class Parser:
                     on_delete = "RESTRICT"
                 elif self._match_kw("NO"):
                     self._expect_kw("ACTION")
-                    on_delete = "RESTRICT"
+                    on_delete = "NO ACTION"
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_delete = "SET NULL"
@@ -740,7 +746,7 @@ class Parser:
                     on_update = "RESTRICT"
                 elif self._match_kw("NO"):
                     self._expect_kw("ACTION")
-                    on_update = "RESTRICT"
+                    on_update = "NO ACTION"
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_update = "SET NULL"
@@ -759,6 +765,28 @@ class Parser:
             else:
                 raise self._error("ON 之后期望 DELETE 或 UPDATE")
         return on_delete, on_update
+
+    def _parse_fk_deferrability(self) -> tuple[bool, bool]:
+        """解析 ``[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]``。"""
+        if self._match_kw("NOT"):
+            self._expect_kw("DEFERRABLE")
+            if self._match_kw("INITIALLY"):
+                raise NotSupportedError(
+                    "NOT DEFERRABLE 不能同时指定 INITIALLY",
+                    hint="使用 DEFERRABLE INITIALLY DEFERRED 或直接省略",
+                )
+            return False, False
+        if not self._match_kw("DEFERRABLE"):
+            return False, False
+        if self._match_kw("INITIALLY"):
+            if self._match_kw("DEFERRED"):
+                return True, True
+            if self._match_kw("IMMEDIATE"):
+                return True, False
+            raise NotSupportedError(
+                "DEFERRABLE INITIALLY 只支持 DEFERRED 或 IMMEDIATE"
+            )
+        return True, False
 
     def _parse_type(self) -> TypeSpec:
         tok = self._cur

@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..errors import TransactionAbortedError, TransactionError
 from .pager import DiskManager
@@ -24,6 +24,7 @@ from .wal import WAL
 
 if TYPE_CHECKING:  # pragma: no cover
     from .bufferpool import BufferPoolManager
+    from .record import RID
 
 #: 事务号预留块大小。崩溃后重启时，下一个 xid 从这个块的边界继续，
 #: 保证不会复用已经写进记录头的事务号。
@@ -57,6 +58,11 @@ class Transaction:
     undo_log: list = field(default_factory=list)
     #: SAVEPOINT 栈；ROLLBACK TO 只撤销保存点之后的页/对象变更。
     savepoints: list[TxnSavepoint] = field(default_factory=list)
+    #: 延迟外键：提交时需要重新检查的行，以及被删除/改写的被引用键。
+    deferred_fk_rows: set[tuple[str, RID]] = field(default_factory=set)
+    deferred_ref_checks: set[tuple[str, str, tuple[Any, ...]]] = field(
+        default_factory=set
+    )
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:

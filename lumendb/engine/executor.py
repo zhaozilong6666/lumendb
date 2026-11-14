@@ -1017,6 +1017,8 @@ class Executor:
                 on_delete=spec.on_delete,
                 on_update=spec.on_update,
                 match_type=spec.match_type,
+                deferrable=spec.deferrable,
+                initially_deferred=spec.initially_deferred,
             )
             used.add(name)
 
@@ -1035,6 +1037,8 @@ class Executor:
                     on_delete=constraint.on_delete,
                     on_update=constraint.on_update,
                     match_type=constraint.match_type,
+                    deferrable=constraint.deferrable,
+                    initially_deferred=constraint.initially_deferred,
                 ),
                 list(constraint.columns),
             )
@@ -1323,6 +1327,8 @@ class Executor:
                         on_delete=ref.on_delete,
                         on_update=ref.on_update,
                         match_type=ref.match_type,
+                        deferrable=ref.deferrable,
+                        initially_deferred=ref.initially_deferred,
                     ),
                 ),
                 txn,
@@ -1853,6 +1859,8 @@ class Executor:
                 on_delete=constraint.on_delete,
                 on_update=constraint.on_update,
                 match_type=constraint.match_type,
+                deferrable=constraint.deferrable,
+                initially_deferred=constraint.initially_deferred,
             )
             provisional = TableDef(
                 name=table.name,
@@ -1863,7 +1871,7 @@ class Executor:
             )
             heap = HeapFile(self._bp, table, self._txns)
             for _rid, values in heap.scan(txn):
-                self._check_foreign_keys(provisional, values, txn)
+                self._check_foreign_keys(provisional, values, txn, force=True)
             old_fks = dict(table.foreign_keys)
             table.foreign_keys[fk_name] = fk
 
@@ -2567,6 +2575,7 @@ class Executor:
             if new_key is not None:
                 tree.insert(txn, new_key, rid)
             idx.root_page = tree.root_page
+        self._track_deferred_fk_row(table, rid, txn)
         for child, child_rid, child_old, child_new in pending:
             child_heap = HeapFile(self._bp, child, self._txns)
             self._rewrite_row(
@@ -2615,6 +2624,15 @@ class Executor:
                     if child_ident in updating:
                         continue
                     if fk.on_update not in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                        if (
+                            fk.on_update == "NO ACTION"
+                            and fk.deferrable
+                            and fk.initially_deferred
+                        ):
+                            txn.deferred_ref_checks.add(
+                                (child.name, fk.name, old_key)
+                            )
+                            continue
                         raise ForeignKeyViolationError(
                             f"外键约束 {fk.name!r} 阻止更新被引用行",
                             detail=(
@@ -2778,6 +2796,7 @@ class Executor:
                 continue
             tree.insert(txn, key, rid)
             idx.root_page = tree.root_page
+        self._track_deferred_fk_row(table, rid, txn)
         returning_row = (
             tuple(fn(EvalContext(tuple(prepared))) for fn in ret_fns)
             if ret_fns
@@ -2957,6 +2976,7 @@ class Executor:
                     tuple(fn(EvalContext(old_tuple)) for fn in ret_fns)
                 )
             heap.delete(txn, rid)
+            txn.deferred_fk_rows.discard((table.name, rid))
             processing.discard(ident)
             deleted_rids.add(ident)
             deleted += 1
@@ -3089,11 +3109,107 @@ class Executor:
         if conflict is not None:
             raise self._duplicate_key_error(conflict[0])
 
-    def _check_foreign_keys(
-        self, table: TableDef, values: list[Any], txn: Transaction
+    def _track_deferred_fk_row(
+        self, table: TableDef, rid: RID, txn: Transaction
     ) -> None:
-        """MATCH SIMPLE：任一本地列为 NULL 就跳过；MATCH FULL 要求全空或全非空。"""
+        if any(
+            fk.deferrable and fk.initially_deferred
+            for fk in table.foreign_keys.values()
+        ):
+            txn.deferred_fk_rows.add((table.name, rid))
+
+    def _parent_key_exists(
+        self,
+        table: TableDef,
+        columns: tuple[str, ...],
+        key: tuple[Any, ...],
+        txn: Transaction,
+    ) -> bool:
+        """提交时判断被引用键是否仍存在；优先走唯一索引。"""
+        heap = HeapFile(self._bp, table, self._txns)
+        positions = [table.column_index(name) for name in columns]
+        index = next(
+            (
+                idx
+                for idx in table.indexes.values()
+                if idx.unique and tuple(idx.columns) == tuple(columns)
+            ),
+            None,
+        )
+        if index is not None:
+            tree = self._tree_for(table, index)
+            for rid in tree.lookup(txn, list(key)):
+                values = heap.get(txn, rid)
+                if values is not None and all(
+                    values[pos] == value
+                    for pos, value in zip(positions, key)
+                ):
+                    return True
+        for _rid, values in heap.scan(txn):
+            if all(
+                values[pos] == value
+                for pos, value in zip(positions, key)
+            ):
+                return True
+        return False
+
+    def validate_deferred_foreign_keys(self, txn: Transaction) -> None:
+        """提交前补检延迟外键，失败由事务层 abort。"""
+        for table_name, rid in list(txn.deferred_fk_rows):
+            try:
+                table = self._catalog.get_table(table_name)
+            except TableNotFoundError:
+                continue
+            values = HeapFile(self._bp, table, self._txns).get(txn, rid)
+            if values is None:
+                continue
+            self._check_foreign_keys(table, list(values), txn, force=True)
+
+        for child_name, fk_name, key in list(txn.deferred_ref_checks):
+            try:
+                child = self._catalog.get_table(child_name)
+            except TableNotFoundError:
+                continue
+            fk = child.foreign_keys.get(fk_name)
+            if fk is None:
+                continue
+            try:
+                ref_table = self._catalog.get_table(fk.ref_table)
+            except TableNotFoundError:
+                continue
+            if self._parent_key_exists(
+                ref_table, fk.ref_columns, key, txn
+            ):
+                continue
+            heap = HeapFile(self._bp, child, self._txns)
+            for _rid, _values in self._fk_child_rows(
+                child, fk, key, txn, heap
+            ):
+                raise ForeignKeyViolationError(
+                    f"外键约束 {fk.name!r} 在提交时仍被引用",
+                    detail=(
+                        f"表 {child.name} 中仍有行引用 "
+                        f"{ref_table.name}.{fk.ref_columns} = {key}"
+                    ),
+                    hint="先删除/更新引用行，或在同一事务中恢复被引用键",
+                )
+
+    def _check_foreign_keys(
+        self,
+        table: TableDef,
+        values: list[Any],
+        txn: Transaction,
+        *,
+        force: bool = False,
+    ) -> None:
+        """MATCH SIMPLE：任一本地列为 NULL 就跳过；MATCH FULL 要求全空或全非空。
+
+        ``DEFERRABLE INITIALLY DEFERRED`` 的外键在 DML 路径跳过检查，由提交前的
+        ``validate_deferred_foreign_keys`` 用 ``force=True`` 统一补检。
+        """
         for fk in table.foreign_keys.values():
+            if not force and fk.deferrable and fk.initially_deferred:
+                continue
             local_key = tuple(
                 values[table.column_index(name)] for name in fk.columns
             )
@@ -3275,6 +3391,15 @@ class Executor:
                             child_new[index] = child.columns[index].default
                     continue
                 if fk.on_delete != "CASCADE":
+                    if (
+                        fk.on_delete == "NO ACTION"
+                        and fk.deferrable
+                        and fk.initially_deferred
+                    ):
+                        txn.deferred_ref_checks.add(
+                            (child.name, fk.name, key)
+                        )
+                        continue
                     raise ForeignKeyViolationError(
                         f"外键约束 {fk.name!r} 阻止删除被引用行",
                         detail=(
@@ -3294,6 +3419,7 @@ class Executor:
                     )
                     self._delete_index_entries(child, child_values, txn, child_rid)
                     child_heap.delete(txn, child_rid)
+                    txn.deferred_fk_rows.discard((child.name, child_rid))
                     processing.discard(ident)
                     deleted.add(ident)
 

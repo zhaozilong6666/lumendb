@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 范围：LumenDB 外键约束、删除/更新动作、`ALTER TABLE` 外键 DDL、测试与文档
 - 基线：`8da5a63`（`ON DELETE CASCADE`）
-- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`8a88bad`
+- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`7d809b7`、`326edbb`、`8f37f76`
 
 ## 1. 成果清单
 
@@ -21,7 +21,8 @@
 | `ON UPDATE CASCADE` | 完成 | 父键更新后递归同步子行，支持多级链与自引用链 |
 | `ON UPDATE SET NULL` | 完成 | 父键更新后将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
 | `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值；默认值不存在时回滚 |
-| `NO ACTION` | 完成 | 接受该语法；无 `DEFERRABLE` 时按立即 `RESTRICT` 处理 |
+| `NO ACTION` | 完成 | 独立动作；配合 `DEFERRABLE` 可提交时检查，否则立即拒绝 |
+| `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 未实现 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT` |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
 | 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护 |
@@ -41,9 +42,10 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 ```
 
 `from_json` 对旧目录缺省为 `RESTRICT` / `SIMPLE`；`validate_table_def` 允许
-`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和 `SIMPLE` / `FULL`，非法动作或
-MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`，因此目录里不会
-留下未定义的延迟动作。
+`RESTRICT` / `NO ACTION` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和
+`SIMPLE` / `FULL`，非法动作或 MATCH 类型直接拒绝。`NO ACTION` 保留为独立动作，
+`DEFERRABLE` / `INITIALLY DEFERRED` 随目录持久化；`INITIALLY DEFERRED` 必须同时
+声明 `DEFERRABLE`。
 
 ### 2.2 插入与更新校验
 
@@ -58,7 +60,23 @@ MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`
 `INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和 `UPDATE` 都走这一入口。
 外键引用列要求存在 `UNIQUE` 或 `PRIMARY KEY` 索引，本地列与被引用列类型必须完全一致。
 
-### 2.3 删除级联
+### 2.3 延迟约束
+
+`ForeignKeyDef` 的 `deferrable` / `initially_deferred` 为真时，DML 路径跳过
+`INSERT` / `UPDATE` 的本地存在性检查，并把 `(table, RID)` 加入
+`Transaction.deferred_fk_rows`。`NO ACTION` 的父行删除/更新把旧键加入
+`Transaction.deferred_ref_checks`，不会立即报错。`Database` 在 `COMMIT` 前调用
+`validate_deferred_foreign_keys`：
+
+- 按当前 RID 重新读取行并强制检查所有外键；
+- 对父行待检查项，先确认被引用键是否已被同事务恢复；否则按子表索引/扫描查找
+  仍存在的引用行；
+- 失败时 `abort` 事务，页 undo 与 WAL 恢复保证子行、父行都不留半状态。
+
+`DEFERRABLE INITIALLY IMMEDIATE` 仍走语句内检查；`RESTRICT`、`CASCADE`、
+`SET NULL`、`SET DEFAULT` 动作始终立即执行。`SET CONSTRAINTS` 暂未实现。
+
+### 2.4 删除级联
 
 `_delete` 在删除目标行前调用 `_cascade_delete_children`：
 
@@ -72,7 +90,7 @@ MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`
 - 删除每个子行前调用 `_snapshot_table_state`，事务回滚可恢复页和索引根页；
 - `affected` 只统计直接目标行，不统计级联子行。
 
-### 2.4 更新级联
+### 2.5 更新级联
 
 `_rewrite_row` 在父行写堆前调用 `_plan_referenced_updates`：
 
@@ -85,7 +103,7 @@ MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`
 - 子行更新继续走自己的 CHECK、外键、唯一索引和下游级联路径；
 - `_updating` 集合用于打断循环引用。
 
-### 2.5 `ALTER TABLE`
+### 2.6 `ALTER TABLE`
 
 - `ADD CONSTRAINT FOREIGN KEY`：先扫描存量行，再写入目录；失败不留下半状态。
 - `ADD COLUMN ... REFERENCES`：先加列，再复用 `ADD CONSTRAINT` 路径建立外键；
@@ -98,7 +116,7 @@ MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`
 
 ## 3. 测试与验证
 
-- 全量测试：**839 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**845 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -107,7 +125,8 @@ MATCH 类型直接拒绝。`NO ACTION` 在解析层归一化为立即 `RESTRICT`
   - `ON UPDATE CASCADE` 单级/多级/自引用链、事务回滚；
   - `ON DELETE SET NULL` / `ON UPDATE SET NULL`、`NOT NULL` 冲突回滚；
   - `MATCH FULL` 全空/全非空/部分 NULL 拒绝；
-  - `NO ACTION` 解析为立即 `RESTRICT`；
+  - `NO ACTION` 保留为独立动作；
+  - `DEFERRABLE INITIALLY DEFERRED`：先子后父提交成功、缺父提交失败、更新后补父、删除后恢复父键；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -150,16 +169,17 @@ CI：
 
 ## 5. 遗留风险与未实现项
 
-1. **动作子集仍有限**：未实现 `DEFERRABLE` / `MATCH PARTIAL`；当前支持
+1. **动作子集仍有限**：未实现 `SET CONSTRAINTS` / `MATCH PARTIAL`；当前支持
    `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
-   `MATCH SIMPLE` / `MATCH FULL`。
+   `DEFERRABLE INITIALLY DEFERRED`（`MATCH SIMPLE` / `MATCH FULL`）。
 2. **级联收集不自动建子表索引**：写入侧 `_check_foreign_keys` 已优先走被引用唯一索引，
    `_plan_referenced_updates` / `_cascade_delete_children` 在子表外键列存在精确索引时
    也走点查，但外键不会自动创建子表索引；没有索引时仍逐表扫描，复杂度与子表行数
    线性相关，数据量大时应显式 `CREATE INDEX`。
 3. **复杂循环图**：`_updating` / `processing` 能打断常见自引用环，但菱形依赖、
    同一子行被多条级联路径同时命中的精确 SQL 顺序语义没有单独建模；
-   并发事务下也没有等锁/延迟约束，当前更接近单写者语义。
+   并发事务下也没有等锁语义，当前更接近单写者语义。`SET CONSTRAINTS` 不可用，
+   延迟检查固定在 `COMMIT`。
 4. **`DROP TABLE ... CASCADE` 不删子表数据**：只删除引用表上的外键约束，
    与部分数据库的“级联删表数据”语义不同；`TRUNCATE` 没有 `CASCADE`。
 5. **保守拒绝**：`DROP INDEX` / `DROP CONSTRAINT` 只要还被外键引用就拒绝，
@@ -173,7 +193,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 839 个测试通过，已推送代码提交
-`5c3dd00` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
-`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 与
-`MATCH SIMPLE` / `MATCH FULL` 子集。
+索引点查、事务回滚、持久化和文档均已落地；全量 845 个测试通过，最新已推送代码提交
+`8f37f76` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
+`RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
+`DEFERRABLE INITIALLY DEFERRED` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

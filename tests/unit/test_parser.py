@@ -200,8 +200,35 @@ class TestCreateTable:
         )
         ref = stmt.columns[0].references
         assert ref is not None
-        assert ref.on_delete == "RESTRICT"
-        assert ref.on_update == "RESTRICT"
+        assert ref.on_delete == "NO ACTION"
+        assert ref.on_update == "NO ACTION"
+
+    def test_foreign_key_deferrable(self):
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.deferrable is True
+        assert ref.initially_deferred is True
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) "
+            "DEFERRABLE INITIALLY IMMEDIATE)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.deferrable is True
+        assert ref.initially_deferred is False
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT REFERENCES other(id) NOT DEFERRABLE)"
+        )
+        ref = stmt.columns[0].references
+        assert ref is not None
+        assert ref.deferrable is False
+        assert ref.initially_deferred is False
 
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
