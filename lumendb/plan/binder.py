@@ -1510,7 +1510,10 @@ class Binder:
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)
         binder.view_stack = self.view_stack
-        plan, cols = binder.bind_select(ref.query)
+        if isinstance(ref.query, Query):
+            plan, cols = binder.bind_query(ref.query)
+        else:
+            plan, cols = binder.bind_select(ref.query)
         self.source_dependencies.update(binder.source_dependencies)
         self.column_dependencies.update(binder.column_dependencies)
         effective = (ref.alias or ref.name).lower()

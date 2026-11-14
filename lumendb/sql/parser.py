@@ -1397,12 +1397,19 @@ class Parser:
     ) -> tuple[
         str,
         Optional[str],
-        Optional[Select | CompoundSelect],
+        Optional[Select | CompoundSelect | Query],
         Optional[list[str]],
     ]:
         """解析一个 FROM 数据源：普通表或 ``(SELECT ...) AS alias``。"""
         if self._match_punct("lparen"):
-            query = self._parse_query_expression()
+            if self._cur.is_keyword("WITH"):
+                query = self._parse_with()
+                if not isinstance(query, Query):
+                    raise NotSupportedError(
+                        "FROM 派生表内部只支持 WITH ... SELECT"
+                    )
+            else:
+                query = self._parse_query_expression()
             self._expect_punct("rparen", ")")
             alias = None
             if self._match_kw("AS"):

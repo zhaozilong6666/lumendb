@@ -287,7 +287,7 @@ class TableRef:
     alias: Optional[str] = None
     joins: list[Join] = field(default_factory=list)
     #: FROM 里的派生表 ``(SELECT ...) AS alias``；普通表为 None。
-    query: Optional[Union[Select, CompoundSelect]] = None
+    query: Optional[Union[Select, CompoundSelect, Query]] = None
     #: ``AS alias(a, b)`` 的列别名列表；None 表示沿用源列名。
     column_aliases: Optional[list[str]] = None
 

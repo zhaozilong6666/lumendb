@@ -3062,6 +3062,16 @@ class TestSubquery:
             ") x ORDER BY x.id",
         ) == [(1,), (3,)]
 
+    def test_derived_table_with_cte(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT x.id FROM ("
+            "WITH t AS (SELECT id FROM users WHERE id = 1) "
+            "SELECT id FROM t"
+            ") x",
+        ) == [(1,)]
+
     def test_derived_table_column_aliases(self, db):
         setup_users(db)
         assert rows(

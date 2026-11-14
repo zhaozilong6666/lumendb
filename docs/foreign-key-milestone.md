@@ -142,7 +142,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 ## 4. 测试与验证
 
-- 全量测试：**957 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**959 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -231,7 +231,7 @@ CI：
 ## 7. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 957 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 959 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

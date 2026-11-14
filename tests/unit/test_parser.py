@@ -16,6 +16,7 @@ from lumendb.sql.ast import (
     Like,
     Literal,
     ParamRef,
+    Query,
     ScalarSubquery,
     Select,
     SetConstraints,
@@ -675,6 +676,13 @@ class TestSelect:
             "SELECT * FROM (SELECT id, name FROM t) AS x(a, b)"
         )
         assert stmt.select.from_[0].column_aliases == ["a", "b"]
+
+    def test_derived_table_with_cte(self):
+        stmt = parse_statement(
+            "SELECT * FROM (WITH t AS (SELECT 1 AS id) SELECT id FROM t) x"
+        )
+        ref = stmt.select.from_[0]
+        assert isinstance(ref.query, Query)
 
     def test_derived_table_on_join_right(self):
         stmt = parse_statement(
