@@ -1790,6 +1790,32 @@ class TestJoin:
             "WHERE a.id = b.id AND b.id = c.id ORDER BY a.id",
         ) == [(1,), (3,)]
 
+    def test_comma_join_reorders_for_small_start_and_restores_columns(self, db):
+        db.execute_one("CREATE TABLE big (id INT)")
+        db.execute_one("CREATE TABLE small (id INT)")
+        db.execute_one("CREATE TABLE mid (id INT)")
+        for i in range(1, 11):
+            db.execute_one(f"INSERT INTO big VALUES ({i})")
+        db.execute_one("INSERT INTO small VALUES (1), (2)")
+        db.execute_one("INSERT INTO mid VALUES (1), (2), (3)")
+        plan = "\n".join(
+            r[0]
+            for r in rows(
+                db,
+                "EXPLAIN SELECT * FROM big, small, mid "
+                "WHERE big.id = small.id AND small.id = mid.id",
+            )
+        )
+        assert "Project" in plan
+        assert plan.index("SeqScan small") < plan.index("SeqScan mid")
+        assert plan.index("SeqScan mid") < plan.index("SeqScan big")
+        assert rows(
+            db,
+            "SELECT * FROM big, small, mid "
+            "WHERE big.id = small.id AND small.id = mid.id "
+            "ORDER BY big.id",
+        ) == [(1, 1, 1), (2, 2, 2)]
+
     def test_right_join(self, db):
         self.setup(db)
         db.execute_one("INSERT INTO b VALUES (4, 'b4')")

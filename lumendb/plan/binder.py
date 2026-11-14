@@ -1485,42 +1485,196 @@ class Binder:
             combined = BinaryOp(op="AND", left=combined, right=term)
         return combined
 
+    def _source_index(self, schemas: list[Schema], col: ColumnRef) -> Optional[int]:
+        """返回列引用所属的数据源下标；找不到或歧义时返回 ``None``。"""
+        found: Optional[int] = None
+        for i, schema in enumerate(schemas):
+            try:
+                schema.resolve(col.table, col.name)
+            except BinderError:
+                continue
+            if found is not None:
+                return None
+            found = i
+        return found
+
+    def _join_edges(
+        self, where, schemas: list[Schema]
+    ) -> set[tuple[int, int]]:
+        """收集 ``WHERE`` 顶层 AND 中跨数据源的等值边。"""
+        edges: set[tuple[int, int]] = set()
+        if where is None:
+            return edges
+        for expr in _conjuncts(where):
+            if not isinstance(expr, BinaryOp) or expr.op != "=":
+                continue
+            if not isinstance(expr.left, ColumnRef) or not isinstance(
+                expr.right, ColumnRef
+            ):
+                continue
+            left = self._source_index(schemas, expr.left)
+            right = self._source_index(schemas, expr.right)
+            if left is None or right is None or left == right:
+                continue
+            edges.add((min(left, right), max(left, right)))
+        return edges
+
+    def _choose_join_order(
+        self, bindings: list[tuple[PlanNode, Schema]], where
+    ) -> Optional[list[int]]:
+        """贪心选择左深连接顺序；不满足条件时返回 ``None`` 表示保持原序。
+
+        只对没有显式 ``JOIN`` 的 ``FROM`` 列表生效；有等值边时优先选择连接
+        最多的源作为起点，之后每一步优先连到已有集合，再按估算结果行数和
+        CPU 选择。源数超过 8 时直接回退，避免为了小收益引入过多复杂度。
+        """
+        n = len(bindings)
+        if n < 3 or n > 8:
+            return None
+        schemas = [schema for _node, schema in bindings]
+        edges = self._join_edges(where, schemas)
+        if not edges:
+            return None
+
+        degree = [0] * n
+        for left, right in edges:
+            degree[left] += 1
+            degree[right] += 1
+
+        def rows_of(i: int) -> float:
+            return self._node_estimate(bindings[i][0]).rows
+
+        start = min(
+            range(n), key=lambda i: (-degree[i], rows_of(i), i)
+        )
+        ordered = [start]
+        remaining = [i for i in range(n) if i != start]
+        accumulated_schema = schemas[start]
+        accumulated_est = self._node_estimate(bindings[start][0])
+
+        while remaining:
+            best: Optional[tuple[tuple, int]] = None
+            for i in remaining:
+                candidate_schema = accumulated_schema.concat(schemas[i])
+                on_expr = self._cross_equalities(
+                    where, accumulated_schema, schemas[i]
+                )
+                if on_expr is None:
+                    keys = ()
+                else:
+                    keys, _labels = self._equi_keys(
+                        on_expr, candidate_schema, len(accumulated_schema)
+                    )
+                est = join_estimate(
+                    accumulated_est,
+                    self._node_estimate(bindings[i][0]),
+                    equi_keys=len(keys),
+                )
+                # 有连接键优先；其次比较结果行数、CPU，最后用原下标稳定排序。
+                rank = (0 if keys else 1, est.rows, est.cpu, i)
+                if best is None or rank < best[0]:
+                    best = (rank, i)
+            assert best is not None
+            chosen = best[1]
+            remaining.remove(chosen)
+            merged = accumulated_schema.concat(schemas[chosen])
+            on_expr = self._cross_equalities(
+                where, accumulated_schema, schemas[chosen]
+            )
+            keys: tuple[tuple[int, int], ...] = ()
+            if on_expr is not None:
+                keys, _labels = self._equi_keys(
+                    on_expr, merged, len(accumulated_schema)
+                )
+            accumulated_est = join_estimate(
+                accumulated_est,
+                self._node_estimate(bindings[chosen][0]),
+                equi_keys=len(keys),
+            )
+            accumulated_schema = merged
+            ordered.append(chosen)
+        return ordered
+
+    def _restore_output_order(
+        self,
+        node: PlanNode,
+        bindings: list[tuple[PlanNode, Schema]],
+        order: list[int],
+    ) -> tuple[PlanNode, Schema]:
+        """把按连接顺序排列的行投影回 SQL 书写顺序。"""
+        original = bindings[0][1]
+        for _node, schema in bindings[1:]:
+            original = original.concat(schema)
+
+        ordered_offsets: dict[int, int] = {}
+        offset = 0
+        for source in order:
+            ordered_offsets[source] = offset
+            offset += len(bindings[source][1])
+
+        exprs: list[Callable[[EvalContext], Any]] = []
+        for source, (_node, source_schema) in enumerate(bindings):
+            new_offset = ordered_offsets[source]
+            for local in range(len(source_schema)):
+                new_index = new_offset + local
+                exprs.append(lambda ctx, i=new_index: ctx.row[i])
+
+        columns = [
+            OutputColumn(col.name, col.type) for col in original.columns
+        ]
+        return (
+            Project(
+                child=node,
+                exprs=exprs,
+                columns=columns,
+                estimated=project_estimate(
+                    self._node_estimate(node), width=len(columns)
+                ),
+            ),
+            original,
+        )
+
     def _bind_from(self, refs, where=None) -> tuple[PlanNode, Schema]:
         if not refs:
             return Values(rows=[()], columns=[]), Schema([])
 
-        node: Optional[PlanNode] = None
-        schema = Schema([])
-        for ref in refs:
-            sub_node, sub_schema = self._bind_table_ref(ref)
-            if node is None:
-                node, schema = sub_node, sub_schema
-            else:
-                merged = schema.concat(sub_schema)
-                on_expr = self._cross_equalities(where, schema, sub_schema)
-                on_fn = None
-                hash_keys, hash_labels = ((), ())
-                if on_expr is not None:
-                    on_fn, _ = self.compile(on_expr, merged, allow_agg=False)
-                    hash_keys, hash_labels = self._equi_keys(
-                        on_expr, merged, len(schema)
-                    )
-                node = Join(
-                    left=node,
-                    right=sub_node,
-                    kind="INNER",
-                    on=on_fn,
-                    columns=[OutputColumn(c.name, c.type) for c in merged.columns],
-                    hash_keys=hash_keys,
-                    hash_labels=hash_labels,
-                    estimated=join_estimate(
-                        self._node_estimate(node),
-                        self._node_estimate(sub_node),
-                        equi_keys=len(hash_keys),
-                    ),
+        bindings = [self._bind_table_ref(ref) for ref in refs]
+        order: list[int] = list(range(len(refs)))
+        if all(not getattr(ref, "joins", ()) for ref in refs):
+            chosen = self._choose_join_order(bindings, where)
+            if chosen is not None:
+                order = chosen
+
+        node, schema = bindings[order[0]]
+        for index in order[1:]:
+            sub_node, sub_schema = bindings[index]
+            merged = schema.concat(sub_schema)
+            on_expr = self._cross_equalities(where, schema, sub_schema)
+            on_fn = None
+            hash_keys, hash_labels = ((), ())
+            if on_expr is not None:
+                on_fn, _ = self.compile(on_expr, merged, allow_agg=False)
+                hash_keys, hash_labels = self._equi_keys(
+                    on_expr, merged, len(schema)
                 )
-                schema = merged
-        assert node is not None
+            node = Join(
+                left=node,
+                right=sub_node,
+                kind="INNER",
+                on=on_fn,
+                columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+                hash_keys=hash_keys,
+                hash_labels=hash_labels,
+                estimated=join_estimate(
+                    self._node_estimate(node),
+                    self._node_estimate(sub_node),
+                    equi_keys=len(hash_keys),
+                ),
+            )
+            schema = merged
+
+        if order != list(range(len(refs))):
+            return self._restore_output_order(node, bindings, order)
         return node, schema
 
     def _source_for(

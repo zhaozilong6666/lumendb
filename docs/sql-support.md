@@ -444,6 +444,8 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 - `LEFT JOIN` 的右侧无匹配时补 `NULL`；`RIGHT JOIN` 的左侧、`FULL JOIN` 的两侧同理。
 - `CROSS JOIN` 与逗号连接等价，不写 `ON`。逗号连接会从 `WHERE` 顶层 `AND`
   中提取跨表的 `列 = 列` 作为哈希键；完整 `WHERE` 仍保留为 `Filter` 兜底。
+- 3–8 个无显式 `JOIN` 的逗号连接源可能被代价模型重排；输出列顺序会还原为
+  SQL 书写顺序，但无 `ORDER BY` 时行顺序不保证稳定。
 - `HAVING` 作用在聚合输出行上：分组键与聚合结果之外的原表列不可见。
 - `GROUP BY` 表达式按语法树同形匹配：`SELECT id % 2 ... GROUP BY id % 2` 合法；
   `GROUP BY id % 2` 与 `GROUP BY id%2` 视为同一个表达式。
