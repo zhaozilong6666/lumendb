@@ -30,17 +30,25 @@ from .executor import Executor, Result
 
 
 class Database:
-    def __init__(self, path: str | Path, *, pool_size: int = 64) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        pool_size: int = 64,
+        checkpoint_wal_bytes: int = 8 * 1024 * 1024,
+    ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.disk = DiskManager(self.path / "lumendb.data")
         self.wal = WAL(self.path / "lumendb.wal")
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
         self.txns = TransactionManager(self.disk, self.wal, self.bp)
+        self._checkpoint_wal_bytes = checkpoint_wal_bytes
 
-        self.recovery_report = RecoveryManager(
+        self.recovery = RecoveryManager(
             self.disk, self.wal, self.bp, self.txns
-        ).recover()
+        )
+        self.recovery_report = self.recovery.recover()
 
         self.catalog = Catalog(CatalogStore(self.bp))
         self.catalog.load()
@@ -95,6 +103,7 @@ class Database:
                 self.txns.abort(txn)
                 raise
             self.txns.commit(txn)
+            self._maybe_checkpoint()
             return Result(tag="COMMIT")
 
         if isinstance(statement, Rollback):
@@ -141,12 +150,23 @@ class Database:
             self.txns.abort(txn)
             raise
         self.txns.commit(txn)
+        self._maybe_checkpoint()
         return result
 
     # ------------------------------------------------------------------
 
     def checkpoint(self) -> None:
-        RecoveryManager(self.disk, self.wal, self.bp, self.txns).checkpoint()
+        self.recovery.checkpoint()
+
+    def _maybe_checkpoint(self) -> None:
+        """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。"""
+        if self._checkpoint_wal_bytes <= 0:
+            return
+        if (
+            self.wal.next_lsn - self.disk.meta.checkpoint_lsn
+            >= self._checkpoint_wal_bytes
+        ):
+            self.recovery.checkpoint()
 
     def close(self) -> None:
         if self._txn is not None:

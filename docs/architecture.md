@@ -56,7 +56,14 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 2. **redo**：从 checkpoint 的 `redo_lsn` 起重放所有日志，`pageLSN >= lsn` 的页跳过；
 3. **undo**：对活跃事务（loser）按 LSN 逆序应用 before image，并写 CLR 防止二次回滚。
 
-恢复结束后写一个 checkpoint，截断旧日志。
+恢复结束后写一个 checkpoint，把 `checkpoint_lsn` 记入元数据页；当前 WAL 仍是
+单文件，旧日志暂不截断，分段回收见 roadmap 第 3 层。
+
+**自动 checkpoint**：`Database(checkpoint_wal_bytes=...)` 在每次提交后比较
+`WAL.next_lsn` 与元数据中的 `checkpoint_lsn`，超过阈值就调用
+`RecoveryManager.checkpoint`。checkpoint 先刷所有脏页，再写 CHECKPOINT 日志并
+更新元数据；因为 `checkpoint_lsn` 随之前移，后续提交不会在同一阈值上重复触发。
+手动 `CHECKPOINT` 语句保留。
 
 ### 2.5 事务与并发
 

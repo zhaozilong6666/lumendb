@@ -159,8 +159,9 @@
 
 组提交已经落地：`TransactionManager` 用一个提交队列和单 leader，把同一刷盘
 窗口内的多个 COMMIT 记录合并成一次 `fsync`；等待者只在自己的记录持久化后
-才变成 `COMMITTED`。还可以继续做的是把整页日志改成"页内 delta"、WAL 分段
-回收和自动 checkpoint。
+才变成 `COMMITTED`。WAL 增长超过 `checkpoint_wal_bytes` 时还会自动
+checkpoint（刷脏页 + 写 CHECKPOINT + 前移 `checkpoint_lsn`）。还可以继续做的
+是把整页日志改成"页内 delta"、WAL 分段回收。
 
 ### 2. 一个真实的 B+ 树坑：键里多塞了 RID
 

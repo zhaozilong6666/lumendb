@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：981 passed。
+- 全量测试：982 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -78,6 +78,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 2. **WAL 分段回收**：checkpoint 之后轮转 WAL，保留基础 LSN，恢复从
    `checkpoint_lsn` 之后开始；旧段在确认无引用后删除。
 3. **CHECKPOINT 策略**：按 WAL 大小或提交数触发，保留手动 `CHECKPOINT`。
+   - **已完成（按 WAL 大小）**：`Database(checkpoint_wal_bytes=...)` 在每次
+     提交后检查 WAL 增长，超过阈值自动调用 `RecoveryManager.checkpoint`；
+     按提交数触发和 WAL 分段仍未实现。
 
 完成标准：崩溃注入测试覆盖“提交后、checkpoint 中、WAL 轮转后”三个时点；
 恢复结果与未崩溃基线一致。

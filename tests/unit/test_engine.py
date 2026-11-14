@@ -3500,6 +3500,19 @@ class TestPersistence:
         assert db.execute_one("CHECKPOINT").tag == "CHECKPOINT"
         assert rows(db, "SELECT COUNT(*) FROM users") == [(3,)]
 
+    def test_auto_checkpoint_when_wal_grows(self, tmp_path):
+        path = tmp_path / "auto-checkpoint"
+        db = Database(path, checkpoint_wal_bytes=64)
+        setup_users(db)
+        before = db.disk.meta.checkpoint_lsn
+        db.execute_one("INSERT INTO users VALUES (4, 'dave', 40)")
+        assert db.disk.meta.checkpoint_lsn > before
+        db.close()
+
+        reopened = Database(path)
+        assert rows(reopened, "SELECT COUNT(*) FROM users") == [(4,)]
+        reopened.close()
+
 
 class TestForeignKey:
     def test_insert_update_delete_restrict(self, db):
