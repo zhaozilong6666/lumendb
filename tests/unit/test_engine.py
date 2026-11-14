@@ -1724,6 +1724,48 @@ class TestJoin:
         self.setup(db)
         assert rows(db, "SELECT COUNT(*) FROM a, b") == [(6,)]
 
+    def test_comma_join_uses_where_equality(self, db):
+        self.setup(db)
+        plan = "\n".join(
+            r[0]
+            for r in rows(
+                db, "EXPLAIN SELECT a.id FROM a, b WHERE a.id = b.id"
+            )
+        )
+        assert "HashJoin (INNER)" in plan
+        assert "a.id = b.id" in plan
+        assert rows(
+            db,
+            "SELECT a.id FROM a, b WHERE a.id = b.id ORDER BY a.id",
+        ) == [(1,), (3,)]
+
+    def test_comma_join_pushdown_keeps_residual_filter(self, db):
+        self.setup(db)
+        assert rows(
+            db,
+            "SELECT a.id FROM a, b "
+            "WHERE a.id = b.id AND b.y <> 'b3' ORDER BY a.id",
+        ) == [(1,)]
+
+    def test_comma_join_three_sources_pushes_edges(self, db):
+        self.setup(db)
+        db.execute_one("CREATE TABLE c (id INT)")
+        db.execute_one("INSERT INTO c VALUES (1), (3)")
+        plan = "\n".join(
+            r[0]
+            for r in rows(
+                db,
+                "EXPLAIN SELECT a.id FROM a, b, c "
+                "WHERE a.id = b.id AND b.id = c.id",
+            )
+        )
+        assert plan.count("HashJoin (INNER)") == 2
+        assert rows(
+            db,
+            "SELECT a.id FROM a, b, c "
+            "WHERE a.id = b.id AND b.id = c.id ORDER BY a.id",
+        ) == [(1,), (3,)]
+
     def test_right_join(self, db):
         self.setup(db)
         db.execute_one("INSERT INTO b VALUES (4, 'b4')")

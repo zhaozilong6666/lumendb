@@ -282,8 +282,11 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 `col > 10` 会把 RID 更大的 `(10, ...)` 当成大于边界，结果里混进 10 本身。
 
 `INNER JOIN` / `LEFT JOIN` 的顶层 `AND` 等值条件走 **hash join**：右侧建哈希表，
-左侧流式探测；没有等值键（逗号连接、`OR` 条件）时退回 nested loop。`NULL` 键
-按 SQL 语义不参与匹配，重复键会展开成多行，剩余谓词仍由完整的 `ON` 复核。
+左侧流式探测；没有等值键（`OR` 条件、`WHERE` 里没有跨数据源等值）时退回
+nested loop。逗号连接会从 `WHERE` 顶层 `AND` 中提取跨源 `列 = 列`，附加到
+对应的 `Join` 作为哈希键；完整 `WHERE` 仍保留为 `Filter`，所以残余谓词和
+非等值条件不会被漏判。`NULL` 键按 SQL 语义不参与匹配，重复键会展开成多行，
+剩余谓词仍由完整的 `ON` 复核。
 `RIGHT JOIN` / `FULL JOIN` 统一用 nested loop：右表做外层，`FULL` 额外记录右表
 哪些行被匹配过，最后补出未匹配的右行；两者都按 left+right 的列顺序输出，未匹配
 的一侧填 `NULL`。`CROSS JOIN` 是 `ON` 为真的 `INNER JOIN`。

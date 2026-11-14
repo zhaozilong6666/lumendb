@@ -987,7 +987,7 @@ class Binder:
             return self._bind_compound(select)
         self.reset_aggregates()
 
-        node, schema = self._bind_from(select.from_)
+        node, schema = self._bind_from(select.from_, select.where)
 
         if (
             select.where is not None
@@ -1407,7 +1407,42 @@ class Binder:
             return RANGE_SELECTIVITY
         return OTHER_SELECTIVITY
 
-    def _bind_from(self, refs) -> tuple[PlanNode, Schema]:
+    def _cross_equalities(
+        self, where, left: Schema, right: Schema
+    ) -> Optional[Expr]:
+        """从 WHERE 顶层的 AND 项里挑出跨左右两个数据源的等值条件。
+
+        只收集 ``列 = 列`` 且两列分别能解析到左右两侧的项。其他谓词继续由
+        上层 Filter 处理，所以这里即使多收集也不会改变结果。
+        """
+        if where is None:
+            return None
+        terms: list[Expr] = []
+        for expr in _conjuncts(where):
+            if not isinstance(expr, BinaryOp) or expr.op != "=":
+                continue
+            if not isinstance(expr.left, ColumnRef) or not isinstance(
+                expr.right, ColumnRef
+            ):
+                continue
+            try:
+                left.resolve(expr.left.table, expr.left.name)
+                right.resolve(expr.right.table, expr.right.name)
+            except BinderError:
+                try:
+                    left.resolve(expr.right.table, expr.right.name)
+                    right.resolve(expr.left.table, expr.left.name)
+                except BinderError:
+                    continue
+            terms.append(expr)
+        if not terms:
+            return None
+        combined = terms[0]
+        for term in terms[1:]:
+            combined = BinaryOp(op="AND", left=combined, right=term)
+        return combined
+
+    def _bind_from(self, refs, where=None) -> tuple[PlanNode, Schema]:
         if not refs:
             return Values(rows=[()], columns=[]), Schema([])
 
@@ -1419,14 +1454,26 @@ class Binder:
                 node, schema = sub_node, sub_schema
             else:
                 merged = schema.concat(sub_schema)
+                on_expr = self._cross_equalities(where, schema, sub_schema)
+                on_fn = None
+                hash_keys, hash_labels = ((), ())
+                if on_expr is not None:
+                    on_fn, _ = self.compile(on_expr, merged, allow_agg=False)
+                    hash_keys, hash_labels = self._equi_keys(
+                        on_expr, merged, len(schema)
+                    )
                 node = Join(
                     left=node,
                     right=sub_node,
                     kind="INNER",
-                    on=None,
+                    on=on_fn,
                     columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+                    hash_keys=hash_keys,
+                    hash_labels=hash_labels,
                     estimated=join_estimate(
-                        self._node_estimate(node), self._node_estimate(sub_node)
+                        self._node_estimate(node),
+                        self._node_estimate(sub_node),
+                        equi_keys=len(hash_keys),
                     ),
                 )
                 schema = merged

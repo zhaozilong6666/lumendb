@@ -442,7 +442,8 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。
 - `LEFT JOIN` 的右侧无匹配时补 `NULL`；`RIGHT JOIN` 的左侧、`FULL JOIN` 的两侧同理。
-- `CROSS JOIN` 与逗号连接等价，不写 `ON`。
+- `CROSS JOIN` 与逗号连接等价，不写 `ON`。逗号连接会从 `WHERE` 顶层 `AND`
+  中提取跨表的 `列 = 列` 作为哈希键；完整 `WHERE` 仍保留为 `Filter` 兜底。
 - `HAVING` 作用在聚合输出行上：分组键与聚合结果之外的原表列不可见。
 - `GROUP BY` 表达式按语法树同形匹配：`SELECT id % 2 ... GROUP BY id % 2` 合法；
   `GROUP BY id % 2` 与 `GROUP BY id%2` 视为同一个表达式。
