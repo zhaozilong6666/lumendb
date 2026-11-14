@@ -4124,6 +4124,42 @@ class TestForeignKey:
         finally:
             reopened.close()
 
+    def test_on_update_set_default_column_list(self, db):
+        db.execute_one("CREATE TABLE p (a INT, b INT, UNIQUE (a, b))")
+        db.execute_one(
+            "CREATE TABLE c (a INT DEFAULT 9, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON UPDATE SET DEFAULT (a))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2), (9, 3)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        db.execute_one("UPDATE p SET b = 3 WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM c") == [(9, 3)]
+
+    def test_on_update_set_null_column_list_match_full_fails(self, db):
+        db.execute_one("CREATE TABLE p (a INT, b INT, UNIQUE (a, b))")
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) MATCH FULL "
+            "ON UPDATE SET NULL (b))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        with pytest.raises(ForeignKeyViolationError, match="MATCH FULL"):
+            db.execute_one("UPDATE p SET b = 3 WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM p") == [(1, 2)]
+        assert rows(db, "SELECT a, b FROM c") == [(1, 2)]
+
+    def test_drop_index_cascade_multiple_dependents(self, db):
+        db.execute_one("CREATE TABLE p (id INT)")
+        db.execute_one("CREATE UNIQUE INDEX p_id_uq ON p (id)")
+        db.execute_one("CREATE TABLE c1 (pid INT REFERENCES p(id))")
+        db.execute_one("CREATE TABLE c2 (pid INT REFERENCES p(id))")
+        result = db.execute_one("DROP INDEX p_id_uq CASCADE")
+        assert "级联删除 2 个外键" in result.notice
+        assert db.catalog.get_table("c1").foreign_keys == {}
+        assert db.catalog.get_table("c2").foreign_keys == {}
+
     def test_on_delete_cascade_self_cycle(self, db):
         db.execute_one(
             "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT "
