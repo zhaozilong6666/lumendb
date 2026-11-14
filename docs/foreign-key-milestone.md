@@ -25,7 +25,7 @@
 | `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 支持事务内切换 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT` |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
-| 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护 |
+| 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护（含 `CASCADE`） |
 | 元数据持久化 | 完成 | `ForeignKeyDef` 的列、引用表/列、`on_delete`、`on_update` 全部写入目录 JSON，兼容旧目录缺省值 |
 | 事务回滚 | 完成 | 删除级联、更新级联、加列建外键失败均可回滚到语句前状态 |
 
@@ -115,11 +115,11 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 - `DROP COLUMN` / `ALTER COLUMN TYPE`：目标列仍被本地或外部外键使用时拒绝。
 - `DROP INDEX` / `DROP CONSTRAINT`：删除支撑外键的唯一键时保守拒绝。
 - `RENAME TABLE` / `RENAME COLUMN` / `RENAME CONSTRAINT`：同步外键元数据。
-- `TRUNCATE`：被外键引用的表直接拒绝。
+- `TRUNCATE`：默认拒绝被外键引用的表；`TRUNCATE ... CASCADE` 递归清空子表。
 
 ## 3. 测试与验证
 
-- 全量测试：**857 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**860 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -131,6 +131,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
   - `NO ACTION` 保留为独立动作；
   - `DEFERRABLE INITIALLY DEFERRED`：先子后父提交成功、缺父提交失败、更新后补父、删除后恢复父键；
   - `SET CONSTRAINTS ALL/named DEFERRED`、`ALL IMMEDIATE` 立即补检失败、未知约束名、非 DEFERRABLE 约束、事务外执行；
+  - `TRUNCATE ... CASCADE` 递归清空父/子/孙表并支持事务回滚；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -189,7 +190,7 @@ CI：
    并发事务下也没有等锁语义，当前更接近单写者语义。`SET CONSTRAINTS` 只覆盖当前
    事务，同名约束按全局匹配一并切换。
 4. **`DROP TABLE ... CASCADE` 不删子表数据**：只删除引用表上的外键约束，
-   与部分数据库的“级联删表数据”语义不同；`TRUNCATE` 没有 `CASCADE`。
+   与部分数据库的“级联删表数据”语义不同；`TRUNCATE ... CASCADE` 会递归清空引用子表。
 5. **保守拒绝**：`DROP INDEX` / `DROP CONSTRAINT` 只要还被外键引用就拒绝，
    即使表中还有另一条可支撑的唯一索引。
 6. **`ADD COLUMN ... REFERENCES` 依赖语句级回滚**：先追加列，再由
@@ -201,7 +202,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 857 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 860 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

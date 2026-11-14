@@ -209,6 +209,34 @@ class TestTruncate:
         with pytest.raises(TableNotFoundError):
             db.execute_one("TRUNCATE nope")
 
+    def test_truncate_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))"
+        )
+        db.execute_one(
+            "CREATE TABLE g (id INT PRIMARY KEY, cid INT REFERENCES c(id))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1, 1)")
+        db.execute_one("INSERT INTO g VALUES (1, 1)")
+        result = db.execute_one("TRUNCATE TABLE p CASCADE")
+        assert result.affected == 3
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM g") == [(0,)]
+
+    def test_truncate_cascade_rollback(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("TRUNCATE p CASCADE")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
 
 class TestDdl:
     def test_create_and_show(self, db):

@@ -285,7 +285,13 @@ class Parser:
         if kw == "TRUNCATE":
             self._advance()
             self._match_kw("TABLE")
-            return Truncate(self._parse_ident("表名"))
+            table = self._parse_ident("表名")
+            cascade = False
+            if self._match_kw("CASCADE"):
+                cascade = True
+            else:
+                self._match_kw("RESTRICT")
+            return Truncate(table, cascade=cascade)
         raise self._error(
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "

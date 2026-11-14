@@ -2229,25 +2229,58 @@ class Executor:
         )
 
     def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
-        """清空整表：页链保留但每一页重置为空页，索引随之重建为空。"""
+        """清空整表：页链保留但每一页重置为空页，索引随之重建为空。
+
+        ``CASCADE`` 会递归清空所有直接/间接引用该表的子表，避免只清父表后
+        留下悬空行。``RESTRICT``（默认）仍拒绝清空被外键引用的表。
+        """
         table = self._catalog.get_table(stmt.table)
-        for other in self._catalog.list_tables():
-            for fk in other.foreign_keys.values():
-                if fk.ref_table == table.name:
-                    raise BinderError(
-                        f"表 {table.name!r} 被外键 {fk.name!r} 引用，不能直接 TRUNCATE",
-                        hint="先删除引用它的外键，或逐个 DELETE 引用行",
-                    )
+        if not stmt.cascade:
+            for other in self._catalog.list_tables():
+                for fk in other.foreign_keys.values():
+                    if fk.ref_table == table.name:
+                        raise BinderError(
+                            f"表 {table.name!r} 被外键 {fk.name!r} 引用，不能直接 TRUNCATE",
+                            hint="使用 TRUNCATE ... CASCADE，或先删除引用它的外键",
+                        )
+            removed = self._truncate_one(table, txn)
+            return Result(
+                affected=removed,
+                tag=f"TRUNCATE TABLE ({removed} rows removed)",
+            )
+
+        tables = self._truncate_cascade_plan(table)
+        total = sum(self._truncate_one(t, txn) for t in tables)
+        return Result(
+            affected=total,
+            tag=f"TRUNCATE TABLE ({total} rows removed)",
+        )
+
+    def _truncate_cascade_plan(self, table: TableDef) -> list[TableDef]:
+        """按外键反向依赖收集需要一起清空的表，打破自引用环。"""
+        seen = {table.name: table}
+        pending = [table]
+        while pending:
+            parent = pending.pop()
+            for other in self._catalog.list_tables():
+                if other.name in seen:
+                    continue
+                if any(
+                    fk.ref_table == parent.name
+                    for fk in other.foreign_keys.values()
+                ):
+                    seen[other.name] = other
+                    pending.append(other)
+        return list(seen.values())
+
+    def _truncate_one(self, table: TableDef, txn: Transaction) -> int:
         self._snapshot_table_state(table, txn)
         heap = HeapFile(self._bp, table, self._txns)
         removed = heap.truncate(txn)
         self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
-        return Result(
-            affected=removed,
-            tag=f"TRUNCATE TABLE ({removed} rows removed)",
-        )
+        return removed
 
     def _show_tables(self) -> Result:
         rows = [

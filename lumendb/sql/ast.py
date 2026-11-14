@@ -650,9 +650,10 @@ class Vacuum(Statement):
 
 @dataclass
 class Truncate(Statement):
-    """``TRUNCATE [TABLE] name``：清空整表并重建索引。"""
+    """``TRUNCATE [TABLE] name [CASCADE | RESTRICT]``：清空整表并重建索引。"""
 
     table: str
+    cascade: bool = False
 
 
 __all__ = [

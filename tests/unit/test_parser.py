@@ -769,6 +769,10 @@ class TestMaintenance:
     def test_truncate_without_table_keyword(self):
         assert parse_statement("TRUNCATE users").table == "users"
 
+    def test_truncate_cascade_and_restrict(self):
+        assert parse_statement("TRUNCATE TABLE users CASCADE").cascade is True
+        assert parse_statement("TRUNCATE users RESTRICT").cascade is False
+
 
 class TestReturning:
     def test_insert_returning(self):

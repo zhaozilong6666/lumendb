@@ -173,7 +173,7 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 `ADD CONSTRAINT FOREIGN KEY` 的存量行回填与校验路径，先加列再原子建立外键，任一步
 失败整条语句回滚；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
 `ALTER COLUMN TYPE` 会拒绝；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
-CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 拒绝被外键引用的表；
+CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 默认拒绝被外键引用的表，`TRUNCATE ... CASCADE` 递归清空引用它的子表；
 删除支撑外键的唯一索引/唯一约束前，必须先删除外键。`RENAME TO` / `RENAME COLUMN`
 会同步更新其它表外键中的 `ref_table` / `ref_columns`，以及本表外键的本地列引用。
 
@@ -369,7 +369,7 @@ SHOW TABLES;
 CHECKPOINT;
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
 VACUUM [FULL] [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
-TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索引重建为空
+TRUNCATE [TABLE] table [CASCADE | RESTRICT];  -- 清空整表（页链保留、逐页重置），CASCADE 递归清空子表
 ```
 
 ## 明确不支持（会报 `NotSupportedError`）
