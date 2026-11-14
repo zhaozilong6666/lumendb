@@ -199,6 +199,8 @@ class Join(PlanNode):
     hash_labels: tuple[str, ...] = ()
     #: 哈希连接是否构建左表；仅对 INNER 生效，默认构建右表
     build_left: bool = False
+    #: 连接顺序的来源；``dp`` 表示绑定阶段重排过，空表示按 SQL 书写顺序
+    order_reason: str = ""
 
     def children(self):
         return [c for c in (self.left, self.right) if c is not None]
@@ -207,7 +209,10 @@ class Join(PlanNode):
         if self.hash_keys and self.kind in ("INNER", "LEFT"):
             keys = ", ".join(self.hash_labels) or "?"
             build = "left" if self.build_left else "right"
-            return f"HashJoin ({self.kind}) on {keys} [build={build}]"
+            suffix = f" [build={build}]"
+            if self.order_reason:
+                suffix += f" [order={self.order_reason}]"
+            return f"HashJoin ({self.kind}) on {keys}{suffix}"
         return f"{self.kind} Join"
 
 

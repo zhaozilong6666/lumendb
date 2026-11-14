@@ -1807,6 +1807,7 @@ class TestJoin:
             )
         )
         assert "Project" in plan
+        assert "[order=dp]" in plan
         assert plan.index("SeqScan small") < plan.index("SeqScan mid")
         assert plan.index("SeqScan mid") < plan.index("SeqScan big")
         assert rows(

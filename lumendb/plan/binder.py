@@ -58,6 +58,7 @@ from .cost import (
     EQ_SELECTIVITY,
     OTHER_SELECTIVITY,
     RANGE_SELECTIVITY,
+    CostEstimate,
     aggregate_estimate,
     choose_build_side,
     distinct_estimate,
@@ -1523,11 +1524,11 @@ class Binder:
     def _choose_join_order(
         self, bindings: list[tuple[PlanNode, Schema]], where
     ) -> Optional[list[int]]:
-        """贪心选择左深连接顺序；不满足条件时返回 ``None`` 表示保持原序。
+        """用左深动态规划选择连接顺序；不满足条件时返回 ``None``。
 
-        只对没有显式 ``JOIN`` 的 ``FROM`` 列表生效；有等值边时优先选择连接
-        最多的源作为起点，之后每一步优先连到已有集合，再按估算结果行数和
-        CPU 选择。源数超过 8 时直接回退，避免为了小收益引入过多复杂度。
+        只对没有显式 ``JOIN`` 的 ``FROM`` 列表生效。状态是“已选源集合”的最优
+        左深顺序；每一步把一个新的源接到左侧，代价取 ``rows + cpu``。源数超过
+        8 时直接回退原序，避免为小收益引入指数级状态。
         """
         n = len(bindings)
         if n < 3 or n > 8:
@@ -1537,64 +1538,53 @@ class Binder:
         if not edges:
             return None
 
-        degree = [0] * n
-        for left, right in edges:
-            degree[left] += 1
-            degree[right] += 1
+        # mask -> (估算, 顺序, 该顺序拼接出的 schema)
+        best: dict[int, tuple[CostEstimate, tuple[int, ...], Schema]] = {}
+        for i, (node, schema) in enumerate(bindings):
+            est = self._node_estimate(node)
+            best[1 << i] = (est, (i,), schema)
 
-        def rows_of(i: int) -> float:
-            return self._node_estimate(bindings[i][0]).rows
-
-        start = min(
-            range(n), key=lambda i: (-degree[i], rows_of(i), i)
-        )
-        ordered = [start]
-        remaining = [i for i in range(n) if i != start]
-        accumulated_schema = schemas[start]
-        accumulated_est = self._node_estimate(bindings[start][0])
-
-        while remaining:
-            best: Optional[tuple[tuple, int]] = None
-            for i in remaining:
-                candidate_schema = accumulated_schema.concat(schemas[i])
+        for mask in range(1, 1 << n):
+            if mask & (mask - 1) == 0:
+                continue
+            for last in range(n):
+                bit = 1 << last
+                if not (mask & bit):
+                    continue
+                previous = mask ^ bit
+                if previous not in best:
+                    continue
+                prev_est, prev_order, prev_schema = best[previous]
+                right_schema = schemas[last]
+                merged = prev_schema.concat(right_schema)
                 on_expr = self._cross_equalities(
-                    where, accumulated_schema, schemas[i]
+                    where, prev_schema, right_schema
                 )
-                if on_expr is None:
-                    keys = ()
-                else:
+                keys: tuple[tuple[int, int], ...] = ()
+                if on_expr is not None:
                     keys, _labels = self._equi_keys(
-                        on_expr, candidate_schema, len(accumulated_schema)
+                        on_expr, merged, len(prev_schema)
                     )
                 est = join_estimate(
-                    accumulated_est,
-                    self._node_estimate(bindings[i][0]),
+                    prev_est,
+                    self._node_estimate(bindings[last][0]),
                     equi_keys=len(keys),
                 )
-                # 有连接键优先；其次比较结果行数、CPU，最后用原下标稳定排序。
-                rank = (0 if keys else 1, est.rows, est.cpu, i)
-                if best is None or rank < best[0]:
-                    best = (rank, i)
-            assert best is not None
-            chosen = best[1]
-            remaining.remove(chosen)
-            merged = accumulated_schema.concat(schemas[chosen])
-            on_expr = self._cross_equalities(
-                where, accumulated_schema, schemas[chosen]
-            )
-            keys: tuple[tuple[int, int], ...] = ()
-            if on_expr is not None:
-                keys, _labels = self._equi_keys(
-                    on_expr, merged, len(accumulated_schema)
-                )
-            accumulated_est = join_estimate(
-                accumulated_est,
-                self._node_estimate(bindings[chosen][0]),
-                equi_keys=len(keys),
-            )
-            accumulated_schema = merged
-            ordered.append(chosen)
-        return ordered
+                order = prev_order + (last,)
+                rank = (est.total, est.rows, est.cpu, order)
+                current = best.get(mask)
+                if current is None:
+                    best[mask] = (est, order, merged)
+                else:
+                    current_rank = (
+                        current[0].total,
+                        current[0].rows,
+                        current[0].cpu,
+                        current[1],
+                    )
+                    if rank < current_rank:
+                        best[mask] = (est, order, merged)
+        return list(best[(1 << n) - 1][1])
 
     def _restore_output_order(
         self,
@@ -1645,6 +1635,7 @@ class Binder:
             chosen = self._choose_join_order(bindings, where)
             if chosen is not None:
                 order = chosen
+        reordered = order != list(range(len(refs)))
 
         node, schema = bindings[order[0]]
         for index in order[1:]:
@@ -1672,13 +1663,14 @@ class Binder:
                     bool(hash_keys)
                     and choose_build_side(left_est, right_est) == "left"
                 ),
+                order_reason="dp" if reordered else "",
                 estimated=join_estimate(
                     left_est, right_est, equi_keys=len(hash_keys)
                 ),
             )
             schema = merged
 
-        if order != list(range(len(refs))):
+        if reordered:
             return self._restore_output_order(node, bindings, order)
         return node, schema
 
