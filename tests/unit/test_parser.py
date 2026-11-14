@@ -799,6 +799,13 @@ class TestMaintenance:
         assert parse_statement("TRUNCATE TABLE users CASCADE").cascade is True
         assert parse_statement("TRUNCATE users RESTRICT").cascade is False
 
+    def test_truncate_multiple_tables(self):
+        stmt = parse_statement("TRUNCATE TABLE users, orders CASCADE")
+        assert isinstance(stmt, Truncate)
+        assert stmt.table == "users"
+        assert stmt.tables == ["users", "orders"]
+        assert stmt.cascade is True
+
 
 class TestReturning:
     def test_insert_returning(self):

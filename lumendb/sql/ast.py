@@ -662,10 +662,15 @@ class Vacuum(Statement):
 
 @dataclass
 class Truncate(Statement):
-    """``TRUNCATE [TABLE] name [CASCADE | RESTRICT]``：清空整表并重建索引。"""
+    """``TRUNCATE [TABLE] name [, ...] [CASCADE | RESTRICT]``：清空整表并重建索引。"""
 
     table: str
     cascade: bool = False
+    tables: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.tables:
+            self.tables = [self.table]
 
 
 __all__ = [

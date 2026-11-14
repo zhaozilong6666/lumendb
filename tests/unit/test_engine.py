@@ -237,6 +237,41 @@ class TestTruncate:
         assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
         assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
 
+    def test_truncate_multiple_tables_with_parent_child(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("INSERT INTO p VALUES (1), (2)")
+        db.execute_one("INSERT INTO c VALUES (1), (2)")
+        result = db.execute_one("TRUNCATE TABLE p, c")
+        assert result.affected == 4
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+
+    def test_truncate_multiple_rejects_missing_dependent(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))")
+        db.execute_one("CREATE TABLE g (cid INT REFERENCES c(id))")
+        with pytest.raises(BinderError, match="不能直接 TRUNCATE"):
+            db.execute_one("TRUNCATE p, c")
+
+    def test_truncate_multiple_cascade_includes_transitive_children(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))")
+        db.execute_one("CREATE TABLE g (cid INT REFERENCES c(id))")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1, 1)")
+        db.execute_one("INSERT INTO g VALUES (1)")
+        result = db.execute_one("TRUNCATE p, c CASCADE")
+        assert result.affected == 3
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+        assert rows(db, "SELECT COUNT(*) FROM g") == [(0,)]
+
+    def test_truncate_multiple_rejects_duplicate_name(self, db):
+        db.execute_one("CREATE TABLE t (id INT)")
+        with pytest.raises(BinderError, match="重复指定"):
+            db.execute_one("TRUNCATE t, t")
+
 
 class TestDdl:
     def test_create_and_show(self, db):

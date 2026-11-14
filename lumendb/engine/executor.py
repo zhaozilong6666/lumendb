@@ -2289,32 +2289,62 @@ class Executor:
         )
 
     def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
-        """清空整表：页链保留但每一页重置为空页，索引随之重建为空。
+        """清空一到多张表：页链保留但每一页重置为空页，索引随之重建为空。
 
-        ``CASCADE`` 会递归清空所有直接/间接引用该表的子表，避免只清父表后
-        留下悬空行。``RESTRICT``（默认）仍拒绝清空被外键引用的表。
+        ``TRUNCATE a, b`` 在默认 ``RESTRICT`` 下允许一起清空有外键依赖的表，
+        但只要某张被引用表的子表没有出现在同一列表中，就仍然拒绝。``CASCADE``
+        会递归清空所有直接/间接引用这些表的子表，避免只清父表后留下悬空行。
         """
-        table = self._catalog.get_table(stmt.table)
+        tables = self._truncate_target_tables(stmt)
         if not stmt.cascade:
-            for other in self._catalog.list_tables():
-                for fk in other.foreign_keys.values():
-                    if fk.ref_table == table.name:
-                        raise BinderError(
-                            f"表 {table.name!r} 被外键 {fk.name!r} 引用，不能直接 TRUNCATE",
-                            hint="使用 TRUNCATE ... CASCADE，或先删除引用它的外键",
-                        )
-            removed = self._truncate_one(table, txn)
-            return Result(
-                affected=removed,
-                tag=f"TRUNCATE TABLE ({removed} rows removed)",
-            )
-
-        tables = self._truncate_cascade_plan(table)
-        total = sum(self._truncate_one(t, txn) for t in tables)
+            self._truncate_restrict_check(tables)
+            total = sum(self._truncate_one(table, txn) for table in tables)
+        else:
+            plan: dict[str, TableDef] = {}
+            for table in tables:
+                for dependent in self._truncate_cascade_plan(table):
+                    plan[dependent.name] = dependent
+            total = sum(self._truncate_one(table, txn) for table in plan.values())
         return Result(
             affected=total,
             tag=f"TRUNCATE TABLE ({total} rows removed)",
         )
+
+    def _truncate_target_tables(self, stmt: Truncate) -> list[TableDef]:
+        """解析并去重 ``TRUNCATE`` 的目标表；重复表名视为语法错误。"""
+        names = list(stmt.tables) or [stmt.table]
+        tables: list[TableDef] = []
+        seen: set[str] = set()
+        for name in names:
+            table = self._catalog.get_table(name)
+            if table.name in seen:
+                raise BinderError(
+                    f"表 {table.name!r} 在 TRUNCATE 中被重复指定",
+                    hint="每张表只能出现一次",
+                )
+            seen.add(table.name)
+            tables.append(table)
+        return tables
+
+    def _truncate_restrict_check(self, tables: list[TableDef]) -> None:
+        """默认 RESTRICT：所有引用目标表的子表都必须同时出现在目标列表。"""
+        targets = {table.name for table in tables}
+        for target in tables:
+            for other in self._catalog.list_tables():
+                for fk in other.foreign_keys.values():
+                    if fk.ref_table != target.name:
+                        continue
+                    # 自引用表不能只靠“自己在列表里”绕过：TRUNCATE 单表时
+                    # 仍然需要 CASCADE，避免删掉父行后子行悬空。
+                    if other.name == target.name or other.name not in targets:
+                        raise BinderError(
+                            f"表 {target.name!r} 被外键 {fk.name!r} 引用，"
+                            "不能直接 TRUNCATE",
+                            hint=(
+                                "把这些引用表加入同一条 TRUNCATE，"
+                                "或使用 TRUNCATE ... CASCADE"
+                            ),
+                        )
 
     def _truncate_cascade_plan(self, table: TableDef) -> list[TableDef]:
         """按外键反向依赖收集需要一起清空的表，打破自引用环。"""

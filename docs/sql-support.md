@@ -180,7 +180,7 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 `ADD CONSTRAINT FOREIGN KEY` 的存量行回填与校验路径，先加列再原子建立外键，任一步
 失败整条语句回滚；目标列被本地或其它表的外键引用时，`DROP COLUMN` /
 `ALTER COLUMN TYPE` 会拒绝；`DROP TABLE` 默认拒绝被外键引用的表，`DROP TABLE ...
-CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 默认拒绝被外键引用的表，`TRUNCATE ... CASCADE` 递归清空引用它的子表；
+CASCADE` 会一并删除引用它的外键（不删除子表数据）；`TRUNCATE` 默认拒绝被外键引用的表；`TRUNCATE a, b` 在同一个列表中允许一起清空相互依赖的表，但任何未列入列表的引用表仍会被拒绝；`TRUNCATE ... CASCADE` 递归清空直接/间接引用它的子表；
 删除支撑外键的唯一索引/唯一约束前，必须先删除外键。`RENAME TO` / `RENAME COLUMN`
 会同步更新其它表外键中的 `ref_table` / `ref_columns`，以及本表外键的本地列引用。
 
@@ -376,7 +376,9 @@ SHOW TABLES;
 CHECKPOINT;
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
 VACUUM [FULL] [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
-TRUNCATE [TABLE] table [CASCADE | RESTRICT];  -- 清空整表（页链保留、逐页重置），CASCADE 递归清空子表
+TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
+                         -- 清空一到多张表（页链保留、逐页重置）；RESTRICT 要求
+                         -- 所有引用目标表的子表同时出现在列表中，CASCADE 自动递归清空
 ```
 
 ## 明确不支持（会报 `NotSupportedError`）

@@ -149,7 +149,7 @@ psycopg2 都不会正常返回结果。
 | 表达式 | 算术、`\|\|` 拼接、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN`、`IS [NOT] DISTINCT FROM` |
 | 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
 | 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，`SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE`，`SET CONSTRAINTS ... DEFERRED/IMMEDIATE`，MVCC 快照隔离 |
-| 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX [TABLE]`、`VACUUM [FULL]`、`TRUNCATE [CASCADE]` |
+| 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX [TABLE]`、`VACUUM [FULL]`、`TRUNCATE [TABLE] t [, ...] [CASCADE | RESTRICT]` |
 
 未支持的语法会明确报错并给出原因，而不是静默返回错误结果——见 [`docs/sql-support.md`](docs/sql-support.md)。
 外键与级联动作的实现、测试矩阵和遗留风险见
@@ -206,7 +206,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **867 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **872 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
