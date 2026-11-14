@@ -256,11 +256,12 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] `VACUUM`：回收死版本、压实堆页、重建索引（要求无并发事务）
 - [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接/投影/聚合/排序/集合/`LIMIT` 基数与 CPU 估算，`EXPLAIN` 输出 `rows≈/cpu≈` 标注，并作为左深连接顺序与哈希构建侧选择的输入
 - [x] 哈希连接构建侧选择：INNER 连接按估算选择较小的一侧建表，`EXPLAIN` 显示 `[build=left/right]`
-- [x] 左深动态规划连接顺序：3–8 个无显式 `JOIN` 的 `FROM` 源按子集枚举选择 `rows + cpu` 最小的顺序；输出列顺序由投影还原；显式 `JOIN`、外连接、超过 8 源保持原序；`EXPLAIN` 标记 `[order=dp]`
+- [x] 左深动态规划连接顺序：3–8 个源按子集枚举选择 `rows + cpu` 最小的顺序；逗号连接和纯 INNER 显式 `JOIN` 链都会重排，外连接/混合 `JOIN`/超过 8 源保持原序；输出列顺序由投影还原；`EXPLAIN` 标记 `[order=dp] [candidates=N]`
 - [x] 唯一/主键约束 `DEFERRABLE`：事务内暂存重复键，`COMMIT` 或 `SET CONSTRAINTS ... IMMEDIATE` 时统一校验
 - [x] 外键：`MATCH SIMPLE/FULL`、`RESTRICT/CASCADE/SET NULL/SET DEFAULT/NO ACTION`、`DEFERRABLE INITIALLY DEFERRED` 提交时检查、`SET CONSTRAINTS` 事务内切换、`ALTER CONSTRAINT` 修改延迟属性、`ALTER TABLE` 外键 DDL、`SET NULL/SET DEFAULT (col...)` 列级动作、`ADD CONSTRAINT ... NOT VALID`（外键/CHECK）与 `VALIDATE CONSTRAINT`
 - [ ] 外键 `MATCH PARTIAL`
-- [ ] 基于代价的连接顺序枚举（当前为规则化）
+- [x] 基于代价的连接顺序枚举（左深 DP，`rows + cpu`）
+- [x] 单源谓词下推：多源查询中只引用一个数据源的 `WHERE` 合取项下推到扫描之上，最终 `WHERE` 仍保留兜底 `Filter`
 - [x] 相关子查询
 - [x] 组提交：WAL 追加/刷盘线程安全，多个并发提交由一个 leader 合并刷盘，提交记录持久化后才标记 `COMMITTED`
 - [x] 自动 CHECKPOINT：WAL 自上次 checkpoint 增长超过阈值时触发，保留手动 `CHECKPOINT`
