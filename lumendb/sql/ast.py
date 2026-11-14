@@ -605,6 +605,15 @@ class RollbackToSavepoint(Statement):
 
 
 @dataclass
+class SetConstraints(Statement):
+    """``SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }``。"""
+
+    names: tuple[str, ...] = ()
+    all_constraints: bool = False
+    deferred: bool = True
+
+
+@dataclass
 class Explain(Statement):
     statement: Statement
     analyze: bool = False

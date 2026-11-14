@@ -151,8 +151,11 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 `DEFERRABLE INITIALLY DEFERRED` 可把 `INSERT` / `UPDATE` 的存在性检查和 `NO ACTION`
 父行删除/更新检查推迟到 `COMMIT`，因此同一事务内可以先插入子行、再插入父行。
 `DEFERRABLE INITIALLY IMMEDIATE` 仍按语句立即检查；`RESTRICT` 始终立即，
-`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也始终立即执行。当前不支持
-`SET CONSTRAINTS` 动态切换时机。`RESTRICT` 下删除或
+`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也始终立即执行。显式事务内可用
+`SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` 覆盖当前事务的
+检查时机：`DEFERRED` 让后续 DML 跟踪待检行，`IMMEDIATE` 会在语句结束时立即补检
+已积压的行；`ALL` 只作用于所有 `DEFERRABLE` 外键，按名称指定非 `DEFERRABLE`
+约束会明确报错。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
 更新被引用键时只要还有子行
 引用旧键就拒绝；`CASCADE` / `SET NULL` / `SET DEFAULT` 会按依赖顺序递归处理，
 并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键最终仍抛
@@ -374,7 +377,7 @@ TRUNCATE [TABLE] table;  -- 清空整表（页链保留、逐页重置），索�
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 支持提交前检查，不支持 `SET CONSTRAINTS` |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

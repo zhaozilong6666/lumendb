@@ -18,6 +18,7 @@ from ..sql.ast import (
     Rollback,
     RollbackToSavepoint,
     Savepoint,
+    SetConstraints,
 )
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
@@ -120,6 +121,12 @@ class Database:
                 raise TransactionError("ROLLBACK TO 必须在事务中执行")
             self.txns.rollback_to(self._txn, statement.name)
             return Result(tag="ROLLBACK")
+
+        if isinstance(statement, SetConstraints) and self._txn is None:
+            raise TransactionError(
+                "SET CONSTRAINTS 只能在显式事务中执行",
+                hint="先执行 BEGIN，再切换约束检查时机",
+            )
 
         if self._txn is not None:
             return self.executor.run(statement, self._txn, params)

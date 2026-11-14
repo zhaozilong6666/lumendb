@@ -17,6 +17,7 @@ from lumendb.sql.ast import (
     Literal,
     ParamRef,
     ScalarSubquery,
+    SetConstraints,
     Star,
     UnaryOp,
     Vacuum,
@@ -884,6 +885,22 @@ class TestTransactions:
     def test_release_savepoint(self):
         stmt = parse_statement("RELEASE SAVEPOINT s")
         assert stmt.name == "s"
+
+    def test_set_constraints(self):
+        stmt = parse_statement("SET CONSTRAINTS ALL DEFERRED")
+        assert isinstance(stmt, SetConstraints)
+        assert stmt.all_constraints is True
+        assert stmt.deferred is True
+
+        stmt = parse_statement("SET CONSTRAINTS c_a, c_b IMMEDIATE")
+        assert isinstance(stmt, SetConstraints)
+        assert stmt.all_constraints is False
+        assert stmt.names == ("c_a", "c_b")
+        assert stmt.deferred is False
+
+    def test_set_constraints_requires_mode(self):
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("SET CONSTRAINTS ALL")
 
     def test_explain(self):
         stmt = parse_statement("EXPLAIN SELECT 1")

@@ -3336,6 +3336,124 @@ class TestForeignKey:
             db.execute_one("COMMIT")
         assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
 
+    def test_deferred_no_action_update_then_child(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("UPDATE p SET id = 2")
+        db.execute_one("UPDATE c SET pid = 2")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT pid FROM c") == [(2,)]
+
+    def test_deferred_no_action_update_without_child(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("UPDATE p SET id = 2")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT id FROM p") == [(1,)]
+
+    def test_set_constraints_all_deferred(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) DEFERRABLE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_set_constraints_all_deferred_no_action_delete(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON DELETE NO ACTION DEFERRABLE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
+
+    def test_set_constraints_all_deferred_no_action_failure(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "ON DELETE NO ACTION DEFERRABLE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM p") == [(1,)]
+
+    def test_set_constraints_all_immediate_detects_pending(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("SET CONSTRAINTS ALL IMMEDIATE")
+        db.execute_one("ROLLBACK")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(0,)]
+
+    def test_set_constraints_named(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT, "
+            "CONSTRAINT fk_child FOREIGN KEY (pid) REFERENCES p(id) "
+            "DEFERRABLE INITIALLY IMMEDIATE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS fk_child DEFERRED")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_set_constraints_unknown_name(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("BEGIN")
+        with pytest.raises(BinderError):
+            db.execute_one("SET CONSTRAINTS nope DEFERRED")
+        db.execute_one("ROLLBACK")
+
+    def test_set_constraints_non_deferrable(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id))"
+        )
+        db.execute_one("BEGIN")
+        with pytest.raises(NotSupportedError):
+            db.execute_one("SET CONSTRAINTS c_pid_fkey DEFERRED")
+        db.execute_one("ROLLBACK")
+
+    def test_set_constraints_outside_transaction(self, db):
+        with pytest.raises(TransactionError):
+            db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+
     def test_on_delete_cascade(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

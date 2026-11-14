@@ -56,6 +56,7 @@ from .ast import (
     ScalarSubquery,
     Select,
     SelectItem,
+    SetConstraints,
     ShowTables,
     ShowViews,
     TableConstraint,
@@ -252,6 +253,8 @@ class Parser:
             self._advance()
             self._match_kw("SAVEPOINT")
             return ReleaseSavepoint(self._parse_ident("保存点名"))
+        if kw == "SET":
+            return self._parse_set_constraints()
         if kw == "EXPLAIN":
             self._advance()
             analyze = self._match_kw("ANALYZE") is not None
@@ -287,6 +290,36 @@ class Parser:
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "
             "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / REINDEX / VACUUM",
+        )
+
+    def _parse_set_constraints(self) -> SetConstraints:
+        self._expect_kw("SET")
+        if not self._match_kw("CONSTRAINTS"):
+            raise self._error(
+                "SET 之后期望 CONSTRAINTS",
+                hint="本引擎只支持 SET CONSTRAINTS",
+            )
+        all_constraints = self._match_kw("ALL") is not None
+        names: list[str] = []
+        if not all_constraints:
+            names.append(self._parse_ident("约束名"))
+            while self._match_punct("comma") is not None:
+                names.append(self._parse_ident("约束名"))
+        if all_constraints and names:
+            raise self._error("SET CONSTRAINTS 不能同时指定 ALL 和约束名")
+        deferred = True
+        if self._match_kw("DEFERRED"):
+            deferred = True
+        elif self._match_kw("IMMEDIATE"):
+            deferred = False
+        else:
+            raise self._error(
+                "SET CONSTRAINTS 之后期望 DEFERRED 或 IMMEDIATE"
+            )
+        return SetConstraints(
+            names=tuple(names),
+            all_constraints=all_constraints,
+            deferred=deferred,
         )
 
     def _parse_create(self) -> Statement:

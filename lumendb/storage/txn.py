@@ -63,6 +63,8 @@ class Transaction:
     deferred_ref_checks: set[tuple[str, str, tuple[Any, ...]]] = field(
         default_factory=set
     )
+    #: ``SET CONSTRAINTS`` 对当前事务生效的约束时机覆盖。
+    constraint_modes: dict[str, str] = field(default_factory=dict)
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:

@@ -60,6 +60,7 @@ from ..sql.ast import (
     Insert,
     Query,
     Reindex,
+    SetConstraints,
     Vacuum,
     Truncate,
     ShowTables,
@@ -221,6 +222,8 @@ class Executor:
                 return self._vacuum(stmt, txn)
             if isinstance(stmt, Truncate):
                 return self._truncate(stmt, txn)
+            if isinstance(stmt, SetConstraints):
+                return self._set_constraints(stmt, txn)
             if isinstance(stmt, ShowTables):
                 return self._show_tables()
             if isinstance(stmt, ShowViews):
@@ -2626,8 +2629,7 @@ class Executor:
                     if fk.on_update not in ("CASCADE", "SET NULL", "SET DEFAULT"):
                         if (
                             fk.on_update == "NO ACTION"
-                            and fk.deferrable
-                            and fk.initially_deferred
+                            and self._fk_is_deferred(fk, txn)
                         ):
                             txn.deferred_ref_checks.add(
                                 (child.name, fk.name, old_key)
@@ -3109,11 +3111,62 @@ class Executor:
         if conflict is not None:
             raise self._duplicate_key_error(conflict[0])
 
+    def _fk_is_deferred(self, fk: ForeignKeyDef, txn: Transaction) -> bool:
+        if not fk.deferrable:
+            return False
+        mode = txn.constraint_modes.get(fk.name)
+        if mode is not None:
+            return mode == "DEFERRED"
+        return fk.initially_deferred
+
+    def _set_constraints(
+        self, stmt: SetConstraints, txn: Transaction
+    ) -> Result:
+        all_fks = [
+            fk
+            for table in self._catalog.tables.values()
+            for fk in table.foreign_keys.values()
+        ]
+        if stmt.all_constraints:
+            targets = [fk for fk in all_fks if fk.deferrable]
+            names = {fk.name for fk in targets}
+            only_names = None
+        else:
+            names = {name.lower() for name in stmt.names}
+            targets = [fk for fk in all_fks if fk.name in names]
+            missing = names - {fk.name for fk in targets}
+            if missing:
+                raise BinderError(
+                    f"约束 {sorted(missing)[0]!r} 不存在",
+                    hint="可用外键约束："
+                    + (", ".join(sorted(fk.name for fk in all_fks)) or "（空）"),
+                )
+            non_deferrable = [fk for fk in targets if not fk.deferrable]
+            if non_deferrable:
+                raise NotSupportedError(
+                    f"约束 {non_deferrable[0].name!r} 不是 DEFERRABLE",
+                    hint="只有声明 DEFERRABLE 的外键可以切换检查时机",
+                )
+            only_names = names
+
+        if not stmt.deferred:
+            self.validate_deferred_foreign_keys(
+                txn, only_names=only_names
+            )
+
+        mode = "DEFERRED" if stmt.deferred else "IMMEDIATE"
+        for fk in targets:
+            txn.constraint_modes[fk.name] = mode
+        return Result(
+            tag="SET CONSTRAINTS",
+            notice=f"已将 {len(targets)} 个外键约束设为 {mode}",
+        )
+
     def _track_deferred_fk_row(
         self, table: TableDef, rid: RID, txn: Transaction
     ) -> None:
         if any(
-            fk.deferrable and fk.initially_deferred
+            self._fk_is_deferred(fk, txn)
             for fk in table.foreign_keys.values()
         ):
             txn.deferred_fk_rows.add((table.name, rid))
@@ -3153,8 +3206,14 @@ class Executor:
                 return True
         return False
 
-    def validate_deferred_foreign_keys(self, txn: Transaction) -> None:
-        """提交前补检延迟外键，失败由事务层 abort。"""
+    def validate_deferred_foreign_keys(
+        self, txn: Transaction, *, only_names: Optional[set[str]] = None
+    ) -> None:
+        """提交前补检延迟外键，失败由事务层 abort。
+
+        ``only_names`` 用于 ``SET CONSTRAINTS ... IMMEDIATE``：只强制检查指定
+        约束；提交时传 ``None``，检查所有延迟外键。
+        """
         for table_name, rid in list(txn.deferred_fk_rows):
             try:
                 table = self._catalog.get_table(table_name)
@@ -3163,9 +3222,13 @@ class Executor:
             values = HeapFile(self._bp, table, self._txns).get(txn, rid)
             if values is None:
                 continue
-            self._check_foreign_keys(table, list(values), txn, force=True)
+            self._check_foreign_keys(
+                table, list(values), txn, force=True, only_names=only_names
+            )
 
         for child_name, fk_name, key in list(txn.deferred_ref_checks):
+            if only_names is not None and fk_name not in only_names:
+                continue
             try:
                 child = self._catalog.get_table(child_name)
             except TableNotFoundError:
@@ -3201,14 +3264,18 @@ class Executor:
         txn: Transaction,
         *,
         force: bool = False,
+        only_names: Optional[set[str]] = None,
     ) -> None:
         """MATCH SIMPLE：任一本地列为 NULL 就跳过；MATCH FULL 要求全空或全非空。
 
-        ``DEFERRABLE INITIALLY DEFERRED`` 的外键在 DML 路径跳过检查，由提交前的
+        ``DEFERRABLE INITIALLY DEFERRED``（或当前事务被 ``SET CONSTRAINTS``
+        改成延迟）的外键在 DML 路径跳过检查，由提交前的
         ``validate_deferred_foreign_keys`` 用 ``force=True`` 统一补检。
         """
         for fk in table.foreign_keys.values():
-            if not force and fk.deferrable and fk.initially_deferred:
+            if only_names is not None and fk.name not in only_names:
+                continue
+            if not force and self._fk_is_deferred(fk, txn):
                 continue
             local_key = tuple(
                 values[table.column_index(name)] for name in fk.columns
@@ -3393,8 +3460,7 @@ class Executor:
                 if fk.on_delete != "CASCADE":
                     if (
                         fk.on_delete == "NO ACTION"
-                        and fk.deferrable
-                        and fk.initially_deferred
+                        and self._fk_is_deferred(fk, txn)
                     ):
                         txn.deferred_ref_checks.add(
                             (child.name, fk.name, key)

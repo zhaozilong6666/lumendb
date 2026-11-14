@@ -180,8 +180,12 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 `ForeignKeyDef` 还保存 `deferrable` / `initially_deferred`。`DEFERRABLE INITIALLY
 DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行器把 `(表, RID)`
 放进 `Transaction.deferred_fk_rows`；`NO ACTION` 删除/更新被引用键时把旧键放进
-`Transaction.deferred_ref_checks`。`Database` 在 `COMMIT`（以及自动提交语句的提交点）
-调用 `executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
+`Transaction.deferred_ref_checks`。显式事务内可执行
+`SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`，覆盖写在
+`Transaction.constraint_modes`，后续写入按覆盖后的时机决定是否立即检查；
+`IMMEDIATE` 会先对已积压的行/父键执行一次强制补检，失败则不改变模式。
+`Database` 在 `COMMIT`（以及自动提交语句的提交点）调用
+`executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
 被引用键是否已恢复或子行是否已清理；失败则 `abort`，WAL/页 undo 恢复。`RESTRICT`
 始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
 
@@ -195,7 +199,7 @@ DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / 
 `NO ACTION`（显式 `NO ACTION` 保留；`DEFERRABLE` 可让它提交时检查），`MATCH` 支持
 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`ADD COLUMN ... REFERENCES`
 复用 `ADD CONSTRAINT FOREIGN KEY` 的存量行校验路径，先加列再原子建立外键，失败时
-整条语句回滚。`SET CONSTRAINTS` 动态切换未实现。
+整条语句回滚。`SET CONSTRAINTS` 不持久化，只影响当前事务。
 
 ### 2.10 视图
 

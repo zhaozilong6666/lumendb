@@ -22,7 +22,7 @@
 | `ON UPDATE SET NULL` | 完成 | 父键更新后将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
 | `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值；默认值不存在时回滚 |
 | `NO ACTION` | 完成 | 独立动作；配合 `DEFERRABLE` 可提交时检查，否则立即拒绝 |
-| `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 未实现 |
+| `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 支持事务内切换 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT` |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
 | 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护 |
@@ -74,7 +74,10 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 - 失败时 `abort` 事务，页 undo 与 WAL 恢复保证子行、父行都不留半状态。
 
 `DEFERRABLE INITIALLY IMMEDIATE` 仍走语句内检查；`RESTRICT`、`CASCADE`、
-`SET NULL`、`SET DEFAULT` 动作始终立即执行。`SET CONSTRAINTS` 暂未实现。
+`SET NULL`、`SET DEFAULT` 动作始终立即执行。显式事务内可用
+`SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` 覆盖检查时机：
+`DEFERRED` 影响后续 DML，`IMMEDIATE` 先补检已积压项；`ALL` 只作用于所有
+`DEFERRABLE` 外键，按名称指定非 `DEFERRABLE` 约束会报错。
 
 ### 2.4 删除级联
 
@@ -116,7 +119,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 ## 3. 测试与验证
 
-- 全量测试：**845 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**857 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -127,6 +130,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
   - `MATCH FULL` 全空/全非空/部分 NULL 拒绝；
   - `NO ACTION` 保留为独立动作；
   - `DEFERRABLE INITIALLY DEFERRED`：先子后父提交成功、缺父提交失败、更新后补父、删除后恢复父键；
+  - `SET CONSTRAINTS ALL/named DEFERRED`、`ALL IMMEDIATE` 立即补检失败、未知约束名、非 DEFERRABLE 约束、事务外执行；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -173,17 +177,17 @@ CI：
 
 ## 5. 遗留风险与未实现项
 
-1. **动作子集仍有限**：未实现 `SET CONSTRAINTS` / `MATCH PARTIAL`；当前支持
+1. **动作子集仍有限**：未实现 `MATCH PARTIAL`；当前支持
    `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION` 和
-   `DEFERRABLE INITIALLY DEFERRED`（`MATCH SIMPLE` / `MATCH FULL`）。
+   `DEFERRABLE` / `SET CONSTRAINTS`（`MATCH SIMPLE` / `MATCH FULL`）。
 2. **级联收集不自动建子表索引**：写入侧 `_check_foreign_keys` 已优先走被引用唯一索引，
    `_plan_referenced_updates` / `_cascade_delete_children` 在子表外键列存在精确索引时
    也走点查，但外键不会自动创建子表索引；没有索引时仍逐表扫描，复杂度与子表行数
    线性相关，数据量大时应显式 `CREATE INDEX`。
 3. **复杂循环图**：`_updating` / `processing` 能打断常见自引用环，但菱形依赖、
    同一子行被多条级联路径同时命中的精确 SQL 顺序语义没有单独建模；
-   并发事务下也没有等锁语义，当前更接近单写者语义。`SET CONSTRAINTS` 不可用，
-   延迟检查固定在 `COMMIT`。
+   并发事务下也没有等锁语义，当前更接近单写者语义。`SET CONSTRAINTS` 只覆盖当前
+   事务，同名约束按全局匹配一并切换。
 4. **`DROP TABLE ... CASCADE` 不删子表数据**：只删除引用表上的外键约束，
    与部分数据库的“级联删表数据”语义不同；`TRUNCATE` 没有 `CASCADE`。
 5. **保守拒绝**：`DROP INDEX` / `DROP CONSTRAINT` 只要还被外键引用就拒绝，
@@ -197,7 +201,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 845 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 857 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
-`DEFERRABLE INITIALLY DEFERRED` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。
+`DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。
