@@ -1,0 +1,23 @@
+name: Apply LumenDB patch
+on:
+  push:
+    paths:
+      - ".lumendb/apply.patch.gz.b64"
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode patch
+        run: base64 -d .lumendb/apply.patch.gz.b64 | gunzip > /tmp/apply.patch
+      - name: Apply patch
+        run: git apply --whitespace=nowarn /tmp/apply.patch
+      - name: Commit and push
+        run: |
+          git config user.name "赵梓聪"
+          git config user.email "3487781376@qq.com"
+          git add README.md docs lumendb tests
+          git commit -m "feat(sql): TRUNCATE CASCADE honors foreign key dependents"
+          git push origin HEAD:main
