@@ -17,6 +17,7 @@ from lumendb.sql.ast import (
     Literal,
     ParamRef,
     ScalarSubquery,
+    Select,
     SetConstraints,
     Star,
     UnaryOp,
@@ -659,6 +660,27 @@ class TestSelect:
     def test_left_join_requires_on(self):
         with pytest.raises(SQLSyntaxError):
             parse_statement("SELECT * FROM a LEFT JOIN b")
+
+    def test_derived_table(self):
+        stmt = parse_statement(
+            "SELECT * FROM (SELECT id FROM t WHERE id > 1) x"
+        )
+        ref = stmt.select.from_[0]
+        assert ref.alias == "x"
+        assert ref.query is not None
+        assert isinstance(ref.query, Select)
+
+    def test_derived_table_on_join_right(self):
+        stmt = parse_statement(
+            "SELECT * FROM a JOIN (SELECT id FROM b) x ON a.id = x.id"
+        )
+        join = stmt.select.from_[0].joins[0]
+        assert join.table.query is not None
+        assert join.table.alias == "x"
+
+    def test_derived_table_requires_alias(self):
+        with pytest.raises(SQLSyntaxError, match="别名"):
+            parse_statement("SELECT * FROM (SELECT id FROM t)")
 
     def test_cte_parses(self):
         stmt = parse_statement("WITH x AS (SELECT 1 AS a) SELECT a FROM x")

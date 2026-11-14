@@ -286,6 +286,8 @@ class TableRef:
     name: str
     alias: Optional[str] = None
     joins: list[Join] = field(default_factory=list)
+    #: FROM 里的派生表 ``(SELECT ...) AS alias``；普通表为 None。
+    query: Optional[Union[Select, CompoundSelect]] = None
 
     @property
     def effective_name(self) -> str:

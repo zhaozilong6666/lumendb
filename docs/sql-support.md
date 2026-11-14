@@ -364,6 +364,10 @@ CASE expr WHEN value THEN result [...] [ELSE result] END
 挂载，支持多层嵌套；每一行外层数据会独立执行一次子查询，当前不做去相关
 重写。
 
+FROM 也支持派生表：`SELECT * FROM (SELECT ...) AS x`，以及 JOIN 左右两侧的
+派生表。派生表必须有别名，输出列按别名限定；它按非 LATERAL 语义只能引用
+外层查询的列，不能引用同一 FROM 列表里的兄弟数据源。
+
 ### 参数占位符
 
 ```sql

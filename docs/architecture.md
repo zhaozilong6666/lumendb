@@ -306,6 +306,10 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
   `WITH c(a, b) AS (...)` 的显式列名会覆盖输出列名并校验列数/重名；
   `WITH ... INSERT ... SELECT` 也走同一套作用域；同一个 CTE 被引用两次会
   执行两次（没有做物化缓存）；
+- FROM 派生表：`TableRef.query` 保存 `(SELECT ...) AS alias` 的子查询；
+  `_bind_derived` 用独立 Binder 绑定并把依赖合并回外层，再包成 `CteScan`。
+  派生表按非 LATERAL 语义处理——只能看到外层查询的 schema，不能引用同一
+  FROM 里的兄弟数据源；普通表与派生表共用同一套 JOIN 绑定路径；
 - `RecursiveCte`：`seed UNION [ALL] recursive` 的递归 CTE。`CteScan(recursive=True)`
   在递归项里读取执行器保存的“上一轮工作表”，每一轮把新行加入结果并作为下一轮输入，
   直到没有新行；`UNION` 用哈希集合去重，`UNION ALL` 保留重复，超过 10000 轮报错；

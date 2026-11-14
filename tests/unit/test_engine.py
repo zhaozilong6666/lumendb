@@ -3033,6 +3033,40 @@ class TestExpressions:
 
 
 class TestSubquery:
+    def test_derived_table_in_from(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT x.id FROM (SELECT id FROM users WHERE age > 30) x "
+            "ORDER BY x.id",
+        ) == [(3,)]
+
+    def test_derived_table_in_join(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (user_id INT, amount INT)")
+        db.execute_one("INSERT INTO orders VALUES (1, 10), (1, 20), (3, 5)")
+        assert rows(
+            db,
+            "SELECT u.name, x.total FROM users u JOIN ("
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id) x ON x.user_id = u.id ORDER BY u.name",
+        ) == [("alice", 30), ("carol", 5)]
+
+    def test_derived_table_compound_select(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT x.id FROM ("
+            "SELECT id FROM users WHERE id = 1 "
+            "UNION ALL SELECT id FROM users WHERE id = 3"
+            ") x ORDER BY x.id",
+        ) == [(1,), (3,)]
+
+    def test_derived_table_requires_alias(self, db):
+        setup_users(db)
+        with pytest.raises(Exception, match="别名"):
+            db.execute_one("SELECT * FROM (SELECT id FROM users)")
+
     def test_correlated_exists(self, db):
         setup_users(db)
         db.execute_one("CREATE TABLE orders (user_id INT, amount INT)")

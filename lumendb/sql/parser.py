@@ -1392,14 +1392,33 @@ class Parser:
             expr=expr, descending=descending, nulls_first=nulls_first
         )
 
-    def _parse_table_ref(self) -> TableRef:
+    def _parse_relation(
+        self,
+    ) -> tuple[str, Optional[str], Optional[Select | CompoundSelect]]:
+        """解析一个 FROM 数据源：普通表或 ``(SELECT ...) AS alias``。"""
+        if self._match_punct("lparen"):
+            query = self._parse_query_expression()
+            self._expect_punct("rparen", ")")
+            alias = None
+            if self._match_kw("AS"):
+                alias = self._parse_ident("别名")
+            elif self._cur.kind == "ident":
+                alias = self._advance().value
+            if alias is None:
+                raise self._error("FROM 里的子查询必须提供别名")
+            return alias, alias, query
+
         name = self._parse_ident("表名")
         alias = None
         if self._match_kw("AS"):
             alias = self._parse_ident("别名")
         elif self._cur.kind == "ident":
             alias = self._advance().value
-        ref = TableRef(name=name, alias=alias)
+        return name, alias, None
+
+    def _parse_table_ref(self) -> TableRef:
+        name, alias, query = self._parse_relation()
+        ref = TableRef(name=name, alias=alias, query=query)
 
         while True:
             kind: Optional[str] = None
@@ -1427,11 +1446,10 @@ class Parser:
                 cross = True
             if kind is None:
                 return ref
-            right = TableRef(name=self._parse_ident("表名"), alias=None)
-            if self._match_kw("AS"):
-                right.alias = self._parse_ident("别名")
-            elif self._cur.kind == "ident":
-                right.alias = self._advance().value
+            right_name, right_alias, right_query = self._parse_relation()
+            right = TableRef(
+                name=right_name, alias=right_alias, query=right_query
+            )
             on = None
             if cross:
                 pass

@@ -1459,13 +1459,42 @@ class Binder:
         )
         return node, schema, columns
 
+    def _bind_relation(self, ref) -> tuple[PlanNode, Schema]:
+        """绑定一个 FROM 数据源；派生表复用 CteScan 执行其子计划。"""
+        if ref.query is not None:
+            return self._bind_derived(ref)
+        node, schema, _cols = self._source_for(ref.name, ref.alias)
+        return node, schema
+
+    def _bind_derived(self, ref) -> tuple[PlanNode, Schema]:
+        # 非 LATERAL 派生表：只能看到外层查询的 schema，不能引用同一
+        # FROM 里的兄弟数据源；这与 PostgreSQL 的默认语义一致。
+        binder = Binder(
+            self.catalog,
+            self.params,
+            outer_schemas=list(self.outer_schemas),
+        )
+        binder.subquery_runner = self.subquery_runner
+        binder.ctes = dict(self.ctes)
+        binder.view_stack = self.view_stack
+        plan, cols = binder.bind_select(ref.query)
+        self.source_dependencies.update(binder.source_dependencies)
+        self.column_dependencies.update(binder.column_dependencies)
+        effective = (ref.alias or ref.name).lower()
+        schema = Schema(
+            [
+                SchemaColumn(effective, col.name, col.type)
+                for col in cols
+            ]
+        )
+        node = CteScan(child=plan, columns=list(cols))
+        return node, schema
+
     def _bind_table_ref(self, ref) -> tuple[PlanNode, Schema]:
-        node, schema, columns = self._source_for(ref.name, ref.alias)
+        node, schema = self._bind_relation(ref)
 
         for join in ref.joins:
-            right_node, right_schema, right_cols = self._source_for(
-                join.table.name, join.table.alias
-            )
+            right_node, right_schema = self._bind_relation(join.table)
             merged = schema.concat(right_schema)
             on_fn = None
             if join.on is not None:
