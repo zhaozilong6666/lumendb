@@ -1394,7 +1394,12 @@ class Parser:
 
     def _parse_relation(
         self,
-    ) -> tuple[str, Optional[str], Optional[Select | CompoundSelect]]:
+    ) -> tuple[
+        str,
+        Optional[str],
+        Optional[Select | CompoundSelect],
+        Optional[list[str]],
+    ]:
         """解析一个 FROM 数据源：普通表或 ``(SELECT ...) AS alias``。"""
         if self._match_punct("lparen"):
             query = self._parse_query_expression()
@@ -1406,7 +1411,8 @@ class Parser:
                 alias = self._advance().value
             if alias is None:
                 raise self._error("FROM 里的子查询必须提供别名")
-            return alias, alias, query
+            aliases = self._parse_column_aliases()
+            return alias, alias, query, aliases
 
         name = self._parse_ident("表名")
         alias = None
@@ -1414,11 +1420,26 @@ class Parser:
             alias = self._parse_ident("别名")
         elif self._cur.kind == "ident":
             alias = self._advance().value
-        return name, alias, None
+        aliases = self._parse_column_aliases() if alias is not None else None
+        return name, alias, None, aliases
+
+    def _parse_column_aliases(self) -> Optional[list[str]]:
+        if not self._match_punct("lparen"):
+            return None
+        names = [self._parse_ident("列别名")]
+        while self._match_punct("comma"):
+            names.append(self._parse_ident("列别名"))
+        self._expect_punct("rparen", ")")
+        return names
 
     def _parse_table_ref(self) -> TableRef:
-        name, alias, query = self._parse_relation()
-        ref = TableRef(name=name, alias=alias, query=query)
+        name, alias, query, column_aliases = self._parse_relation()
+        ref = TableRef(
+            name=name,
+            alias=alias,
+            query=query,
+            column_aliases=column_aliases,
+        )
 
         while True:
             kind: Optional[str] = None
@@ -1446,9 +1467,14 @@ class Parser:
                 cross = True
             if kind is None:
                 return ref
-            right_name, right_alias, right_query = self._parse_relation()
+            right_name, right_alias, right_query, right_aliases = (
+                self._parse_relation()
+            )
             right = TableRef(
-                name=right_name, alias=right_alias, query=right_query
+                name=right_name,
+                alias=right_alias,
+                query=right_query,
+                column_aliases=right_aliases,
             )
             on = None
             if cross:

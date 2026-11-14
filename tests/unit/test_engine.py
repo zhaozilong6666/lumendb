@@ -3062,6 +3062,30 @@ class TestSubquery:
             ") x ORDER BY x.id",
         ) == [(1,), (3,)]
 
+    def test_derived_table_column_aliases(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT x.a, x.b FROM ("
+            "SELECT id, name FROM users WHERE age > 30"
+            ") AS x(a, b)",
+        ) == [(3, "carol")]
+
+    def test_table_alias_column_aliases(self, db):
+        setup_users(db)
+        assert rows(
+            db,
+            "SELECT u.code, u.years FROM users AS u(code, nm, years) "
+            "WHERE u.code = 1",
+        ) == [(1, 30)]
+
+    def test_derived_table_column_aliases_count_mismatch(self, db):
+        setup_users(db)
+        with pytest.raises(BinderError, match="别名数量"):
+            db.execute_one(
+                "SELECT * FROM (SELECT id, name FROM users) AS x(a)"
+            )
+
     def test_derived_table_requires_alias(self, db):
         setup_users(db)
         with pytest.raises(Exception, match="别名"):

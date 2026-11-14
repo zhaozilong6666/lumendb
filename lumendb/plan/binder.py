@@ -1462,9 +1462,42 @@ class Binder:
     def _bind_relation(self, ref) -> tuple[PlanNode, Schema]:
         """绑定一个 FROM 数据源；派生表复用 CteScan 执行其子计划。"""
         if ref.query is not None:
-            return self._bind_derived(ref)
-        node, schema, _cols = self._source_for(ref.name, ref.alias)
-        return node, schema
+            node, schema = self._bind_derived(ref)
+        else:
+            node, schema, _cols = self._source_for(ref.name, ref.alias)
+        return self._apply_column_aliases(ref, node, schema)
+
+    def _apply_column_aliases(
+        self, ref, node: PlanNode, schema: Schema
+    ) -> tuple[PlanNode, Schema]:
+        aliases = ref.column_aliases
+        if not aliases:
+            return node, schema
+        if len(aliases) != len(schema):
+            raise BinderError(
+                f"数据源 {ref.effective_name!r} 的列别名数量不匹配",
+                detail=f"提供了 {len(aliases)} 个别名，源有 {len(schema)} 列",
+                hint="列别名列表必须覆盖数据源的全部输出列",
+            )
+        normalized = [alias.lower() for alias in aliases]
+        if len(set(normalized)) != len(normalized):
+            raise BinderError(
+                f"数据源 {ref.effective_name!r} 的列别名重复"
+            )
+        columns = [
+            SchemaColumn(
+                col.qualifier,
+                alias,
+                col.type,
+                source_table=col.source_table,
+            )
+            for col, alias in zip(schema.columns, normalized)
+        ]
+        node.columns = [
+            OutputColumn(alias, col.type)
+            for alias, col in zip(normalized, schema.columns)
+        ]
+        return node, Schema(columns)
 
     def _bind_derived(self, ref) -> tuple[PlanNode, Schema]:
         # 非 LATERAL 派生表：只能看到外层查询的 schema，不能引用同一

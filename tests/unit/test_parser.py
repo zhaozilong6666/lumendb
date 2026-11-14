@@ -670,6 +670,12 @@ class TestSelect:
         assert ref.query is not None
         assert isinstance(ref.query, Select)
 
+    def test_derived_table_column_aliases(self):
+        stmt = parse_statement(
+            "SELECT * FROM (SELECT id, name FROM t) AS x(a, b)"
+        )
+        assert stmt.select.from_[0].column_aliases == ["a", "b"]
+
     def test_derived_table_on_join_right(self):
         stmt = parse_statement(
             "SELECT * FROM a JOIN (SELECT id FROM b) x ON a.id = x.id"
