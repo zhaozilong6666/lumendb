@@ -4334,6 +4334,12 @@ def _describe_plan(
 ) -> Iterator[str]:
     prefix = "  " * depth
     line = prefix + node.describe()
+    if node.estimated is not None:
+        est = node.estimated
+        line += (
+            f" (rows≈{est.rows:.0f} cpu≈{est.cpu:.0f} "
+            f"confidence={est.confidence})"
+        )
     if profile is not None:
         entry = profile.get(id(node))
         if entry is None:

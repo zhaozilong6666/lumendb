@@ -395,7 +395,7 @@ COMMIT; ROLLBACK;
 SAVEPOINT name;
 ROLLBACK TO [SAVEPOINT] name;  -- 撤销到保存点，事务继续
 RELEASE [SAVEPOINT] name;       -- 释放保存点及其之后建立的保存点
-EXPLAIN <query>;
+EXPLAIN <query>;          -- 计划树每行带 rows≈ / cpu≈ / confidence 估算
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
 CHECKPOINT;

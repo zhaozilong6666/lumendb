@@ -1305,6 +1305,21 @@ class TestExplainAnalyze:
         assert "IndexRangeScan" in plan
         assert "rows=1" in plan
 
+    def test_explain_shows_estimated_rows(self, db):
+        setup_users(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT id FROM users")
+        )
+        assert "rows≈3" in plan
+        assert "confidence=stats" in plan
+
+    def test_explain_estimate_for_index_lookup_is_one_row(self, db):
+        setup_users(db)
+        plan = "\n".join(
+            r[0] for r in rows(db, "EXPLAIN SELECT name FROM users WHERE id = 2")
+        )
+        assert "rows≈1" in plan
+
     def test_query_still_works_after_analyze(self, db):
         setup_users(db)
         rows(db, "EXPLAIN ANALYZE SELECT id FROM users")

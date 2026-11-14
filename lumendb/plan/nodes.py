@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
 from ..datatypes import TypeSpec
+from .cost import CostEstimate
 
 
 #: 当前正在执行的相关子查询的外层行。``_run_subquery`` 在求值一个子查询
@@ -49,6 +50,8 @@ class OutputColumn:
 @dataclass
 class PlanNode:
     columns: list[OutputColumn] = field(default_factory=list)
+    #: 代价模型给出的估算；EXPLAIN 用它标注 rows≈/cpu≈。
+    estimated: Optional[CostEstimate] = None
 
     def children(self) -> list["PlanNode"]:
         return []

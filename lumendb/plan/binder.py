@@ -54,6 +54,15 @@ from ..sql.ast import (
 )
 from ..sql.lexer import Token
 from ..sql.parser import Parser
+from .cost import (
+    EQ_SELECTIVITY,
+    OTHER_SELECTIVITY,
+    RANGE_SELECTIVITY,
+    filter_estimate,
+    join_estimate,
+    scan_estimate,
+    unknown_estimate,
+)
 from .nodes import (
     Aggregate,
     CteScan,
@@ -993,11 +1002,25 @@ class Binder:
                 predicate, _ = self.compile(select.where, schema, allow_agg=False)
                 child = range_node if range_node is not None else node
                 node = Filter(
-                    child=child, predicate=predicate, columns=child.columns
+                    child=child,
+                    predicate=predicate,
+                    columns=child.columns,
+                    estimated=filter_estimate(
+                        self._node_estimate(child),
+                        self._predicate_selectivity(select.where),
+                    ),
                 )
         elif select.where is not None:
             predicate, _ = self.compile(select.where, schema, allow_agg=False)
-            node = Filter(child=node, predicate=predicate, columns=node.columns)
+            node = Filter(
+                child=node,
+                predicate=predicate,
+                columns=node.columns,
+                estimated=filter_estimate(
+                    self._node_estimate(node),
+                    self._predicate_selectivity(select.where),
+                ),
+            )
 
         has_agg = (
             bool(select.group_by)
@@ -1018,7 +1041,12 @@ class Binder:
                 )
                 having_fn, _ = self.compile(having_expr, out_schema, allow_agg=True)
                 node = Filter(
-                    child=node, predicate=having_fn, columns=node.columns
+                    child=node,
+                    predicate=having_fn,
+                    columns=node.columns,
+                    estimated=filter_estimate(
+                        self._node_estimate(node), OTHER_SELECTIVITY
+                    ),
                 )
         else:
             out_schema = schema
@@ -1259,6 +1287,9 @@ class Binder:
             index_name=index.name,
             index_columns=index.columns,
             key=(value,),
+            estimated=filter_estimate(
+                scan.estimated or unknown_estimate(), EQ_SELECTIVITY
+            ),
         )
 
     def _try_index_range(
@@ -1330,6 +1361,7 @@ class Binder:
             high=high_key,
             low_inclusive=low_inclusive,
             high_inclusive=high_inclusive,
+            estimated=scan.estimated or unknown_estimate(),
         )
 
     def _equi_keys(
@@ -1361,6 +1393,20 @@ class Binder:
             labels.append(f"{lcol.qualifier}.{lcol.name} = {rcol.qualifier}.{rcol.name}")
         return tuple(keys), tuple(labels)
 
+    def _node_estimate(self, node: PlanNode):
+        return node.estimated or unknown_estimate()
+
+    def _predicate_selectivity(self, expr) -> float:
+        """给常见谓词一个粗略选择率；未知谓词用默认值。"""
+        if isinstance(expr, BinaryOp):
+            if expr.op == "=":
+                return EQ_SELECTIVITY
+            if expr.op in (">", ">=", "<", "<="):
+                return RANGE_SELECTIVITY
+        if isinstance(expr, Between):
+            return RANGE_SELECTIVITY
+        return OTHER_SELECTIVITY
+
     def _bind_from(self, refs) -> tuple[PlanNode, Schema]:
         if not refs:
             return Values(rows=[()], columns=[]), Schema([])
@@ -1379,6 +1425,9 @@ class Binder:
                     kind="INNER",
                     on=None,
                     columns=[OutputColumn(c.name, c.type) for c in merged.columns],
+                    estimated=join_estimate(
+                        self._node_estimate(node), self._node_estimate(sub_node)
+                    ),
                 )
                 schema = merged
         assert node is not None
@@ -1392,7 +1441,11 @@ class Binder:
         if entry is not None:
             child, cols = entry
             effective = (alias or name).lower()
-            node = CteScan(child=child, columns=list(cols))
+            node = CteScan(
+                child=child,
+                columns=list(cols),
+                estimated=child.estimated or unknown_estimate(),
+            )
             schema = Schema(
                 [SchemaColumn(effective, col.name, col.type) for col in cols]
             )
@@ -1438,7 +1491,11 @@ class Binder:
                     for alias, col in zip(normalized, cols)
                 ]
             effective = (alias or name).lower()
-            node = CteScan(child=child, columns=list(cols))
+            node = CteScan(
+                child=child,
+                columns=list(cols),
+                estimated=child.estimated or unknown_estimate(),
+            )
             schema = Schema(
                 [SchemaColumn(effective, col.name, col.type) for col in cols]
             )
@@ -1448,7 +1505,12 @@ class Binder:
         self.source_dependencies.add(table.name)
         effective = (alias or table.name).lower()
         columns = [OutputColumn(col.name, col.type) for col in table.columns]
-        node = Scan(columns=columns, table=table.name, alias=effective)
+        node = Scan(
+            columns=columns,
+            table=table.name,
+            alias=effective,
+            estimated=scan_estimate(table.row_count_hint),
+        )
         schema = Schema(
             [
                 SchemaColumn(
@@ -1523,7 +1585,11 @@ class Binder:
                 for col in cols
             ]
         )
-        node = CteScan(child=plan, columns=list(cols))
+        node = CteScan(
+            child=plan,
+            columns=list(cols),
+            estimated=plan.estimated or unknown_estimate(confidence="derived"),
+        )
         return node, schema
 
     def _bind_table_ref(self, ref) -> tuple[PlanNode, Schema]:
@@ -1548,6 +1614,11 @@ class Binder:
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
                 hash_keys=hash_keys,
                 hash_labels=hash_labels,
+                estimated=join_estimate(
+                    self._node_estimate(node),
+                    self._node_estimate(right_node),
+                    equi_keys=len(hash_keys),
+                ),
             )
             schema = merged
         return node, schema

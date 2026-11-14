@@ -266,7 +266,12 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 ### 3.3 计划与优化
 
-老实说：**当前没有代价模型**。规则只有两条能被 `EXPLAIN` 看见：
+计划节点带有 `estimated` 字段（`plan/cost.py` 的 `CostEstimate`）：扫描用堆表
+维护的 `row_count_hint`，过滤按等值/范围/其他谓词的选择率估算，连接按等值键
+数量估算并区分哈希与嵌套循环。`EXPLAIN` 会把 `rows≈N cpu≈M confidence=...`
+标在节点后面；`EXPLAIN ANALYZE` 再追加实际耗时、行数与循环次数。
+
+这些估算目前只用于观测，不改变执行顺序。索引选择仍是两条规则：
 
 - 单表查询、`WHERE` 形如 `col = 常量`、且该列上有索引 → `IndexLookup`；
 - `WHERE` 是单列范围条件（`>` / `>=` / `<` / `<=` / `BETWEEN`）→ `IndexRangeScan`，
@@ -284,7 +289,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 的一侧填 `NULL`。`CROSS JOIN` 是 `ON` 为真的 `INNER JOIN`。
 集合运算用 `SetOp`：`UNION ALL` 直接拼接，`UNION` 流式去重，`EXCEPT` 先物化右表
 再筛左表，`INTERSECT` 同理；`INTERSECT` 在解析时被收紧成更高的优先级。
-连接顺序枚举与代价模型仍未实现——`EXPLAIN` 输出的是真实执行的计划，不是理想计划。
+连接顺序枚举仍未实现——`EXPLAIN` 输出的是真实执行的计划，不是理想计划；
+估算行数用于观测和下一步枚举的前置输入。
 
 ## 4. 执行
 
