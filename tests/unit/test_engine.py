@@ -4274,6 +4274,61 @@ class TestForeignKey:
             db.execute_one("SELECT pid FROM c")
         assert rows(db, "SELECT id FROM c") == [(1,)]
 
+    def test_drop_column_view_dependency_requires_cascade(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("INSERT INTO p VALUES (1, 'x')")
+        db.execute_one("CREATE VIEW v AS SELECT note FROM p")
+        with pytest.raises(BinderError, match="视图依赖"):
+            db.execute_one("ALTER TABLE p DROP COLUMN note")
+        result = db.execute_one("ALTER TABLE p DROP COLUMN note CASCADE")
+        assert "1 个视图" in result.notice
+        assert not db.catalog.has_view("v")
+        assert db.catalog.get_table("p").column_names == ["id"]
+
+    def test_drop_column_view_dependency_alias(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("CREATE VIEW v AS SELECT t.note FROM p AS t")
+        with pytest.raises(BinderError, match="视图依赖"):
+            db.execute_one("ALTER TABLE p DROP COLUMN note")
+        db.execute_one("ALTER TABLE p DROP COLUMN note CASCADE")
+        assert not db.catalog.has_view("v")
+
+    def test_drop_column_view_star_dependency(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("CREATE VIEW v AS SELECT * FROM p")
+        result = db.execute_one("ALTER TABLE p DROP COLUMN note CASCADE")
+        assert "1 个视图" in result.notice
+        assert not db.catalog.has_view("v")
+
+    def test_drop_column_view_dependency_nested(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("CREATE VIEW v1 AS SELECT note FROM p")
+        db.execute_one("CREATE VIEW v2 AS SELECT note FROM v1")
+        db.execute_one("ALTER TABLE p DROP COLUMN note CASCADE")
+        assert not db.catalog.has_view("v1")
+        assert not db.catalog.has_view("v2")
+
+    def test_drop_column_view_dependency_persists(self, tmp_path):
+        path = tmp_path / "view_dep"
+        database = Database(path)
+        database.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        database.execute_one("CREATE VIEW v AS SELECT note FROM p")
+        database.close()
+        reopened = Database(path)
+        try:
+            with pytest.raises(BinderError, match="视图依赖"):
+                reopened.execute_one("ALTER TABLE p DROP COLUMN note")
+        finally:
+            reopened.close()
+
+    def test_rename_column_view_dependency_rejected(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("CREATE VIEW v AS SELECT note FROM p")
+        with pytest.raises(BinderError, match="视图依赖"):
+            db.execute_one("ALTER TABLE p RENAME COLUMN note TO body")
+        db.execute_one("ALTER TABLE p RENAME COLUMN id TO code")
+        assert rows(db, "SELECT code FROM p") == []
+
     def test_drop_table_cascade_notice_counts(self, db):
         db.execute_one("CREATE TABLE p (id INT UNIQUE)")
         db.execute_one("CREATE TABLE c1 (pid INT REFERENCES p(id))")

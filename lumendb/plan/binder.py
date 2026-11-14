@@ -87,6 +87,9 @@ class SchemaColumn:
     qualifier: str
     name: str
     type: TypeSpec
+    #: 列实际来自哪张基表；CTE/派生列/``excluded`` 为 None。
+    #: 视图列级依赖只记录基表列，避免把别名误当成表名。
+    source_table: Optional[str] = None
 
 
 class Schema:
@@ -243,6 +246,8 @@ class Binder:
         self._agg_slots: dict[int, int] = {}
         self._agg_specs: list[AggSpec] = []
         self._agg_base: int = 0
+        #: 视图绑定时收集的基表列依赖：(表名, 列名)
+        self.column_dependencies: set[tuple[str, str]] = set()
         #: 需要执行子查询时由执行器注入的钩子
         self.subquery_runner: Optional[Callable[[Any, EvalContext], Any]] = None
         #: 当前查询可见的 CTE：name -> (已绑定计划, 输出列)
@@ -298,7 +303,12 @@ class Binder:
 
     def _column(self, expr: ColumnRef, schema, allow_agg):
         index = schema.resolve(expr.table, expr.name)
+        self._record_column_dependency(schema.columns[index])
         return (lambda ctx, i=index: ctx.row[i]), schema.type_of(index)
+
+    def _record_column_dependency(self, col: SchemaColumn) -> None:
+        if col.source_table:
+            self.column_dependencies.add((col.source_table, col.name))
 
     def _star(self, expr: Star, schema, allow_agg):
         raise TypeMismatchError(
@@ -746,7 +756,11 @@ class Binder:
             ]
             scans.append(Scan(columns=columns, table=table.name, alias=alias))
             for col in table.columns:
-                schema_cols.append(SchemaColumn(alias, col.name, col.type))
+                schema_cols.append(
+                    SchemaColumn(
+                        alias, col.name, col.type, source_table=table.name
+                    )
+                )
         return Schema(schema_cols), scans
 
     # -- SELECT 绑定 -----------------------------------------------------
@@ -842,8 +856,10 @@ class Binder:
         self.bind_ctes(query.ctes, recursive=query.recursive)
         return self.bind_select(query.select)
 
-    def collect_view_dependencies(self, name: str) -> set[str]:
-        """重新绑定一个视图定义，返回它实际引用到的表/视图集合。"""
+    def collect_view_dependencies(
+        self, name: str
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        """重新绑定一个视图定义，返回它引用到的表/视图与基表列集合。"""
         tokens = self.catalog.get_view(name)
         view_query = Parser(
             [Token(kind, value, 0, 0) for kind, value in tokens]
@@ -855,7 +871,10 @@ class Binder:
             binder.bind_query(view_query)
         else:
             binder.bind_select(view_query)
-        return set(binder.source_dependencies)
+        return (
+            set(binder.source_dependencies),
+            set(binder.column_dependencies),
+        )
 
     def bind_returning(self, items, schema) -> tuple[list, list[OutputColumn]]:
         """把 ``RETURNING`` 列表编译成 (表达式函数, 输出列)。
@@ -960,6 +979,7 @@ class Binder:
                     picked = list(out_schema.columns)
                 for col in picked:
                     index = out_schema.resolve(col.qualifier, col.name)
+                    self._record_column_dependency(col)
                     proj_fns.append(lambda ctx, i=index: ctx.row[i])
                     proj_cols.append(OutputColumn(col.name, col.type))
                 continue
@@ -1373,7 +1393,12 @@ class Binder:
         columns = [OutputColumn(col.name, col.type) for col in table.columns]
         node = Scan(columns=columns, table=table.name, alias=effective)
         schema = Schema(
-            [SchemaColumn(effective, col.name, col.type) for col in table.columns]
+            [
+                SchemaColumn(
+                    effective, col.name, col.type, source_table=table.name
+                )
+                for col in table.columns
+            ]
         )
         return node, schema, columns
 

@@ -76,6 +76,8 @@ class Catalog:
         self.view_columns: dict[str, list[str]] = {}
         #: 视图名 -> 实际引用到的表/视图名；用于拒绝悬空的 DROP。
         self.view_dependencies: dict[str, set[str]] = {}
+        #: 视图名 -> 实际引用到的基表列 (表名, 列名)；用于列级依赖检查。
+        self.view_column_dependencies: dict[str, set[tuple[str, str]]] = {}
         self._loaded = False
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
@@ -93,6 +95,7 @@ class Catalog:
         self.views.clear()
         self.view_columns.clear()
         self.view_dependencies.clear()
+        self.view_column_dependencies.clear()
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -118,6 +121,10 @@ class Catalog:
                 ]
                 self.view_columns[name] = list(vdata.get("columns", []))
                 self.view_dependencies[name] = set(vdata.get("dependencies", []))
+                self.view_column_dependencies[name] = {
+                    (table, column)
+                    for table, column in vdata.get("column_dependencies", [])
+                }
         self._loaded = True
 
     def persist(self, txn: Transaction) -> None:
@@ -132,6 +139,9 @@ class Catalog:
                         "columns": self.view_columns.get(name, []),
                         "dependencies": sorted(
                             self.view_dependencies.get(name, set())
+                        ),
+                        "column_dependencies": sorted(
+                            self.view_column_dependencies.get(name, set())
                         ),
                     }
                     for name, tokens in self.views.items()
@@ -227,6 +237,7 @@ class Catalog:
         tokens: list[tuple[str, str]],
         columns: Optional[list[str]] = None,
         dependencies: Optional[set[str]] = None,
+        column_dependencies: Optional[set[tuple[str, str]]] = None,
     ) -> None:
         key = name.lower()
         if key in self.tables or key in self.views:
@@ -237,11 +248,13 @@ class Catalog:
         self.views[key] = list(tokens)
         self.view_columns[key] = list(columns or [])
         self.view_dependencies[key] = set(dependencies or ())
+        self.view_column_dependencies[key] = set(column_dependencies or ())
 
         def undo() -> None:
             self.views.pop(key, None)
             self.view_columns.pop(key, None)
             self.view_dependencies.pop(key, None)
+            self.view_column_dependencies.pop(key, None)
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -253,6 +266,7 @@ class Catalog:
         tokens: list[tuple[str, str]],
         columns: Optional[list[str]] = None,
         dependencies: Optional[set[str]] = None,
+        column_dependencies: Optional[set[tuple[str, str]]] = None,
     ) -> None:
         key = name.lower()
         if key not in self.views:
@@ -260,32 +274,47 @@ class Catalog:
         old = self.views[key]
         old_columns = self.view_columns.get(key, [])
         old_dependencies = self.view_dependencies.get(key, set())
+        old_column_dependencies = self.view_column_dependencies.get(key, set())
         self.views[key] = list(tokens)
         self.view_columns[key] = list(columns or [])
         self.view_dependencies[key] = set(dependencies or ())
+        self.view_column_dependencies[key] = set(column_dependencies or ())
 
         def undo() -> None:
             self.views[key] = old
             self.view_columns[key] = old_columns
             self.view_dependencies[key] = old_dependencies
+            self.view_column_dependencies[key] = old_column_dependencies
 
         txn.undo_log.append(undo)
         self.persist(txn)
 
     def update_view_dependencies(
-        self, txn: Transaction, updates: dict[str, set[str]]
+        self,
+        txn: Transaction,
+        updates: dict[str, set[str]],
+        column_updates: Optional[dict[str, set[tuple[str, str]]]] = None,
     ) -> None:
         """刷新多个视图的依赖快照，并登记事务 undo。"""
+        column_updates = column_updates or {}
         old = {
             key: set(self.view_dependencies.get(key, set()))
             for key in updates
         }
+        old_columns = {
+            key: set(self.view_column_dependencies.get(key, set()))
+            for key in column_updates
+        }
         for key, deps in updates.items():
             self.view_dependencies[key] = set(deps)
+        for key, deps in column_updates.items():
+            self.view_column_dependencies[key] = set(deps)
 
         def undo() -> None:
             for key, deps in old.items():
                 self.view_dependencies[key] = deps
+            for key, deps in old_columns.items():
+                self.view_column_dependencies[key] = deps
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -309,11 +338,13 @@ class Catalog:
         tokens = self.views.pop(key)
         columns = self.view_columns.pop(key, [])
         dependencies = self.view_dependencies.pop(key, set())
+        column_dependencies = self.view_column_dependencies.pop(key, set())
 
         def undo() -> None:
             self.views[key] = tokens
             self.view_columns[key] = columns
             self.view_dependencies[key] = dependencies
+            self.view_column_dependencies[key] = column_dependencies
 
         txn.undo_log.append(undo)
         self.persist(txn)
@@ -323,6 +354,13 @@ class Catalog:
             name
             for name, deps in self.view_dependencies.items()
             if key in deps
+        )
+
+    def _view_column_dependents(self, table: str, column: str) -> list[str]:
+        return sorted(
+            name
+            for name, deps in self.view_column_dependencies.items()
+            if (table, column) in deps
         )
 
     def drop_table(
@@ -461,6 +499,12 @@ class Catalog:
             raise BinderError(
                 f"列 {new_name!r} 已存在",
                 hint="换一个列名",
+            )
+        view_dependents = self._view_column_dependents(table.name, old_key)
+        if view_dependents:
+            raise BinderError(
+                f"列 {old_name!r} 被视图依赖：{', '.join(view_dependents)}",
+                hint="先 DROP VIEW 依赖它的视图，再重命名列",
             )
         index = table.column_index(old_key)
         old_column = table.columns[index]

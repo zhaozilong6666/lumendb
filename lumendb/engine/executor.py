@@ -1162,10 +1162,13 @@ class Executor:
 
     def _refresh_view_dependencies(self, txn: Transaction) -> None:
         updates: dict[str, set[str]] = {}
+        column_updates: dict[str, set[tuple[str, str]]] = {}
         for name in self._catalog.view_names():
             binder = self._new_binder()
-            updates[name.lower()] = binder.collect_view_dependencies(name)
-        self._catalog.update_view_dependencies(txn, updates)
+            deps, column_deps = binder.collect_view_dependencies(name)
+            updates[name.lower()] = deps
+            column_updates[name.lower()] = column_deps
+        self._catalog.update_view_dependencies(txn, updates, column_updates)
 
     def _create_view(self, stmt: CreateView, txn: Transaction) -> Result:
         if self._catalog.has_table(stmt.name):
@@ -1205,6 +1208,7 @@ class Executor:
             self._catalog.replace_view(
                 txn, stmt.name, stmt.tokens, stmt.columns,
                 binder.source_dependencies,
+                binder.column_dependencies,
             )
             # 替换可能改变了间接依赖：重算所有视图，避免依赖快照里残留旧表，
             # 也避免新表没有被依赖视图记录而允许 DROP TABLE。
@@ -1214,6 +1218,7 @@ class Executor:
             self._catalog.create_view(
                 txn, stmt.name, stmt.tokens, stmt.columns,
                 binder.source_dependencies,
+                binder.column_dependencies,
             )
             notice = f"已创建视图 {stmt.name.lower()}"
         return Result(tag="CREATE VIEW", notice=notice)
@@ -1636,6 +1641,15 @@ class Executor:
             )
         index = table.column_index(stmt.column)
         column = table.columns[index]
+        view_dependents = self._catalog._view_column_dependents(
+            table.name, column.name
+        )
+        if view_dependents and not stmt.cascade:
+            raise BinderError(
+                f"列 {column.name!r} 被视图依赖："
+                f"{', '.join(view_dependents)}",
+                hint="使用 DROP COLUMN ... CASCADE，或先 DROP VIEW 依赖它的视图",
+            )
         if len(table.columns) == 1:
             raise NotSupportedError(
                 "表必须至少保留一列，不能删除最后一列",
@@ -1745,6 +1759,9 @@ class Executor:
             for idx in index_dependents:
                 self._catalog.drop_index(txn, idx.name)
 
+        for view_name in view_dependents:
+            self._catalog.drop_view(txn, view_name, cascade=True)
+
         heap = HeapFile(self._bp, table, self._txns)
         source_rows = [
             (rid, list(values)) for rid, values in heap.scan(txn)
@@ -1801,6 +1818,8 @@ class Executor:
                 cascade_parts.append(f"{len(index_dependents)} 个索引")
             if check_dependents:
                 cascade_parts.append(f"{len(check_dependents)} 个 CHECK 约束")
+            if view_dependents:
+                cascade_parts.append(f"{len(view_dependents)} 个视图")
         cascade_note = (
             f"；级联删除 {'、'.join(cascade_parts)}"
             if cascade_parts
