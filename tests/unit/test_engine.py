@@ -4730,6 +4730,18 @@ class TestForeignKey:
         assert "1 个视图" in result.notice
         assert not db.catalog.has_view("v")
 
+    def test_drop_column_view_dependency_correlated_subquery(self, db):
+        db.execute_one("CREATE TABLE p (id INT, note TEXT)")
+        db.execute_one("CREATE TABLE q (pid INT)")
+        db.execute_one(
+            "CREATE VIEW v AS SELECT note FROM p "
+            "WHERE EXISTS (SELECT 1 FROM q WHERE q.pid = p.id)"
+        )
+        with pytest.raises(BinderError, match="视图依赖"):
+            db.execute_one("ALTER TABLE p DROP COLUMN id")
+        db.execute_one("ALTER TABLE p DROP COLUMN id CASCADE")
+        assert not db.catalog.has_view("v")
+
     def test_drop_column_view_dependency_nested(self, db):
         db.execute_one("CREATE TABLE p (id INT, note TEXT)")
         db.execute_one("CREATE VIEW v1 AS SELECT note FROM p")

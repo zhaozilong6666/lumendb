@@ -313,6 +313,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
   当前查询、再逐个外层查找；编译后的外层列闭包沿 `EvalContext.parent` 取值。
   `_run_subquery` 在执行子查询计划前把外层行写入上下文变量，计划内新建的
   `EvalContext` 自动继承它，支持多层嵌套；当前按外层行逐次执行，未做去相关优化；
+  `_bind_subquery` 会把子查询 Binder 的表/列依赖合并回外层，保证带相关子查询的
+  视图仍能被 `DROP COLUMN ... CASCADE` 正确识别；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；每键独立处理
   `ASC/DESC` 与 `NULLS FIRST/LAST`（默认 ASC 时 NULL 最后、DESC 时 NULL 最前）；
 - `Limit`：跳 `offset`，取 `limit`；`WITH TIES` 时用排序键比较边界行，

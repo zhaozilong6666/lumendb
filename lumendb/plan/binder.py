@@ -711,9 +711,13 @@ class Binder:
         """
         return self._subquery_column_type(query, "标量子查询", schema)
 
-    def _subquery_column_type(
-        self, query, label: str, schema: Schema
-    ) -> TypeSpec:
+    def _bind_subquery(self, query, schema: Schema):
+        """绑定子查询并把它的表/列依赖合并回当前 Binder。
+
+        相关子查询的外层列引用发生在子查询 Binder 里；如果只把它当一次性
+        类型推断，视图的列级依赖会漏掉这些列，DROP COLUMN CASCADE 就无法
+        正确处理带相关子查询的视图。
+        """
         binder = Binder(
             self.catalog,
             self.params,
@@ -722,6 +726,14 @@ class Binder:
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)
         _, cols = binder.bind_select(query)
+        self.source_dependencies.update(binder.source_dependencies)
+        self.column_dependencies.update(binder.column_dependencies)
+        return cols
+
+    def _subquery_column_type(
+        self, query, label: str, schema: Schema
+    ) -> TypeSpec:
+        cols = self._bind_subquery(query, schema)
         if len(cols) != 1:
             raise BinderError(
                 f"{label}只能返回一列",
@@ -768,6 +780,7 @@ class Binder:
             raise NotSupportedError("子查询在当前上下文不可用")
         negated = expr.negated
         outer_schemas = [schema] + self.outer_schemas
+        self._bind_subquery(expr.query, schema)
 
         def _exists(ctx):
             rows = runner(expr.query, ctx, outer_schemas)
