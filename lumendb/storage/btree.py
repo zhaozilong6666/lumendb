@@ -21,8 +21,9 @@
    摘除，父节点只剩一个孩子时把孩子的页内容复制上来并降低树高（"塌陷"）。
    代价是节点可能偏稀疏（页利用率下降），空间回收交给 ``REINDEX``；
    收益是删除路径只有"摘除"和"塌陷"两种动作，正确性可以用属性测试穷举。
-4. **日志粒度是"变化区间"**：每次只记录 ``[首个变化字节, 最后一个变化字节]``，
-   区间定位按 128 字节块跳过相同前缀/后缀，避免逐字节比较。
+4. **日志粒度是"变化区间"**：把页内互不相连的变化拆成若干
+   ``[首个变化字节, 最后一个变化字节]`` 的小区间，区间之间的大片零区不写
+   进 WAL；区间定位与拆分见 ``_diff_ranges``。
 """
 
 from __future__ import annotations
@@ -51,6 +52,40 @@ LEAF_SLOT_SIZE = 2
 #: RID 在键里的哨兵值（页号 0 是元数据页，永远不会是堆页）
 MIN_RID = (0, 0)
 MAX_RID = (2**31 - 1, 2**31 - 1)
+
+
+def _diff_ranges(old: bytes, new: bytes) -> list[tuple[int, int]]:
+    """返回若干互不相连的 ``[first, last)`` 变化区间。
+
+    B+ 树叶子是 slotted page：头部的键数、页首的记录区、页尾的槽位目录
+    可能同时变化，中间夹着成片未变化的空闲区。按“变化游程 + 间隔”拆成
+    多条，比把中间零区一起写进 WAL 更省空间；间隔小于 8 字节时合并，
+    避免一条插入产生过多小记录。
+    """
+    size = len(old)
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    while i < size:
+        if old[i] == new[i]:
+            i += 1
+            continue
+        start = i
+        end = i + 1
+        i += 1
+        while i < size:
+            if old[i] != new[i]:
+                end = i + 1
+                i += 1
+                continue
+            # 向后看一段相同区；短间隔合并，长间隔断开成两条区间。
+            j = i
+            while j < size and old[j] == new[j]:
+                j += 1
+            if j - i >= 8 or j >= size:
+                break
+            i = j
+        ranges.append((start, end))
+    return ranges
 
 
 class _NodeOverflow(Exception):
@@ -325,27 +360,29 @@ class BPlusTree:
     def _commit_page(self, txn: Transaction, page: Page, new_buf: bytearray) -> None:
         """把新页内容写成"变化区间"日志，再更新页。
 
-        区间定位按 128 字节块跳过相同的前后缀：叶子插入通常只改记录区末尾
-        和页尾的槽位目录，逐字节比较会成为插入路径上最大的开销之一。
+        如果页中间有成片的未变化零区（叶子插入常见：槽位目录在页尾、
+        记录区在页首），拆成多条互不相连的 UPDATE 记录，避免把中间
+        零区也写进 WAL。多条记录仍按 pageLSN 顺序重放，恢复/复制语义
+        不变。
         """
         old = bytes(page.buf)
         newb = bytes(new_buf)
         if old == newb:
             return
-        block = 128
-        first = 0
-        while first < PAGE_SIZE and old[first : first + block] == newb[first : first + block]:
-            first += block
-        while first < PAGE_SIZE and old[first] == newb[first]:
-            first += 1
-
-        last = PAGE_SIZE
-        while last - block >= first and old[last - block : last] == newb[last - block : last]:
-            last -= block
-        while last > first and old[last - 1] == newb[last - 1]:
-            last -= 1
-
-        self._bp.log_page_update(txn.xid, page, first, old[first:last], newb[first:last])
+        ranges = _diff_ranges(old, newb)
+        if len(ranges) > 32:
+            # 变化过于零碎时退回单区间，避免一条插入产生几十条日志。
+            first = next(
+                i for i, (a, b) in enumerate(zip(old, newb)) if a != b
+            )
+            last = PAGE_SIZE
+            while last > first and old[last - 1] == newb[last - 1]:
+                last -= 1
+            ranges = [(first, last)]
+        for first, last in ranges:
+            self._bp.log_page_update(
+                txn.xid, page, first, old[first:last], newb[first:last]
+            )
         page.buf[:] = new_buf
         self._bp.mark_dirty(page)
 
