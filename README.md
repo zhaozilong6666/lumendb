@@ -24,7 +24,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 | 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
 | 查询执行 | 火山模型算子 + 哈希连接 + 等值/范围索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
 | 协议 | PostgreSQL v3 wire protocol（simple + extended query，支持 `$1` 参数绑定） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
-| 复制 | TCP 物理 WAL 流、基准备份、只读副本、LSN 延迟、手动提升 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
+| 复制 | TCP 物理 WAL 流、分块基准备份、只读副本、LSN 延迟、手动提升 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
 | 进程模型 | 数据目录独占锁（OS 级字节锁），拒绝双开 | `tests/unit/test_filelock.py`：第二个打开者必须失败 |
 
 ## 架构

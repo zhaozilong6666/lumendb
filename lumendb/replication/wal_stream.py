@@ -22,6 +22,7 @@ import base64
 import json
 import os
 import socket
+import tempfile
 import threading
 from pathlib import Path
 from typing import Iterable
@@ -122,6 +123,8 @@ class WALServer:
             kind = request.get("type")
             if kind == "backup":
                 self._handle_backup(conn)
+            elif kind == "backup_stream":
+                self._handle_backup_stream(conn, request)
             elif kind == "replicate":
                 self._handle_replicate(conn, request)
             elif kind == "ack":
@@ -158,6 +161,41 @@ class WALServer:
                 "data": base64.b64encode(data).decode("ascii"),
             },
         )
+
+    def _handle_backup_stream(self, conn: socket.socket, request: dict) -> None:
+        chunk_size = max(4096, min(int(request.get("chunk_size", 256 * 1024)), 8 * 1024 * 1024))
+        fd, temp_name = tempfile.mkstemp(prefix="lumendb-backup-", suffix=".data")
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            try:
+                checkpoint_lsn = self.primary.snapshot_file(temp_path)
+            except TransactionError as exc:
+                _send_line(conn, {"type": "error", "message": str(exc)})
+                return
+            retain = getattr(self.primary.wal, "retain_lsn", None)
+            if retain is not None:
+                self.primary.wal.retain_lsn = checkpoint_lsn
+            with open(temp_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(chunk_size)
+                    if not chunk:
+                        break
+                    _send_line(
+                        conn,
+                        {
+                            "type": "backup_chunk",
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                        },
+                    )
+            _send_line(
+                conn, {"type": "backup_end", "checkpoint_lsn": checkpoint_lsn}
+            )
+        finally:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
     def _handle_replicate(self, conn: socket.socket, request: dict) -> None:
         start_lsn = int(request.get("start_lsn", 0))
@@ -243,6 +281,33 @@ class WALClient:
                 sock.close()
             except OSError:
                 pass
+
+    def backup_to(self, target: str | Path, *, chunk_size: int = 256 * 1024) -> int:
+        """分块接收基准备份并落盘，返回基础 checkpoint LSN。"""
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".part")
+        try:
+            checkpoint_lsn = None
+            with open(tmp, "wb") as fh:
+                for data in self._request(
+                    {"type": "backup_stream", "chunk_size": chunk_size}
+                ):
+                    if data.get("type") == "backup_chunk":
+                        fh.write(base64.b64decode(data["data"]))
+                    elif data.get("type") == "backup_end":
+                        checkpoint_lsn = int(data["checkpoint_lsn"])
+                        break
+            if checkpoint_lsn is None:
+                raise StorageError("基准备份流没有结束标记")
+            os.replace(tmp, target)
+            return checkpoint_lsn
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def backup(self) -> tuple[bytes, int]:
         for data in self._request({"type": "backup"}):

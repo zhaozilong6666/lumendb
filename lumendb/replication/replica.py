@@ -93,7 +93,6 @@ class Replica:
         """通过 TCP 拉取主库基准备份并打开副本。"""
         from .wal_stream import WALClient
 
-        data, base_lsn = WALClient(host, port, timeout=timeout).backup()
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
         data_path = target / "lumendb.data"
@@ -102,7 +101,7 @@ class Replica:
                 "副本目录已经有数据文件",
                 hint="换一个空目录，或先手动确认旧副本可以删除",
             )
-        data_path.write_bytes(data)
+        base_lsn = WALClient(host, port, timeout=timeout).backup_to(data_path)
         return cls(target, applied_lsn=base_lsn)
 
     # ------------------------------------------------------------------

@@ -239,6 +239,22 @@ class Database:
             self.recovery.checkpoint()
             return self.disk.snapshot_bytes(), self.disk.meta.checkpoint_lsn
 
+    def snapshot_file(self, target: str | Path) -> int:
+        """与 :meth:`snapshot` 相同的写冻结语义，但把数据文件复制到 target。
+
+        这样大库不需要把整个数据文件读成 ``bytes``；服务端可以复制到临时
+        文件后再分块发送。返回基础 checkpoint LSN。
+        """
+        with self._write_lock:
+            if self.txns.active_xids:
+                raise TransactionError(
+                    "基准备份要求主库没有活跃事务",
+                    hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和复制",
+                )
+            self.recovery.checkpoint()
+            self.disk.copy_to(target)
+            return self.disk.meta.checkpoint_lsn
+
     def _maybe_checkpoint(self) -> None:
         """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。
 

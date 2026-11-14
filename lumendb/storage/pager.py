@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import struct
 from pathlib import Path
 from typing import Optional
@@ -255,6 +256,11 @@ class DiskManager:
         """
         self._fh.flush()
         return self.path.read_bytes()
+
+    def copy_to(self, target: str | Path) -> None:
+        """在调用方持锁时把数据文件复制到 target，不把整库读进内存。"""
+        self._fh.flush()
+        shutil.copyfile(self.path, Path(target))
 
     def close(self) -> None:
         if not self._fh.closed:

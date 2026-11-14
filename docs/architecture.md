@@ -294,7 +294,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 **基准备份写冻结**：`Database.snapshot()` 用 `_write_lock` 阻止新的写语句
 进入，要求 `txns.active_xids` 为空，然后先 checkpoint、再读取数据文件。读
 查询不走写锁，可以在备份期间继续；副本的基准备份因此不会包含未提交版本
-或 checkpoint 之后的混合页。
+或 checkpoint 之后的混合页。`snapshot_file()` 用同一条写锁路径把数据文件
+复制到目标，而不是读成 `bytes`；`WALServer.backup_stream` 再把临时文件按
+块发送，`WALClient.backup_to` 分块落盘，避免大库占用 Python 内存。
 
 **手动提升 fencing**：`PromotionFence` 是一个共享文件 marker，副本提升时
 原子写入 `promoted_node` 和 `lsn`；旧主库通过 `Database(write_fence=...)`
@@ -305,6 +307,7 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 - 复制槽只覆盖单个副本；主库重启时用 `Database(wal_retain_lsn=read_slot(...))`
   在恢复和自动 checkpoint 之前恢复保留点，避免启动顺序造成误回收；
+- 基准备份已分块传输，但仍是完整全量拷贝；没有增量/压缩备份；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - fencing 依赖共享 marker，自动故障切换、客户端重定向和租约都没有实现；

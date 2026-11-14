@@ -140,6 +140,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 - 复制槽只能在一个主库数据目录上持久化 `confirmed_lsn`；启动顺序已由
   `Database(wal_retain_lsn=read_slot(...))` 覆盖：在恢复和自动 checkpoint 之前
   就恢复保留点。仍只支持单副本。
+- 基准备份已改为 `snapshot_file` + `backup_stream` 分块传输，不再把整个
+  数据文件读成 bytes；仍未做增量/压缩基准备份。
 - 基准备份的写冻结依赖 `Database._write_lock`；它把主库写语句串行化，
   读查询仍可并发。跨进程/绕过 Database 的直接磁盘写不受保护。
 
