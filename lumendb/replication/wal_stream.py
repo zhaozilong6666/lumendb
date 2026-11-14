@@ -271,6 +271,8 @@ class WALServer:
                 self._handle_ack(conn, request)
             elif kind == "status":
                 self._handle_status(conn, request)
+            elif kind == "slots":
+                self._handle_slots(conn, request)
             else:
                 _send_line(
                     conn,
@@ -443,6 +445,14 @@ class WALServer:
             compress=compress,
         )
 
+    def _handle_slots(self, conn: socket.socket, request: dict) -> None:
+        compress = bool(request.get("compress"))
+        _send_line(
+            conn,
+            {"type": "slots", "slots": self.list_slots()},
+            compress=compress,
+        )
+
     def _handle_status(self, conn: socket.socket, request: dict) -> None:
         wal = self.primary.wal
         replica_id = self._replica_id(request)
@@ -505,6 +515,7 @@ class WALClient:
         ssl_context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
         replica_id: str | None = None,
+        follow_redirects: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -513,9 +524,12 @@ class WALClient:
         self.compress = compress
         self.ssl_context = ssl_context
         self.server_hostname = server_hostname or host
+        self._explicit_hostname = server_hostname is not None
         self.replica_id = replica_id
+        self.follow_redirects = follow_redirects
+        self.redirects = 0
 
-    def _request(self, payload: dict) -> Iterable[dict]:
+    def _request(self, payload: dict, _depth: int = 0) -> Iterable[dict]:
         payload = dict(payload)
         if self.token is not None:
             payload["token"] = self.token
@@ -537,9 +551,17 @@ class WALClient:
                 if data.get("type") == "error":
                     raise StorageError(data.get("message", "复制请求失败"))
                 if data.get("type") == "redirect":
-                    raise RedirectError(
-                        str(data.get("host", "")), int(data.get("port", 0))
-                    )
+                    target_host = str(data.get("host", ""))
+                    target_port = int(data.get("port", 0))
+                    if self.follow_redirects and _depth < 3:
+                        self.host = target_host
+                        self.port = target_port
+                        if not self._explicit_hostname:
+                            self.server_hostname = target_host
+                        self.redirects += 1
+                        yield from self._request(payload, _depth + 1)
+                        return
+                    raise RedirectError(target_host, target_port)
                 yield data
         finally:
             try:
@@ -636,6 +658,12 @@ class WALClient:
                     "confirmed_lsn": int(data.get("confirmed_lsn", 0)),
                 }
         return {"current_lsn": 0, "base_lsn": 0, "confirmed_lsn": 0}
+
+    def slots(self) -> dict[str, int]:
+        for data in self._request({"type": "slots"}):
+            if data.get("type") == "slots":
+                return {str(k): int(v) for k, v in data.get("slots", {}).items()}
+        return {}
 
     def fetch(self, start_lsn: int, max_records: int = 1000) -> list[LogRecord]:
         records: list[LogRecord] = []

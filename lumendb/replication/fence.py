@@ -58,6 +58,12 @@ class PromotionFence:
             )
 
     def promote(self, lsn: int = 0) -> None:
+        existing = self.read()
+        if existing is not None and int(existing.get("lsn", 0)) > int(lsn):
+            raise NotSupportedError(
+                "fence 中已有更高的提升 LSN，拒绝用旧副本覆盖",
+                detail=f"fence_lsn={existing.get('lsn')} requested={lsn}",
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "promoted_node": self.node_id,

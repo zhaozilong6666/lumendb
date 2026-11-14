@@ -39,6 +39,7 @@ class ReplicationMonitor:
         token: str | None = None,
         compress: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
         replica_id: str | None = None,
         auto_rebase: bool = True,
         poll_interval: float = 1.0,
@@ -49,6 +50,7 @@ class ReplicationMonitor:
         self.token = token
         self.compress = compress
         self.ssl_context = ssl_context
+        self.server_hostname = server_hostname
         self.replica_id = replica_id
         self.auto_rebase = auto_rebase
         self.poll_interval = max(0.05, float(poll_interval))
@@ -76,6 +78,7 @@ class ReplicationMonitor:
                 token=self.token,
                 compress=self.compress,
                 ssl_context=self.ssl_context,
+                server_hostname=self.server_hostname,
                 replica_id=self.replica_id,
             ).status()
             self.replica.replicate_from_server(
@@ -86,6 +89,7 @@ class ReplicationMonitor:
                 token=self.token,
                 compress=self.compress,
                 ssl_context=self.ssl_context,
+                server_hostname=self.server_hostname,
                 replica_id=self.replica_id,
             )
             self.failures = 0
@@ -112,6 +116,7 @@ class ReplicationMonitor:
                         token=self.token,
                         compress=self.compress,
                         ssl_context=self.ssl_context,
+                        server_hostname=self.server_hostname,
                         replica_id=self.replica_id,
                     )
                     self.failures = 0

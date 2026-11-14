@@ -234,6 +234,8 @@ class TestReplica:
             )
             assert (slots / "r1.confirmed").exists()
             assert (slots / "r2.confirmed").exists()
+            remote_slots = WALClient(server.host, server.port).slots()
+            assert remote_slots == {"r1": r1.applied_lsn, "r2": r2.applied_lsn}
         finally:
             for replica in (r1, r2):
                 if replica is not None:
@@ -583,3 +585,31 @@ class TestReplica:
         promoted.execute_one("INSERT INTO t VALUES (2, 'b')")
         assert promoted.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
         promoted.close()
+
+    def test_client_follows_server_redirect(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary.execute_one("INSERT INTO t VALUES (1)")
+        target = WALServer(primary).start()
+        redirect = WALServer(
+            primary, redirect_to=(target.host, target.port)
+        ).start()
+        try:
+            client = WALClient(
+                redirect.host, redirect.port, follow_redirects=True
+            )
+            status = client.status()
+            assert status["current_lsn"] > 0
+            assert client.host == target.host
+        finally:
+            redirect.stop()
+            target.stop()
+            primary.close()
+
+    def test_fence_rejects_stale_promotion_lsn(self, tmp_path):
+        fence_path = tmp_path / "fence.json"
+        PromotionFence(fence_path, node_id="a").promote(lsn=10)
+        with pytest.raises(NotSupportedError):
+            PromotionFence(fence_path, node_id="b").promote(lsn=5)
+        PromotionFence(fence_path, node_id="b").promote(lsn=11)
+        assert PromotionFence(fence_path, node_id="b").read()["lsn"] == 11
