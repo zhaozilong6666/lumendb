@@ -2832,6 +2832,11 @@ class Executor:
         wanted = list(columns)
         for idx in table.indexes.values():
             if idx.unique and list(idx.columns) == wanted:
+                if idx.deferrable:
+                    raise NotSupportedError(
+                        "可延迟唯一约束不能作为 ON CONFLICT 的仲裁者",
+                        hint="PostgreSQL 要求冲突仲裁索引必须是非延迟唯一索引",
+                    )
                 for name in wanted:
                     table.column_index(name)
                 return idx
@@ -2848,6 +2853,11 @@ class Executor:
         wanted = name.lower()
         for idx in table.indexes.values():
             if idx.unique and idx.name.lower() == wanted:
+                if idx.deferrable:
+                    raise NotSupportedError(
+                        "可延迟唯一约束不能作为 ON CONFLICT 的仲裁者",
+                        hint="PostgreSQL 要求冲突仲裁索引必须是非延迟唯一索引",
+                    )
                 return idx
         available = sorted(idx.name for idx in table.indexes.values() if idx.unique)
         raise BinderError(
@@ -2870,6 +2880,14 @@ class Executor:
             )
         if stmt.conflict_columns is not None:
             return self._conflict_index_for(table, stmt.conflict_columns)
+        if not stmt.on_conflict_nothing and stmt.on_conflict_update is None:
+            return None
+        unique = [idx for idx in table.indexes.values() if idx.unique]
+        if unique and all(idx.deferrable for idx in unique):
+            raise NotSupportedError(
+                "可延迟唯一约束不能作为 ON CONFLICT 的仲裁者",
+                hint="为该表建立非延迟唯一索引，或改用显式冲突目标",
+            )
         return None
 
     def _find_conflict_rid(

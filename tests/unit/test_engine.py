@@ -4266,6 +4266,23 @@ class TestForeignKey:
         with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
             db.execute_one("COMMIT")
 
+    def test_on_conflict_rejects_deferrable_unique(self, db):
+        db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        with pytest.raises(NotSupportedError, match="仲裁者"):
+            db.execute_one(
+                "INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING"
+            )
+        with pytest.raises(NotSupportedError, match="仲裁者"):
+            db.execute_one(
+                "INSERT INTO t VALUES (1) "
+                "ON CONFLICT ON CONSTRAINT t_id_key DO NOTHING"
+            )
+        with pytest.raises(NotSupportedError, match="仲裁者"):
+            db.execute_one(
+                "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING"
+            )
+
     def test_deferrable_unique_savepoint_rollback(self, db):
         db.execute_one(
             "CREATE TABLE t (id INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"

@@ -164,7 +164,9 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 检查时机：`DEFERRED` 让后续 DML 跟踪待检行，`IMMEDIATE` 会在语句结束时立即补检
 已积压的行；`ALL` 作用于所有 `DEFERRABLE` 外键以及 `DEFERRABLE` 的
 UNIQUE/PRIMARY KEY 约束，按名称指定非 `DEFERRABLE` 约束会明确报错。
-延迟唯一约束的积压重复键也由同一入口补检，错误为 `DuplicateKeyError`。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
+延迟唯一约束的积压重复键也由同一入口补检，错误为 `DuplicateKeyError`。
+延迟唯一索引不能作为 `ON CONFLICT` 的仲裁者：显式列/约束目标和无目标但
+表中只有延迟唯一索引时都会明确报 `NotSupportedError`（与 PostgreSQL 一致）。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
 更新被引用键时只要还有子行
 引用旧键就拒绝；`CASCADE` / `SET NULL` / `SET DEFAULT` 会按依赖顺序递归处理，
 并同步维护子表索引。`ON DELETE` / `ON UPDATE` 的 `SET NULL` / `SET DEFAULT`
