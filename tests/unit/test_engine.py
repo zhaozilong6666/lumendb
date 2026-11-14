@@ -4347,6 +4347,60 @@ class TestForeignKey:
             db.execute_one("INSERT INTO t VALUES ('b', 1)")
         db.execute_one("ROLLBACK")
 
+    def test_drop_constraint_cascade_clears_dependent_fk_mode(self, db):
+        db.execute_one("CREATE TABLE p (id INT UNIQUE DEFERRABLE)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) DEFERRABLE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS c_pid_fkey DEFERRED")
+        db.execute_one("ALTER TABLE p DROP CONSTRAINT p_id_key CASCADE")
+        db.execute_one(
+            "ALTER TABLE p ADD CONSTRAINT p_id_key UNIQUE (id)"
+        )
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT c_pid_fkey "
+            "FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE"
+        )
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("ROLLBACK")
+
+    def test_drop_index_cascade_clears_dependent_fk_mode(self, db):
+        db.execute_one("CREATE TABLE p (id INT)")
+        db.execute_one("CREATE UNIQUE INDEX uq_p ON p (id)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) DEFERRABLE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS c_pid_fkey DEFERRED")
+        db.execute_one("DROP INDEX uq_p CASCADE")
+        db.execute_one("CREATE UNIQUE INDEX uq_p ON p (id)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT c_pid_fkey "
+            "FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE"
+        )
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("ROLLBACK")
+
+    def test_alter_type_cascade_clears_dependent_fk_mode(self, db):
+        db.execute_one("CREATE TABLE p (id INT UNIQUE)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) DEFERRABLE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS c_pid_fkey DEFERRED")
+        db.execute_one("ALTER TABLE p ALTER COLUMN id TYPE BIGINT CASCADE")
+        db.execute_one("ALTER TABLE c ALTER COLUMN pid TYPE BIGINT")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT c_pid_fkey "
+            "FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE"
+        )
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("ROLLBACK")
+
     def test_rename_constraint_transfers_deferred_mode(self, db):
         db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
         db.execute_one("BEGIN")

@@ -1505,6 +1505,10 @@ class Executor:
                 and old_column.name in fk.ref_columns
             )
         ]
+        removed_constraints = (
+            {fk.name for fk in own_fk_dependents}
+            | {fk.name for _other, fk in ext_fk_dependents}
+        )
         if not stmt.cascade:
             if own_fk_dependents:
                 fk = own_fk_dependents[0]
@@ -1641,6 +1645,19 @@ class Executor:
             rebuilt, _entries = self._rebuild_indexes(table, txn)
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
+        old_modes = {
+            name: txn.constraint_modes[name]
+            for name in removed_constraints
+            if name in txn.constraint_modes
+        }
+        for name in old_modes:
+            txn.constraint_modes.pop(name, None)
+        if old_modes:
+
+            def undo_modes() -> None:
+                txn.constraint_modes.update(old_modes)
+
+            txn.undo_log.append(undo_modes)
         index_note = (
             f"；重建 {rebuilt} 个索引" if rebuilt else ""
         )
@@ -2438,13 +2455,20 @@ class Executor:
                 else:
                     cascade_note = ""
                 old_columns = list(table.columns)
-                old_mode = txn.constraint_modes.get(name)
+                dropped_names = {name} | {
+                    fk_name for _other, fk_name in dependents
+                }
+                old_modes = {
+                    n: txn.constraint_modes[n]
+                    for n in dropped_names
+                    if n in txn.constraint_modes
+                }
                 self._catalog.drop_index(txn, name)
-                txn.constraint_modes.pop(name, None)
+                for n in old_modes:
+                    txn.constraint_modes.pop(n, None)
 
                 def undo_mode() -> None:
-                    if old_mode is not None:
-                        txn.constraint_modes[name] = old_mode
+                    txn.constraint_modes.update(old_modes)
 
                 txn.undo_log.append(undo_mode)
                 if index.constraint_kind == "PRIMARY":
@@ -2645,6 +2669,19 @@ class Executor:
             if stmt.if_exists:
                 return Result(tag="DROP INDEX", notice="索引不存在，已跳过")
             raise
+        dropped_names = {name} | {fk_name for _other, fk_name in dependents}
+        old_modes = {
+            n: txn.constraint_modes[n]
+            for n in dropped_names
+            if n in txn.constraint_modes
+        }
+        for n in old_modes:
+            txn.constraint_modes.pop(n, None)
+
+        def undo_modes() -> None:
+            txn.constraint_modes.update(old_modes)
+
+        txn.undo_log.append(undo_modes)
         notice = (
             f"已级联删除 {len(dependents)} 个外键"
             if dependents
