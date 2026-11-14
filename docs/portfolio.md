@@ -69,8 +69,10 @@
 > - 实现物理复制与只读副本：新页首次修改写 `PAGE_IMAGE` 保证物理 WAL 自包含，
 >   `WALServer` 通过 TCP 提供基准备份和增量 WAL 流，`Replica` 按 LSN 重放页更新
 >   与事务状态、以 pageLSN 幂等、用 `replica.lsn` 断点续传，只读 `Database`
->   在语句入口拒绝写入，`lag_lsn` 量化延迟，并支持手动提升；
-> - 1010 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+>   在语句入口拒绝写入，`lag_lsn` 量化延迟；基准备份用 `Database.snapshot`
+>   冻结写路径、先 checkpoint 再读数据文件，手动提升用共享 `PromotionFence`
+>   marker 阻止旧主继续写；
+> - 1011 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -152,8 +154,10 @@
 >   streams base backups and incremental records, the replica applies page
 >   updates and transaction states in LSN order with pageLSN idempotence,
 >   resumes from an atomic `replica.lsn` marker, rejects writes at statement
->   entry, quantifies lag with `lag_lsn`, and supports manual promotion.
-> - 1010 automated tests including crash-injection and a 20-seed randomized
+>   entry, quantifies lag with `lag_lsn`; base backup freezes the write path
+>   with `Database.snapshot`, and manual promotion uses a shared
+>   `PromotionFence` marker to stop the old primary from writing.
+> - 1011 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

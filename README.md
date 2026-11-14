@@ -209,7 +209,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **1010 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1011 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -257,7 +257,8 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [ ] 按提交数触发的 checkpoint 策略
 - [x] 复制 / 只读副本（MVP）：TCP 物理 WAL 流、基准备份写冻结、只读拒绝写入、LSN 延迟、手动提升
 - [x] 复制槽：副本 ack 的 `confirmed_lsn` 原子持久化，服务重启恢复 WAL 保留点
-- [ ] 提升 fencing 与自动故障切换
+- [x] 手动提升 fencing：副本提升时原子写 marker，旧主通过写回调拒绝写入
+- [ ] 自动故障切换与客户端重定向
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。

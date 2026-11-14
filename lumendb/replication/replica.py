@@ -17,6 +17,7 @@ MVCC 可见性。记录可以直接来自同进程的 ``primary.wal``，也可�
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from ..engine.database import Database
@@ -24,6 +25,7 @@ from ..errors import StorageError, TransactionError
 from ..storage.txn import TxnState
 from ..storage.page import PageType
 from ..storage.wal import LogType, decode_page_image, decode_page_update
+from .fence import PromotionFence
 
 
 class Replica:
@@ -46,6 +48,8 @@ class Replica:
             wal_segment_bytes=wal_segment_bytes,
         )
         self._applied_lsn = applied_lsn
+        # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
+        self._lock = threading.RLock()
         self._write_marker()
 
     # ------------------------------------------------------------------
@@ -105,24 +109,27 @@ class Replica:
 
     @property
     def applied_lsn(self) -> int:
-        return self._applied_lsn
+        with self._lock:
+            return self._applied_lsn
 
     def lag_lsn(self, primary: Database) -> int:
         """尚未应用的 WAL 字节数；没有待应用记录时返回 0。"""
-        if next(primary.wal.iter_records(self._applied_lsn + 1), None) is None:
-            return 0
-        return max(1, primary.wal.next_lsn - self._applied_lsn)
+        with self._lock:
+            if next(primary.wal.iter_records(self._applied_lsn + 1), None) is None:
+                return 0
+            return max(1, primary.wal.next_lsn - self._applied_lsn)
 
     def apply_from_primary(self, primary: Database) -> int:
         """读取主库 WAL 中尚未应用的部分，返回本次应用的记录数。"""
-        base_lsn = getattr(primary.wal, "base_lsn", 0)
-        if base_lsn and self._applied_lsn + 1 < base_lsn:
-            raise StorageError(
-                "副本落后于主库已回收的 WAL，需要重新基准备份",
-                detail=f"applied_lsn={self._applied_lsn} base_lsn={base_lsn}",
-            )
-        records = primary.wal.iter_records(self._applied_lsn + 1)
-        return self.apply(records, primary=primary)
+        with self._lock:
+            base_lsn = getattr(primary.wal, "base_lsn", 0)
+            if base_lsn and self._applied_lsn + 1 < base_lsn:
+                raise StorageError(
+                    "副本落后于主库已回收的 WAL，需要重新基准备份",
+                    detail=f"applied_lsn={self._applied_lsn} base_lsn={base_lsn}",
+                )
+            records = primary.wal.iter_records(self._applied_lsn + 1)
+            return self.apply(records, primary=primary)
 
     def replicate_from_server(
         self,
@@ -133,46 +140,48 @@ class Replica:
         timeout: float = 10.0,
     ) -> int:
         """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
-        from .wal_stream import WALClient
+        with self._lock:
+            from .wal_stream import WALClient
 
-        records = WALClient(host, port, timeout=timeout).fetch(
-            self._applied_lsn, max_records=max_records
-        )
-        applied = self.apply(records, primary=None)
-        if applied:
-            WALClient(host, port, timeout=timeout).ack(self._applied_lsn)
-        return applied
+            records = WALClient(host, port, timeout=timeout).fetch(
+                self._applied_lsn, max_records=max_records
+            )
+            applied = self.apply(records, primary=None)
+            if applied:
+                WALClient(host, port, timeout=timeout).ack(self._applied_lsn)
+            return applied
 
     def apply(self, records, *, primary: Database | None = None) -> int:
-        count = 0
-        for record in records:
-            if record.lsn <= self._applied_lsn:
-                continue
-            if record.rtype == LogType.PAGE_IMAGE:
-                self._apply_page_image(record)
-            elif record.rtype in (LogType.UPDATE, LogType.CLR):
-                self._apply_page_update(record, primary)
-            elif record.rtype == LogType.BEGIN:
-                self.db.txns.note_replica_state(record.xid, TxnState.ACTIVE)
-            elif record.rtype == LogType.COMMIT:
-                self.db.txns.note_replica_state(record.xid, TxnState.COMMITTED)
-            elif record.rtype == LogType.ABORT:
-                self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
-            # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
-            self._applied_lsn = record.lsn
-            count += 1
+        with self._lock:
+            count = 0
+            for record in records:
+                if record.lsn <= self._applied_lsn:
+                    continue
+                if record.rtype == LogType.PAGE_IMAGE:
+                    self._apply_page_image(record)
+                elif record.rtype in (LogType.UPDATE, LogType.CLR):
+                    self._apply_page_update(record, primary)
+                elif record.rtype == LogType.BEGIN:
+                    self.db.txns.note_replica_state(record.xid, TxnState.ACTIVE)
+                elif record.rtype == LogType.COMMIT:
+                    self.db.txns.note_replica_state(record.xid, TxnState.COMMITTED)
+                elif record.rtype == LogType.ABORT:
+                    self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
+                # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
+                self._applied_lsn = record.lsn
+                count += 1
 
-        if count:
-            # 先把页写下去，再推进副本 LSN；崩溃后最多重放一段记录，
-            # pageLSN 会让重复应用变成幂等操作。
-            self.db.bp.flush_all()
-            self.db.catalog.load()
-            self._write_marker()
-            if primary is not None:
-                retain = getattr(primary.wal, "retain_lsn", None)
-                if retain is not None:
-                    primary.wal.retain_lsn = self._applied_lsn
-        return count
+            if count:
+                # 先把页写下去，再推进副本 LSN；崩溃后最多重放一段记录，
+                # pageLSN 会让重复应用变成幂等操作。
+                self.db.bp.flush_all()
+                self.db.catalog.load()
+                self._write_marker()
+                if primary is not None:
+                    retain = getattr(primary.wal, "retain_lsn", None)
+                    if retain is not None:
+                        primary.wal.retain_lsn = self._applied_lsn
+            return count
 
     def _apply_page_image(self, record) -> None:
         page_id, image = decode_page_image(record.payload)
@@ -219,17 +228,33 @@ class Replica:
     # ------------------------------------------------------------------
 
     def execute_one(self, sql: str, params=None):
-        return self.db.execute_one(sql, params)
+        with self._lock:
+            return self.db.execute_one(sql, params)
 
-    def promote(self) -> Database:
-        """关闭只读句柄并以读写模式重新打开，完成手动提升。"""
-        self.db.close()
-        self.db = Database(
-            self.path,
-            read_only=False,
-            checkpoint_wal_bytes=0,
-        )
-        return self.db
+    def promote(
+        self,
+        *,
+        fence_path: str | Path | None = None,
+        node_id: str = "replica",
+    ) -> Database:
+        """关闭只读句柄并以读写模式重新打开，完成手动提升。
+
+        若给出 ``fence_path``，先原子写入提升 marker；旧主库如果配置了同一
+        路径的 ``PromotionFence.assert_writable`` 写回调，就会在下一笔写语句
+        上拒绝，形成最小的防双写约束。没有自动选举和网络租约。
+        """
+        with self._lock:
+            if fence_path is not None:
+                PromotionFence(fence_path, node_id=node_id).promote(
+                    self._applied_lsn
+                )
+            self.db.close()
+            self.db = Database(
+                self.path,
+                read_only=False,
+                checkpoint_wal_bytes=0,
+            )
+            return self.db
 
 
 __all__ = ["Replica"]

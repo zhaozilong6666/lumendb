@@ -8,7 +8,7 @@ import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import NotSupportedError, TransactionError
-from lumendb.replication import Replica, WALServer
+from lumendb.replication import PromotionFence, Replica, WALServer
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.page import PageType
 
@@ -115,6 +115,27 @@ class TestReplica:
         assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
         primary.close()
         replica.db.close()
+
+    def test_promotion_fence_blocks_old_primary_writes(self, tmp_path):
+        fence_path = tmp_path / "promotion.fence"
+        primary_fence = PromotionFence(fence_path, node_id="primary")
+        primary = Database(
+            tmp_path / "primary",
+            checkpoint_wal_bytes=0,
+            write_fence=primary_fence.assert_writable,
+        )
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        primary.execute_one("INSERT INTO t VALUES (1, 'before')")
+        replica = Replica.bootstrap(primary, tmp_path / "replica")
+        primary.execute_one("INSERT INTO t VALUES (2, 'after')")
+        replica.apply_from_primary(primary)
+
+        replica.promote(fence_path=fence_path, node_id="replica")
+        with pytest.raises(NotSupportedError):
+            primary.execute_one("INSERT INTO t VALUES (3, 'stale')")
+        # 读仍然允许，旧主可以降级为只读观察者。
+        assert primary.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
+        primary.close()
 
     def test_snapshot_freezes_concurrent_writes(self, tmp_path, monkeypatch):
         primary = make_primary(tmp_path)

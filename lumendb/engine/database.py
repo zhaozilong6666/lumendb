@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
@@ -63,10 +63,12 @@ class Database:
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
+        write_fence: Optional[Callable[[], None]] = None,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        self._write_fence = write_fence
         # 写路径串行化：既保护单文件 DiskManager，也作为基准备份的写冻结门。
         self._write_lock = threading.RLock()
         self.disk = DiskManager(self.path / "lumendb.data")
@@ -125,6 +127,12 @@ class Database:
                 "只读副本拒绝写入",
                 hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
             )
+        if (
+            not self._read_only
+            and self._write_fence is not None
+            and type(statement).__name__ not in _PURE_READ_STATEMENTS
+        ):
+            self._write_fence()
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             with self._write_lock:
                 return self._run_unlocked(statement, params)

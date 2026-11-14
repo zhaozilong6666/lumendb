@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1010 passed。
+- 全量测试：1011 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -125,9 +125,14 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 事务，先 checkpoint 再读数据文件；新写语句被挡在锁外，读查询仍可继续。
 `WALServer.backup` 和 `Replica.bootstrap` 都走这条路径。
 
+**手动提升 fencing**：`Replica.promote(fence_path=..., node_id="replica")`
+先原子写提升 marker；旧主库用 `Database(write_fence=PromotionFence(...).assert_writable)`
+配置写回调，在 marker 指向别的节点时拒绝写语句。它依赖共享文件，不是自动
+选举或网络租约。
+
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
-- 提升 fencing（旧主降级、防止双写）、自动故障切换、客户端重定向。
+- 自动故障切换与客户端重定向。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
 - 副本查询与 apply 的并发调度；当前是单线程应用。
 - 复制槽只能在一个主库数据目录上持久化 `confirmed_lsn`；主库重启后若在

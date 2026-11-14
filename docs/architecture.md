@@ -290,14 +290,21 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 查询不走写锁，可以在备份期间继续；副本的基准备份因此不会包含未提交版本
 或 checkpoint 之后的混合页。
 
+**手动提升 fencing**：`PromotionFence` 是一个共享文件 marker，副本提升时
+原子写入 `promoted_node` 和 `lsn`；旧主库通过 `Database(write_fence=...)`
+在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它不做自动选举，
+也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
+
 当前边界（也是下一步）：
 
 - 复制槽只覆盖单个副本；主库重启后若在复制服务启动前自动 checkpoint，
   仍可能回收槽位之前的段，需要启动顺序约束；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
+- fencing 依赖共享 marker，自动故障切换、客户端重定向和租约都没有实现；
 - 复制连接没有认证/TLS，默认只应监听本机或可信网络；
-- 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，没有 fencing。
+- 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 只覆盖
+  共享 marker，没有自动租约。
 
 `Replica.promote()` 关闭只读 `Database`，以读写模式重新打开同一数据目录，
 返回可写 `Database`。副本只保留已应用的 WAL 前缀；主库尚未发送的尾段会在
