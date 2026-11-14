@@ -148,7 +148,8 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 则要求复合本地键全为 `NULL` 或全非 `NULL`，部分 `NULL` 直接抛
 `ForeignKeyViolationError`（SQLSTATE `23503`）。`MATCH PARTIAL` 暂不支持。删除动作默认
 `RESTRICT`，支持 `ON DELETE CASCADE` 递归删除子行、`ON DELETE SET NULL`
-将匹配子行的外键列置为 `NULL`，以及 `ON DELETE SET DEFAULT` 将匹配子行的外键列
+将匹配子行的外键列置为 `NULL`（可用 `SET NULL (col...)` 只置空指定列），以及
+`ON DELETE SET DEFAULT` 将匹配子行的外键列
 置为列默认值；更新被引用键默认 `RESTRICT`，支持 `ON UPDATE CASCADE` 递归同步
 子行、`ON UPDATE SET NULL` 置空和 `ON UPDATE SET DEFAULT` 置为列默认值（多级链
 和自引用链都会经过同一写路径）。`NO ACTION` 作为独立动作保留，缺省检查是立即的；
@@ -162,7 +163,10 @@ SIMPLE` 语义处理 NULL：本地键任一列为 `NULL` 时跳过检查；显�
 约束会明确报错。约束名在本引擎中按全局匹配，同名约束会一并切换。`RESTRICT` 下删除或
 更新被引用键时只要还有子行
 引用旧键就拒绝；`CASCADE` / `SET NULL` / `SET DEFAULT` 会按依赖顺序递归处理，
-并同步维护子表索引。`INSERT` / `UPDATE` 写入不存在的被引用键最终仍抛
+并同步维护子表索引。`ON DELETE` / `ON UPDATE` 的 `SET NULL` / `SET DEFAULT`
+支持 PostgreSQL 15 风格的 `(col...)` 列级动作：删除时未列出的外键列保持不变；
+更新时未列出的列写入新的父键值，列表中的列置 `NULL` 或写回默认值。`MATCH FULL`
+下只置空部分列会因部分 `NULL` 失败并回滚。`INSERT` / `UPDATE` 写入不存在的被引用键最终仍抛
 `ForeignKeyViolationError`（SQLSTATE `23503`）。
 外键定义（含删除/更新动作、`MATCH`、`DEFERRABLE` 标志、`validated` 状态）随目录 JSON 持久化，
 事务 undo 会恢复外键字典；支持自引用（同一张表内 `REFERENCES` 自身），自引用未显式
@@ -391,7 +395,7 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | 语法 | 原因 |
 |---|---|
 | `CHECK` 子查询 / 聚合 | 约束表达式必须是行内标量表达式，不能包含 `SELECT` / `WITH` 或聚合函数 |
-| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查；`ADD CONSTRAINT ... NOT VALID`（外键与 CHECK）+ `VALIDATE CONSTRAINT` 支持分批校验存量行 |
+| 外键级联 / 延迟检查 | `ON DELETE` 与 `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`；`MATCH` 支持 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`DEFERRABLE INITIALLY DEFERRED` 与事务内 `SET CONSTRAINTS ... DEFERRED/IMMEDIATE` 支持提交前/立即检查；`SET NULL` / `SET DEFAULT` 支持列级 `(col...)`；`ADD CONSTRAINT ... NOT VALID`（外键与 CHECK）+ `VALIDATE CONSTRAINT` 支持分批校验存量行 |
 | 触发器 / 存储过程 | 未实现 |
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |

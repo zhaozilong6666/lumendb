@@ -121,6 +121,9 @@ class ForeignKeyDef:
     ref_columns: tuple[str, ...]
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
+    #: SET NULL / SET DEFAULT 的列级动作；空表示作用于全部外键列。
+    on_delete_columns: tuple[str, ...] = ()
+    on_update_columns: tuple[str, ...] = ()
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False
@@ -136,6 +139,8 @@ class ForeignKeyDef:
             "ref_columns": list(self.ref_columns),
             "on_delete": self.on_delete,
             "on_update": self.on_update,
+            "on_delete_columns": list(self.on_delete_columns),
+            "on_update_columns": list(self.on_update_columns),
             "match_type": self.match_type,
             "deferrable": self.deferrable,
             "initially_deferred": self.initially_deferred,
@@ -151,6 +156,8 @@ class ForeignKeyDef:
             ref_columns=tuple(data["ref_columns"]),
             on_delete=data.get("on_delete", "RESTRICT"),
             on_update=data.get("on_update", "RESTRICT"),
+            on_delete_columns=tuple(data.get("on_delete_columns", ())),
+            on_update_columns=tuple(data.get("on_update_columns", ())),
             match_type=data.get("match_type", "SIMPLE"),
             deferrable=bool(data.get("deferrable", False)),
             initially_deferred=bool(data.get("initially_deferred", False)),

@@ -15,12 +15,12 @@
 | `MATCH FULL` | 完成 | 复合本地键必须全 `NULL` 或全非 `NULL`，部分 `NULL` 报错 |
 | `ON DELETE RESTRICT` | 完成 | 默认动作，阻止删除仍被引用的父行 |
 | `ON DELETE CASCADE` | 完成 | 递归删除子行，维护子表索引，支持多级链与自引用链 |
-| `ON DELETE SET NULL` | 完成 | 将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
-| `ON DELETE SET DEFAULT` | 完成 | 父行删除后把匹配子行写回列默认值；默认值不存在时回滚 |
+| `ON DELETE SET NULL` | 完成 | 将匹配子行的外键列置空（支持 `(col...)` 列级动作）；`NOT NULL` 子列会报错并回滚 |
+| `ON DELETE SET DEFAULT` | 完成 | 父行删除后把匹配子行写回列默认值（支持 `(col...)` 列级动作）；默认值不存在时回滚 |
 | `ON UPDATE RESTRICT` | 完成 | 默认动作，阻止更新仍被引用的父键 |
 | `ON UPDATE CASCADE` | 完成 | 父键更新后递归同步子行，支持多级链与自引用链 |
-| `ON UPDATE SET NULL` | 完成 | 父键更新后将匹配子行的外键列置空；`NOT NULL` 子列会报错并回滚 |
-| `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值；默认值不存在时回滚 |
+| `ON UPDATE SET NULL` | 完成 | 父键更新后将匹配子行的外键列置空（支持 `(col...)` 列级动作）；`NOT NULL` 子列会报错并回滚 |
+| `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值（支持 `(col...)` 列级动作）；默认值不存在时回滚 |
 | `NO ACTION` | 完成 | 独立动作；配合 `DEFERRABLE` 可提交时检查，否则立即拒绝 |
 | `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 支持事务内切换 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 默认先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT`、`NOT VALID` |
@@ -44,7 +44,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 ```
 
 `from_json` 对旧目录缺省为 `RESTRICT` / `SIMPLE`；`validate_table_def` 允许
-`RESTRICT` / `NO ACTION` / `CASCADE` / `SET NULL` / `SET DEFAULT` 和
+`RESTRICT` / `NO ACTION` / `CASCADE` / `SET NULL` / `SET DEFAULT`（后两者支持 `(col...)` 列级动作）和
 `SIMPLE` / `FULL`，非法动作或 MATCH 类型直接拒绝。`NO ACTION` 保留为独立动作，
 `DEFERRABLE` / `INITIALLY DEFERRED` 随目录持久化；`INITIALLY DEFERRED` 必须同时
 声明 `DEFERRABLE`。
@@ -121,7 +121,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 ## 3. 测试与验证
 
-- 全量测试：**889 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**896 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -210,7 +210,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 889 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 896 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

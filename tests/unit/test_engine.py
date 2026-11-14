@@ -4031,6 +4031,99 @@ class TestForeignKey:
         assert rows(db, "SELECT id FROM p") == [(1,)]
         assert rows(db, "SELECT pid FROM c") == [(1,)]
 
+    def test_on_delete_set_null_column_list(self, db):
+        db.execute_one(
+            "CREATE TABLE p (a INT, b INT, UNIQUE (a, b))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON DELETE SET NULL (a))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        db.execute_one("DELETE FROM p WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM c") == [(None, 2)]
+        fk = db.catalog.get_table("c").foreign_keys["c_a_b_fkey"]
+        assert fk.on_delete == "SET NULL"
+        assert fk.on_delete_columns == ("a",)
+
+    def test_on_delete_set_default_column_list(self, db):
+        db.execute_one(
+            "CREATE TABLE p (a INT, b INT, UNIQUE (a, b))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT DEFAULT 9, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON DELETE SET DEFAULT (a))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2), (9, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        db.execute_one("DELETE FROM p WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM c") == [(9, 2)]
+
+    def test_on_update_set_null_column_list(self, db):
+        db.execute_one(
+            "CREATE TABLE p (a INT, b INT, UNIQUE (a, b))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON UPDATE SET NULL (b))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        db.execute_one("UPDATE p SET b = 3 WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM c") == [(1, None)]
+
+    def test_on_delete_set_null_column_list_match_full_fails(self, db):
+        db.execute_one(
+            "CREATE TABLE p (a INT, b INT, UNIQUE (a, b))"
+        )
+        db.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) MATCH FULL "
+            "ON DELETE SET NULL (a))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1, 2)")
+        db.execute_one("INSERT INTO c VALUES (1, 2)")
+        with pytest.raises(ForeignKeyViolationError, match="MATCH FULL"):
+            db.execute_one("DELETE FROM p WHERE a = 1")
+        assert rows(db, "SELECT a, b FROM p") == [(1, 2)]
+        assert rows(db, "SELECT a, b FROM c") == [(1, 2)]
+
+    def test_alter_add_action_column_list(self, db):
+        db.execute_one("CREATE TABLE p (a INT, b INT, UNIQUE (a, b))")
+        db.execute_one("CREATE TABLE c (a INT, b INT)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON DELETE SET NULL (a) ON UPDATE SET DEFAULT (b)"
+        )
+        fk = db.catalog.get_table("c").foreign_keys["fk_c"]
+        assert fk.on_delete_columns == ("a",)
+        assert fk.on_update_columns == ("b",)
+
+    def test_action_columns_persist_across_reopen(self, tmp_path):
+        path = tmp_path / "action_cols"
+        database = Database(path)
+        database.execute_one(
+            "CREATE TABLE p (a INT, b INT, UNIQUE (a, b))"
+        )
+        database.execute_one(
+            "CREATE TABLE c (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES p(a, b) "
+            "ON DELETE SET NULL (a) ON UPDATE SET DEFAULT (b))"
+        )
+        database.close()
+        reopened = Database(path)
+        try:
+            fk = reopened.catalog.get_table("c").foreign_keys["c_a_b_fkey"]
+            assert fk.on_delete_columns == ("a",)
+            assert fk.on_update_columns == ("b",)
+        finally:
+            reopened.close()
+
     def test_on_delete_cascade_rollback(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(

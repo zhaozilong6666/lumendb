@@ -159,6 +159,27 @@ class TestCreateTable:
         assert delete_ref is not None
         assert delete_ref.on_delete == "SET DEFAULT"
 
+    def test_foreign_key_action_column_list(self):
+        from lumendb.errors import BinderError
+
+        stmt = parse_statement(
+            "CREATE TABLE t (a INT, b INT, "
+            "FOREIGN KEY (a, b) REFERENCES other(x, y) "
+            "ON DELETE SET NULL (a) ON UPDATE SET DEFAULT (b))"
+        )
+        fk = stmt.constraints[0]
+        assert fk.on_delete == "SET NULL"
+        assert fk.on_delete_columns == ["a"]
+        assert fk.on_update == "SET DEFAULT"
+        assert fk.on_update_columns == ["b"]
+
+        with pytest.raises(BinderError, match="不属于外键列"):
+            parse_statement(
+                "CREATE TABLE t (a INT, b INT, "
+                "FOREIGN KEY (a, b) REFERENCES other(x, y) "
+                "ON DELETE SET NULL (c))"
+            )
+
         update_stmt = parse_statement(
             "CREATE TABLE t (a INT REFERENCES other(id) ON UPDATE SET DEFAULT)"
         )

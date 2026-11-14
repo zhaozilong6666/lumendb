@@ -347,6 +347,9 @@ class ForeignKeySpec:
     name: Optional[str] = None
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
+    #: SET NULL / SET DEFAULT 的列级动作；空表示作用于全部外键列。
+    on_delete_columns: list[str] = field(default_factory=list)
+    on_update_columns: list[str] = field(default_factory=list)
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False
@@ -378,6 +381,9 @@ class TableConstraint:
     ref_columns: list[str] = field(default_factory=list)
     on_delete: str = "RESTRICT"
     on_update: str = "RESTRICT"
+    #: SET NULL / SET DEFAULT 的列级动作；空表示作用于全部外键列。
+    on_delete_columns: list[str] = field(default_factory=list)
+    on_update_columns: list[str] = field(default_factory=list)
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False

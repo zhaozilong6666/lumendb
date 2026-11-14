@@ -204,7 +204,7 @@ DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / 
 `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 默认先扫描存量行，再原子写入目录（即使约束
 声明为延迟，也先校验存量数据）；声明 `NOT VALID` 时跳过扫描并等待
 `VALIDATE CONSTRAINT`。当前
-`ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` /
+`ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`（后两者可带 `(col...)` 列级动作） /
 `NO ACTION`（显式 `NO ACTION` 保留；`DEFERRABLE` 可让它提交时检查），`MATCH` 支持
 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`ADD COLUMN ... REFERENCES`
 复用 `ADD CONSTRAINT FOREIGN KEY` 的存量行校验路径，先加列再原子建立外键，失败时

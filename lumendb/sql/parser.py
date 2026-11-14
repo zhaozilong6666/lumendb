@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..datatypes import DataType, TypeSpec
-from ..errors import NotSupportedError, SQLSyntaxError
+from ..errors import BinderError, NotSupportedError, SQLSyntaxError
 from .ast import (
     Between,
     Begin,
@@ -663,7 +663,7 @@ class Parser:
                     ref_columns.append(self._parse_ident("被引用列名"))
                 self._expect_punct("rparen", ")")
             match_type = self._parse_fk_match()
-            on_delete, on_update = self._parse_fk_actions()
+            on_delete, on_delete_columns, on_update, on_update_columns = self._parse_fk_actions(fk_columns)
             deferrable, initially_deferred = self._parse_fk_deferrability()
             not_valid = False
             if self._match_kw("NOT"):
@@ -677,6 +677,8 @@ class Parser:
                 ref_columns=ref_columns,
                 on_delete=on_delete,
                 on_update=on_update,
+                on_delete_columns=on_delete_columns,
+                on_update_columns=on_update_columns,
                 match_type=match_type,
                 deferrable=deferrable,
                 initially_deferred=initially_deferred,
@@ -769,7 +771,7 @@ class Parser:
                 ref_columns.append(self._parse_ident("被引用列名"))
             self._expect_punct("rparen", ")")
         match_type = self._parse_fk_match()
-        on_delete, on_update = self._parse_fk_actions()
+        on_delete, on_delete_columns, on_update, on_update_columns = self._parse_fk_actions(columns)
         deferrable, initially_deferred = self._parse_fk_deferrability()
         return ForeignKeySpec(
             columns=columns,
@@ -778,6 +780,8 @@ class Parser:
             name=name,
             on_delete=on_delete,
             on_update=on_update,
+            on_delete_columns=on_delete_columns,
+            on_update_columns=on_update_columns,
             match_type=match_type,
             deferrable=deferrable,
             initially_deferred=initially_deferred,
@@ -796,10 +800,32 @@ class Parser:
             hint="MATCH PARTIAL 暂不支持",
         )
 
-    def _parse_fk_actions(self) -> tuple[str, str]:
+    def _parse_fk_actions(
+        self, local_columns: list[str]
+    ) -> tuple[str, list[str], str, list[str]]:
         """解析外键 ON DELETE/UPDATE 动作；当前支持 RESTRICT / CASCADE / SET NULL。"""
         on_delete = "RESTRICT"
         on_update = "RESTRICT"
+        on_delete_columns: list[str] = []
+        on_update_columns: list[str] = []
+        local_names = {name.lower() for name in local_columns}
+
+        def parse_action_columns(action: str) -> list[str]:
+            if not self._match_punct("lparen"):
+                return []
+            columns = [self._parse_ident("列名")]
+            while self._match_punct("comma"):
+                columns.append(self._parse_ident("列名"))
+            self._expect_punct("rparen", ")")
+            if not columns:
+                raise self._error(f"{action} 的列列表不能为空")
+            for name in columns:
+                if name.lower() not in local_names:
+                    raise BinderError(
+                        f"{action} 列 {name!r} 不属于外键列"
+                    )
+            return columns
+
         while self._match_kw("ON"):
             if self._match_kw("DELETE"):
                 if self._match_kw("CASCADE"):
@@ -812,8 +838,14 @@ class Parser:
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_delete = "SET NULL"
+                        on_delete_columns = parse_action_columns(
+                            "ON DELETE SET NULL"
+                        )
                     elif self._match_kw("DEFAULT"):
                         on_delete = "SET DEFAULT"
+                        on_delete_columns = parse_action_columns(
+                            "ON DELETE SET DEFAULT"
+                        )
                     else:
                         raise NotSupportedError(
                             "外键 ON DELETE 的 SET 动作只支持 SET NULL / SET DEFAULT",
@@ -835,8 +867,14 @@ class Parser:
                 elif self._match_kw("SET"):
                     if self._match_kw("NULL"):
                         on_update = "SET NULL"
+                        on_update_columns = parse_action_columns(
+                            "ON UPDATE SET NULL"
+                        )
                     elif self._match_kw("DEFAULT"):
                         on_update = "SET DEFAULT"
+                        on_update_columns = parse_action_columns(
+                            "ON UPDATE SET DEFAULT"
+                        )
                     else:
                         raise NotSupportedError(
                             "外键 ON UPDATE 的 SET 动作只支持 SET NULL / SET DEFAULT",
@@ -849,7 +887,7 @@ class Parser:
                     )
             else:
                 raise self._error("ON 之后期望 DELETE 或 UPDATE")
-        return on_delete, on_update
+        return on_delete, on_delete_columns, on_update, on_update_columns
 
     def _parse_fk_deferrability(self) -> tuple[bool, bool]:
         """解析 ``[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]``。

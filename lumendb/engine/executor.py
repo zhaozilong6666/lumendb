@@ -1032,6 +1032,8 @@ class Executor:
                 ref_columns=ref_columns,
                 on_delete=spec.on_delete,
                 on_update=spec.on_update,
+                on_delete_columns=tuple(spec.on_delete_columns),
+                on_update_columns=tuple(spec.on_update_columns),
                 match_type=spec.match_type,
                 deferrable=spec.deferrable,
                 initially_deferred=spec.initially_deferred,
@@ -1053,6 +1055,8 @@ class Executor:
                     name=constraint.name,
                     on_delete=constraint.on_delete,
                     on_update=constraint.on_update,
+                    on_delete_columns=list(constraint.on_delete_columns),
+                    on_update_columns=list(constraint.on_update_columns),
                     match_type=constraint.match_type,
                     deferrable=constraint.deferrable,
                     initially_deferred=constraint.initially_deferred,
@@ -2013,6 +2017,8 @@ class Executor:
                 ref_columns=ref_columns,
                 on_delete=constraint.on_delete,
                 on_update=constraint.on_update,
+                on_delete_columns=tuple(constraint.on_delete_columns),
+                on_update_columns=tuple(constraint.on_update_columns),
                 match_type=constraint.match_type,
                 deferrable=constraint.deferrable,
                 initially_deferred=constraint.initially_deferred,
@@ -2997,11 +3003,22 @@ class Executor:
                         pending[child_ident] = entry
                     else:
                         child_new = entry[3]
+                    action_columns = (
+                        fk.on_update_columns
+                        if fk.on_update in ("SET NULL", "SET DEFAULT")
+                        else ()
+                    ) or fk.columns
                     for local_name, ref_name in zip(fk.columns, fk.ref_columns):
                         index = child.column_index(local_name)
-                        if fk.on_update == "SET NULL":
+                        if (
+                            fk.on_update == "SET NULL"
+                            and local_name in action_columns
+                        ):
                             child_new[index] = None
-                        elif fk.on_update == "SET DEFAULT":
+                        elif (
+                            fk.on_update == "SET DEFAULT"
+                            and local_name in action_columns
+                        ):
                             child_new[index] = child.columns[index].default
                         else:
                             child_new[index] = new_values[
@@ -3776,7 +3793,8 @@ class Executor:
                         if ident in deleted or ident in processing:
                             continue
                         child_new = list(child_values)
-                        for name in fk.columns:
+                        action_columns = fk.on_delete_columns or fk.columns
+                        for name in action_columns:
                             child_new[child.column_index(name)] = None
                         self._rewrite_row(
                             child,
@@ -3800,7 +3818,8 @@ class Executor:
                             deferred[ident] = entry
                         else:
                             child_new = entry[3]
-                        for name in fk.columns:
+                        action_columns = fk.on_delete_columns or fk.columns
+                        for name in action_columns:
                             index = child.column_index(name)
                             child_new[index] = child.columns[index].default
                     continue
