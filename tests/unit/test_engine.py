@@ -4124,6 +4124,39 @@ class TestForeignKey:
         finally:
             reopened.close()
 
+    def test_on_delete_cascade_self_cycle(self, db):
+        db.execute_one(
+            "CREATE TABLE node (id INT PRIMARY KEY, parent_id INT "
+            "REFERENCES node(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO node VALUES (1, NULL), (2, 1), (3, 2)")
+        db.execute_one("UPDATE node SET parent_id = 3 WHERE id = 1")
+        db.execute_one("DELETE FROM node WHERE id = 1")
+        assert rows(db, "SELECT COUNT(*) FROM node") == [(0,)]
+
+    def test_on_delete_cascade_diamond(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c1 (id INT PRIMARY KEY, pid INT "
+            "REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one(
+            "CREATE TABLE c2 (id INT PRIMARY KEY, pid INT "
+            "REFERENCES p(id) ON DELETE CASCADE)"
+        )
+        db.execute_one(
+            "CREATE TABLE g (id INT PRIMARY KEY, "
+            "c1 INT REFERENCES c1(id) ON DELETE CASCADE, "
+            "c2 INT REFERENCES c2(id) ON DELETE CASCADE)"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c1 VALUES (10, 1)")
+        db.execute_one("INSERT INTO c2 VALUES (20, 1)")
+        db.execute_one("INSERT INTO g VALUES (100, 10, 20)")
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        for table in ("p", "c1", "c2", "g"):
+            assert rows(db, f"SELECT COUNT(*) FROM {table}") == [(0,)]
+
     def test_on_delete_cascade_rollback(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one(
