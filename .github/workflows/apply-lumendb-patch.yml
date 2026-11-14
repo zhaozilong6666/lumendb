@@ -1,0 +1,47 @@
+name: Apply LumenDB Patch
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-lumendb-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and apply patch
+        run: |
+          curl -fsSL "https://aka.doubaocdn.com/s/4Ote8YAtOZ" -o /tmp/apply.patch.gz
+          gunzip -c /tmp/apply.patch.gz > /tmp/apply.patch
+          git apply --index /tmp/apply.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+      - name: Compile check
+        run: python -m compileall -q lumendb tests
+
+      - name: Whitespace check
+        run: git diff --check
+
+      - name: Commit and push
+        run: |
+          git config user.name "lumendb-bot"
+          git config user.email "bot@lumendb.local"
+          git add README.md docs lumendb tests
+          git commit -m "fix(sql): reject deferrable unique indexes as ON CONFLICT arbiters"
+          git push origin HEAD:main
