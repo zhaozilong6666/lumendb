@@ -284,6 +284,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 起点保留 WAL；`WALServer` 可配置一个 `slot_path`，客户端 `ack` 后把
 `confirmed_lsn` 原子写盘，服务重启时重新装载并恢复保留点。若起点已经落在
 已回收段之前，服务端返回明确错误，要求重新基准备份，避免静默丢段。
+`status` 请求返回 `last_lsn` / `base_lsn` / `confirmed_lsn`；`last_lsn` 是最后
+一条记录自身的 LSN，不是 `next_lsn` 字节偏移，副本的 `lag_from_server` 用它
+计算真实落后量。
 主库重启时应在打开 `Database` 前读槽位，并用
 `Database(wal_retain_lsn=read_slot(slot_path))` 把保留点放回 WAL；这比“先开库、
 再启动 WALServer”更安全。

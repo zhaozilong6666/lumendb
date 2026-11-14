@@ -119,6 +119,17 @@ class Replica:
                 return 0
             return max(1, primary.wal.next_lsn - self._applied_lsn)
 
+    def lag_from_server(
+        self, host: str, port: int, *, timeout: float = 10.0
+    ) -> int:
+        """通过 TCP 读取主库当前 LSN，计算尚未应用的字节数。"""
+        from .wal_stream import WALClient
+
+        with self._lock:
+            status = WALClient(host, port, timeout=timeout).status()
+            lag = status["current_lsn"] - self._applied_lsn
+            return max(0, lag)
+
     def apply_from_primary(self, primary: Database) -> int:
         """读取主库 WAL 中尚未应用的部分，返回本次应用的记录数。"""
         with self._lock:

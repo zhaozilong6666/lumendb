@@ -69,6 +69,7 @@ class SegmentedWAL(WAL):
         self._current_size = 0
         self._size = 0
         self._next_lsn = 1
+        self._last_lsn = 0
         #: 下游副本仍需要的 LSN；为 0 表示没有保留约束。
         self._retain_lsn = 0
 
@@ -83,6 +84,7 @@ class SegmentedWAL(WAL):
                         fh.truncate(valid_end)
                 self._size = records[-1].lsn
                 self._next_lsn = records[-1].lsn + len(records[-1].encode())
+                self._last_lsn = records[-1].lsn
                 self._fh = open(last, "ab")
                 self._current_path = last
                 self._current_size = valid_end
@@ -99,6 +101,7 @@ class SegmentedWAL(WAL):
                                 fh.truncate(valid_end)
                         self._size = records[-1].lsn
                         self._next_lsn = records[-1].lsn + len(records[-1].encode())
+                        self._last_lsn = records[-1].lsn
                         self._fh = open(last, "ab")
                         self._current_path = last
                         self._current_size = valid_end
@@ -149,6 +152,7 @@ class SegmentedWAL(WAL):
             data = record.encode()
             self._pending.append((lsn, data))
             self._next_lsn += len(data)
+            self._last_lsn = lsn
             return lsn
 
     def _ensure_current(self, first_lsn: int) -> None:

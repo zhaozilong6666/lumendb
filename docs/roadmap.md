@@ -112,6 +112,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
      `ABORT`。主库 WAL 的 `retain_lsn` 会按副本请求起点保留记录；`WALServer`
      可配置 `slot_path`，把副本 ack 的 `confirmed_lsn` 原子持久化，并在服务
      重启时恢复保留点。若副本落后于已回收段，明确报错要求重新基准备份。
+     `status` 请求返回主库 `last_lsn`、WAL `base_lsn` 和槽位 `confirmed_lsn`，
+     `Replica.lag_from_server` 用它计算网络延迟。
 2. 只读副本：副本拒绝写入，提供快照读；延迟以 LSN 衡量。
    - **已完成（垂直切片）**：`Database(read_only=True)` 在 `_run` 入口拒绝
      非白名单语句；`Replica.lag_lsn` 返回待应用字节数；副本 LSN 以

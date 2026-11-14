@@ -8,7 +8,12 @@ import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import NotSupportedError, TransactionError
-from lumendb.replication import PromotionFence, Replica, WALServer
+from lumendb.replication import (
+    PromotionFence,
+    Replica,
+    WALClient,
+    WALServer,
+)
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.page import PageType
 
@@ -85,7 +90,13 @@ class TestReplica:
             )
             assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
             primary.execute_one("INSERT INTO t VALUES (1, 'net')")
+            status = WALClient(server.host, server.port).status()
+            assert status["current_lsn"] > 0
+            assert status["confirmed_lsn"] == 0
+            assert replica.lag_from_server(server.host, server.port) > 0
             assert replica.replicate_from_server(server.host, server.port) > 0
+            assert replica.lag_from_server(server.host, server.port) == 0
+            assert WALClient(server.host, server.port).status()["confirmed_lsn"] == replica.applied_lsn
             assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
         finally:
             if replica is not None:

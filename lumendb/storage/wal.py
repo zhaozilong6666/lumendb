@@ -157,10 +157,20 @@ class WAL:
         self._size = os.path.getsize(self.path) if existed else 0
         self._pending = bytearray()
         self._next_lsn = self._size + 1
+        self._last_lsn = 0
         # 多个提交线程可能同时追加；文件写入与 pending 必须成组保护。
         self._lock = threading.RLock()
+        if self._size:
+            for record in self.iter_records(1):
+                self._last_lsn = record.lsn
 
     # -- 属性 ---------------------------------------------------------------
+
+    @property
+    def last_lsn(self) -> int:
+        """最后一条记录自身的 LSN（不是下一条的字节偏移）。"""
+        with self._lock:
+            return self._last_lsn
 
     @property
     def next_lsn(self) -> int:
@@ -182,6 +192,7 @@ class WAL:
             data = rec.encode()
             self._pending += data
             self._next_lsn += len(data)
+            self._last_lsn = lsn
             return lsn
 
     def begin(self, xid: int) -> int:

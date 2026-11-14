@@ -126,6 +126,8 @@ class WALServer:
                 self._handle_replicate(conn, request)
             elif kind == "ack":
                 self._handle_ack(conn, request)
+            elif kind == "status":
+                self._handle_status(conn)
             else:
                 _send_line(conn, {"type": "error", "message": "未知复制请求"})
         except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -181,6 +183,18 @@ class WALServer:
             if max_records and count >= max_records:
                 break
         _send_line(conn, {"type": "end", "next_lsn": self.primary.wal.next_lsn})
+
+    def _handle_status(self, conn: socket.socket) -> None:
+        wal = self.primary.wal
+        _send_line(
+            conn,
+            {
+                "type": "status",
+                "current_lsn": int(getattr(wal, "last_lsn", 0)),
+                "base_lsn": getattr(wal, "base_lsn", 0),
+                "confirmed_lsn": self._confirmed_lsn,
+            },
+        )
 
     def _handle_ack(self, conn: socket.socket, request: dict) -> None:
         lsn = max(0, int(request.get("lsn", 0)))
@@ -244,6 +258,17 @@ class WALClient:
             if data.get("type") == "ack":
                 return int(data["confirmed_lsn"])
         return 0
+
+    def status(self) -> dict:
+        """读取主库当前 LSN、WAL 基础 LSN 和槽位确认 LSN。"""
+        for data in self._request({"type": "status"}):
+            if data.get("type") == "status":
+                return {
+                    "current_lsn": int(data.get("current_lsn", 0)),
+                    "base_lsn": int(data.get("base_lsn", 0)),
+                    "confirmed_lsn": int(data.get("confirmed_lsn", 0)),
+                }
+        return {"current_lsn": 0, "base_lsn": 0, "confirmed_lsn": 0}
 
     def fetch(self, start_lsn: int, max_records: int = 1000) -> list[LogRecord]:
         records: list[LogRecord] = []
