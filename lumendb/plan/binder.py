@@ -59,6 +59,7 @@ from .cost import (
     OTHER_SELECTIVITY,
     RANGE_SELECTIVITY,
     aggregate_estimate,
+    choose_build_side,
     distinct_estimate,
     filter_estimate,
     join_estimate,
@@ -1657,6 +1658,8 @@ class Binder:
                 hash_keys, hash_labels = self._equi_keys(
                     on_expr, merged, len(schema)
                 )
+            left_est = self._node_estimate(node)
+            right_est = self._node_estimate(sub_node)
             node = Join(
                 left=node,
                 right=sub_node,
@@ -1665,10 +1668,12 @@ class Binder:
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
                 hash_keys=hash_keys,
                 hash_labels=hash_labels,
+                build_left=(
+                    bool(hash_keys)
+                    and choose_build_side(left_est, right_est) == "left"
+                ),
                 estimated=join_estimate(
-                    self._node_estimate(node),
-                    self._node_estimate(sub_node),
-                    equi_keys=len(hash_keys),
+                    left_est, right_est, equi_keys=len(hash_keys)
                 ),
             )
             schema = merged
@@ -1850,6 +1855,8 @@ class Binder:
                 hash_keys, hash_labels = self._equi_keys(
                     join.on, merged, len(schema)
                 )
+            left_est = self._node_estimate(node)
+            right_est = self._node_estimate(right_node)
             node = Join(
                 left=node,
                 right=right_node,
@@ -1858,10 +1865,13 @@ class Binder:
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
                 hash_keys=hash_keys,
                 hash_labels=hash_labels,
+                build_left=(
+                    join.kind == "INNER"
+                    and bool(hash_keys)
+                    and choose_build_side(left_est, right_est) == "left"
+                ),
                 estimated=join_estimate(
-                    self._node_estimate(node),
-                    self._node_estimate(right_node),
-                    equi_keys=len(hash_keys),
+                    left_est, right_est, equi_keys=len(hash_keys)
                 ),
             )
             schema = merged

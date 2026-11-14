@@ -658,6 +658,9 @@ class Executor:
 
     def _hash_join(self, node: Join, txn: Transaction) -> Iterator[tuple]:
         assert node.left is not None and node.right is not None
+        if node.build_left and node.kind == "INNER":
+            yield from self._hash_join_build_left(node, txn)
+            return
         right_rows = list(self._execute(node.right, txn))
         right_width = len(node.right.columns)
         left_keys = [pair[0] for pair in node.hash_keys]
@@ -682,6 +685,30 @@ class Executor:
                     yield combined
             if node.kind == "LEFT" and not matched:
                 yield tuple(left) + (None,) * right_width
+
+    def _hash_join_build_left(
+        self, node: Join, txn: Transaction
+    ) -> Iterator[tuple]:
+        """INNER 哈希连接的反向形态：左侧建表，右侧流式探测。"""
+        assert node.left is not None and node.right is not None
+        left_rows = list(self._execute(node.left, txn))
+        left_keys = [pair[0] for pair in node.hash_keys]
+        right_keys = [pair[1] for pair in node.hash_keys]
+
+        buckets: dict[tuple, list[tuple]] = {}
+        for left in left_rows:
+            key = tuple(left[i] for i in left_keys)
+            if any(value is None for value in key):
+                continue
+            buckets.setdefault(key, []).append(tuple(left))
+
+        for right in self._execute(node.right, txn):
+            key = tuple(right[i] for i in right_keys)
+            matches = () if any(v is None for v in key) else buckets.get(key, ())
+            for left in matches:
+                combined = left + tuple(right)
+                if node.on is None or _truthy(node.on(EvalContext(combined))):
+                    yield combined
 
     def _aggregate(self, node: Aggregate, txn: Transaction) -> Iterator[tuple]:
         assert node.child is not None

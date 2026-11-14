@@ -197,6 +197,8 @@ class Join(PlanNode):
     hash_keys: tuple[tuple[int, int], ...] = ()
     #: EXPLAIN 用的可读键名，如 ``a.id = b.id``
     hash_labels: tuple[str, ...] = ()
+    #: 哈希连接是否构建左表；仅对 INNER 生效，默认构建右表
+    build_left: bool = False
 
     def children(self):
         return [c for c in (self.left, self.right) if c is not None]
@@ -204,7 +206,8 @@ class Join(PlanNode):
     def describe(self) -> str:
         if self.hash_keys and self.kind in ("INNER", "LEFT"):
             keys = ", ".join(self.hash_labels) or "?"
-            return f"HashJoin ({self.kind}) on {keys}"
+            build = "left" if self.build_left else "right"
+            return f"HashJoin ({self.kind}) on {keys} [build={build}]"
         return f"{self.kind} Join"
 
 

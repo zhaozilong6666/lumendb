@@ -442,6 +442,8 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
   会走索引；范围谓词仍由上层 `Filter` 复核。`AND` 组合的多个条件暂不合并成索引区间。
 - `DISTINCT` 在 `ORDER BY` 之前生效（按输出列去重，隐藏排序键不参与）。
 - `LEFT JOIN` 的右侧无匹配时补 `NULL`；`RIGHT JOIN` 的左侧、`FULL JOIN` 的两侧同理。
+- 哈希连接默认构建右侧；`INNER` 连接若左侧估算更小则构建左侧，`EXPLAIN`
+  会显示 `[build=left/right]`。
 - `CROSS JOIN` 与逗号连接等价，不写 `ON`。逗号连接会从 `WHERE` 顶层 `AND`
   中提取跨表的 `列 = 列` 作为哈希键；完整 `WHERE` 仍保留为 `Filter` 兜底。
 - 3–8 个无显式 `JOIN` 的逗号连接源可能被代价模型重排；输出列顺序会还原为

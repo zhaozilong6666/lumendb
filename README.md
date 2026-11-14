@@ -206,7 +206,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **978 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **979 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -240,7 +240,8 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 等值与范围的索引选择（`EXPLAIN` 可见）
 - [x] PostgreSQL wire protocol（simple + extended query，支持 `$1` 参数绑定）
 - [x] `VACUUM`：回收死版本、压实堆页、重建索引（要求无并发事务）
-- [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接/投影/聚合/排序/集合/`LIMIT` 基数与 CPU 估算，`EXPLAIN` 输出 `rows≈/cpu≈` 标注，并作为贪心连接顺序的输入
+- [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接/投影/聚合/排序/集合/`LIMIT` 基数与 CPU 估算，`EXPLAIN` 输出 `rows≈/cpu≈` 标注，并作为贪心连接顺序与哈希构建侧选择的输入
+- [x] 哈希连接构建侧选择：INNER 连接按估算选择较小的一侧建表，`EXPLAIN` 显示 `[build=left/right]`
 - [x] 贪心左深连接顺序：3–8 个无显式 `JOIN` 的 `FROM` 源按等值边选择起点与下一步；输出列顺序由投影还原；显式 `JOIN`、外连接、超过 8 源保持原序
 - [ ] 动态规划连接顺序枚举（当前是贪心，非全局最优）
 - [x] 唯一/主键约束 `DEFERRABLE`：事务内暂存重复键，`COMMIT` 或 `SET CONSTRAINTS ... IMMEDIATE` 时统一校验

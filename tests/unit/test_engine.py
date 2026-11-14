@@ -1883,6 +1883,21 @@ class TestJoin:
         )
         assert "HashJoin" not in plan
 
+    def test_hash_join_builds_smaller_left_side(self, db):
+        db.execute_one("CREATE TABLE l (id INT)")
+        db.execute_one("CREATE TABLE r (id INT)")
+        db.execute_one("INSERT INTO l VALUES (1)")
+        for i in range(1, 101):
+            db.execute_one(f"INSERT INTO r VALUES ({i})")
+        plan = "\n".join(
+            r[0]
+            for r in rows(db, "EXPLAIN SELECT l.id FROM l JOIN r ON l.id = r.id")
+        )
+        assert "[build=left]" in plan
+        assert rows(
+            db, "SELECT l.id FROM l JOIN r ON l.id = r.id"
+        ) == [(1,)]
+
     def test_hash_join_composite_key(self, db):
         db.execute_one("CREATE TABLE a (id INT, x INT)")
         db.execute_one("CREATE TABLE b (id INT, y INT)")
