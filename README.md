@@ -206,7 +206,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **959 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **966 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -240,6 +240,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 等值与范围的索引选择（`EXPLAIN` 可见）
 - [x] PostgreSQL wire protocol（simple + extended query，支持 `$1` 参数绑定）
 - [x] `VACUUM`：回收死版本、压实堆页、重建索引（要求无并发事务）
+- [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接基数与 CPU 估算（尚未接入连接顺序枚举）
 - [x] 唯一/主键约束 `DEFERRABLE`：事务内暂存重复键，`COMMIT` 或 `SET CONSTRAINTS ... IMMEDIATE` 时统一校验
 - [x] 外键：`MATCH SIMPLE/FULL`、`RESTRICT/CASCADE/SET NULL/SET DEFAULT/NO ACTION`、`DEFERRABLE INITIALLY DEFERRED` 提交时检查、`SET CONSTRAINTS` 事务内切换、`ALTER CONSTRAINT` 修改延迟属性、`ALTER TABLE` 外键 DDL、`SET NULL/SET DEFAULT (col...)` 列级动作、`ADD CONSTRAINT ... NOT VALID`（外键/CHECK）与 `VALIDATE CONSTRAINT`
 - [ ] 外键 `MATCH PARTIAL`
@@ -247,6 +248,9 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 相关子查询
 - [ ] 组提交与 WAL 分段回收
 - [ ] 复制 / 只读副本
+
+长期分层路线、阶段依赖与“不青黄不接”的完成标准见
+[`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 想把它讲出来
 

@@ -1,0 +1,65 @@
+"""代价模型单元测试。"""
+
+from __future__ import annotations
+
+import pytest
+
+from lumendb.plan.cost import (
+    DEFAULT_ROWS,
+    MIN_SELECTIVITY,
+    choose_build_side,
+    equality_selectivity,
+    filter_estimate,
+    join_estimate,
+    scan_estimate,
+    unknown_estimate,
+)
+
+
+def test_scan_estimate_uses_row_hint_and_clamps_empty_table():
+    assert scan_estimate(0).rows == 1
+    assert scan_estimate(120).rows == 120
+    assert scan_estimate(120, indexed=True).cpu < scan_estimate(120).cpu
+    assert scan_estimate(120).confidence == "stats"
+
+
+def test_unknown_estimate_is_conservative():
+    est = unknown_estimate()
+    assert est.rows == DEFAULT_ROWS
+    assert est.confidence == "default"
+
+
+def test_filter_estimate_clamps_selectivity():
+    child = scan_estimate(100)
+    assert filter_estimate(child, 0).rows == 1
+    assert filter_estimate(child, 1).rows == 100
+    assert filter_estimate(child, 0.5).rows == 50
+
+
+def test_equality_selectivity_has_floor():
+    assert equality_selectivity(0) == 1.0
+    assert equality_selectivity(1) == 0.1
+    assert equality_selectivity(2) == pytest.approx(0.01)
+    assert equality_selectivity(5) == MIN_SELECTIVITY
+
+
+def test_join_estimate_prefers_hash_when_equi_keys_exist():
+    left = scan_estimate(10)
+    right = scan_estimate(20)
+    est = join_estimate(left, right, equi_keys=1)
+    assert est.rows == pytest.approx(20)
+    assert est.algorithm == "hash"
+    assert est.cpu == pytest.approx(10 + 20 + 10 + 20)
+
+
+def test_join_estimate_uses_nested_loop_without_keys():
+    est = join_estimate(scan_estimate(10), scan_estimate(20))
+    assert est.rows == 200
+    assert est.algorithm == "nested_loop"
+    assert est.cpu >= 200
+
+
+def test_choose_build_side_prefers_smaller_left():
+    assert choose_build_side(scan_estimate(5), scan_estimate(50)) == "left"
+    assert choose_build_side(scan_estimate(50), scan_estimate(5)) == "right"
+    assert choose_build_side(scan_estimate(5), scan_estimate(5)) == "right"
