@@ -303,6 +303,11 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它不做自动选举，
 也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
 
+**自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
+连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
+它不重定向客户端，也不处理“主库其实还活着但网络分区”的脑裂；共享 fence
+是唯一的防双写约束。
+
 当前边界（也是下一步）：
 
 - 复制槽只覆盖单个副本；主库重启时用 `Database(wal_retain_lsn=read_slot(...))`
@@ -310,7 +315,8 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 - 基准备份已分块传输，但仍是完整全量拷贝；没有增量/压缩备份；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
-- fencing 依赖共享 marker，自动故障切换、客户端重定向和租约都没有实现；
+- 自动提升只有连续失败阈值，没有心跳租约/仲裁和客户端重定向；fencing 依赖
+  共享 marker，网络分区时仍可能双写；
 - 复制连接没有认证/TLS，默认只应监听本机或可信网络；
 - 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 只覆盖
   共享 marker，没有自动租约。

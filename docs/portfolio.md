@@ -71,8 +71,8 @@
 >   与事务状态、以 pageLSN 幂等、用 `replica.lsn` 断点续传，只读 `Database`
 >   在语句入口拒绝写入，`lag_lsn` 量化延迟；基准备份用 `Database.snapshot`
 >   冻结写路径、先 checkpoint 再读数据文件，手动提升用共享 `PromotionFence`
->   marker 阻止旧主继续写；
-> - 1012 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+>   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
+> - 1013 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -156,8 +156,9 @@
 >   resumes from an atomic `replica.lsn` marker, rejects writes at statement
 >   entry, quantifies lag with `lag_lsn`; base backup freezes the write path
 >   with `Database.snapshot`, and manual promotion uses a shared
->   `PromotionFence` marker to stop the old primary from writing.
-> - 1012 automated tests including crash-injection and a 20-seed randomized
+>   `PromotionFence` marker to stop the old primary from writing;
+>   `ReplicationMonitor` promotes after consecutive network failures.
+> - 1013 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

@@ -11,6 +11,7 @@ from lumendb.errors import NotSupportedError, TransactionError
 from lumendb.replication import (
     PromotionFence,
     Replica,
+    ReplicationMonitor,
     WALClient,
     WALServer,
 )
@@ -126,6 +127,44 @@ class TestReplica:
         assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
         primary.close()
         replica.db.close()
+
+    def test_monitor_promotes_after_network_failures(self, tmp_path):
+        fence_path = tmp_path / "promotion.fence"
+        primary_fence = PromotionFence(fence_path, node_id="primary")
+        primary = Database(
+            tmp_path / "primary",
+            checkpoint_wal_bytes=0,
+            write_fence=primary_fence.assert_writable,
+        )
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        primary.execute_one("INSERT INTO t VALUES (1)")
+        server = WALServer(primary).start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica"
+            )
+            primary.execute_one("INSERT INTO t VALUES (2)")
+            replica.replicate_from_server(server.host, server.port)
+            server.stop()
+            monitor = ReplicationMonitor(
+                replica,
+                server.host,
+                server.port,
+                fence_path=fence_path,
+                max_failures=2,
+                timeout=0.2,
+            )
+            assert monitor.poll() == "degraded"
+            assert monitor.poll() == "promoted"
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
+            with pytest.raises(NotSupportedError):
+                primary.execute_one("INSERT INTO t VALUES (3)")
+        finally:
+            if replica is not None and not replica.db._read_only:
+                replica.db.close()
+            server.stop()
+            primary.close()
 
     def test_promotion_fence_blocks_old_primary_writes(self, tmp_path):
         fence_path = tmp_path / "promotion.fence"
