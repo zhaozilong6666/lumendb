@@ -4124,6 +4124,23 @@ class TestForeignKey:
         finally:
             reopened.close()
 
+    def test_rename_column_rewrites_action_column_list(self, db):
+        db.execute_one("CREATE TABLE p (id INT UNIQUE)")
+        db.execute_one(
+            "CREATE TABLE c (a INT, note TEXT, "
+            "FOREIGN KEY (a) REFERENCES p(id) "
+            "ON DELETE SET NULL (a) ON UPDATE SET DEFAULT (a))"
+        )
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("INSERT INTO c VALUES (1, 'x')")
+        db.execute_one("ALTER TABLE c RENAME COLUMN a TO b")
+        fk = next(iter(db.catalog.get_table("c").foreign_keys.values()))
+        assert fk.columns == ("b",)
+        assert fk.on_delete_columns == ("b",)
+        assert fk.on_update_columns == ("b",)
+        db.execute_one("DELETE FROM p WHERE id = 1")
+        assert rows(db, "SELECT b, note FROM c") == [(None, "x")]
+
     def test_on_update_set_default_column_list(self, db):
         db.execute_one("CREATE TABLE p (a INT, b INT, UNIQUE (a, b))")
         db.execute_one(

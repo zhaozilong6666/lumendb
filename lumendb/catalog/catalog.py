@@ -490,9 +490,31 @@ class Catalog:
                     new_key if cname == old_key else cname
                     for cname in fk.ref_columns
                 ) if fk.ref_table == table.name else fk.ref_columns
-                if (columns, ref_columns) != (fk.columns, fk.ref_columns):
+                on_delete_columns = tuple(
+                    new_key if cname == old_key else cname
+                    for cname in fk.on_delete_columns
+                ) if holder is table else fk.on_delete_columns
+                on_update_columns = tuple(
+                    new_key if cname == old_key else cname
+                    for cname in fk.on_update_columns
+                ) if holder is table else fk.on_update_columns
+                if (
+                    columns,
+                    ref_columns,
+                    on_delete_columns,
+                    on_update_columns,
+                ) != (
+                    fk.columns,
+                    fk.ref_columns,
+                    fk.on_delete_columns,
+                    fk.on_update_columns,
+                ):
                     fks[name] = replace(
-                        fk, columns=columns, ref_columns=ref_columns
+                        fk,
+                        columns=columns,
+                        ref_columns=ref_columns,
+                        on_delete_columns=on_delete_columns,
+                        on_update_columns=on_update_columns,
                     )
                     changed = True
             if changed:

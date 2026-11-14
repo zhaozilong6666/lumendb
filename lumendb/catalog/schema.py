@@ -353,6 +353,27 @@ def validate_table_def(table: TableDef) -> None:
                 raise ColumnNotFoundError(
                     f"外键 {name!r} 引用了本表不存在的列 {cname!r}"
                 )
+        for action, action_columns, label in (
+            (fk.on_delete, fk.on_delete_columns, "ON DELETE"),
+            (fk.on_update, fk.on_update_columns, "ON UPDATE"),
+        ):
+            if not action_columns:
+                continue
+            if action not in ("SET NULL", "SET DEFAULT"):
+                raise NotSupportedError(
+                    f"外键 {name!r} 的 {label} 动作 {action!r} "
+                    "不支持列级列清单"
+                )
+            if len(set(action_columns)) != len(action_columns):
+                raise NotSupportedError(
+                    f"外键 {name!r} 的 {label} 列清单包含重复列"
+                )
+            for cname in action_columns:
+                if cname not in fk.columns:
+                    raise NotSupportedError(
+                        f"外键 {name!r} 的 {label} 列 {cname!r} "
+                        "不属于外键列"
+                    )
         if not fk.ref_table:
             raise NotSupportedError(f"外键 {name!r} 缺少被引用表名")
 
