@@ -3033,6 +3033,74 @@ class TestExpressions:
 
 
 class TestSubquery:
+    def test_correlated_exists(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (user_id INT, amount INT)")
+        db.execute_one("INSERT INTO orders VALUES (1, 9), (3, 20)")
+        assert rows(
+            db,
+            "SELECT id FROM users u "
+            "WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id) "
+            "ORDER BY id",
+        ) == [(1,), (3,)]
+
+    def test_correlated_scalar_subquery_in_projection(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (user_id INT, amount INT)")
+        db.execute_one("INSERT INTO orders VALUES (1, 9), (3, 20)")
+        assert rows(
+            db,
+            "SELECT u.id, "
+            "(SELECT MAX(o.amount) FROM orders o WHERE o.user_id = u.id) "
+            "FROM users u ORDER BY u.id",
+        ) == [(1, 9), (2, None), (3, 20)]
+
+    def test_correlated_in_subquery(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (user_id INT, amount INT)")
+        db.execute_one("INSERT INTO orders VALUES (1, 31), (1, 20), (3, 36)")
+        assert rows(
+            db,
+            "SELECT id FROM users "
+            "WHERE id IN ("
+            "SELECT user_id FROM orders WHERE amount > users.age"
+            ") ORDER BY id",
+        ) == [(1,), (3,)]
+
+    def test_correlated_exists_two_levels(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (id INT, user_id INT)")
+        db.execute_one("CREATE TABLE shipments (order_id INT, user_id INT)")
+        db.execute_one("INSERT INTO orders VALUES (10, 1), (11, 2)")
+        db.execute_one("INSERT INTO shipments VALUES (10, 1)")
+        assert rows(
+            db,
+            "SELECT id FROM users u WHERE EXISTS ("
+            "SELECT 1 FROM orders o WHERE o.user_id = u.id AND EXISTS ("
+            "SELECT 1 FROM shipments s "
+            "WHERE s.order_id = o.id AND s.user_id = u.id"
+            ")) ORDER BY id",
+        ) == [(1,)]
+
+    def test_correlated_subquery_in_update_and_delete(self, db):
+        setup_users(db)
+        db.execute_one("CREATE TABLE orders (user_id INT)")
+        db.execute_one("INSERT INTO orders VALUES (1), (1), (3)")
+        db.execute_one(
+            "UPDATE users SET age = "
+            "(SELECT COUNT(*) FROM orders o WHERE o.user_id = users.id)"
+        )
+        assert rows(db, "SELECT id, age FROM users ORDER BY id") == [
+            (1, 2),
+            (2, 0),
+            (3, 1),
+        ]
+        db.execute_one(
+            "DELETE FROM users WHERE EXISTS ("
+            "SELECT 1 FROM orders o WHERE o.user_id = users.id)"
+        )
+        assert rows(db, "SELECT id FROM users") == [(2,)]
+
     def test_scalar_subquery(self, db):
         setup_users(db)
         assert rows(db, "SELECT (SELECT COUNT(*) FROM users)") == [(3,)]

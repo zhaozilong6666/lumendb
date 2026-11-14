@@ -309,6 +309,10 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 - `RecursiveCte`：`seed UNION [ALL] recursive` 的递归 CTE。`CteScan(recursive=True)`
   在递归项里读取执行器保存的“上一轮工作表”，每一轮把新行加入结果并作为下一轮输入，
   直到没有新行；`UNION` 用哈希集合去重，`UNION ALL` 保留重复，超过 10000 轮报错；
+- 相关子查询：`Binder.outer_schemas` 保存由近到远的外层 schema 链，列解析先查
+  当前查询、再逐个外层查找；编译后的外层列闭包沿 `EvalContext.parent` 取值。
+  `_run_subquery` 在执行子查询计划前把外层行写入上下文变量，计划内新建的
+  `EvalContext` 自动继承它，支持多层嵌套；当前按外层行逐次执行，未做去相关优化；
 - `Sort`：从最后一个键往前依次稳定排序，支持多键；每键独立处理
   `ASC/DESC` 与 `NULLS FIRST/LAST`（默认 ASC 时 NULL 最后、DESC 时 NULL 最前）；
 - `Limit`：跳 `offset`，取 `limit`；`WITH TIES` 时用排序键比较边界行，

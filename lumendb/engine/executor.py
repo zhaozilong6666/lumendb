@@ -84,6 +84,7 @@ from ..storage.wal import WAL
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 from ..plan.binder import AggregateAccumulatorGroup, Binder, Schema, SchemaColumn
 from ..plan.nodes import (
+    _CURRENT_OUTER,
     Aggregate,
     CteScan,
     Distinct,
@@ -329,13 +330,24 @@ class Executor:
         binder.subquery_runner = self._run_subquery
         return binder
 
-    def _run_subquery(self, select, outer_ctx: Optional[EvalContext]):
-        # 子查询在"没有外层列可用"的 schema 下绑定：如果它引用了外层列，
-        # binder 会报 ColumnNotFoundError，这就是"相关子查询不支持"的明确表现。
+    def _run_subquery(
+        self,
+        select,
+        outer_ctx: Optional[EvalContext],
+        outer_schemas: list[Schema],
+    ):
+        # 子查询可以引用外层列。绑定阶段把外层 schema 链交给新 Binder；
+        # 执行阶段把外层行挂到 contextvar，计划内所有 EvalContext 都会
+        # 继承它，从而沿 parent 链读取对应层级的列。
         binder = self._new_binder()
+        binder.outer_schemas = list(outer_schemas)
         binder.ctes = dict(self._active_ctes or self.binder.ctes)
         plan, _ = binder.bind_select(select)
-        return list(self._execute(plan, self._require_txn()))
+        token = _CURRENT_OUTER.set(outer_ctx)
+        try:
+            return list(self._execute(plan, self._require_txn()))
+        finally:
+            _CURRENT_OUTER.reset(token)
 
     def _require_txn(self) -> Transaction:
         if self._txn is None:

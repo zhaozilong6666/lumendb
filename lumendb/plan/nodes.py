@@ -7,20 +7,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
 from ..datatypes import TypeSpec
 
 
+#: 当前正在执行的相关子查询的外层行。``_run_subquery`` 在求值一个子查询
+#: 计划时设置它，计划里所有 ``EvalContext(row)`` 会通过 ``__post_init__``
+#: 自动挂到同一个外层行上，从而让子查询里的外层列引用可以沿 parent 链取值。
+_CURRENT_OUTER: ContextVar[Optional["EvalContext"]] = ContextVar(
+    "lumendb_current_outer", default=None
+)
+
+
 @dataclass
 class EvalContext:
-    """表达式求值上下文：一行数据 + 该行所属分组的聚合结果。"""
+    """表达式求值上下文：一行数据 + 该行所属分组的聚合结果 + 外层行。"""
 
     row: tuple
     aggs: tuple = ()
+    parent: Optional["EvalContext"] = None
+
+    def __post_init__(self) -> None:
+        if self.parent is None:
+            self.parent = _CURRENT_OUTER.get()
 
     def with_row(self, row: tuple) -> "EvalContext":
-        return EvalContext(row, self.aggs)
+        return EvalContext(row, self.aggs, self.parent)
 
 
 EvalFn = Callable[[EvalContext], Any]

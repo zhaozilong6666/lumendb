@@ -147,7 +147,7 @@ psycopg2 都不会正常返回结果。
 | 连接 | `INNER JOIN`、`LEFT JOIN`、`RIGHT JOIN`、`FULL JOIN`、`CROSS JOIN`、多表连接；等值 INNER/LEFT 走哈希，外连接补 NULL |
 | 聚合 | `GROUP BY`（列或表达式）、`HAVING`、`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、`COUNT(DISTINCT x)` |
 | 表达式 | 算术、`\|\|` 拼接、比较、`AND`/`OR`/`NOT`、`IN`、`BETWEEN`、`LIKE`、`CAST`、`CASE WHEN`、`IS [NOT] DISTINCT FROM` |
-| 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`（不支持相关子查询，会明确报错） |
+| 子查询 | 标量子查询、`IN (子查询)`、`EXISTS`；支持单层/多层相关子查询（子查询可引用外层 `FROM` 列） |
 | 事务 | `BEGIN`/`COMMIT`/`ROLLBACK`，`SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE`，`SET CONSTRAINTS ... DEFERRED/IMMEDIATE`，MVCC 快照隔离 |
 | 运维 | `EXPLAIN`、`EXPLAIN ANALYZE`、`SHOW TABLES`、`CHECKPOINT`、`REINDEX [TABLE]`、`VACUUM [FULL]`、`TRUNCATE [TABLE] t [, ...] [CASCADE | RESTRICT]` |
 
@@ -206,7 +206,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **940 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **945 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -244,7 +244,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 外键：`MATCH SIMPLE/FULL`、`RESTRICT/CASCADE/SET NULL/SET DEFAULT/NO ACTION`、`DEFERRABLE INITIALLY DEFERRED` 提交时检查、`SET CONSTRAINTS` 事务内切换、`ALTER CONSTRAINT` 修改延迟属性、`ALTER TABLE` 外键 DDL、`SET NULL/SET DEFAULT (col...)` 列级动作、`ADD CONSTRAINT ... NOT VALID`（外键/CHECK）与 `VALIDATE CONSTRAINT`
 - [ ] 外键 `MATCH PARTIAL`
 - [ ] 基于代价的连接顺序枚举（当前为规则化）
-- [ ] 相关子查询
+- [x] 相关子查询
 - [ ] 组提交与 WAL 分段回收
 - [ ] 复制 / 只读副本
 

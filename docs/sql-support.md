@@ -359,7 +359,10 @@ CASE expr WHEN value THEN result [...] [ELSE result] END
 
 子查询：标量子查询、`IN (SELECT ...)`、`EXISTS (SELECT ...)`。
 `IN` 子查询必须返回一列，且列类型与左侧操作数兼容（否则在绑定阶段报错，
-不会静默返回空结果）。
+不会静默返回空结果）。子查询可以引用外层查询的列（相关子查询）：绑定阶段
+外层 schema 由近到远参与列解析，执行阶段外层行沿 `EvalContext.parent` 链
+挂载，支持多层嵌套；每一行外层数据会独立执行一次子查询，当前不做去相关
+重写。
 
 ### 参数占位符
 
@@ -408,7 +411,6 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | 窗口函数 | 未实现 |
 | 事务隔离级别切换 | 内部固定快照隔离 |
 | 二进制大对象 / 溢出页 | 行大小硬上限，超限报错而非截断 |
-| **相关子查询** | 子查询里引用外层列会报 `ColumnNotFoundError` |
 | `ON CONFLICT` 约束目标 | 支持 `DO NOTHING` / `DO UPDATE SET` / `DO UPDATE ... WHERE` / `excluded.col`；列组合或 `ON CONSTRAINT name` 必须映射到一个唯一索引 |
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |

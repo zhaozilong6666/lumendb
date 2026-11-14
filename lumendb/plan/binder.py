@@ -234,8 +234,17 @@ class AggregateAccumulatorGroup:
 
 
 class Binder:
-    def __init__(self, catalog: Catalog, params: Optional[list[Any]] = None) -> None:
+    def __init__(
+        self,
+        catalog: Catalog,
+        params: Optional[list[Any]] = None,
+        *,
+        outer_schemas: Optional[list[Schema]] = None,
+    ) -> None:
         self.catalog = catalog
+        #: 外层查询的 schema 链（由内向外）。相关子查询里的列引用会按
+        #: 当前查询优先、外层由近到远的顺序解析。
+        self.outer_schemas: list[Schema] = list(outer_schemas or ())
         #: 正在展开的视图名，用于检测 A -> B -> A 这类循环定义。
         self.view_stack: frozenset[str] = frozenset()
         #: 绑定过程中实际引用到的基础表/视图名，用于视图依赖检查。
@@ -248,8 +257,11 @@ class Binder:
         self._agg_base: int = 0
         #: 视图绑定时收集的基表列依赖：(表名, 列名)
         self.column_dependencies: set[tuple[str, str]] = set()
-        #: 需要执行子查询时由执行器注入的钩子
-        self.subquery_runner: Optional[Callable[[Any, EvalContext], Any]] = None
+        #: 需要执行子查询时由执行器注入的钩子：
+        #: (子查询 AST, 外层求值上下文, 外层 schema 链) -> 行列表
+        self.subquery_runner: Optional[
+            Callable[[Any, EvalContext, list[Schema]], Any]
+        ] = None
         #: 当前查询可见的 CTE：name -> (已绑定计划, 输出列)
         self.ctes: dict[str, tuple[PlanNode, list[OutputColumn]]] = {}
 
@@ -302,7 +314,28 @@ class Binder:
         return self._literal(Literal(self.params[index]), schema, allow_agg)
 
     def _column(self, expr: ColumnRef, schema, allow_agg):
-        index = schema.resolve(expr.table, expr.name)
+        try:
+            index = schema.resolve(expr.table, expr.name)
+        except ColumnNotFoundError as outer_error:
+            # 相关子查询：当前查询找不到时，再沿外层 schema 链由近到远
+            # 查找。限定名（如 users.id）同样可以在外层命中。
+            for depth, outer in enumerate(self.outer_schemas):
+                try:
+                    outer_index = outer.resolve(expr.table, expr.name)
+                except ColumnNotFoundError:
+                    continue
+                self._record_column_dependency(outer.columns[outer_index])
+
+                def _outer_value(ctx, d=depth, i=outer_index):
+                    scope = ctx
+                    for _ in range(d + 1):
+                        scope = scope.parent
+                    if scope is None:
+                        raise BinderError("相关子查询缺少外层行")
+                    return scope.row[i]
+
+                return _outer_value, outer.type_of(outer_index)
+            raise outer_error
         self._record_column_dependency(schema.columns[index])
         return (lambda ctx, i=index: ctx.row[i]), schema.type_of(index)
 
@@ -653,9 +686,10 @@ class Binder:
         runner = self.subquery_runner
         if runner is None:
             raise NotSupportedError("子查询在当前上下文不可用")
+        outer_schemas = [schema] + self.outer_schemas
 
         def _sub(ctx):
-            rows = runner(expr.query, ctx) or []
+            rows = runner(expr.query, ctx, outer_schemas) or []
             if not rows:
                 return None
             if len(rows) > 1:
@@ -666,19 +700,25 @@ class Binder:
                 )
             return rows[0][0]
 
-        type_spec = self._scalar_subquery_type(expr.query)
+        type_spec = self._scalar_subquery_type(expr.query, schema)
         return _sub, type_spec
 
-    def _scalar_subquery_type(self, query) -> TypeSpec:
+    def _scalar_subquery_type(self, query, schema) -> TypeSpec:
         """只绑定、不执行，用输出列推断标量子查询的静态类型。
 
         之前这里固定返回 TEXT，导致 ``id = (SELECT 2)`` 被误判为
         INT 与 TEXT 比较；类型必须来自子查询的真实输出列。
         """
-        return self._subquery_column_type(query, "标量子查询")
+        return self._subquery_column_type(query, "标量子查询", schema)
 
-    def _subquery_column_type(self, query, label: str) -> TypeSpec:
-        binder = Binder(self.catalog, self.params)
+    def _subquery_column_type(
+        self, query, label: str, schema: Schema
+    ) -> TypeSpec:
+        binder = Binder(
+            self.catalog,
+            self.params,
+            outer_schemas=[schema] + self.outer_schemas,
+        )
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)
         _, cols = binder.bind_select(query)
@@ -694,7 +734,9 @@ class Binder:
         # IN (SELECT ...) 的输出列类型必须和左侧操作数兼容；只做运行时
         # 比较会让 INT IN (SELECT '1') 静默返回空结果，也会让多列子查询
         # 悄悄忽略后面的列。
-        sub_type = self._subquery_column_type(expr.query, "IN 子查询")
+        sub_type = self._subquery_column_type(
+            expr.query, "IN 子查询", schema
+        )
         if not _comparable_types(operand_type, sub_type):
             raise TypeMismatchError(
                 "IN 左侧与子查询列类型不兼容",
@@ -708,12 +750,13 @@ class Binder:
         if runner is None:
             raise NotSupportedError("子查询在当前上下文不可用")
         negated = expr.negated
+        outer_schemas = [schema] + self.outer_schemas
 
         def _in(ctx):
             value = fn(ctx)
             if value is None:
                 return None
-            rows = runner(expr.query, ctx) or []
+            rows = runner(expr.query, ctx, outer_schemas) or []
             hit = any(r[0] == value for r in rows)
             return (not hit) if negated else hit
 
@@ -724,9 +767,10 @@ class Binder:
         if runner is None:
             raise NotSupportedError("子查询在当前上下文不可用")
         negated = expr.negated
+        outer_schemas = [schema] + self.outer_schemas
 
         def _exists(ctx):
-            rows = runner(expr.query, ctx)
+            rows = runner(expr.query, ctx, outer_schemas)
             found = bool(rows) if rows is not None else False
             return (not found) if negated else found
 
