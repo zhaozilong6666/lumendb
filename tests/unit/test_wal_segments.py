@@ -45,6 +45,23 @@ class TestSegmentedWal:
         assert [record.lsn for record in wal.read_all()] == lsns[4:]
         wal.close()
 
+    def test_retain_lsn_prevents_checkpoint_from_dropping_replica_window(self, tmp_path):
+        wal = make_wal(tmp_path, segment_bytes=17)
+        lsns = [wal.append(1, LogType.BEGIN) for _ in range(10)]
+        wal.flush()
+        wal.retain_lsn = lsns[4]
+
+        wal.truncate_before(lsns[8])
+        retained = [record.lsn for record in wal.read_all()]
+        assert lsns[4] in retained or wal.base_lsn <= lsns[4]
+        assert all(lsn >= wal.base_lsn for lsn in retained)
+
+        wal.retain_lsn = 0
+        wal.truncate_before(lsns[8])
+        assert wal.base_lsn >= lsns[4]
+        assert all(lsn >= lsns[4] for lsn in [record.lsn for record in wal.read_all()])
+        wal.close()
+
     def test_partial_tail_is_ignored_and_append_continues(self, tmp_path):
         wal = make_wal(tmp_path)
         wal.append(1, LogType.BEGIN)

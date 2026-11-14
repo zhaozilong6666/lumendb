@@ -47,6 +47,12 @@ LSN”的整段；安全 LSN 取活跃事务最老的 BEGIN LSN，没有活跃�
 `checkpoint_lsn`。已有单文件 `lumendb.wal` 的旧库继续走单文件路径，避免
 在没有迁移逻辑时误读旧数据。
 
+**页镜像**：页分配本身不写日志，只有页内容修改才写 `UPDATE`。为了让物理
+副本能从较旧的基准备份重建主库新分配的页，Buffer Pool 在“新分配页第一次
+被修改”时额外写一条 `PAGE_IMAGE`（`u32 page_id + 4096B 镜像`），随后才写
+普通的页内 `UPDATE`。恢复与副本都先按 `PAGE_IMAGE` 初始化页、再按 pageLSN
+应用后续 diff；这条记录同时补上了“恢复时新页可能尚未落盘”的缺口。
+
 **组提交**：`WAL` 的追加与刷盘都持同一把锁；`TransactionManager.commit` 先把
 COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可以覆盖多个
 目标 LSN。其余提交在条件变量上等待，只有自己的 COMMIT 记录持久化后才被标记
@@ -257,6 +263,39 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 当前限制：没有物化视图，视图不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；
 `SHOW TABLES` 只列基表，`SHOW VIEWS` 单独列出视图。
+
+### 2.11 只读副本与物理 WAL 流
+
+复制层不引入第二套日志：副本消费主库同一份物理 WAL。`Replica` 打开一个
+`Database(read_only=True)`，按 LSN 递增应用：
+
+- `PAGE_IMAGE`：先 `DiskManager.ensure_page` 补齐页号，再写完整页镜像；
+- `UPDATE` / `CLR`：按 pageLSN 判断是否需要写 after image；
+- `BEGIN` / `COMMIT` / `ABORT`：只更新副本的 `TransactionManager` 状态，
+  让快照读看到与主库一致的事务可见性；副本不参与本机提交队列。
+
+每批应用结束后先 `flush_all` 页、再原子写 `replica.lsn` marker，崩溃后
+从 marker 重放；pageLSN 保证重复应用幂等。副本的 `Database(read_only=True)`
+在语句入口拒绝写操作，只允许 `SELECT`/`EXPLAIN`/`SHOW`/事务控制。
+
+传输层是 `WALServer` + `WALClient`：换行分隔 JSON，二进制内容 base64；
+`backup` 返回主库 checkpoint 后的数据文件，`replicate` 从请求的
+`start_lsn` 起按上限返回记录。主库 `SegmentedWAL.retain_lsn` 按副本请求的
+起点保留 WAL；`WALServer` 可配置一个 `slot_path`，客户端 `ack` 后把
+`confirmed_lsn` 原子写盘，服务重启时重新装载并恢复保留点。若起点已经落在
+已回收段之前，服务端返回明确错误，要求重新基准备份，避免静默丢段。
+
+当前边界（也是下一步）：
+
+- 基准备份要求主库无活跃事务，且 `backup` 没有阻塞并发写的写冻结协议；
+- 复制槽只覆盖单个副本；主库重启后若在复制服务启动前自动 checkpoint，
+  仍可能回收槽位之前的段，需要启动顺序约束；
+- 复制连接没有认证/TLS，默认只应监听本机或可信网络；
+- 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，没有 fencing。
+
+`Replica.promote()` 关闭只读 `Database`，以读写模式重新打开同一数据目录，
+返回可写 `Database`。副本只保留已应用的 WAL 前缀；主库尚未发送的尾段会在
+提升时丢失，调用方应先确认 `lag_lsn` 或接受该窗口。
 
 ## 3. SQL 与计划
 

@@ -1,4 +1,4 @@
-# 怎么把这个项目写进简历、怎么在面试里讲
+﻿# 怎么把这个项目写进简历、怎么在面试里讲
 
 这个文件不是给"读者"看的，是给你自己用的：面试前十分钟翻一遍，确保每个
 数字和每个技术点都能落到具体代码上。
@@ -66,7 +66,11 @@
 > - 实现 PostgreSQL v3 wire protocol（启动握手、simple/extended query、
 >   Parse/Bind/Describe/Execute、`$n` 文本/二进制参数、Describe Statement/Portal
 >   静态列描述、Close 生命周期、带 SQLSTATE 的错误响应），可直接用 `psql` 连接；
-> - 959 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 实现物理复制与只读副本：新页首次修改写 `PAGE_IMAGE` 保证物理 WAL 自包含，
+>   `WALServer` 通过 TCP 提供基准备份和增量 WAL 流，`Replica` 按 LSN 重放页更新
+>   与事务状态、以 pageLSN 幂等、用 `replica.lsn` 断点续传，只读 `Database`
+>   在语句入口拒绝写入，`lag_lsn` 量化延迟，并支持手动提升；
+> - 1009 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -143,7 +147,13 @@
 >   simple/extended query, Parse/Bind/Describe/Execute, `$n` text/binary
 >   parameters, static Describe metadata, Close lifecycle, SQLSTATE-bearing
 >   error responses), so `psql` can connect directly.
-> - 959 automated tests including crash-injection and a 20-seed randomized
+> - Built physical replication and read-only replicas: first-touch page images
+>   make the WAL self-contained for newly allocated pages, a TCP WAL server
+>   streams base backups and incremental records, the replica applies page
+>   updates and transaction states in LSN order with pageLSN idempotence,
+>   resumes from an atomic `replica.lsn` marker, rejects writes at statement
+>   entry, quantifies lag with `lag_lsn`, and supports manual promotion.
+> - 1009 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

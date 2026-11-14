@@ -1,4 +1,4 @@
-# LumenDB
+﻿# LumenDB
 
 [![CI](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
@@ -24,6 +24,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 | 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
 | 查询执行 | 火山模型算子 + 哈希连接 + 等值/范围索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
 | 协议 | PostgreSQL v3 wire protocol（simple + extended query，支持 `$1` 参数绑定） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
+| 复制 | TCP 物理 WAL 流、基准备份、只读副本、LSN 延迟、手动提升 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
 | 进程模型 | 数据目录独占锁（OS 级字节锁），拒绝双开 | `tests/unit/test_filelock.py`：第二个打开者必须失败 |
 
 ## 架构
@@ -49,9 +50,11 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
         │  storage/bufferpool.py   │  LRU 淘汰、pin/unpin、脏页
         │  storage/pager.py        │  页分配、读写、元数据页
         │  storage/wal.py          │  预写日志、LSN、fsync
+        │  storage/wal_segments.py │  分段 WAL、轮转与安全回收
         │  storage/recovery.py     │  analysis / redo / undo / checkpoint
         │  storage/txn.py, lock.py │  事务状态、快照隔离、行锁与死锁检测
         │  storage/filelock.py     │  数据目录独占锁（拒绝双开）
+        │  replication/*           │  WAL TCP 流、只读副本、手动提升
         │  catalog/*               │  表定义持久化（存进数据文件页链）
         └────────────┬─────────────┘
                      │
@@ -206,7 +209,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **995 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1009 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -252,7 +255,9 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 自动 CHECKPOINT：WAL 自上次 checkpoint 增长超过阈值时触发，保留手动 `CHECKPOINT`
 - [x] WAL 分段回收：新库使用 `wal-<first_lsn>.log` 分段，checkpoint 后按安全 LSN 删除旧段，活跃事务 BEGIN 之前的历史保留
 - [ ] 按提交数触发的 checkpoint 策略
-- [ ] 复制 / 只读副本
+- [x] 复制 / 只读副本（MVP）：TCP 物理 WAL 流、基准备份、只读拒绝写入、LSN 延迟、手动提升
+- [x] 复制槽：副本 ack 的 `confirmed_lsn` 原子持久化，服务重启恢复 WAL 保留点
+- [ ] 写冻结基准备份、提升 fencing 与自动故障切换
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。

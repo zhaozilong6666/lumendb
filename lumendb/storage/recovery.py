@@ -28,7 +28,12 @@ from ..errors import StorageError
 from .bufferpool import BufferPoolManager
 from .pager import DiskManager
 from .txn import TransactionManager
-from .wal import LogType, WAL, decode_page_update
+from .wal import (
+    LogType,
+    WAL,
+    decode_page_image,
+    decode_page_update,
+)
 
 
 @dataclass
@@ -94,11 +99,25 @@ class RecoveryManager:
 
         # ---- redo -----------------------------------------------------
         for rec in records:
-            if rec.rtype != LogType.UPDATE:
+            if rec.rtype not in (LogType.UPDATE, LogType.PAGE_IMAGE):
                 continue
             if rec.lsn <= start_lsn:
                 continue
+            if rec.rtype == LogType.PAGE_IMAGE:
+                page_id, image = decode_page_image(rec.payload)
+                self._disk.ensure_page(page_id)
+                page = self._bp.fetch_page(page_id)
+                try:
+                    if page.page_lsn < rec.lsn:
+                        page.buf[:] = image
+                        page.page_lsn = rec.lsn
+                        self._bp.mark_dirty(page)
+                        report.redo_applied += 1
+                finally:
+                    self._bp.unpin(page_id)
+                continue
             page_id, offset, _old, new = decode_page_update(rec.payload)
+            self._disk.ensure_page(page_id)
             page = self._bp.fetch_page(page_id)
             try:
                 if page.page_lsn < rec.lsn:

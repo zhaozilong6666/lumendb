@@ -34,6 +34,7 @@ class LogType(IntEnum):
     UPDATE = 4  # 页内物理更新（带 before/after image）
     CLR = 5  # 补偿记录，undo 时用来阻止二次回滚
     CHECKPOINT = 6
+    PAGE_IMAGE = 7  # 新页的完整镜像，用于让物理副本重建页分配后的初始状态
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class LogRecord:
 
     @property
     def is_update_like(self) -> bool:
-        return self.rtype in (LogType.UPDATE, LogType.CLR)
+        return self.rtype in (LogType.UPDATE, LogType.CLR, LogType.PAGE_IMAGE)
 
     def encode(self) -> bytes:
         return _HEADER.pack(self.lsn, self.xid, self.rtype, len(self.payload)) + self.payload
@@ -97,6 +98,29 @@ def decode_page_update(payload: bytes) -> tuple[int, int, bytes, bytes]:
         raise StorageError("页更新日志的 after image 被截断")
     new = payload[pos : pos + new_len]
     return page_id, offset, bytes(old), bytes(new)
+
+
+_PAGE_IMAGE_HEAD = struct.Struct("<I")  # page_id
+
+
+def encode_page_image(page_id: int, image: bytes) -> bytes:
+    """``u32 page_id | 完整页字节``"""
+    if len(image) != PAGE_SIZE:
+        raise StorageError("页镜像长度不是 PAGE_SIZE")
+    return _PAGE_IMAGE_HEAD.pack(page_id) + bytes(image)
+
+
+def decode_page_image(payload: bytes) -> tuple[int, bytes]:
+    if len(payload) < _PAGE_IMAGE_HEAD.size:
+        raise StorageError("页镜像日志头被截断")
+    page_id = _PAGE_IMAGE_HEAD.unpack_from(payload, 0)[0]
+    image = payload[_PAGE_IMAGE_HEAD.size :]
+    if len(image) != PAGE_SIZE:
+        raise StorageError(
+            "页镜像长度不匹配",
+            detail=f"page_id={page_id} len={len(image)}",
+        )
+    return page_id, bytes(image)
 
 
 def encode_checkpoint(active_xids: list[int]) -> bytes:
@@ -181,6 +205,9 @@ class WAL:
     ) -> int:
         payload = encode_page_update(page_id, offset, old, new)
         return self.append(xid, LogType.CLR if clr else LogType.UPDATE, payload)
+
+    def log_page_image(self, xid: int, page_id: int, image: bytes) -> int:
+        return self.append(xid, LogType.PAGE_IMAGE, encode_page_image(page_id, image))
 
     def checkpoint(self, active_xids: list[int]) -> int:
         return self.append(0, LogType.CHECKPOINT, encode_checkpoint(active_xids))

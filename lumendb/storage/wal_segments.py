@@ -69,6 +69,8 @@ class SegmentedWAL(WAL):
         self._current_size = 0
         self._size = 0
         self._next_lsn = 1
+        #: 下游副本仍需要的 LSN；为 0 表示没有保留约束。
+        self._retain_lsn = 0
 
         files = self._discover()
         if files:
@@ -127,6 +129,16 @@ class SegmentedWAL(WAL):
                 return 0
             records, _ = _read_segment(files[0])
             return records[0].lsn if records else 0
+
+    @property
+    def retain_lsn(self) -> int:
+        with self._lock:
+            return self._retain_lsn
+
+    @retain_lsn.setter
+    def retain_lsn(self, lsn: int) -> None:
+        with self._lock:
+            self._retain_lsn = max(0, int(lsn))
 
     # -- 追加与刷盘 ---------------------------------------------------------
 
@@ -209,6 +221,10 @@ class SegmentedWAL(WAL):
         with self._lock:
             self.flush()
             removed = 0
+            if self._retain_lsn > 0:
+                # retain_lsn 是下游还需要的最早 LSN；不能按 checkpoint
+                # 的安全 LSN 把 retain 之后、checkpoint 之前的记录删掉。
+                safe_lsn = min(safe_lsn, self._retain_lsn)
             files = self._discover()
             for path in files[:-1]:
                 records, _ = _read_segment(path)

@@ -321,6 +321,18 @@ class TransactionManager:
     def state_of(self, xid: int) -> Optional[TxnState]:
         return self._states.get(xid)
 
+    def note_replica_state(self, xid: int, state: TxnState) -> None:
+        """副本重放 WAL 时更新事务可见性表，不参与本机提交。"""
+        with self._lock:
+            self._states[xid] = state
+            if state is TxnState.ACTIVE:
+                self._active.add(xid)
+            else:
+                self._active.discard(xid)
+                self._active_starts.pop(xid, None)
+            if xid + 1 > self._next_xid:
+                self._next_xid = xid + 1
+
     def _committed_before(self, xid: int, txn: Transaction) -> bool:
         """该 xid 的修改在 txn 的快照里是否已经提交。"""
         if xid == 0:

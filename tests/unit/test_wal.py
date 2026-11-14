@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from lumendb.storage.page import PAGE_SIZE
+from lumendb.storage.page import PAGE_SIZE, PageType
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.txn import TransactionManager, TxnState
 from lumendb.storage.wal import (
@@ -19,8 +19,10 @@ from lumendb.storage.wal import (
     LogType,
     WAL,
     decode_checkpoint,
+    decode_page_image,
     decode_page_update,
     encode_checkpoint,
+    encode_page_image,
     encode_page_update,
 )
 from lumendb.storage.wal_segments import SegmentedWAL
@@ -49,6 +51,19 @@ class TestAppendAndRead:
         assert [r.lsn for r in recs] == [lsn1, lsn2]
         assert recs[0].rtype == LogType.BEGIN
         assert recs[1].rtype == LogType.COMMIT
+        wal.close()
+
+    def test_page_image_roundtrip(self, wal_path):
+        wal = WAL(wal_path)
+        image = bytes([PageType.BTREE_LEAF]) + bytes(PAGE_SIZE - 1)
+        lsn = wal.log_page_image(3, 7, image)
+        wal.flush()
+        records = wal.read_all()
+        assert records[-1].lsn == lsn
+        assert records[-1].rtype == LogType.PAGE_IMAGE
+        page_id, decoded = decode_page_image(records[-1].payload)
+        assert page_id == 7
+        assert decoded == image
         wal.close()
 
     def test_records_survive_reopen(self, wal_path):

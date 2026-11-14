@@ -196,6 +196,30 @@ class DiskManager:
         self._persist_meta()
         return pid
 
+    def ensure_page(self, page_id: int) -> None:
+        """把文件扩展到至少包含 ``page_id``；用于副本应用主库 WAL。
+
+        主库分配新页时并不写一条“分配日志”，物理 WAL 只记录页内容。
+        副本从较旧的基准备份开始时，可能先看到某个新页的 UPDATE；这里按
+        页号补齐中间的 FREE 页，使 redo 能落在正确的文件偏移上。
+        """
+        if page_id < 0:
+            raise StorageError("页号不能为负数")
+        current = self.num_pages
+        if page_id < current:
+            return
+        for pid in range(current, page_id + 1):
+            buf = bytearray(PAGE_SIZE)
+            struct.pack_into("<H", buf, 0, PageType.FREE)
+            struct.pack_into("<I", buf, 16, pid)
+            self._fh.seek(pid * PAGE_SIZE)
+            self._fh.write(buf)
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        if self._meta.next_page_id <= page_id:
+            self._meta.next_page_id = page_id + 1
+            self._persist_meta()
+
     def read_page(self, page_id: int) -> bytes:
         if page_id < 0 or page_id >= self.num_pages:
             raise PageNotFoundError(

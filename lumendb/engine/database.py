@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
-from ..errors import StorageError, TransactionError
+from ..errors import NotSupportedError, StorageError, TransactionError
 from ..sql.ast import (
     Begin,
     Commit,
@@ -29,6 +29,26 @@ from ..storage.wal import WAL
 from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result
 
+_READ_ONLY_STATEMENTS = {
+    "Query",
+    "Select",
+    "Explain",
+    "ShowTables",
+    "ShowViews",
+    "Checkpoint",
+    "Begin",
+    "Commit",
+    "Rollback",
+    "Savepoint",
+    "ReleaseSavepoint",
+    "RollbackToSavepoint",
+    "SetConstraints",
+}
+
+
+def _is_read_only_statement(statement: object) -> bool:
+    return type(statement).__name__ in _READ_ONLY_STATEMENTS
+
 
 class Database:
     def __init__(
@@ -38,9 +58,11 @@ class Database:
         pool_size: int = 64,
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
         wal_segment_bytes: int = 1024 * 1024,
+        read_only: bool = False,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
         self.disk = DiskManager(self.path / "lumendb.data")
         # 兼容旧库：如果已有单文件 WAL，继续用它；新库默认使用分段 WAL，
         # 这样 checkpoint 后可以回收旧段。
@@ -92,6 +114,11 @@ class Database:
     # ------------------------------------------------------------------
 
     def _run(self, statement, params: Optional[list[Any]] = None) -> Result:
+        if self._read_only and not _is_read_only_statement(statement):
+            raise NotSupportedError(
+                "只读副本拒绝写入",
+                hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
+            )
         if isinstance(statement, Begin):
             if self._txn is not None:
                 raise TransactionError(

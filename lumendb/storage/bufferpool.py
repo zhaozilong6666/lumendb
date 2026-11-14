@@ -73,6 +73,8 @@ class BufferPoolManager:
         self._dirty: set[int] = set()
         # xid -> [(page_id, offset, before_image)]，用于显式 ROLLBACK 的页级撤销
         self._undo: dict[int, list[tuple[int, int, bytes]]] = {}
+        # 新分配、尚未写入 WAL 的页；第一次更新时先记一条完整页镜像。
+        self._fresh_pages: set[int] = set()
         self.stats = BufferPoolStats()
 
     # -- 查询状态 -----------------------------------------------------------
@@ -125,6 +127,7 @@ class BufferPoolManager:
             self._frames[page_id] = page
             self._pins[page_id] = 1
             self._dirty.add(page_id)
+            self._fresh_pages.add(page_id)
             return page if page_cls is Page else page.view(page_cls)
 
     def unpin(self, page_id: int, *, dirty: bool = False) -> None:
@@ -159,6 +162,11 @@ class BufferPoolManager:
         只做其中一两个——那是 WAL 规则最常见的破坏方式。
         """
         with self._lock:
+            if page.page_id in self._fresh_pages:
+                # 页分配与初始化不单独记日志；第一次修改前补一条完整镜像，
+                # 让副本/恢复不依赖主库磁盘上的页分配状态。
+                self._wal.log_page_image(xid, page.page_id, bytes(page.buf))
+                self._fresh_pages.discard(page.page_id)
             lsn = self._wal.log_page_update(
                 xid, page.page_id, offset, old, new, clr=clr
             )
