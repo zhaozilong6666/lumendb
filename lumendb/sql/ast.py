@@ -350,6 +350,8 @@ class ForeignKeySpec:
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False
+    #: ALTER TABLE ADD CONSTRAINT ... NOT VALID：只约束新行，存量行暂不校验。
+    not_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -379,6 +381,8 @@ class TableConstraint:
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False
+    #: ALTER TABLE ADD CONSTRAINT ... NOT VALID：只约束新行，存量行暂不校验。
+    not_valid: bool = False
 
 
 @dataclass
@@ -453,6 +457,14 @@ class AlterTableDropConstraint(Statement):
     table: str
     name: str
     if_exists: bool = False
+
+
+@dataclass
+class AlterTableValidateConstraint(Statement):
+    """``ALTER TABLE ... VALIDATE CONSTRAINT name``：校验 NOT VALID 的存量行。"""
+
+    table: str
+    name: str
 
 
 @dataclass
@@ -687,6 +699,8 @@ __all__ = [
     "DropTable",
     "CreateIndex",
     "AlterTableAddColumn",
+    "AlterTableAddConstraint",
+    "AlterTableValidateConstraint",
     "AlterTableDropConstraint",
     "AlterTableAlterType",
     "AlterTableDropColumn",

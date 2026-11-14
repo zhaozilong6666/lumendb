@@ -231,6 +231,32 @@ class TestCreateTable:
         assert ref.deferrable is False
         assert ref.initially_deferred is False
 
+    def test_foreign_key_not_valid_and_validate_constraint(self):
+        from lumendb.sql.ast import (
+            AlterTableAddConstraint,
+            AlterTableValidateConstraint,
+        )
+
+        stmt = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) "
+            "REFERENCES other(id) NOT VALID"
+        )
+        assert isinstance(stmt, AlterTableAddConstraint)
+        assert stmt.constraint.not_valid is True
+
+        stmt = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) "
+            "REFERENCES other(id) DEFERRABLE INITIALLY DEFERRED NOT VALID"
+        )
+        assert stmt.constraint.deferrable is True
+        assert stmt.constraint.initially_deferred is True
+        assert stmt.constraint.not_valid is True
+
+        stmt = parse_statement("ALTER TABLE t VALIDATE CONSTRAINT fk")
+        assert isinstance(stmt, AlterTableValidateConstraint)
+        assert stmt.table == "t"
+        assert stmt.name == "fk"
+
     def test_foreign_key_alter_add_constraint(self):
         from lumendb.sql.ast import AlterTableAddConstraint
 

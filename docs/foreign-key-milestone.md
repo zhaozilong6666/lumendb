@@ -1,9 +1,9 @@
 # 外键完整性与级联动作阶段报告
 
-- 日期：2026-11-13
+- 日期：2026-11-14
 - 范围：LumenDB 外键约束、删除/更新动作、`ALTER TABLE` 外键 DDL、测试与文档
 - 基线：`8da5a63`（`ON DELETE CASCADE`）
-- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`7d809b7`、`326edbb`、`8f37f76`、`02e9c68`
+- 本轮提交：`9cc420f`、`640f38d`、`d27fea0`、`42627d8`、`9039add`、`5c3dd00`、`35b702e`、`2c20173`、`7d809b7`、`326edbb`、`8f37f76`、`02e9c68`、`852641b`、`bd979bd`
 
 ## 1. 成果清单
 
@@ -23,10 +23,12 @@
 | `ON UPDATE SET DEFAULT` | 完成 | 父键更新后将匹配子行写回列默认值；默认值不存在时回滚 |
 | `NO ACTION` | 完成 | 独立动作；配合 `DEFERRABLE` 可提交时检查，否则立即拒绝 |
 | `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 支持事务内切换 |
-| `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT` |
+| `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 默认先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT`、`NOT VALID` |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
+| `NOT VALID` / `VALIDATE CONSTRAINT` | 完成 | `NOT VALID` 只跳过存量行、新写入仍立即检查；`VALIDATE` 只读扫描全部可见行，成功后才把 `validated` 置为真 |
+| 保存点与延迟状态 | 完成 | `SAVEPOINT` 同时快照 `deferred_fk_rows` / `deferred_ref_checks` / `constraint_modes`，`ROLLBACK TO` 一并恢复 |
 | 外键 DDL 依赖保护 | 完成 | `DROP COLUMN`、`ALTER COLUMN TYPE`、`DROP INDEX`、`DROP CONSTRAINT`、`DROP TABLE`、`TRUNCATE` 均有保护（含 `CASCADE`） |
-| 元数据持久化 | 完成 | `ForeignKeyDef` 的列、引用表/列、`on_delete`、`on_update` 全部写入目录 JSON，兼容旧目录缺省值 |
+| 元数据持久化 | 完成 | `ForeignKeyDef` 的列、引用表/列、`on_delete`、`on_update`、`deferrable`、`validated` 全部写入目录 JSON，兼容旧目录缺省值 |
 | 事务回滚 | 完成 | 删除级联、更新级联、加列建外键失败均可回滚到语句前状态 |
 
 ## 2. 关键实现
@@ -119,7 +121,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 ## 3. 测试与验证
 
-- 全量测试：**860 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**867 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -132,6 +134,8 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
   - `DEFERRABLE INITIALLY DEFERRED`：先子后父提交成功、缺父提交失败、更新后补父、删除后恢复父键；
   - `SET CONSTRAINTS ALL/named DEFERRED`、`ALL IMMEDIATE` 立即补检失败、未知约束名、非 DEFERRABLE 约束、事务外执行；
   - `TRUNCATE ... CASCADE` 递归清空父/子/孙表并支持事务回滚；
+  - `ADD CONSTRAINT ... NOT VALID` 跳过存量行、新写入仍检查、`VALIDATE` 失败保持未校验并可重试、持久化；
+  - `SAVEPOINT` / `ROLLBACK TO` 恢复延迟外键队列与 `SET CONSTRAINTS` 覆盖模式；
   - `ON DELETE SET DEFAULT` / `ON UPDATE SET DEFAULT`、默认值缺失回滚；
   - `ALTER ADD CONSTRAINT` 的 `SET NULL` 动作；
   - `RESTRICT` 阻止删除/更新；
@@ -155,6 +159,9 @@ CI：
 - `326edbb`：success（其代码树由 `8f37f76` 覆盖）
 - `8f37f76`：success
 - `02e9c68`：success
+- `4b6b13c`：success
+- `852641b`：success
+- `1f4337f`：success（TRUNCATE CASCADE 的远端代码树）
 
 ## 4. 基准（2000 行）
 
@@ -202,7 +209,7 @@ CI：
 ## 6. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 860 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 867 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

@@ -177,24 +177,31 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 临时 `processing` / `deleted` 集合用于打断自引用环，事务 abort 会恢复所有页和目录。
 子表外键列有精确索引时走点查，没有索引时退回逐表扫描，规模上最坏仍是 O(子表行数)。
 
-`ForeignKeyDef` 还保存 `deferrable` / `initially_deferred`。`DEFERRABLE INITIALLY
+`ForeignKeyDef` 还保存 `deferrable` / `initially_deferred` / `validated`。`DEFERRABLE INITIALLY
 DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行器把 `(表, RID)`
 放进 `Transaction.deferred_fk_rows`；`NO ACTION` 删除/更新被引用键时把旧键放进
 `Transaction.deferred_ref_checks`。显式事务内可执行
 `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`，覆盖写在
 `Transaction.constraint_modes`，后续写入按覆盖后的时机决定是否立即检查；
 `IMMEDIATE` 会先对已积压的行/父键执行一次强制补检，失败则不改变模式。
-`Database` 在 `COMMIT`（以及自动提交语句的提交点）调用
+`SAVEPOINT` 记录这三个延迟状态并在 `ROLLBACK TO` 时一并恢复，避免已撤销的检查
+或模式泄漏到提交阶段。`Database` 在 `COMMIT`（以及自动提交语句的提交点）调用
 `executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
 被引用键是否已恢复或子行是否已清理；失败则 `abort`，WAL/页 undo 恢复。`RESTRICT`
 始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
+
+`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` 只跳过存量行扫描，
+新写入仍走 `_check_foreign_keys`；`VALIDATE CONSTRAINT` 用同一检查函数对全部可见行
+做一次 `force=True` 的只读扫描，成功后才把 `validated` 从 `False` 改为 `True`。
+因此大表可以先上线约束、再择机校验，失败时约束仍保持 `NOT VALID`。
 
 DDL 侧的保护不是“补丁”而是同一份目录语义：`DROP COLUMN` / `ALTER COLUMN TYPE`
 拒绝仍被外键使用的列；`DROP INDEX` / `DROP CONSTRAINT` 拒绝删除支撑外键的唯一键；
 `DROP TABLE` 默认拒绝被引用的表，`CASCADE` 时删除引用表上的外键约束；`TRUNCATE`
 默认拒绝被引用的表，`TRUNCATE ... CASCADE` 递归清空直接/间接引用它的子表。`RENAME TO` / `RENAME COLUMN` 会同步改外键里的表名/列名；
-`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 先扫描存量行，再原子写入目录（即使约束
-声明为延迟，也先校验存量数据）。当前
+`ALTER TABLE ADD CONSTRAINT FOREIGN KEY` 默认先扫描存量行，再原子写入目录（即使约束
+声明为延迟，也先校验存量数据）；声明 `NOT VALID` 时跳过扫描并等待
+`VALIDATE CONSTRAINT`。当前
 `ON DELETE` / `ON UPDATE` 均支持 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` /
 `NO ACTION`（显式 `NO ACTION` 保留；`DEFERRABLE` 可让它提交时检查），`MATCH` 支持
 `SIMPLE` / `FULL`，不支持 `PARTIAL`；`ADD COLUMN ... REFERENCES`

@@ -117,6 +117,9 @@ class ForeignKeyDef:
     match_type: str = "SIMPLE"
     deferrable: bool = False
     initially_deferred: bool = False
+    #: False 表示通过 ALTER TABLE ... NOT VALID 添加，存量行尚未校验；
+    #: 新写入仍由 _check_foreign_keys 正常检查，VALIDATE CONSTRAINT 后转 True。
+    validated: bool = True
 
     def to_json(self) -> dict:
         return {
@@ -129,6 +132,7 @@ class ForeignKeyDef:
             "match_type": self.match_type,
             "deferrable": self.deferrable,
             "initially_deferred": self.initially_deferred,
+            "validated": self.validated,
         }
 
     @classmethod
@@ -143,6 +147,7 @@ class ForeignKeyDef:
             match_type=data.get("match_type", "SIMPLE"),
             deferrable=bool(data.get("deferrable", False)),
             initially_deferred=bool(data.get("initially_deferred", False)),
+            validated=bool(data.get("validated", True)),
         )
 
 

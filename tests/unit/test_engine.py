@@ -3066,6 +3066,22 @@ class TestTransactions:
         assert rows(db, "SELECT id FROM t ORDER BY id") == [(1,), (2,)]
         db.execute_one("COMMIT")
 
+    def test_savepoint_restores_deferred_constraint_mode(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (id INT PRIMARY KEY, "
+            "pid INT REFERENCES p(id) DEFERRABLE INITIALLY IMMEDIATE)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("SET CONSTRAINTS ALL DEFERRED")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("SET CONSTRAINTS ALL IMMEDIATE")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        # 保存点之前是 DEFERRED；回滚后必须恢复，而不是保留 IMMEDIATE。
+        db.execute_one("INSERT INTO c VALUES (1, 99)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+
 
 class TestPersistence:
     def test_data_survives_reopen(self, tmp_path):
@@ -3208,6 +3224,85 @@ class TestForeignKey:
         )
         with pytest.raises(ForeignKeyViolationError):
             db.execute_one("INSERT INTO c VALUES (100)")
+
+    def test_alter_add_not_valid_then_validate(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id) NOT VALID"
+        )
+        fk = db.catalog.get_table("c").foreign_keys["fk_c"]
+        assert fk.validated is False
+        # NOT VALID 只跳过存量行；新写入仍然立即检查。
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (100)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("ALTER TABLE c VALIDATE CONSTRAINT fk_c")
+        assert fk.validated is False
+        db.execute_one("INSERT INTO p VALUES (99)")
+        db.execute_one("ALTER TABLE c VALIDATE CONSTRAINT fk_c")
+        assert db.catalog.get_table("c").foreign_keys["fk_c"].validated is True
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (101)")
+
+    def test_alter_not_valid_survives_reopen(self, tmp_path):
+        path = tmp_path / "fk_not_valid"
+        db = Database(path)
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id) NOT VALID"
+        )
+        db.close()
+
+        db2 = Database(path)
+        fk = db2.catalog.get_table("c").foreign_keys["fk_c"]
+        assert fk.validated is False
+        db2.execute_one("INSERT INTO p VALUES (99)")
+        db2.execute_one("ALTER TABLE c VALIDATE CONSTRAINT fk_c")
+        assert db2.catalog.get_table("c").foreign_keys["fk_c"].validated is True
+        db2.close()
+
+    def test_validate_constraint_rollback_restores_not_valid(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c "
+            "FOREIGN KEY (pid) REFERENCES p(id) NOT VALID"
+        )
+        db.execute_one("INSERT INTO p VALUES (99)")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE c VALIDATE CONSTRAINT fk_c")
+        assert db.catalog.get_table("c").foreign_keys["fk_c"].validated is True
+        db.execute_one("ROLLBACK")
+        assert db.catalog.get_table("c").foreign_keys["fk_c"].validated is False
+
+    def test_not_valid_deferrable_new_rows_still_checked(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT)")
+        db.execute_one("INSERT INTO c VALUES (99)")
+        db.execute_one(
+            "ALTER TABLE c ADD CONSTRAINT fk_c FOREIGN KEY (pid) "
+            "REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED NOT VALID"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (100)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_create_table_rejects_not_valid(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        with pytest.raises(NotSupportedError):
+            db.execute_one(
+                "CREATE TABLE c (pid INT, CONSTRAINT fk_c "
+                "FOREIGN KEY (pid) REFERENCES p(id) NOT VALID)"
+            )
 
     def test_drop_table_requires_cascade(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")

@@ -45,6 +45,7 @@ from ..sql.ast import (
     AlterTableRenameColumn,
     AlterTableRenameConstraint,
     AlterTableRenameTable,
+    AlterTableValidateConstraint,
     CreateIndex,
     CreateTable,
     CreateTableAs,
@@ -183,6 +184,8 @@ class Executor:
                 return self._alter_add_constraint(stmt, txn)
             if isinstance(stmt, AlterTableDropConstraint):
                 return self._alter_drop_constraint(stmt, txn)
+            if isinstance(stmt, AlterTableValidateConstraint):
+                return self._alter_validate_constraint(stmt, txn)
             if isinstance(stmt, AlterTableAlterDefault):
                 return self._alter_default(stmt, txn)
             if isinstance(stmt, AlterTableAlterNullability):
@@ -928,6 +931,11 @@ class Executor:
         by_name = {c.name: c for c in columns}
 
         def add(spec: ForeignKeySpec, fallback_columns: list[str]) -> None:
+            if spec.not_valid:
+                raise NotSupportedError(
+                    "CREATE TABLE 不支持 NOT VALID 外键",
+                    hint="先建表，再 ALTER TABLE ... ADD CONSTRAINT ... NOT VALID",
+                )
             local_columns = tuple(
                 name.lower() for name in (spec.columns or fallback_columns)
             )
@@ -1022,6 +1030,7 @@ class Executor:
                 match_type=spec.match_type,
                 deferrable=spec.deferrable,
                 initially_deferred=spec.initially_deferred,
+                validated=True,
             )
             used.add(name)
 
@@ -1042,6 +1051,7 @@ class Executor:
                     match_type=constraint.match_type,
                     deferrable=constraint.deferrable,
                     initially_deferred=constraint.initially_deferred,
+                    not_valid=constraint.not_valid,
                 ),
                 list(constraint.columns),
             )
@@ -1864,6 +1874,7 @@ class Executor:
                 match_type=constraint.match_type,
                 deferrable=constraint.deferrable,
                 initially_deferred=constraint.initially_deferred,
+                validated=not constraint.not_valid,
             )
             provisional = TableDef(
                 name=table.name,
@@ -1873,8 +1884,9 @@ class Executor:
                 foreign_keys=dict(table.foreign_keys, **{fk_name: fk}),
             )
             heap = HeapFile(self._bp, table, self._txns)
-            for _rid, values in heap.scan(txn):
-                self._check_foreign_keys(provisional, values, txn, force=True)
+            if not constraint.not_valid:
+                for _rid, values in heap.scan(txn):
+                    self._check_foreign_keys(provisional, values, txn, force=True)
             old_fks = dict(table.foreign_keys)
             table.foreign_keys[fk_name] = fk
 
@@ -1967,6 +1979,54 @@ class Executor:
 
         raise NotSupportedError(
             f"不支持的表级约束：{constraint.kind}"
+        )
+
+    def _alter_validate_constraint(
+        self, stmt: AlterTableValidateConstraint, txn: Transaction
+    ) -> Result:
+        """校验 NOT VALID 外键的存量行；成功后才把 validated 置为 True。
+
+        PostgreSQL 的 VALIDATE CONSTRAINT 只读扫描、不等待延迟队列；这里同样
+        用 force=True 立即检查，扫描失败时约束保持 NOT VALID，事务可继续修复
+        数据后重试。
+        """
+        table = self._catalog.get_table(stmt.table)
+        name = stmt.name.lower()
+        fk = table.foreign_keys.get(name)
+        if fk is None:
+            if name in table.checks:
+                return Result(
+                    tag="ALTER TABLE",
+                    notice=f"约束 {name} 已处于校验状态",
+                )
+            raise BinderError(
+                f"约束 {name!r} 不存在",
+                hint="可用外键约束："
+                + (", ".join(sorted(table.foreign_keys)) or "（空）"),
+            )
+        if fk.validated:
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"外键约束 {name} 已处于校验状态",
+            )
+
+        heap = HeapFile(self._bp, table, self._txns)
+        for _rid, values in heap.scan(txn):
+            self._check_foreign_keys(
+                table, values, txn, force=True, only_names={name}
+            )
+        old_fk = fk
+        table.foreign_keys[name] = replace(fk, validated=True)
+
+        def undo_validated() -> None:
+            table.foreign_keys[name] = old_fk
+
+        txn.undo_log.append(undo_validated)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"已校验外键约束 {name}",
         )
 
     def _alter_drop_constraint(

@@ -39,11 +39,18 @@ class TxnState(IntEnum):
 
 @dataclass
 class TxnSavepoint:
-    """事务内保存点：记录页 undo 与 DDL 内存 undo 的深度。"""
+    """事务内保存点：记录页 undo、DDL 内存 undo 与延迟约束状态。"""
 
     name: str
     page_depth: int
     undo_depth: int
+    #: 保存点建立时的延迟外键队列；ROLLBACK TO 必须一并恢复，否则保存点
+    #: 之后的 INSERT/DELETE 会把已撤销的检查残留到提交阶段。
+    deferred_fk_rows: frozenset[tuple[str, "RID"]] = field(default_factory=frozenset)
+    deferred_ref_checks: frozenset[tuple[str, str, tuple[Any, ...]]] = field(
+        default_factory=frozenset
+    )
+    constraint_modes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -182,6 +189,9 @@ class TransactionManager:
                     self._bp.undo_depth(txn.xid) if self._bp is not None else 0
                 ),
                 undo_depth=len(txn.undo_log),
+                deferred_fk_rows=frozenset(txn.deferred_fk_rows),
+                deferred_ref_checks=frozenset(txn.deferred_ref_checks),
+                constraint_modes=dict(txn.constraint_modes),
             )
             txn.savepoints.append(sp)
             return sp
@@ -211,6 +221,11 @@ class TransactionManager:
                     undo()
                 except Exception:  # pragma: no cover
                     pass
+            # 延迟约束队列和 SET CONSTRAINTS 覆盖也属于事务状态，必须回到
+            # 保存点建立时的样子；仅回滚页/DDL 会让已撤销的检查或模式泄漏。
+            txn.deferred_fk_rows = set(target.deferred_fk_rows)
+            txn.deferred_ref_checks = set(target.deferred_ref_checks)
+            txn.constraint_modes = dict(target.constraint_modes)
             # 保存点之后的保存点已经被这次回滚销毁。
             del txn.savepoints[idx + 1 :]
             return pages

@@ -77,6 +77,7 @@ from .ast import (
     AlterTableRenameColumn,
     AlterTableRenameConstraint,
     AlterTableRenameTable,
+    AlterTableValidateConstraint,
 )
 from .lexer import RESERVED, Token, tokenize
 
@@ -359,6 +360,10 @@ class Parser:
         self._expect_kw("ALTER")
         self._expect_kw("TABLE")
         table = self._parse_ident("表名")
+        if self._match_kw("VALIDATE"):
+            self._expect_kw("CONSTRAINT")
+            name = self._parse_ident("约束名")
+            return AlterTableValidateConstraint(table=table, name=name)
         if self._match_kw("DROP"):
             if self._match_kw("CONSTRAINT"):
                 if_exists = False
@@ -624,6 +629,10 @@ class Parser:
             match_type = self._parse_fk_match()
             on_delete, on_update = self._parse_fk_actions()
             deferrable, initially_deferred = self._parse_fk_deferrability()
+            not_valid = False
+            if self._match_kw("NOT"):
+                self._expect_kw("VALID")
+                not_valid = True
             return TableConstraint(
                 kind="FOREIGN KEY",
                 columns=fk_columns,
@@ -635,6 +644,7 @@ class Parser:
                 match_type=match_type,
                 deferrable=deferrable,
                 initially_deferred=initially_deferred,
+                not_valid=not_valid,
             )
         else:
             raise self._error(
@@ -806,9 +816,19 @@ class Parser:
         return on_delete, on_update
 
     def _parse_fk_deferrability(self) -> tuple[bool, bool]:
-        """解析 ``[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]``。"""
-        if self._match_kw("NOT"):
-            self._expect_kw("DEFERRABLE")
+        """解析 ``[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]``。
+
+        ``NOT VALID`` 也以 NOT 开头，但它属于 ALTER TABLE 的约束校验选项；
+        这里只在下一个词确实是 DEFERRABLE 时消费 NOT，避免把 NOT VALID
+        误判成 NOT DEFERRABLE。
+        """
+        if (
+            self._cur.is_keyword("NOT")
+            and self._i + 1 < len(self._tokens)
+            and self._tokens[self._i + 1].is_keyword("DEFERRABLE")
+        ):
+            self._advance()
+            self._advance()
             if self._match_kw("INITIALLY"):
                 raise NotSupportedError(
                     "NOT DEFERRABLE 不能同时指定 INITIALLY",
