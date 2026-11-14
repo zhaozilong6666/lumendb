@@ -1,4 +1,4 @@
-﻿# LumenDB
+# LumenDB
 
 [![CI](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
@@ -68,9 +68,6 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 无需任何第三方依赖，只需要 Python 3.12+。
 
 ```bash
-git clone https://github.com/zhaozilong6666/lumendb.git
-cd lumendb
-
 # 交互式 shell
 python -m lumendb shell --path ./mydb
 
@@ -214,12 +211,13 @@ python -m bench.replication --rows 2000 --repeat 3
 ```
 
 它量化基准备份、WAL 追平、`lag_from_server` 字节延迟和副本查询；实测与分析见
-[`docs/replication-bench.md`](docs/replication-bench.md)。当前观察到的物理 WAL
-放大（约 7.7 KB/行）和基准备份内存占用都已记录为下一步优化项，不当作 SLA。
+[`docs/replication-bench.md`](docs/replication-bench.md)。同一 2000 行场景下，
+多区间页 diff 把写入后 WAL 延迟从 13.9 MB 降到 1.1 MB；基准备份已分块传输，
+不再整库读进内存。这些数字是相对基线，不作为 SLA。
 
 ## 怎么验证它真的能跑
 
-- **1014 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1017 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -271,7 +269,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 自动提升 MVP：`ReplicationMonitor` 连续网络失败后 `promote`
 - [ ] 客户端重定向、租约/仲裁与真实网络分区防护
 
-长期分层路线、阶段依赖与“不青黄不接”的完成标准见
+长期分层路线、阶段依赖与"不青黄不接"的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 想把它讲出来
