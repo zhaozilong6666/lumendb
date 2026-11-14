@@ -358,6 +358,9 @@ class TestCreateTable:
         stmt = parse_statement("ALTER TABLE t DROP COLUMN IF EXISTS b")
         assert stmt.if_exists is True
 
+        stmt = parse_statement("ALTER TABLE t DROP COLUMN b CASCADE")
+        assert stmt.cascade is True
+
     def test_create_view(self):
         from lumendb.sql.ast import CreateView
 

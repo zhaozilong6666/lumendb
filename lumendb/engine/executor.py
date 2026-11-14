@@ -1592,27 +1592,23 @@ class Executor:
                 "表必须至少保留一列，不能删除最后一列",
                 hint="可以先 DROP TABLE 再重建空表",
             )
-        for fk in table.foreign_keys.values():
-            if column.name in fk.columns:
-                raise NotSupportedError(
-                    f"列 {column.name!r} 被外键约束 {fk.name!r} 引用",
-                    hint="先 ALTER TABLE ... DROP CONSTRAINT 删除外键",
-                )
-        for other in self._catalog.list_tables():
-            for fk in other.foreign_keys.values():
-                if fk.ref_table == table.name and column.name in fk.ref_columns:
-                    raise NotSupportedError(
-                        f"列 {column.name!r} 被表 {other.name} 的外键 "
-                        f"{fk.name!r} 引用",
-                        hint="先删除引用它的外键约束",
-                    )
-        for idx in table.indexes.values():
-            if column.name in idx.columns:
-                raise NotSupportedError(
-                    f"列 {column.name!r} 被索引/约束 {idx.name!r} 引用",
-                    hint="先 DROP INDEX 或 ALTER TABLE ... DROP CONSTRAINT",
-                )
-        for check in table.checks.values():
+        own_fk_dependents = [
+            fk for fk in table.foreign_keys.values()
+            if column.name in fk.columns
+        ]
+        ext_fk_dependents = [
+            (other, fk)
+            for other in self._catalog.list_tables()
+            if other is not table
+            for fk in other.foreign_keys.values()
+            if fk.ref_table == table.name and column.name in fk.ref_columns
+        ]
+        index_dependents = [
+            idx for idx in table.indexes.values()
+            if column.name in idx.columns
+        ]
+
+        def check_uses_column(check: CheckDef) -> bool:
             tokens = list(check.tokens)
             for pos, (kind, value) in enumerate(tokens):
                 if kind not in ("ident", "keyword"):
@@ -1622,10 +1618,83 @@ class Executor:
                 # ``t.a`` 里的 ``t`` 是表限定符，不是列引用。
                 if pos + 1 < len(tokens) and tokens[pos + 1][0] == "dot":
                     continue
+                return True
+            return False
+
+        check_dependents = [
+            check for check in table.checks.values()
+            if check_uses_column(check)
+        ]
+
+        if not stmt.cascade:
+            if own_fk_dependents:
+                fk = own_fk_dependents[0]
+                raise NotSupportedError(
+                    f"列 {column.name!r} 被外键约束 {fk.name!r} 引用",
+                    hint="先 ALTER TABLE ... DROP CONSTRAINT 删除外键",
+                )
+            if ext_fk_dependents:
+                other, fk = ext_fk_dependents[0]
+                raise NotSupportedError(
+                    f"列 {column.name!r} 被表 {other.name} 的外键 "
+                    f"{fk.name!r} 引用",
+                    hint="先删除引用它的外键约束",
+                )
+            if index_dependents:
+                idx = index_dependents[0]
+                raise NotSupportedError(
+                    f"列 {column.name!r} 被索引/约束 {idx.name!r} 引用",
+                    hint="先 DROP INDEX 或 ALTER TABLE ... DROP CONSTRAINT",
+                )
+            if check_dependents:
+                check = check_dependents[0]
                 raise BinderError(
                     f"CHECK 约束 {check.name!r} 引用了列 {column.name!r}",
                     hint="先删除引用该列的 CHECK 约束",
                 )
+        else:
+            fk_holders: dict[str, tuple[TableDef, dict[str, ForeignKeyDef]]] = {}
+            if own_fk_dependents:
+                fk_holders[table.name] = (table, dict(table.foreign_keys))
+            for other, _fk in ext_fk_dependents:
+                if other.name not in fk_holders:
+                    fk_holders[other.name] = (
+                        other,
+                        dict(other.foreign_keys),
+                    )
+            for holder, old_map in fk_holders.values():
+                holder.foreign_keys = {
+                    name: fk
+                    for name, fk in holder.foreign_keys.items()
+                    if not (
+                        (holder is table and column.name in fk.columns)
+                        or (
+                            fk.ref_table == table.name
+                            and column.name in fk.ref_columns
+                        )
+                    )
+                }
+
+            if fk_holders:
+
+                def undo_cascade_fks() -> None:
+                    for holder, old_map in fk_holders.values():
+                        holder.foreign_keys = old_map
+
+                txn.undo_log.append(undo_cascade_fks)
+
+            old_checks = dict(table.checks)
+            for check in check_dependents:
+                del table.checks[check.name]
+            if check_dependents:
+
+                def undo_cascade_checks() -> None:
+                    table.checks = old_checks
+
+                txn.undo_log.append(undo_cascade_checks)
+
+            for idx in index_dependents:
+                self._catalog.drop_index(txn, idx.name)
 
         heap = HeapFile(self._bp, table, self._txns)
         source_rows = [
@@ -1674,11 +1743,25 @@ class Executor:
         self._catalog.mark_dirty()
         self._catalog.persist(txn)
         index_note = f"；重建 {rebuilt} 个索引" if rebuilt else ""
+        cascade_parts: list[str] = []
+        if stmt.cascade:
+            fk_count = len(own_fk_dependents) + len(ext_fk_dependents)
+            if fk_count:
+                cascade_parts.append(f"{fk_count} 个外键")
+            if index_dependents:
+                cascade_parts.append(f"{len(index_dependents)} 个索引")
+            if check_dependents:
+                cascade_parts.append(f"{len(check_dependents)} 个 CHECK 约束")
+        cascade_note = (
+            f"；级联删除 {'、'.join(cascade_parts)}"
+            if cascade_parts
+            else ""
+        )
         return Result(
             tag="ALTER TABLE",
             notice=(
                 f"已删除列 {column.name}；重写 {len(new_rows)} 行"
-                f"{index_note}"
+                f"{index_note}{cascade_note}"
             ),
         )
 

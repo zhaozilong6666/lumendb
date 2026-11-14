@@ -2340,6 +2340,46 @@ class TestDropColumn:
         assert rows(db, "SELECT a, b FROM t") == [(1, "x")]
         db.execute_one("INSERT INTO t VALUES (3, 'z')")
 
+    def test_drop_column_cascade_removes_referencing_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY, note TEXT)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        with pytest.raises(NotSupportedError, match="外键"):
+            db.execute_one("ALTER TABLE p DROP COLUMN id")
+        result = db.execute_one("ALTER TABLE p DROP COLUMN id CASCADE")
+        assert "级联删除" in result.notice
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        db.execute_one("INSERT INTO c VALUES (99)")
+
+    def test_drop_column_cascade_removes_local_fk(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id), note TEXT)")
+        result = db.execute_one("ALTER TABLE c DROP COLUMN pid CASCADE")
+        assert "级联删除" in result.notice
+        assert db.catalog.get_table("c").foreign_keys == {}
+        db.execute_one("INSERT INTO c VALUES ('x')")
+
+    def test_drop_column_cascade_removes_index_and_check(self, db):
+        db.execute_one("CREATE TABLE t (a INT CHECK (a > 0), b TEXT)")
+        db.execute_one("CREATE UNIQUE INDEX t_a_uq ON t (a)")
+        result = db.execute_one("ALTER TABLE t DROP COLUMN a CASCADE")
+        assert "级联删除" in result.notice
+        assert "t_a_check" not in db.catalog.get_table("t").checks
+        assert "t_a_uq" not in db.catalog.get_table("t").indexes
+        db.execute_one("INSERT INTO t VALUES ('x')")
+
+    def test_drop_column_cascade_rollback_restores_dependencies(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY, note TEXT)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE p DROP COLUMN id CASCADE")
+        assert "c_pid_fkey" not in db.catalog.get_table("c").foreign_keys
+        db.execute_one("ROLLBACK")
+        assert "p_pkey" in db.catalog.get_table("p").indexes
+        assert "c_pid_fkey" in db.catalog.get_table("c").foreign_keys
+        db.execute_one("INSERT INTO p VALUES (1, 'x')")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (2)")
+
     def test_drop_column_preserves_unrelated_check(self, db):
         db.execute_one(
             "CREATE TABLE t (a INT CHECK (a > 0), b TEXT)"

@@ -512,6 +512,8 @@ class AlterTableDropColumn(Statement):
     table: str
     column: str
     if_exists: bool = False
+    #: DROP COLUMN ... CASCADE：同时删除依赖该列的外键、索引与 CHECK。
+    cascade: bool = False
 
 
 @dataclass

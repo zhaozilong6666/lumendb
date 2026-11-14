@@ -390,8 +390,16 @@ class Parser:
                 self._expect_kw("EXISTS")
                 if_exists = True
             column = self._parse_ident("列名")
+            cascade = False
+            if self._match_kw("CASCADE"):
+                cascade = True
+            else:
+                self._match_kw("RESTRICT")
             return AlterTableDropColumn(
-                table=table, column=column, if_exists=if_exists
+                table=table,
+                column=column,
+                if_exists=if_exists,
+                cascade=cascade,
             )
         if self._match_kw("ADD"):
             if self._cur.is_keyword(
