@@ -69,6 +69,7 @@ from .ast import (
     Truncate,
     AlterTableAddColumn,
     AlterTableAddConstraint,
+    AlterTableAlterConstraint,
     AlterTableAlterDefault,
     AlterTableAlterNullability,
     AlterTableAlterType,
@@ -426,6 +427,38 @@ class Parser:
             )
 
         if self._match_kw("ALTER"):
+            if self._match_kw("CONSTRAINT"):
+                name = self._parse_ident("约束名")
+                deferrable: Optional[bool] = None
+                initially_deferred: Optional[bool] = None
+                if self._match_kw("DEFERRABLE"):
+                    deferrable = True
+                elif self._match_kw("NOT"):
+                    self._expect_kw("DEFERRABLE")
+                    deferrable = False
+                    initially_deferred = False
+                if self._match_kw("INITIALLY"):
+                    if self._match_kw("DEFERRED"):
+                        initially_deferred = True
+                    elif self._match_kw("IMMEDIATE"):
+                        initially_deferred = False
+                    else:
+                        raise self._error(
+                            "INITIALLY 之后期望 DEFERRED 或 IMMEDIATE"
+                        )
+                if deferrable is None and initially_deferred is None:
+                    raise self._error(
+                        "ALTER CONSTRAINT 需要 DEFERRABLE、NOT DEFERRABLE "
+                        "或 INITIALLY ..."
+                    )
+                if initially_deferred and deferrable is False:
+                    raise self._error("NOT DEFERRABLE 不能 INITIALLY DEFERRED")
+                return AlterTableAlterConstraint(
+                    table=table,
+                    name=name,
+                    deferrable=deferrable,
+                    initially_deferred=initially_deferred,
+                )
             self._match_kw("COLUMN")
             column = self._parse_ident("列名")
             if self._match_word("TYPE"):
@@ -511,7 +544,8 @@ class Parser:
             )
 
         raise NotSupportedError(
-            "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN、DROP COLUMN、RENAME 和 DROP CONSTRAINT",
+            "ALTER TABLE 只支持 ADD COLUMN、ALTER COLUMN、ALTER CONSTRAINT、"
+            "DROP COLUMN、RENAME 和 DROP CONSTRAINT",
             hint=(
                 "支持 ADD [COLUMN] / ALTER [COLUMN] TYPE / SET DATA TYPE / "
                 "SET|DROP DEFAULT|NOT NULL / DROP [COLUMN] [IF EXISTS] name / "

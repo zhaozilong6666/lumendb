@@ -24,6 +24,7 @@
 | `NO ACTION` | 完成 | 独立动作；配合 `DEFERRABLE` 可提交时检查，否则立即拒绝 |
 | `DEFERRABLE INITIALLY DEFERRED` | 完成 | `INSERT`/`UPDATE` 存在性检查与 `NO ACTION` 父行动作延迟到 `COMMIT`；`SET CONSTRAINTS` 支持事务内切换 |
 | `ALTER TABLE ADD CONSTRAINT FOREIGN KEY` | 完成 | 默认先校验存量行，再原子写入目录；支持 `ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL/SET DEFAULT`、`NOT VALID` |
+| `ALTER TABLE ALTER CONSTRAINT` | 完成 | 修改已有外键的 `DEFERRABLE` / `INITIALLY`；改为立即检查前补检积压行，失败不改目录；回滚恢复旧定义与 `SET CONSTRAINTS` 覆盖 |
 | `ALTER TABLE ADD COLUMN ... REFERENCES` | 完成 | 复用 `ADD CONSTRAINT` 的存量行回填/校验路径，失败整条语句回滚 |
 | `NOT VALID` / `VALIDATE CONSTRAINT` | 完成 | 外键与 CHECK 均支持：`NOT VALID` 只跳过存量行、新写入仍立即检查；`VALIDATE` 只读扫描全部可见行，成功后才把 `validated` 置为真 |
 | 保存点与延迟状态 | 完成 | `SAVEPOINT` 同时快照 `deferred_fk_rows` / `deferred_ref_checks` / `constraint_modes`，`ROLLBACK TO` 一并恢复 |
@@ -112,6 +113,8 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 ### 2.6 `ALTER TABLE`
 
 - `ADD CONSTRAINT FOREIGN KEY`：先扫描存量行，再写入目录；失败不留下半状态。
+- `ALTER CONSTRAINT`：解析 `DEFERRABLE` / `NOT DEFERRABLE` / `INITIALLY`，只允许外键；
+  改为立即模式前复用延迟队列补检，成功后才替换目录并清理事务覆盖。
 - `ADD COLUMN ... REFERENCES`：先加列，再复用 `ADD CONSTRAINT` 路径建立外键；
   任一步失败整条语句回滚（测试覆盖“列已加、外键校验失败”场景）。
 - `DROP TABLE ... CASCADE`：删除其他表上引用该表的外键约束，不删除子表数据。
@@ -138,7 +141,7 @@ match_type: str = "SIMPLE"  # SIMPLE / FULL
 
 ## 4. 测试与验证
 
-- 全量测试：**924 passed**（`python -m pytest tests -q`，约 35 秒）
+- 全量测试：**931 passed**（`python -m pytest tests -q`，约 35 秒）
 - 编译检查：`python -m compileall -q lumendb tests` 通过
 - 空白检查：`git diff --check` 通过
 - 测试覆盖重点：
@@ -227,7 +230,7 @@ CI：
 ## 7. 验收结论
 
 本轮外键能力已形成完整闭环：DDL 创建/变更、DML 写入校验、删除/更新级联、
-索引点查、事务回滚、持久化和文档均已落地；全量 924 个测试通过，最新已推送代码提交
+索引点查、事务回滚、持久化和文档均已落地；全量 931 个测试通过，最新已推送代码提交
 `02e9c68` 的 CI 成功。上述遗留项属于后续扩展，不影响当前已声明支持的
 `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` / `NO ACTION`、
 `DEFERRABLE INITIALLY DEFERRED` / `SET CONSTRAINTS` 与 `MATCH SIMPLE` / `MATCH FULL` 子集。

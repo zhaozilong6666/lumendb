@@ -366,6 +366,23 @@ class TestCreateTable:
         stmt = parse_statement("ALTER TABLE t DROP CONSTRAINT ck CASCADE")
         assert stmt.cascade is True
 
+    def test_alter_constraint_deferrable(self):
+        from lumendb.sql.ast import AlterTableAlterConstraint
+
+        stmt = parse_statement(
+            "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+            "DEFERRABLE INITIALLY DEFERRED"
+        )
+        assert isinstance(stmt, AlterTableAlterConstraint)
+        assert stmt.table == "c"
+        assert stmt.name == "c_pid_fkey"
+        assert stmt.deferrable is True
+        assert stmt.initially_deferred is True
+
+    def test_alter_constraint_requires_attribute(self):
+        with pytest.raises(SQLSyntaxError, match="ALTER CONSTRAINT"):
+            parse_statement("ALTER TABLE c ALTER CONSTRAINT c_pid_fkey")
+
     def test_alter_column_type(self):
         from lumendb.sql.ast import AlterTableAlterType
 

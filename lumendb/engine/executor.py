@@ -37,6 +37,7 @@ from ..errors import (
 from ..sql.ast import (
     AlterTableAddColumn,
     AlterTableAddConstraint,
+    AlterTableAlterConstraint,
     AlterTableAlterDefault,
     AlterTableAlterNullability,
     AlterTableAlterType,
@@ -182,6 +183,8 @@ class Executor:
                 return self._alter_add_column(stmt, txn)
             if isinstance(stmt, AlterTableAddConstraint):
                 return self._alter_add_constraint(stmt, txn)
+            if isinstance(stmt, AlterTableAlterConstraint):
+                return self._alter_alter_constraint(stmt, txn)
             if isinstance(stmt, AlterTableDropConstraint):
                 return self._alter_drop_constraint(stmt, txn)
             if isinstance(stmt, AlterTableValidateConstraint):
@@ -2179,6 +2182,86 @@ class Executor:
 
         raise NotSupportedError(
             f"不支持的表级约束：{constraint.kind}"
+        )
+
+    def _alter_alter_constraint(
+        self, stmt: AlterTableAlterConstraint, txn: Transaction
+    ) -> Result:
+        """修改外键的 DEFERRABLE / INITIALLY 属性并立即持久化目录。"""
+        table = self._catalog.get_table(stmt.table)
+        name = stmt.name.lower()
+        fk = table.foreign_keys.get(name)
+        if fk is None:
+            available = sorted(table.foreign_keys)
+            raise BinderError(
+                f"外键约束 {name!r} 不存在",
+                hint="可用外键：" + (", ".join(available) or "（空）"),
+            )
+        if (
+            stmt.initially_deferred is True
+            and stmt.deferrable is None
+            and not fk.deferrable
+        ):
+            raise NotSupportedError(
+                f"外键 {name!r} 不是 DEFERRABLE，不能直接 INITIALLY DEFERRED",
+                hint="同时声明 DEFERRABLE INITIALLY DEFERRED",
+            )
+        deferrable = (
+            fk.deferrable if stmt.deferrable is None else stmt.deferrable
+        )
+        initially_deferred = (
+            fk.initially_deferred
+            if stmt.initially_deferred is None
+            else stmt.initially_deferred
+        )
+        if not deferrable:
+            initially_deferred = False
+        if initially_deferred and not deferrable:
+            raise NotSupportedError(
+                f"外键 {name!r} 的 INITIALLY DEFERRED 需要 DEFERRABLE",
+                hint="先声明 DEFERRABLE，再设置 INITIALLY DEFERRED",
+            )
+        if (
+            deferrable == fk.deferrable
+            and initially_deferred == fk.initially_deferred
+        ):
+            return Result(
+                tag="ALTER TABLE",
+                notice=f"外键 {name} 的延迟属性未改变",
+            )
+
+        # 目标模式是立即检查时，先把当前事务已积压的违反行补检掉；
+        # 失败则不修改目录，事务可以继续修复后重试。
+        if not (deferrable and initially_deferred):
+            self.validate_deferred_foreign_keys(txn, only_names={name})
+
+        old_mode = txn.constraint_modes.get(name)
+        new_fk = replace(
+            fk, deferrable=deferrable, initially_deferred=initially_deferred
+        )
+        table.foreign_keys[name] = new_fk
+        txn.constraint_modes.pop(name, None)
+
+        def undo() -> None:
+            table.foreign_keys[name] = fk
+            if old_mode is None:
+                txn.constraint_modes.pop(name, None)
+            else:
+                txn.constraint_modes[name] = old_mode
+
+        txn.undo_log.append(undo)
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
+        mode = (
+            "INITIALLY DEFERRED"
+            if deferrable and initially_deferred
+            else "INITIALLY IMMEDIATE"
+            if deferrable
+            else "NOT DEFERRABLE"
+        )
+        return Result(
+            tag="ALTER TABLE",
+            notice=f"已修改外键 {name} 为 {mode}",
         )
 
     def _alter_validate_constraint(

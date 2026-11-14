@@ -475,6 +475,18 @@ class AlterTableDropConstraint(Statement):
 
 
 @dataclass
+class AlterTableAlterConstraint(Statement):
+    """``ALTER TABLE ... ALTER CONSTRAINT name``：修改外键的延迟属性。"""
+
+    table: str
+    name: str
+    #: None 表示保持原值；False 表示 NOT DEFERRABLE。
+    deferrable: Optional[bool] = None
+    #: None 表示保持原值；False 表示 INITIALLY IMMEDIATE。
+    initially_deferred: Optional[bool] = None
+
+
+@dataclass
 class AlterTableValidateConstraint(Statement):
     """``ALTER TABLE ... VALIDATE CONSTRAINT name``：校验 NOT VALID 的存量行。"""
 

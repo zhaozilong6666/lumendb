@@ -4266,6 +4266,93 @@ class TestForeignKey:
         with pytest.raises(DuplicateKeyError, match="延迟唯一约束"):
             db.execute_one("COMMIT")
 
+    def test_alter_constraint_deferrable(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        result = db.execute_one(
+            "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+            "DEFERRABLE INITIALLY DEFERRED"
+        )
+        assert "INITIALLY DEFERRED" in result.notice
+        fk = db.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+        assert fk.deferrable is True
+        assert fk.initially_deferred is True
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        db.execute_one("INSERT INTO p VALUES (1)")
+        db.execute_one("COMMIT")
+        assert rows(db, "SELECT COUNT(*) FROM c") == [(1,)]
+
+    def test_alter_constraint_initially_deferred_requires_deferrable(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        with pytest.raises(NotSupportedError, match="不是 DEFERRABLE"):
+            db.execute_one(
+                "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+                "INITIALLY DEFERRED"
+            )
+
+    def test_alter_constraint_not_deferrable(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        result = db.execute_one(
+            "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey NOT DEFERRABLE"
+        )
+        assert "NOT DEFERRABLE" in result.notice
+        fk = db.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+        assert fk.deferrable is False
+        assert fk.initially_deferred is False
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one("INSERT INTO c VALUES (1)")
+
+    def test_alter_constraint_flags_persist_and_reopen(self, tmp_path):
+        path = tmp_path / "alter_fk_deferrable"
+        first = Database(path)
+        first.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        first.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")
+        first.execute_one(
+            "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+            "DEFERRABLE INITIALLY DEFERRED"
+        )
+        first.close()
+        reopened = Database(path)
+        try:
+            fk = reopened.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+            assert fk.deferrable is True
+            assert fk.initially_deferred is True
+            reopened.execute_one(
+                "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+                "INITIALLY IMMEDIATE"
+            )
+            fk = reopened.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+            assert fk.deferrable is True
+            assert fk.initially_deferred is False
+            with pytest.raises(ForeignKeyViolationError):
+                reopened.execute_one("INSERT INTO c VALUES (1)")
+        finally:
+            reopened.close()
+
+    def test_alter_constraint_immediate_rejects_pending_violation(self, db):
+        db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+        db.execute_one(
+            "CREATE TABLE c (pid INT REFERENCES p(id) "
+            "DEFERRABLE INITIALLY DEFERRED)"
+        )
+        db.execute_one("BEGIN")
+        db.execute_one("INSERT INTO c VALUES (1)")
+        with pytest.raises(ForeignKeyViolationError):
+            db.execute_one(
+                "ALTER TABLE c ALTER CONSTRAINT c_pid_fkey "
+                "INITIALLY IMMEDIATE"
+            )
+        db.execute_one("ROLLBACK")
+        fk = db.catalog.get_table("c").foreign_keys["c_pid_fkey"]
+        assert fk.deferrable is True
+        assert fk.initially_deferred is True
+
     def test_on_conflict_rejects_deferrable_unique(self, db):
         db.execute_one("CREATE TABLE t (id INT UNIQUE DEFERRABLE)")
         db.execute_one("INSERT INTO t VALUES (1)")
