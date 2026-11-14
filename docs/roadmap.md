@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1033 passed。
+- 全量测试：1034 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -161,7 +161,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
     在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
     zlib 压缩；`WALServer(ssl_context=...)` / `WALClient(ssl_context=...)`
     可以走标准库 TLS；服务端 `SSLContext.verify_mode = CERT_REQUIRED` + 客户端
-    证书即双向认证，已有测试覆盖。证书分发、轮换和主机名校验策略仍需部署层补齐。
+    证书即双向认证，已有测试覆盖。证书分发和轮换仍需部署层补齐；主机名校验由客户端 `server_hostname`
+  控制，已有“错误主机名必须握手失败”的测试。
 - 副本查询与 apply 的并发调度；当前是单线程应用。
 - 多副本槽位已做 MVP：`WALServer(slot_dir=...)` 每个 `replica_id` 一个
   `<id>.confirmed`，主库保留点取所有槽位的最小确认 LSN；`Replica` 在

@@ -95,6 +95,7 @@ class Replica:
         token: str | None = None,
         compress: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
         replica_id: str | None = None,
     ) -> "Replica":
         """通过 TCP 拉取主库基准备份并打开副本。"""
@@ -110,7 +111,8 @@ class Replica:
             )
         client = WALClient(
             host, port, timeout=timeout, token=token, compress=compress,
-            ssl_context=ssl_context, replica_id=replica_id,
+            ssl_context=ssl_context, server_hostname=server_hostname,
+            replica_id=replica_id,
         )
         base_lsn = client.backup_to(data_path)
         if replica_id is not None:
@@ -140,6 +142,7 @@ class Replica:
         token: str | None = None,
         compress: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
         replica_id: str | None = None,
     ) -> int:
         """通过 TCP 读取主库当前 LSN，计算尚未应用的字节数。"""
@@ -148,7 +151,8 @@ class Replica:
         with self._lock:
             status = WALClient(
                 host, port, timeout=timeout, token=token, compress=compress,
-                ssl_context=ssl_context, replica_id=replica_id,
+                ssl_context=ssl_context, server_hostname=server_hostname,
+                replica_id=replica_id,
             ).status()
             lag = status["current_lsn"] - self._applied_lsn
             return max(0, lag)
@@ -175,6 +179,7 @@ class Replica:
         token: str | None = None,
         compress: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
         replica_id: str | None = None,
     ) -> int:
         """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
@@ -183,7 +188,8 @@ class Replica:
 
             client = WALClient(
                 host, port, timeout=timeout, token=token, compress=compress,
-                ssl_context=ssl_context, replica_id=replica_id,
+                ssl_context=ssl_context, server_hostname=server_hostname,
+                replica_id=replica_id,
             )
             records = client.fetch(self._applied_lsn, max_records=max_records)
             applied = self.apply(records, primary=None)
@@ -280,6 +286,7 @@ class Replica:
         token: str | None = None,
         compress: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
         replica_id: str | None = None,
     ) -> int:
         """用主库的页级增量备份重建数据文件，并返回新的基础 LSN。
@@ -307,7 +314,8 @@ class Replica:
             try:
                 client = WALClient(
                     host, port, timeout=timeout, token=token, compress=compress,
-                    ssl_context=ssl_context, replica_id=replica_id,
+                    ssl_context=ssl_context, server_hostname=server_hostname,
+                    replica_id=replica_id,
                 )
                 checkpoint_lsn, _count = client.incremental_to(
                     temp, self._applied_lsn
@@ -328,6 +336,7 @@ class Replica:
                     for path in sorted(temp.glob("*.page")):
                         page_id = int(path.stem)
                         disk.write_page_bytes(page_id, path.read_bytes())
+                    disk.sync()
                 finally:
                     disk.close()
                 os.replace(staged_path, data_path)

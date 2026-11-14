@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ssl
+
+import pytest
 from pathlib import Path
 
 from lumendb.engine.database import Database
@@ -75,5 +77,24 @@ def test_mutual_tls_requires_client_certificate(tmp_path):
     finally:
         if replica is not None:
             replica.db.close()
+        server.stop()
+        primary.close()
+
+
+def test_tls_hostname_verification_rejects_wrong_name(tmp_path):
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    primary.execute_one("INSERT INTO t VALUES (1)")
+    server = WALServer(primary, ssl_context=_server_context()).start()
+    try:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            Replica.bootstrap_from_server(
+                server.host,
+                server.port,
+                tmp_path / "replica",
+                ssl_context=_client_context(),
+                server_hostname="wrong.example",
+            )
+    finally:
         server.stop()
         primary.close()
