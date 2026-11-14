@@ -61,6 +61,7 @@ class Database:
         *,
         pool_size: int = 64,
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
+        checkpoint_every_commits: int = 0,
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
         write_fence: Optional[Callable[[], None]] = None,
@@ -89,6 +90,8 @@ class Database:
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
         self.txns = TransactionManager(self.disk, self.wal, self.bp)
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
+        self._checkpoint_every_commits = max(0, checkpoint_every_commits)
+        self._commits_since_checkpoint = 0
 
         self.recovery = RecoveryManager(
             self.disk, self.wal, self.bp, self.txns
@@ -222,6 +225,7 @@ class Database:
     def checkpoint(self) -> None:
         with self._write_lock:
             self.recovery.checkpoint()
+            self._commits_since_checkpoint = 0
 
     def snapshot(self) -> tuple[bytes, int]:
         """冻结写、做一次 checkpoint，然后返回数据文件快照和基础 LSN。
@@ -237,6 +241,7 @@ class Database:
                     hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和复制",
                 )
             self.recovery.checkpoint()
+            self._commits_since_checkpoint = 0
             return self.disk.snapshot_bytes(), self.disk.meta.checkpoint_lsn
 
     def snapshot_file(self, target: str | Path) -> int:
@@ -252,26 +257,35 @@ class Database:
                     hint="先让所有事务 COMMIT / ROLLBACK，再 checkpoint 和复制",
                 )
             self.recovery.checkpoint()
+            self._commits_since_checkpoint = 0
             self.disk.copy_to(target)
             return self.disk.meta.checkpoint_lsn
 
     def _maybe_checkpoint(self) -> None:
-        """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。
+        """按 WAL 字节或累计提交数自动落一次 checkpoint。
 
         checkpoint 是提交后的维护动作，失败不能把已经持久化的提交改判为
-        失败；这里只吞掉存储层错误，编程错误仍然照常暴露。
+        失败；这里只吞掉存储层错误，编程错误仍然照常暴露。两个阈值都可为 0
+        表示关闭对应策略；同时配置时任意一个命中都会触发。
         """
-        if self._checkpoint_wal_bytes <= 0:
-            return
-        if (
-            self.wal.next_lsn - self.disk.meta.checkpoint_lsn
+        self._commits_since_checkpoint += 1
+        by_bytes = (
+            self._checkpoint_wal_bytes > 0
+            and self.wal.next_lsn - self.disk.meta.checkpoint_lsn
             >= self._checkpoint_wal_bytes
-        ):
-            try:
-                self.recovery.checkpoint()
-            except (StorageError, OSError):
-                # WAL 中的提交记录已经是持久的；下一次启动会重新恢复。
-                return
+        )
+        by_commits = (
+            self._checkpoint_every_commits > 0
+            and self._commits_since_checkpoint >= self._checkpoint_every_commits
+        )
+        if not (by_bytes or by_commits):
+            return
+        try:
+            self.recovery.checkpoint()
+            self._commits_since_checkpoint = 0
+        except (StorageError, OSError):
+            # WAL 中的提交记录已经是持久的；下一次启动会重新恢复。
+            return
 
     def maybe_checkpoint(self) -> None:
         """给服务端等非 ``Database._run`` 提交路径使用的公开钩子。"""
