@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：982 passed。
+- 全量测试：995 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -14,6 +14,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
   不变。
 - 自动 checkpoint 已落地：WAL 增长超过 `checkpoint_wal_bytes` 时刷脏页、
   写 CHECKPOINT 并前移 `checkpoint_lsn`；手动 `CHECKPOINT` 保留。
+- WAL 分段回收已落地：新库使用分段 WAL，checkpoint 后按安全 LSN 删除旧段，
+  活跃事务的 BEGIN 之前的历史不会被回收。
 - 外键主线已闭环：引用完整性、级联动作、DDL、延迟约束、`NOT VALID` /
   `VALIDATE`、`TRUNCATE` 依赖、依赖删除 `CASCADE`。
 - SQL 查询：相关子查询（单层/多层）、FROM 派生表、列别名列表、派生表内部
@@ -79,13 +81,21 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
      提交数，崩溃恢复测试仍通过。
 2. **WAL 分段回收**：checkpoint 之后轮转 WAL，保留基础 LSN，恢复从
    `checkpoint_lsn` 之后开始；旧段在确认无引用后删除。
+   - **已完成**：新库默认使用 `wal-<first_lsn>.log` 分段 WAL；checkpoint 后
+     只删除“最后一条记录 LSN 小于安全 LSN”的整段。安全 LSN 取活跃事务的
+     最老 BEGIN LSN；没有活跃事务时取 `checkpoint_lsn`。旧单文件库继续走
+     兼容路径。
 3. **CHECKPOINT 策略**：按 WAL 大小或提交数触发，保留手动 `CHECKPOINT`。
    - **已完成（按 WAL 大小）**：`Database(checkpoint_wal_bytes=...)` 在每次
      提交后检查 WAL 增长，超过阈值自动调用 `RecoveryManager.checkpoint`；
-     按提交数触发和 WAL 分段仍未实现。
+     按提交数触发暂未实现，手动 `CHECKPOINT` 保留。
 
 完成标准：崩溃注入测试覆盖“提交后、checkpoint 中、WAL 轮转后”三个时点；
 恢复结果与未崩溃基线一致。
+
+- **已完成**：崩溃测试覆盖已提交事务、checkpoint 刷脏页后崩溃、checkpoint
+  元数据写入失败、活跃事务 checkpoint 后崩溃、WAL 轮转后崩溃；恢复结果与
+  未崩溃基线一致。第 3 层可进入第 4 层。
 
 ### 第 4 层：复制与只读副本
 

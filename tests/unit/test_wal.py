@@ -23,6 +23,7 @@ from lumendb.storage.wal import (
     encode_checkpoint,
     encode_page_update,
 )
+from lumendb.storage.wal_segments import SegmentedWAL
 
 
 @pytest.fixture
@@ -207,6 +208,45 @@ class TestGroupCommit:
         assert len(committed) == 8
         assert all(txn.state is TxnState.COMMITTED for txn in committed)
         # 一个 leader 的慢刷盘窗口足够收集其余提交；强断言少于提交数。
+        assert len(flush_calls) < 8
+        dm.close()
+        wal.close()
+
+    def test_segmented_commits_share_flush(self, tmp_path, monkeypatch):
+        dm = DiskManager(tmp_path / "data.db")
+        wal = SegmentedWAL(tmp_path / "wal", segment_bytes=64)
+        txns = TransactionManager(dm, wal)
+        original_flush = wal.flush
+        flush_calls: list[int] = []
+
+        def slow_flush():
+            flush_calls.append(1)
+            time.sleep(0.01)
+            return original_flush()
+
+        monkeypatch.setattr(wal, "flush", slow_flush)
+
+        barrier = threading.Barrier(8)
+        threads: list[threading.Thread] = []
+        committed = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            txn = txns.begin()
+            txns.commit(txn)
+            with lock:
+                committed.append(txn)
+
+        for _ in range(8):
+            thread = threading.Thread(target=worker)
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(committed) == 8
+        assert all(txn.state is TxnState.COMMITTED for txn in committed)
         assert len(flush_calls) < 8
         dm.close()
         wal.close()

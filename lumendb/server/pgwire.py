@@ -265,6 +265,7 @@ class PGWireServer:
             session.txn = None
             if isinstance(statement, Commit) and not session.failed:
                 database.txns.commit(txn)
+                database.maybe_checkpoint()
                 result = Result(tag="COMMIT")
             else:
                 # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
@@ -313,6 +314,7 @@ class PGWireServer:
             session.portals.clear()
             raise
         database.txns.commit(txn)
+        database.maybe_checkpoint()
         # 语句级隐式事务结束，关闭本次事务创建的门户。
         session.portals.clear()
         return result

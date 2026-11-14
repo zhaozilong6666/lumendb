@@ -3513,6 +3513,41 @@ class TestPersistence:
         assert rows(reopened, "SELECT COUNT(*) FROM users") == [(4,)]
         reopened.close()
 
+    def test_segmented_wal_recycles_after_checkpoint(self, tmp_path):
+        path = tmp_path / "segmented"
+        db = Database(path, wal_segment_bytes=64, checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        for i in range(20):
+            db.execute_one(f"INSERT INTO t VALUES ({i})")
+        before = len(db.wal.segments)
+        assert before > 1
+        db.checkpoint()
+        assert len(db.wal.segments) < before
+        assert rows(db, "SELECT COUNT(*) FROM t") == [(20,)]
+        db.close()
+
+        reopened = Database(path)
+        assert rows(reopened, "SELECT COUNT(*) FROM t") == [(20,)]
+        reopened.close()
+
+    def test_checkpoint_keeps_active_transaction_wal(self, tmp_path):
+        path = tmp_path / "active-retained"
+        db = Database(path, wal_segment_bytes=64, checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("BEGIN")
+        for i in range(10):
+            db.execute_one(f"INSERT INTO t VALUES ({i})")
+        active_start = db.txns.active_first_lsn
+        assert active_start is not None
+        db.checkpoint()
+        assert db.wal.base_lsn <= active_start
+        db.execute_one("ROLLBACK")
+        db.close()
+
+        reopened = Database(path)
+        assert rows(reopened, "SELECT COUNT(*) FROM t") == [(0,)]
+        reopened.close()
+
 
 class TestForeignKey:
     def test_insert_update_delete_restrict(self, db):

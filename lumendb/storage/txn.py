@@ -103,6 +103,8 @@ class TransactionManager:
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
+        #: 活跃事务的 BEGIN LSN；checkpoint 回收 WAL 时必须保留到这里。
+        self._active_starts: dict[int, int] = {}
         self._current: Optional[Transaction] = None
         # 组提交：提交记录先入队，由一个 leader 统一刷盘；其余提交等待
         # durable_lsn 覆盖自己的目标 LSN 后再标记为 COMMITTED。
@@ -138,6 +140,7 @@ class TransactionManager:
             self._active.add(xid)
             txn.first_lsn = self._wal.begin(xid)
             txn.last_lsn = txn.first_lsn
+            self._active_starts[xid] = txn.first_lsn
             self._current = txn
             return txn
 
@@ -202,6 +205,7 @@ class TransactionManager:
         txn.state = TxnState.COMMITTED
         self._states[txn.xid] = TxnState.COMMITTED
         self._active.discard(txn.xid)
+        self._active_starts.pop(txn.xid, None)
         if self._bp is not None:
             self._bp.clear_undo(txn.xid)
         txn.undo_log.clear()
@@ -231,6 +235,7 @@ class TransactionManager:
             txn.state = TxnState.ABORTED
             self._states[txn.xid] = TxnState.ABORTED
             self._active.discard(txn.xid)
+            self._active_starts.pop(txn.xid, None)
             if self._current is txn:
                 self._current = None
 
@@ -305,6 +310,14 @@ class TransactionManager:
         with self._lock:
             return sorted(self._active)
 
+    @property
+    def active_first_lsn(self) -> int | None:
+        """最老的活跃事务 BEGIN LSN；没有活跃事务时返回 None。"""
+        with self._lock:
+            if not self._active_starts:
+                return None
+            return min(self._active_starts.values())
+
     def state_of(self, xid: int) -> Optional[TxnState]:
         return self._states.get(xid)
 
@@ -355,6 +368,7 @@ class TransactionManager:
                 self._states[xid] = TxnState.COMMITTED
             for xid in aborted:
                 self._states[xid] = TxnState.ABORTED
+            self._active_starts.clear()
             if max_xid + 1 > self._next_xid:
                 self._next_xid = max_xid + 1
             if self._next_xid >= self._xid_ceiling:

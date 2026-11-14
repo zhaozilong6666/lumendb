@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
-from ..errors import TransactionError
+from ..errors import StorageError, TransactionError
 from ..sql.ast import (
     Begin,
     Commit,
@@ -26,6 +26,7 @@ from ..storage.pager import DiskManager
 from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
+from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result
 
 
@@ -36,11 +37,20 @@ class Database:
         *,
         pool_size: int = 64,
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
+        wal_segment_bytes: int = 1024 * 1024,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.disk = DiskManager(self.path / "lumendb.data")
-        self.wal = WAL(self.path / "lumendb.wal")
+        # 兼容旧库：如果已有单文件 WAL，继续用它；新库默认使用分段 WAL，
+        # 这样 checkpoint 后可以回收旧段。
+        legacy_wal = self.path / "lumendb.wal"
+        if legacy_wal.exists():
+            self.wal = WAL(legacy_wal)
+        else:
+            self.wal = SegmentedWAL(
+                self.path / "wal", segment_bytes=wal_segment_bytes
+            )
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
         self.txns = TransactionManager(self.disk, self.wal, self.bp)
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
@@ -159,14 +169,26 @@ class Database:
         self.recovery.checkpoint()
 
     def _maybe_checkpoint(self) -> None:
-        """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。"""
+        """WAL 自上次 checkpoint 增长超过阈值时自动落一次 checkpoint。
+
+        checkpoint 是提交后的维护动作，失败不能把已经持久化的提交改判为
+        失败；这里只吞掉存储层错误，编程错误仍然照常暴露。
+        """
         if self._checkpoint_wal_bytes <= 0:
             return
         if (
             self.wal.next_lsn - self.disk.meta.checkpoint_lsn
             >= self._checkpoint_wal_bytes
         ):
-            self.recovery.checkpoint()
+            try:
+                self.recovery.checkpoint()
+            except (StorageError, OSError):
+                # WAL 中的提交记录已经是持久的；下一次启动会重新恢复。
+                return
+
+    def maybe_checkpoint(self) -> None:
+        """给服务端等非 ``Database._run`` 提交路径使用的公开钩子。"""
+        self._maybe_checkpoint()
 
     def close(self) -> None:
         if self._txn is not None:

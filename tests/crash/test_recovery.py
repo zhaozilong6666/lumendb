@@ -20,6 +20,7 @@ from lumendb.storage.pager import DiskManager
 from lumendb.storage.recovery import RecoveryManager
 from lumendb.storage.txn import TransactionManager
 from lumendb.storage.wal import WAL
+from lumendb.storage.wal_segments import SegmentedWAL
 
 
 @dataclass
@@ -34,9 +35,18 @@ class Handle:
         return HeapFile(self.bp, self.cat.get_table(table), self.txns)
 
 
-def open_db(path, pool_size=8, recover=True) -> Handle:
+def open_db(
+    path,
+    pool_size=8,
+    recover=True,
+    segmented=False,
+    segment_bytes=64,
+) -> Handle:
     dm = DiskManager(path / "data.db")
-    wal = WAL(path / "wal.log")
+    if segmented:
+        wal = SegmentedWAL(path / "wal", segment_bytes=segment_bytes)
+    else:
+        wal = WAL(path / "wal.log")
     bp = BufferPoolManager(dm, wal, pool_size=pool_size)
     txns = TransactionManager(dm, wal)
     if recover:
@@ -49,6 +59,7 @@ def open_db(path, pool_size=8, recover=True) -> Handle:
 def crash(handle: Handle) -> None:
     """模拟崩溃：WAL 落盘，数据页不落盘。"""
     handle.wal.flush()
+    handle.wal.close()
     handle.dm.close()  # 只写元数据页，不 flush 数据页
 
 
@@ -220,6 +231,7 @@ class TestSavepointCrashRecovery:
 
         # 崩溃：只保证 WAL 落盘，数据页留在 Buffer Pool，不执行 commit。
         db.wal.flush()
+        db.wal.close()
         db.disk.close()
 
         db2 = Database(path)
@@ -302,6 +314,93 @@ class TestCheckpoint:
         rows = list(HeapFile(h2.bp, h2.cat.get_table("t"), h2.txns).scan(report_reader))
         h2.txns.commit(report_reader)
         assert [r[1][0] for r in rows] == [42]
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+    def test_segmented_checkpoint_with_active_txn_then_crash(self, db_path):
+        path = db_path / "active-checkpoint-crash"
+        db = Database(path, wal_segment_bytes=64, checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("BEGIN")
+        for i in range(20):
+            db.execute_one(f"INSERT INTO t VALUES ({i})")
+        # checkpoint 会把未提交的脏页也刷下去；WAL 必须保留到活跃事务的
+        # BEGIN，否则重启后无法 undo 这些行。
+        db.checkpoint()
+        db.wal.flush()
+        db.wal.close()
+        db.disk.close()
+
+        db2 = Database(path)
+        assert db2.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+        db2.close()
+
+    def test_checkpoint_then_crash_uses_post_checkpoint_wal(self, db_path):
+        path = db_path / "checkpoint-then-crash"
+        db = Database(path, wal_segment_bytes=64, checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        for i in range(20):
+            db.execute_one(f"INSERT INTO t VALUES ({i})")
+        db.checkpoint()
+        for i in range(20, 25):
+            db.execute_one(f"INSERT INTO t VALUES ({i})")
+        db.wal.flush()
+        db.wal.close()
+        db.disk.close()
+
+        db2 = Database(path)
+        assert db2.execute_one("SELECT COUNT(*) FROM t").rows == [(25,)]
+        db2.close()
+
+    def test_crash_during_checkpoint_before_meta_persist(self, db_path, monkeypatch):
+        h = open_db(db_path, segmented=True, segment_bytes=64)
+        txn = h.txns.begin()
+        h.cat.create_table(txn, "t", columns())
+        h.cat.persist(txn)
+        heap = HeapFile(h.bp, h.cat.get_table("t"), h.txns)
+        heap.insert(txn, [7, "seven"])
+        h.cat.persist(txn)
+        h.txns.commit(txn)
+
+        def fail_meta():
+            raise RuntimeError("crash during checkpoint")
+
+        with pytest.raises(RuntimeError, match="crash during checkpoint"):
+            monkeypatch.setattr(h.dm, "_persist_meta", fail_meta)
+            RecoveryManager(h.dm, h.wal, h.bp, h.txns).checkpoint()
+        monkeypatch.undo()
+
+        # checkpoint 已经把脏页刷盘、也写了 checkpoint 日志，但元数据页
+        # 还没更新；这正是“checkpoint 中崩溃”的窗口。
+        crash(h)
+        h2 = open_db(db_path, segmented=True, segment_bytes=64)
+        reader = h2.txns.begin()
+        rows = list(HeapFile(h2.bp, h2.cat.get_table("t"), h2.txns).scan(reader))
+        h2.txns.commit(reader)
+        assert [r[1][0] for r in rows] == [7]
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+    def test_crash_after_segment_rotation(self, db_path):
+        h = open_db(db_path, segmented=True, segment_bytes=64)
+        txn = h.txns.begin()
+        h.cat.create_table(txn, "t", columns())
+        h.cat.persist(txn)
+        heap = HeapFile(h.bp, h.cat.get_table("t"), h.txns)
+        for i in range(20):
+            heap.insert(txn, [i, f"v{i}"])
+        h.cat.persist(txn)
+        h.txns.commit(txn)
+        assert len(h.wal.segments) > 1
+        crash(h)
+
+        h2 = open_db(db_path, segmented=True, segment_bytes=64)
+        reader = h2.txns.begin()
+        rows = list(HeapFile(h2.bp, h2.cat.get_table("t"), h2.txns).scan(reader))
+        h2.txns.commit(reader)
+        assert sorted(r[1][0] for r in rows) == list(range(20))
         h2.bp.close()
         h2.wal.close()
         h2.dm.close()

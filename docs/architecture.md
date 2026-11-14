@@ -40,7 +40,12 @@ server  →  plan  →  engine  →  storage  →  pager (OS file)
 - undo 不需要反向推导 SQL 语义；
 - 恢复正确性可以用 before/after image 直接断言。
 
-代价是日志体积大，分段回收仍留作后续优化（见 roadmap）。
+代价是日志体积大。新库默认使用**分段 WAL**：LSN 仍是逻辑字节偏移 + 1，
+但日志拆成 `wal-<first_lsn>.log` 多个段文件，文件名记录该段第一条记录的
+LSN。checkpoint 之后，`RecoveryManager` 只删除“最后一条记录 LSN 小于安全
+LSN”的整段；安全 LSN 取活跃事务最老的 BEGIN LSN，没有活跃事务时取
+`checkpoint_lsn`。已有单文件 `lumendb.wal` 的旧库继续走单文件路径，避免
+在没有迁移逻辑时误读旧数据。
 
 **组提交**：`WAL` 的追加与刷盘都持同一把锁；`TransactionManager.commit` 先把
 COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可以覆盖多个
@@ -56,8 +61,9 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 2. **redo**：从 checkpoint 的 `redo_lsn` 起重放所有日志，`pageLSN >= lsn` 的页跳过；
 3. **undo**：对活跃事务（loser）按 LSN 逆序应用 before image，并写 CLR 防止二次回滚。
 
-恢复结束后写一个 checkpoint，把 `checkpoint_lsn` 记入元数据页；当前 WAL 仍是
-单文件，旧日志暂不截断，分段回收见 roadmap 第 3 层。
+恢复结束后写一个 checkpoint，把 `checkpoint_lsn` 记入元数据页。分段 WAL 会在
+checkpoint 落盘后回收旧段；恢复只读取保留下来的段，仍然从
+`checkpoint_lsn` 之后开始 redo。
 
 **自动 checkpoint**：`Database(checkpoint_wal_bytes=...)` 在每次提交后比较
 `WAL.next_lsn` 与元数据中的 `checkpoint_lsn`，超过阈值就调用

@@ -152,6 +152,14 @@ class RecoveryManager:
         self._disk.meta.checkpoint_lsn = lsn
         self._disk._persist_meta()
         self._disk.sync()
+        # 分段 WAL 可以在 checkpoint 后回收旧段。安全下界是活跃事务的
+        # BEGIN LSN：这些事务崩溃后仍需要 before image 做 undo。没有活跃
+        # 事务时，checkpoint 之前的所有记录都可以回收。
+        active_start = self._txns.active_first_lsn
+        safe_lsn = lsn if active_start is None else min(active_start, lsn)
+        truncate = getattr(self._wal, "truncate_before", None)
+        if truncate is not None:
+            truncate(safe_lsn)
         return lsn
 
 

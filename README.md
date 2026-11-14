@@ -206,7 +206,7 @@ python -m bench.run --rows 2000
 
 ## 怎么验证它真的能跑
 
-- **982 个自动化测试**（`python -m pytest tests -q`，约 25–40 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **995 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -250,7 +250,8 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 相关子查询
 - [x] 组提交：WAL 追加/刷盘线程安全，多个并发提交由一个 leader 合并刷盘，提交记录持久化后才标记 `COMMITTED`
 - [x] 自动 CHECKPOINT：WAL 自上次 checkpoint 增长超过阈值时触发，保留手动 `CHECKPOINT`
-- [ ] WAL 分段回收与按提交数触发的 checkpoint 策略
+- [x] WAL 分段回收：新库使用 `wal-<first_lsn>.log` 分段，checkpoint 后按安全 LSN 删除旧段，活跃事务 BEGIN 之前的历史保留
+- [ ] 按提交数触发的 checkpoint 策略
 - [ ] 复制 / 只读副本
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见

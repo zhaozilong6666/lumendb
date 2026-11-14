@@ -161,6 +161,48 @@ class TestSessionIsolation:
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
 
+    def test_wire_commit_triggers_auto_checkpoint(self, tmp_path):
+        db = Database(
+            tmp_path / "db",
+            checkpoint_wal_bytes=64,
+            wal_segment_bytes=64,
+        )
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await _connect(port)
+            before = db.disk.meta.checkpoint_lsn
+            await _query(reader, writer, "INSERT INTO t VALUES (1, 'a')")
+            assert db.disk.meta.checkpoint_lsn > before
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
+    def test_wire_explicit_commit_triggers_auto_checkpoint(self, tmp_path):
+        db = Database(
+            tmp_path / "db",
+            checkpoint_wal_bytes=64,
+            wal_segment_bytes=64,
+        )
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        server = PGWireServer(db)
+
+        async def body(port):
+            reader, writer = await _connect(port)
+            await _query(reader, writer, "BEGIN")
+            await _query(reader, writer, "INSERT INTO t VALUES (1)")
+            before = db.disk.meta.checkpoint_lsn
+            await _query(reader, writer, "COMMIT")
+            assert db.disk.meta.checkpoint_lsn > before
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        db.close()
+
     def test_two_connections_can_open_transactions_simultaneously(self, tmp_path):
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
