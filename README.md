@@ -207,6 +207,16 @@ python -m bench.run --rows 2000
   引擎的卖点，正确性和可验证性才是。
 <!-- BENCH_TABLE_END -->
 
+复制路径另有一个脚本：
+
+```bash
+python -m bench.replication --rows 2000 --repeat 3
+```
+
+它量化基准备份、WAL 追平、`lag_from_server` 字节延迟和副本查询；实测与分析见
+[`docs/replication-bench.md`](docs/replication-bench.md)。当前观察到的物理 WAL
+放大（约 7.7 KB/行）和基准备份内存占用都已记录为下一步优化项，不当作 SLA。
+
 ## 怎么验证它真的能跑
 
 - **1012 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、

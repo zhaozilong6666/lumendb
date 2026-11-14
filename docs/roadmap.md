@@ -147,6 +147,11 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 与丢失窗口的量化报告；上述未完成项至少补齐复制槽、写冻结基准备份和提升
 fencing。
 
+**当前状态**：上述三条已补齐；延迟/吞吐与丢失窗口的实测见
+[`docs/replication-bench.md`](replication-bench.md)。自动故障切换、TLS/认证、
+分块基准备份和低放大 WAL 仍未完成，因此第 4 层只能标“MVP 验收”，不能标
+“生产就绪”。
+
 ## 明确不做
 
 - `MATCH PARTIAL` 外键匹配：PostgreSQL 本身不支持，不实现。
