@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - ".lumendb/notvalid.patch.gz.b64"
+      - ".github/workflows/apply-lumendb-patch.yml"
 permissions:
   contents: write
 jobs:
@@ -10,6 +11,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Repair payload typo
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.lumendb/notvalid.patch.gz.b64')
+          s = p.read_text().strip()
+          s = s[:-1]
+          s = s[:156] + 'X' + s[157:]
+          p.write_text(s, encoding='utf-8')
+          PY
+          base64 -d .lumendb/notvalid.patch.gz.b64 | gzip -t
       - name: Decode patch
         run: base64 -d .lumendb/notvalid.patch.gz.b64 | gunzip > /tmp/apply.patch
       - name: Apply patch
