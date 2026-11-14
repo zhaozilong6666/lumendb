@@ -327,7 +327,8 @@ class Catalog:
 
     def drop_table(
         self, txn: Transaction, name: str, cascade: bool = False
-    ) -> None:
+    ) -> tuple[int, int]:
+        """删除表；返回 (级联删除的视图数, 级联删除的外键数)。"""
         key = name.lower()
         if key not in self.tables:
             raise TableNotFoundError(f"表 {name!r} 不存在")
@@ -382,6 +383,7 @@ class Catalog:
 
         txn.undo_log.append(undo)
         self.persist(txn)
+        return len(dependents), len(fk_dependents)
 
     def rename_table(self, txn: Transaction, old_name: str, new_name: str) -> TableDef:
         old_key = old_name.lower()

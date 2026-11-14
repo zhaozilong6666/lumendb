@@ -4274,6 +4274,14 @@ class TestForeignKey:
             db.execute_one("SELECT pid FROM c")
         assert rows(db, "SELECT id FROM c") == [(1,)]
 
+    def test_drop_table_cascade_notice_counts(self, db):
+        db.execute_one("CREATE TABLE p (id INT UNIQUE)")
+        db.execute_one("CREATE TABLE c1 (pid INT REFERENCES p(id))")
+        db.execute_one("CREATE TABLE c2 (pid INT REFERENCES p(id))")
+        db.execute_one("CREATE VIEW v AS SELECT id FROM p")
+        result = db.execute_one("DROP TABLE p CASCADE")
+        assert "级联删除 1 个视图、2 个外键" in result.notice
+
     def test_drop_table_cascade_rollback_restores_fk(self, db):
         db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
         db.execute_one("CREATE TABLE c (pid INT REFERENCES p(id))")

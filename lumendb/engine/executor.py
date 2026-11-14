@@ -2319,13 +2319,20 @@ class Executor:
         )
 
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:
+        views = 0
+        foreign_keys = 0
         for name in stmt.names:
             if not self._catalog.has_table(name):
                 if stmt.if_exists:
                     continue
                 raise TableNotFoundError(f"表 {name!r} 不存在")
-            self._catalog.drop_table(txn, name, stmt.cascade)
-        return Result(tag="DROP TABLE")
+            v, f = self._catalog.drop_table(txn, name, stmt.cascade)
+            views += v
+            foreign_keys += f
+        notice = ""
+        if stmt.cascade and (views or foreign_keys):
+            notice = f"级联删除 {views} 个视图、{foreign_keys} 个外键"
+        return Result(tag="DROP TABLE", notice=notice)
 
     def _create_index(
         self,
