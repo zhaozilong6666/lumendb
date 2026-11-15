@@ -528,6 +528,7 @@ class HeartbeatLoop:
         self.on_higher_term = on_higher_term
         self.last_acks = 0
         self.last_errors: list[str] = []
+        self.last_callback_error: str | None = None
         self.last_observed_term = node.state.term
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -566,7 +567,11 @@ class HeartbeatLoop:
             term_after = self.node.state.term
             self.last_observed_term = term_after
             if term_after > term_before and self.on_higher_term is not None:
-                self.on_higher_term(term_after)
+                try:
+                    self.on_higher_term(term_after)
+                    self.last_callback_error = None
+                except Exception as exc:  # 后台线程不能因上层回调失败而静默退出
+                    self.last_callback_error = str(exc)
 
     def __enter__(self) -> "HeartbeatLoop":
         return self.start()
