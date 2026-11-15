@@ -352,6 +352,8 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
 
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
+传入 `lease_path` 等参数时，自动提升也走 `promote_with_quorum`，把租约、
+心跳续租和写围栏一并装到新主库。
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
 

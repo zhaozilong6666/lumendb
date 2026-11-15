@@ -204,6 +204,44 @@ def test_monitor_uses_quorum_for_auto_promotion(tmp_path):
         primary.close()
 
 
+def test_monitor_auto_promotion_uses_lease(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    primary.execute_one("INSERT INTO t VALUES (1)")
+    server = WALServer(primary).start()
+    replica = None
+    nodes = _cluster(tmp_path)
+    lease_path = tmp_path / "lease.json"
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        server.stop()
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            lease_path=lease_path,
+            lease_ttl=30,
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+        )
+        assert monitor.poll() == "promoted"
+        assert Lease(lease_path, "n0").read()["holder"] == "n0"
+        replica.execute_one("INSERT INTO t VALUES (2)")
+        Lease(lease_path, "n0").release()
+        with pytest.raises(NotSupportedError, match="没有有效写租约"):
+            replica.execute_one("INSERT INTO t VALUES (3)")
+    finally:
+        _stop(nodes)
+        if replica is not None:
+            replica.db.close()
+        server.stop()
+        primary.close()
+
+
 def test_monitor_refuses_promotion_without_quorum(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
