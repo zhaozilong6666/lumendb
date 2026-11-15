@@ -111,6 +111,35 @@ class TestQuorumCommitWatermark:
         finally:
             node.stop()
 
+    def test_observe_applied_also_advances_last_lsn(self, tmp_path):
+        """真正 apply 过 100 的副本，不能对外声称自己只“听到”到 0。
+
+        否则预投票会用一个陈旧的 last_lsn 放行落后候选，绕过
+        ``candidate_lsn >= last_lsn`` 的投票安全性检查。
+        """
+        node = QuorumNode("n0", state_path=tmp_path / "n0.vote.json")
+        try:
+            node.observe_applied(100)
+            assert node.state.match_lsn == 100
+            assert node.state.last_lsn == 100
+        finally:
+            node.stop()
+
+    def test_heartbeat_propagates_the_commit_watermark(self, tmp_path):
+        """水位必须随心跳传播，否则新候选本地看到的 commit_lsn 还是 0。"""
+        nodes = _cluster(tmp_path)
+        try:
+            nodes[1].observe_applied(100)
+            nodes[2].observe_applied(120)
+            nodes[0].heartbeat_round(150)
+            assert nodes[0].quorum_commit_lsn == 120
+            # 第一轮把水位算出来；下一轮心跳才可能把它带给 follower。
+            nodes[0].heartbeat_round(150)
+            assert nodes[1].state.commit_lsn == 120
+            assert nodes[2].state.commit_lsn == 120
+        finally:
+            _stop(nodes)
+
 
 class TestPromotionGate:
     def test_campaign_refuses_a_lagging_candidate(self, tmp_path):
@@ -145,6 +174,35 @@ class TestPromotionGate:
         try:
             assert nodes[0].quorum_commit_lsn == 0
             assert nodes[0].campaign(0) >= 1
+        finally:
+            _stop(nodes)
+
+    def test_pre_vote_rejects_a_candidate_behind_peers_that_have_applied(self, tmp_path):
+        """两个 peer 已 apply 到 100、候选只有 80 时，预投票必须拒绝。
+
+        没有 ``observe_applied -> last_lsn`` 的联动时，这两个 peer 的
+        last_lsn 还是 0，会误把 80 的候选放进多数派；候选一旦当选，
+        重新广播日志前就可能覆盖/丢弃已应用到 100 的日志。
+        """
+        nodes = _cluster(tmp_path)
+        try:
+            nodes[0].observe_applied(100)
+            nodes[2].observe_applied(100)
+            nodes[1].observe_applied(80)
+            term_before = nodes[1].state.term
+            with pytest.raises(NotSupportedError, match="预投票未通过多数派"):
+                nodes[1].campaign(80)
+            assert nodes[1].state.term == term_before, "预投票失败不能推进任期"
+        finally:
+            _stop(nodes)
+
+    def test_campaign_reads_a_peer_watermark_when_local_is_zero(self, tmp_path):
+        """候选本地水位为 0，但 peer 已经知道 100：闸门不能被本地值绕过。"""
+        nodes = _cluster(tmp_path)
+        try:
+            nodes[0].observe_commit(100)
+            with pytest.raises(NotSupportedError, match="落后于多数派已提交水位"):
+                nodes[1].campaign(80)
         finally:
             _stop(nodes)
 
@@ -195,6 +253,37 @@ class TestReplicaReportsAppliedLsn:
             finally:
                 loop.stop()
         finally:
+            _stop(nodes)
+
+    def test_promoted_replica_heartbeat_tracks_the_writable_wal(self, tmp_path):
+        """提升后的正常 ``db.execute`` 也要推进心跳水位。
+
+        复用旧 ``_applied_lsn`` 会让 leader 在心跳里一直报 0；三节点里只有
+        一个 follower 可达时，多数派水位就永远算不上去，同步复制屏障会把
+        本来可以提交的事务卡成 40003。
+        """
+        nodes = _cluster(tmp_path)
+        replica = Replica(tmp_path / "promoted", applied_lsn=0)
+        try:
+            db = replica.promote_with_quorum(
+                nodes[0],
+                heartbeat_interval=0.05,
+                sync_replication=True,
+                sync_timeout=0.5,
+            )
+            # leader + n1 是多数派；n2 没有收到数据。
+            nodes[1].observe_applied(10**9)
+            db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+            assert db.wal.last_lsn > 0
+            deadline = time.monotonic() + 2
+            while (
+                time.monotonic() < deadline
+                and nodes[0].quorum_commit_lsn < db.wal.last_lsn
+            ):
+                time.sleep(0.02)
+            assert nodes[0].quorum_commit_lsn >= db.wal.last_lsn
+        finally:
+            replica.close()
             _stop(nodes)
 
 

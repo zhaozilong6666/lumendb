@@ -122,11 +122,23 @@ class VoteState:
                 self.save()
 
     def observe_applied(self, lsn: int) -> None:
-        """记录本节点***真正复制到***的 LSN；心跳会把它报给 leader。"""
+        """记录本节点***真正复制到***的 LSN；心跳会把它报给 leader。
+
+        真正 apply 到某个 LSN，意味着本节点既持有它、也"听到过"它；因此
+        ``last_lsn`` 必须一起前进。否则一个已经持有 100 的副本会因为没收到
+        心跳而把 ``last_lsn`` 留在 0，投票时放行一个只有 80 的候选，直接
+        破坏"候选至少持有全部已提交日志"的前提。
+        """
         with self._lock:
             value = max(0, int(lsn))
+            changed = False
             if value > self.match_lsn:
                 self.match_lsn = value
+                changed = True
+            if value > self.last_lsn:
+                self.last_lsn = value
+                changed = True
+            if changed:
                 self.save()
 
     def observe_commit(self, lsn: int) -> None:
@@ -226,6 +238,7 @@ class QuorumClient:
         leader_id: str,
         last_lsn: int,
         *,
+        commit_lsn: int = 0,
         timeout: float = 2.0,
         token: str | None = None,
     ) -> dict[str, Any]:
@@ -234,6 +247,7 @@ class QuorumClient:
             "term": int(term),
             "leader_id": str(leader_id),
             "last_lsn": int(last_lsn),
+            "commit_lsn": int(commit_lsn),
         }
         if token is not None:
             payload["token"] = token
@@ -275,6 +289,7 @@ def _send_heartbeat(
     term: int,
     leader_id: str,
     last_lsn: int,
+    commit_lsn: int,
     timeout: float,
     token: str | None,
 ) -> dict[str, Any]:
@@ -285,6 +300,7 @@ def _send_heartbeat(
         term,
         leader_id,
         last_lsn,
+        commit_lsn=commit_lsn,
         timeout=timeout,
         token=token,
     )
@@ -439,7 +455,11 @@ class QuorumNode:
             }
 
     def heartbeat(
-        self, term: int, leader_id: str, last_lsn: int
+        self,
+        term: int,
+        leader_id: str,
+        last_lsn: int,
+        commit_lsn: int = 0,
     ) -> dict[str, Any]:
         """更新 leader 心跳；旧任期不更新活跃时间，新任期推进节点任期。"""
         leader = _validate_node_id(leader_id)
@@ -458,6 +478,9 @@ class QuorumNode:
             # 注意：``last_lsn`` 只进 "听到过" 水位（用于拒绝落后候选），
             # 不进 ``match_lsn``——leader 的心跳不代表本节点持有这些数据。
             self.state.observe_lsn(int(last_lsn))
+            # 多数派水位随心跳传播，候选提升前才能读到集群已知的 commit_lsn；
+            # 只存在 leader 本地的话，换主时闸门会退化成 0。
+            self.state.observe_commit(int(commit_lsn))
             self._last_heartbeat_at = time.time()
             self._last_heartbeat_from = leader
             return {
@@ -465,6 +488,7 @@ class QuorumNode:
                 "term": self.state.term,
                 "ok": True,
                 "match_lsn": self.state.match_lsn,
+                "commit_lsn": self.state.commit_lsn,
             }
 
     def heartbeat_round(
@@ -489,6 +513,7 @@ class QuorumNode:
         """
         with self._lock:
             term = self.state.term
+            commit_lsn = self.state.commit_lsn
             peers = [
                 (peer_id, address)
                 for peer_id, address in self.peers.items()
@@ -513,6 +538,7 @@ class QuorumNode:
                         term,
                         self.node_id,
                         int(last_lsn),
+                        int(commit_lsn),
                         self.timeout,
                         self.token,
                     ): peer_id
@@ -555,7 +581,9 @@ class QuorumNode:
             errors.append(f"observed higher term {highest_term}")
         # 多数派水位：自己和 peers 的 match_lsn 取第 majority 大的值。
         # 只有拿到多数派响应时才推进；不足多数派时保持原水位不动。
-        self._advance_commit_lsn(last_lsn, matches)
+        # 观察到更高任期说明本节点已经不是 leader，不能再替集群推进水位。
+        if highest_term <= term:
+            self._advance_commit_lsn(last_lsn, matches)
         return len(acks), errors
 
     def renew_lease(
@@ -625,6 +653,30 @@ class QuorumNode:
                 hint="确认 peers 可达后再发起提升；任期保持原值，不会干扰现有主库",
             )
 
+    def _known_commit_lsn(self) -> int:
+        """水位不能只信本地：候选可能错过 leader 的心跳。
+
+        多数派水位已经随心跳传播，但一个刚恢复/分区的候选本地仍可能是 0；
+        提升闸门如果只读本地 `commit_lsn`，就会把落后候选放进来。这里向
+        可达 peer 读一次 status，取本地与 peer 的最大值——与"听到过"的
+        `last_lsn` 不同，`commit_lsn` 是集群级水位，取最大值是保守方向。
+        """
+        known = self.quorum_commit_lsn
+        for peer_id, address in self.peers.items():
+            if peer_id == self.node_id:
+                continue
+            try:
+                status = QuorumClient.status(
+                    address[0],
+                    int(address[1]),
+                    timeout=self.timeout,
+                    token=self.token,
+                )
+            except (OSError, ValueError, StorageError):
+                continue
+            known = max(known, int(status.get("commit_lsn", 0) or 0))
+        return known
+
     def campaign(
         self,
         last_lsn: int,
@@ -642,7 +694,7 @@ class QuorumNode:
         candidate_lsn = max(0, int(last_lsn))
         # [P2] 提升闸门：候选必须至少追平"多数派已提交水位"。没有这道闸门时，
         # 提升一个落后副本会静默丢掉主库已经提交、但还没发给它的尾段。
-        known_commit = self.quorum_commit_lsn
+        known_commit = self._known_commit_lsn()
         if candidate_lsn < known_commit:
             raise NotSupportedError(
                 "候选落后于多数派已提交水位，拒绝提升",
@@ -785,6 +837,7 @@ class QuorumNode:
                     int(request.get("term", 0)),
                     str(request.get("leader_id", "")),
                     int(request.get("last_lsn", 0)),
+                    int(request.get("commit_lsn", 0)),
                 )
             else:
                 conn.sendall(

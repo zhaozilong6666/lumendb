@@ -92,6 +92,9 @@ class Database:
         if wal_retain_lsn > 0 and isinstance(self.wal, SegmentedWAL):
             self.wal.retain_lsn = wal_retain_lsn
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
+        #: 关闭标志：放在 TransactionManager 之前，提交点围栏回调在初始化
+        #: 阶段就能安全读取它。
+        self._closed = False
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
         self.txns = TransactionManager(
@@ -99,7 +102,9 @@ class Database:
             self.wal,
             self.bp,
             self.locks,
-            write_fence=self._write_fence,
+            # 提交点也用统一入口：它同时检查 fence 与 _closed。只传裸
+            # _write_fence 会让"关闭后仍提交"漏过关闭检查。
+            write_fence=self.assert_writable,
             commit_barrier=self._commit_barrier,
         )
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
@@ -124,7 +129,6 @@ class Database:
         )
 
         self._txn: Optional[Transaction] = None
-        self._closed = False
 
     # ------------------------------------------------------------------
 
@@ -143,6 +147,11 @@ class Database:
         复检，见那里的注释）。只在一个地方检查的后果已经出现过两次：
         线协议会话直接调 ``executor.run``，绕过了 ``Database._run``。
         """
+        if self._closed:
+            raise StorageError(
+                "数据库已关闭",
+                hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+            )
         fence = self._write_fence
         if fence is not None:
             fence()
@@ -185,9 +194,15 @@ class Database:
             )
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             with self._write_lock:
-                # [Review-Fix] 围栏检查必须在拿到 _write_lock **之后**：
-                # 只在语句入口检查时，等锁期间租约可能已经过期/换主，
-                # 而这一笔写会带着过期租约落盘。
+                # [Review-Fix] 关闭/围栏检查必须在拿到 _write_lock **之后**：
+                # 入口检查通过后可能在等锁期间被 close 关掉，此时再写就会
+                # 落到已经关闭的 WAL/磁盘句柄上。两个检查都放进锁内，
+                # 与 close() 的持锁顺序一致。
+                if self._closed:
+                    raise StorageError(
+                        "数据库已关闭",
+                        hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+                    )
                 if not self._read_only:
                     self.assert_writable()
                 return self._run_unlocked(statement, params)

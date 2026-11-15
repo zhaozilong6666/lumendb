@@ -199,7 +199,7 @@ class TestHeartbeatFanOut:
         node.peers = {"n0": (node.host, node.port), "slow": ("127.0.0.1", 1), "slow2": ("127.0.0.1", 2)}
         calls: list[str] = []
 
-        def fake_send(host, port, term, leader_id, last_lsn, timeout, token):
+        def fake_send(host, port, term, leader_id, last_lsn, commit_lsn, timeout, token):
             calls.append(f"{host}:{port}")
             time.sleep(0.3)
             raise OSError("peer down")

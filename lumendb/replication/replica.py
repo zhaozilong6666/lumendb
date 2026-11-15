@@ -287,12 +287,42 @@ class Replica:
         os.replace(tmp, marker)
         # 把"本副本真正复制到哪"告诉仲裁节点：leader 的心跳响应/水位计算
         # 依赖这个值，而它和"听到过"的 last_lsn 不是一回事。
-        node = self._quorum_node
+        node = getattr(self, "_quorum_node", None)
         if node is not None:
             try:
                 node.observe_applied(self._applied_lsn)
             except (AttributeError, OSError):
                 pass
+
+    def _current_lsn(self) -> int:
+        """当前写路径真正到过的 LSN。
+
+        提升之后 ``_applied_lsn`` 只记录复制 apply 的进度，正常 ``db.execute``
+        不再更新它；心跳和租约如果继续读这个旧值，会把 leader 自己报成 0，
+        多数派水位永远算不上去。只读句柄仍用复制标记，避免把 WAL 中尚未
+        apply 的尾部误报成已持有。
+        """
+        db = getattr(self, "db", None)
+        local = int(getattr(self, "_applied_lsn", 0))
+        if db is None or getattr(db, "_read_only", True):
+            return local
+        try:
+            return max(local, int(db.wal.last_lsn))
+        except (AttributeError, OSError):
+            return local
+
+    def _adopt_local_lsn(self) -> int:
+        """把可写句柄的 WAL 进度吸收进复制标记。
+
+        提升后本节点成为主库，写入只推进 ``db.wal.last_lsn``；降级/关闭前
+        必须把它写回 ``replica.lsn``，否则重启后再次提升会拿旧进度参加
+        竞选，把自己误判成落后副本。
+        """
+        current = self._current_lsn()
+        if current > int(getattr(self, "_applied_lsn", 0)):
+            self._applied_lsn = current
+            self._write_marker()
+        return int(getattr(self, "_applied_lsn", 0))
 
     def attach_quorum(self, quorum) -> None:
         """绑定仲裁节点：之后每次 apply 推进都会 `observe_applied`。"""
@@ -310,6 +340,7 @@ class Replica:
     def close(self) -> None:
         """停止后台线程并关闭数据库句柄。"""
         self._stop_background()
+        self._adopt_local_lsn()
         self.db.close()
 
     def add_step_down_listener(self, callback: Callable[[str], None]) -> None:
@@ -328,6 +359,7 @@ class Replica:
         """
         self._stop_background()
         with self._lock:
+            self._adopt_local_lsn()
             self.db.close()
             self.db = Database(
                 self.path,
@@ -543,7 +575,7 @@ class Replica:
                 callback = lambda term: self.step_down(f"observed higher term {term}")
             self._heartbeat = HeartbeatLoop(
                 quorum,
-                lambda: self._applied_lsn,
+                lambda: self._current_lsn(),
                 interval=heartbeat_interval,
                 on_higher_term=callback,
             ).start()
@@ -576,7 +608,7 @@ class Replica:
         if lease_renew_with_quorum:
             def renew():
                 return quorum.renew_lease(
-                    self._applied_lsn,
+                    self._current_lsn(),
                     lease_path=lease_path,
                     lease_ttl=lease_ttl,
                 )
@@ -640,6 +672,7 @@ class Replica:
                 checkpoint_wal_bytes=0,
                 write_fence=write_fence,
             )
+            self._adopt_local_lsn()
             return self.db
 
 

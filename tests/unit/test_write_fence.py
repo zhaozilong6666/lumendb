@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import NotSupportedError
+from lumendb.errors import NotSupportedError, StorageError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 
@@ -117,3 +117,20 @@ class TestCommitPointRecheck:
         db.assert_writable = spy  # type: ignore[method-assign]
         db.execute_one("INSERT INTO t VALUES (1)")
         assert observed and all(observed), "围栏检查必须在 _write_lock 之内执行"
+
+
+class TestClosedDatabase:
+    def test_internal_write_after_close_is_rejected(self, env):
+        db, _ = env
+        db.close()
+        with pytest.raises(StorageError, match="已关闭"):
+            db.execute_one("INSERT INTO t VALUES (1)")
+
+    def test_wire_write_after_close_is_rejected(self, env):
+        """pgwire 直接调 executor；assert_writable 也必须知道库已关闭。"""
+        db, _ = env
+        server = PGWireServer(db)
+        session = Session(database=db)
+        db.close()
+        with pytest.raises(StorageError, match="已关闭"):
+            _run(server, session, "INSERT INTO t VALUES (1)")
