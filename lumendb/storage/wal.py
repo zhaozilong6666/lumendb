@@ -334,6 +334,7 @@ __all__ = [
     "WAL",
     "LogRecord",
     "LogType",
+    "WALCorruptionError",
     "HEADER_SIZE",
     "CRC_SIZE",
     "encode_page_update",
