@@ -74,8 +74,8 @@
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
 >   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
 >   持久化任期并拒绝落后候选，失败时副本保持只读；`Lease` 用 TTL 约束旧主库
->   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，租约丢失或任期落后会自动停写/降级只读；
-> - 1065 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+>   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径；
+> - 1066 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -167,7 +167,7 @@
 >   candidate waits for the old lease to expire before acquiring it. A
 >   `QuorumNode.heartbeat_round()` / `renew_lease()` path renews only after a
 >   majority of heartbeat acknowledgements.
-> - 1065 automated tests including crash-injection and a 20-seed randomized
+> - 1066 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

@@ -44,6 +44,11 @@ class ReplicationMonitor:
         auto_rebase: bool = True,
         poll_interval: float = 1.0,
         quorum=None,
+        lease_path: str | Path | None = None,
+        lease_ttl: float = 10.0,
+        lease_keeper_interval: float | None = None,
+        lease_renew_with_quorum: bool = False,
+        lease_loss_stepdown: bool = False,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -60,6 +65,11 @@ class ReplicationMonitor:
         self._thread: threading.Thread | None = None
         self.fence_path = Path(fence_path) if fence_path is not None else None
         self.node_id = node_id
+        self.lease_path = Path(lease_path) if lease_path is not None else None
+        self.lease_ttl = lease_ttl
+        self.lease_keeper_interval = lease_keeper_interval
+        self.lease_renew_with_quorum = lease_renew_with_quorum
+        self.lease_loss_stepdown = lease_loss_stepdown
         self.max_failures = max(1, int(max_failures))
         self.timeout = timeout
         self.max_records = max_records
@@ -168,6 +178,11 @@ class ReplicationMonitor:
                 self.replica.promote_with_quorum(
                     self.quorum,
                     fence_path=self.fence_path,
+                    lease_path=self.lease_path,
+                    lease_ttl=self.lease_ttl,
+                    lease_keeper_interval=self.lease_keeper_interval,
+                    lease_renew_with_quorum=self.lease_renew_with_quorum,
+                    lease_loss_stepdown=self.lease_loss_stepdown,
                     node_id=self.quorum.node_id,
                 )
             else:

@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1065 passed。
+- 全量测试：1066 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -156,7 +156,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 `term/voted_for/last_lsn`，会拒绝落后于自己 LSN 的候选，也会拒绝旧任期。
 `Replica.promote_with_quorum()` 把投票和切换读写串起来，投票失败时副本保持
 只读。`ReplicationMonitor(quorum=...)` 的自动提升也走这条路径；没有多数票时
-返回 `needs_attention`，不会退化成单机提升。这不是完整 Raft：没有 leader 心跳、
+返回 `needs_attention`，不会退化成单机提升。传入 `lease_path` / `lease_ttl` /
+`lease_keeper_interval` 时，监控器会把租约和写围栏一并带到自动提升后的主库，
+避免“自动提升成功但新主库没有租约围栏”的接线缺口。这不是完整 Raft：没有 leader 心跳、
 基础 heartbeat RPC 与多数派续租已做 MVP，但仍没有日志复制协商；网络分区时多数派不可达会明确失败，
 但不能自动判断旧主库是否还活着。
 
