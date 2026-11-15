@@ -330,8 +330,9 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 **多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn` 的
 状态下响应 `vote_request`；`campaign()` 需要拿到集群多数票，投票节点拒绝
 比自己 LSN 落后的候选。`Replica.promote_with_quorum()` 先拿票再切换读写。
-它没有 leader 心跳、任期租约或日志协商，不能单独处理“主库还活着但网络
-分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
+它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，但没有日志复制
+协商，不能单独处理“主库还活着但网络分区”的脑裂；提升后仍依赖共享 fence
+挡住旧主库。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写进共享文件。主库每次写语句前调用 `lease.assert_writable`，超过 TTL
@@ -368,14 +369,14 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
   内容本身的压缩仍未做；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
-- 自动提升只有连续失败阈值；多数派投票和 TTL 写租约已做 MVP，但没有
-  心跳 RPC / quorum 续租，网络分区时仍可能双写。fencing 依赖共享 marker
+- 自动提升已有连续失败阈值、多数派投票、TTL 写租约、heartbeat RPC 和多数派
+  续租；但仍没有日志复制协商，网络分区时仍可能双写。fencing 依赖共享 marker
   和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
   JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；
 - 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 覆盖
-  共享 marker + TTL 租约，没有 quorum 心跳续租。
+  共享 marker + TTL 租约 + 多数派心跳续租。
 
 `Replica.promote()` 关闭只读 `Database`，以读写模式重新打开同一数据目录，
 返回可写 `Database`。副本只保留已应用的 WAL 前缀；主库尚未发送的尾段会在

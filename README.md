@@ -24,7 +24,7 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 | 并发控制 | MVCC 快照隔离 + 行级写锁 + 等待图死锁检测 | 快照隔离用例 + 死锁检测单元测试 |
 | 查询执行 | 火山模型算子 + 哈希连接 + 等值/范围索引选择 | `EXPLAIN` 输出与实际执行路径对照 |
 | 协议 | PostgreSQL v3 wire protocol（simple + extended query，支持 `$1` 参数绑定） | `tests/unit/test_pgwire.py` 走真实 socket；可用 `psql` 直连 |
-| 复制 | TCP 物理 WAL 流、分块基准备份、token 认证、zlib 压缩响应、可选 TLS、多副本槽位、页级增量基准备份、重定向、只读副本、LSN 延迟、手动/自动提升、多数派投票、心跳 RPC/多数派续租、TTL 写租约、租约锁/后台续租、副本提升自动续租/租约写围栏/租约丢失自动降级/自动提升租约 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
+| 复制 | TCP 物理 WAL 流、分块基准备份、token 认证、zlib 压缩响应、可选 TLS、多副本槽位、页级增量基准备份、重定向、只读副本、LSN 延迟、手动/自动提升、多数派投票、心跳 RPC/独立心跳循环/多数派续租、TTL 写租约、租约锁/后台续租、副本提升自动续租/租约写围栏/租约丢失自动降级/自动提升租约 | `tests/unit/test_replication.py`：本地与真实 TCP 两条路径 |
 | 进程模型 | 数据目录独占锁（OS 级字节锁），拒绝双开 | `tests/unit/test_filelock.py`：第二个打开者必须失败 |
 
 ## 架构
@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1066 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1067 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -280,6 +280,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 租约丢失自动降级：`lease_loss_stepdown=True` 时 keeper 续租失败自动 `step_down()`，主库切回只读
 - [x] 任期感知续租：`Lease.renew(term=...)` 与 `QuorumNode.renew_lease()` 拒绝用更高任期节点续旧任期租约
 - [x] 自动提升租约：`ReplicationMonitor(quorum=..., lease_path=...)` 把投票、租约、心跳续租和写围栏串到自动提升路径
+- [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写
 - [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见

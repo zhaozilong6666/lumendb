@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lumendb.errors import NotSupportedError
 from lumendb.engine.database import Database
-from lumendb.replication import Lease, PromotionFence, Replica, ReplicationMonitor, WALServer
+from lumendb.replication import HeartbeatLoop, Lease, PromotionFence, Replica, ReplicationMonitor, WALServer
 from lumendb.replication.quorum import QuorumClient, QuorumNode, VoteState
 
 
@@ -295,3 +297,27 @@ def test_renew_lease_rejects_stale_term(tmp_path):
     node.state.save()
     with pytest.raises(NotSupportedError, match="任期已过期"):
         node.renew_lease(0, lease_path=lease_path, lease_ttl=30)
+
+
+def test_heartbeat_loop_reports_higher_term(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].state.term = 7
+        nodes[1].state.save()
+        seen = []
+        loop = HeartbeatLoop(
+            nodes[0],
+            lambda: 0,
+            interval=0.05,
+            on_higher_term=seen.append,
+        ).start()
+        try:
+            time.sleep(0.2)
+            assert seen
+            assert seen[-1] >= 7
+            assert nodes[0].state.term == 7
+            assert loop.last_acks >= 1
+        finally:
+            loop.stop()
+    finally:
+        _stop(nodes)
