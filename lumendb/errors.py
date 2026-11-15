@@ -196,6 +196,16 @@ class SerializationError(TransactionError):
     sqlstate = "40001"
 
 
+class CommitOutcomeUnknown(TransactionError):
+    """本地已经提交（COMMIT 记录已 fsync），但多数派水位没在超时内追平。
+
+    调用方不能把它当成"没写进去"：数据可能已经在本地持久化、并且随后会被
+    复制出去。正确处理是重新读一次确认，或把结果交给幂等重试逻辑。
+    """
+
+    sqlstate = "40003"  # statement_completion_unknown
+
+
 class TransactionAbortedError(TransactionError):
     """事务已处于 aborted 状态，只允许 ROLLBACK。"""
 
@@ -243,6 +253,7 @@ __all__ = [
     "BTreeInvariantError",
     "TransactionError",
     "DeadlockError",
+    "CommitOutcomeUnknown",
     "SerializationError",
     "TransactionAbortedError",
     "ProtocolError",

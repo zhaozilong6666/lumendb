@@ -67,6 +67,8 @@ class ReplicationMonitor:
         lease_loss_stepdown: bool = False,
         lease_keeper_auto: bool = True,
         heartbeat_interval: float | None = None,
+        sync_replication: bool = False,
+        sync_timeout: float = 2.0,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -90,6 +92,8 @@ class ReplicationMonitor:
         self.lease_loss_stepdown = lease_loss_stepdown
         self.lease_keeper_auto = lease_keeper_auto
         self.heartbeat_interval = heartbeat_interval
+        self.sync_replication = sync_replication
+        self.sync_timeout = sync_timeout
         self.max_failures = max(1, int(max_failures))
         self.timeout = timeout
         self.max_records = max_records
@@ -215,6 +219,8 @@ class ReplicationMonitor:
                     lease_renew_with_quorum=self.lease_renew_with_quorum,
                     lease_loss_stepdown=self.lease_loss_stepdown,
                     heartbeat_interval=self.heartbeat_interval,
+                    sync_replication=self.sync_replication,
+                    sync_timeout=self.sync_timeout,
                     node_id=self.quorum.node_id,
                 )
             else:

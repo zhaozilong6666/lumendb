@@ -115,14 +115,18 @@ class TransactionManager:
         buffer_pool: Optional["BufferPoolManager"] = None,
         locks: Optional["LockManager"] = None,
         write_fence: Optional[Callable[[], None]] = None,
+        commit_barrier: Optional[Callable[[int], None]] = None,
     ) -> None:
         self._disk = disk
         self._wal = wal
         self._bp = buffer_pool
         self._locks = locks
         #: 写围栏回调（租约/任期/提升 marker）。它在**提交点**再检查一次：
-        #: 语句入口的检查不足以保证安全和，一条长语句可以膜越租约到期。
+        #: 语句入口的检查不足以保证安全，一条长语句可以跨越租约到期。
         self._write_fence = write_fence
+        #: 提交屏障：本地 COMMIT 记录落盘后、返回成功前调用，参数是本事务
+        #: COMMIT 记录的 LSN。同步复制用它等"多数派已持有该 LSN"。
+        self._commit_barrier = commit_barrier
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
@@ -168,6 +172,7 @@ class TransactionManager:
             return txn
 
     def commit(self, txn: Transaction) -> None:
+        follower = False
         with self._lock:
             txn.require_active()
             # [Review-Fix] 提交点复检写围栏：租约/任期可能在语句执行期间
@@ -177,25 +182,41 @@ class TransactionManager:
                 self._write_fence()
             txn.last_lsn = self._wal.commit(txn.xid)
             self._commit_queue.append((txn, txn.last_lsn))
-            if self._commit_leader:
-                # 已有 leader 在刷盘；等它覆盖到自己的 LSN。
+            follower = self._commit_leader
+            if not follower:
+                self._commit_leader = True
+
+        if follower:
+            # 已有 leader 在刷盘；等它覆盖到自己的 LSN。
+            with self._lock:
                 while txn.state is TxnState.ACTIVE:
                     self._commit_condition.wait()
                     if self._commit_error is not None:
                         raise TransactionError(
                             f"事务 {txn.xid} 提交失败：WAL 刷盘错误"
                         ) from self._commit_error
-                return
-            self._commit_leader = True
+        else:
+            try:
+                self._run_commit_group()
+            except BaseException as exc:
+                with self._lock:
+                    self._commit_error = exc
+                    self._commit_leader = False
+                    self._commit_condition.notify_all()
+                raise
 
-        try:
-            self._run_commit_group()
-        except BaseException as exc:
-            with self._lock:
-                self._commit_error = exc
-                self._commit_leader = False
-                self._commit_condition.notify_all()
-            raise
+        # 同步复制的屏障：本地已 fsync，但要等多数派追上这个 LSN 才对调用方
+        # 报告成功。注意这里**不再持锁**——等水位可能要几十毫秒，持 TM 锁
+        # 会把同批其它提交一起卡住。
+        self._await_majority(txn)
+
+    def _await_majority(self, txn: Transaction) -> None:
+        barrier = self._commit_barrier
+        if barrier is None or not txn.wrote:
+            # 只读事务（自动提交的 SELECT 也算）没有需要复制的写入，
+            # 不能让它们去等水位——否则每次查询都要卡到超时。
+            return
+        barrier(int(txn.last_lsn))
 
     def _run_commit_group(self) -> None:
         """leader 循环：把当前队列里的提交合并成一次 WAL 刷盘。

@@ -3,7 +3,13 @@
 from .failover import MonitorState, ReplicationMonitor
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
-from .quorum import HeartbeatLoop, QuorumClient, QuorumNode, VoteState
+from .quorum import (
+    HeartbeatLoop,
+    QuorumClient,
+    QuorumCommitBarrier,
+    QuorumNode,
+    VoteState,
+)
 from .replica import Replica
 from .wal_stream import WALClient, WALServer, read_slot
 
@@ -14,6 +20,7 @@ __all__ = [
     "MonitorState",
     "PromotionFence",
     "QuorumClient",
+    "QuorumCommitBarrier",
     "QuorumNode",
     "Replica",
     "ReplicationMonitor",

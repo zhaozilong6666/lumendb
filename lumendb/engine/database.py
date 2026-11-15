@@ -66,12 +66,15 @@ class Database:
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
         write_fence: Optional[Callable[[], None]] = None,
+        commit_barrier: Optional[Callable[[int], None]] = None,
         wal_retain_lsn: int = 0,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
         self._write_fence = write_fence
+        #: 同步复制的提交屏障（参数是 COMMIT 记录的 LSN）。
+        self._commit_barrier = commit_barrier
         # 写路径串行化：既保护单文件 DiskManager，也作为基准备份的写冻结门。
         self._write_lock = threading.RLock()
         self.disk = DiskManager(self.path / "lumendb.data")
@@ -92,7 +95,12 @@ class Database:
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
         self.txns = TransactionManager(
-            self.disk, self.wal, self.bp, self.locks, write_fence=self._write_fence
+            self.disk,
+            self.wal,
+            self.bp,
+            self.locks,
+            write_fence=self._write_fence,
+            commit_barrier=self._commit_barrier,
         )
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
         self._checkpoint_every_commits = max(0, checkpoint_every_commits)
@@ -119,6 +127,13 @@ class Database:
         self._closed = False
 
     # ------------------------------------------------------------------
+
+    def set_commit_barrier(
+        self, barrier: Optional[Callable[[int], None]]
+    ) -> None:
+        """安装/替换同步复制的提交屏障（提升之后由 ``Replica`` 安装）。"""
+        self._commit_barrier = barrier
+        self.txns._commit_barrier = barrier
 
     def assert_writable(self) -> None:
         """写围栏的**唯一入口**。

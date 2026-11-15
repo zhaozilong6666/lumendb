@@ -657,6 +657,68 @@ class QuorumNode:
                 pass
 
 
+class QuorumCommitBarrier:
+    """同步复制的提交屏障：等"多数派已持有"的水位追到目标 LSN。
+
+    它被装在 `TransactionManager` 上，在本地 COMMIT 记录 fsync 之后、返回
+    成功之前调用。语义是：
+
+    * 水位追上了 → 正常返回，客户端看到的 COMMIT 才代表"多数派都有"；
+    * 超时没追上 → 抛 :class:`CommitOutcomeUnknown`（SQLSTATE `40003`）。
+      注意**不能**把它当成"没写进去"：数据已经本地落盘，后续可能被复制出去。
+      正确处理是重新读一次确认，或交给幂等重试。
+
+    水位由 `heartbeat_round` 推进，所以同步复制必须配心跳循环；没有心跳时
+    水位永远不动，每笔写都会等到超时。
+    """
+
+    def __init__(
+        self,
+        node,
+        *,
+        timeout: float = 2.0,
+        poll_interval: float = 0.01,
+    ) -> None:
+        self.node = node
+        self.timeout = max(0.0, float(timeout))
+        self.poll_interval = max(0.001, float(poll_interval))
+        self.last_observed = 0
+        self.timeouts = 0
+
+    @property
+    def quorum_commit_lsn(self) -> int:
+        return int(getattr(self.node, "quorum_commit_lsn", 0))
+
+    def __call__(self, lsn: int) -> None:
+        target = max(0, int(lsn))
+        if self.quorum_commit_lsn >= target:
+            return
+        deadline = time.monotonic() + self.timeout
+        while True:
+            observed = self.quorum_commit_lsn
+            self.last_observed = observed
+            if observed >= target:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.poll_interval, remaining))
+        self.timeouts += 1
+        from ..errors import CommitOutcomeUnknown
+
+        raise CommitOutcomeUnknown(
+            "本地已提交，但多数派水位没能在超时内追平",
+            detail=(
+                f"commit_lsn={target} quorum_commit_lsn={self.quorum_commit_lsn} "
+                f"timeout={self.timeout}s"
+            ),
+            hint=(
+                "结果未知：先读一次确认这一笔是否生效，再决定重试；"
+                "如果持续发生，检查副本是否掉线或心跳循环是否在运行"
+            ),
+        )
+
+
 class HeartbeatLoop:
     """后台 leader 心跳循环：定期向 peers 发 ``heartbeat``。
 
@@ -734,4 +796,10 @@ class HeartbeatLoop:
         self.stop()
 
 
-__all__ = ["HeartbeatLoop", "QuorumClient", "QuorumNode", "VoteState"]
+__all__ = [
+    "HeartbeatLoop",
+    "QuorumClient",
+    "QuorumCommitBarrier",
+    "QuorumNode",
+    "VoteState",
+]

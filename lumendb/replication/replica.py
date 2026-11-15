@@ -26,14 +26,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..engine.database import Database
-from ..errors import StorageError, TransactionError
+from ..errors import NotSupportedError, StorageError, TransactionError
 from ..storage.txn import TxnState
 from ..storage.page import PageType
 from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
-from .quorum import HeartbeatLoop
+from .quorum import HeartbeatLoop, QuorumCommitBarrier
 
 _log = logging.getLogger(__name__)
 
@@ -64,6 +64,8 @@ class Replica:
         self._heartbeat: HeartbeatLoop | None = None
         #: 本副本对应的仲裁节点；用来把复制进度（match_lsn）报给 leader。
         self._quorum_node = None
+        #: 同步复制的提交屏障（未开启时为 None）。
+        self._commit_barrier: QuorumCommitBarrier | None = None
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
         self._write_marker()
@@ -454,6 +456,8 @@ class Replica:
         lease_loss_stepdown: bool = False,
         heartbeat_interval: float | None = None,
         on_higher_term: Callable[[int], None] | None = None,
+        sync_replication: bool = False,
+        sync_timeout: float = 2.0,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -477,6 +481,14 @@ class Replica:
           ``on_higher_term(term)``；未提供时若 ``lease_loss_stepdown`` 为真就
           直接 ``step_down()``，否则只记录在 ``last_heartbeat_errors``。
         """
+        if sync_replication and heartbeat_interval is None:
+            # 同步复制靠心跳轮次推进多数派水位；没有心跳就等于每笔写都要
+            # 等到超时。宁可在提升前明确拒绝。
+            raise NotSupportedError(
+                "同步复制需要心跳循环推进多数派水位",
+                detail="sync_replication=True 但 heartbeat_interval 为空",
+                hint="传 heartbeat_interval（例如 0.5），或关掉 sync_replication",
+            )
         candidate_node = node_id or quorum.node_id
         self._stop_background()
         # 先把自己的复制进度登记到仲裁节点，再投票：水位计算和提升闸门都
@@ -535,6 +547,14 @@ class Replica:
                 interval=heartbeat_interval,
                 on_higher_term=callback,
             ).start()
+
+        if sync_replication:
+            # 装上提交屏障：本地 COMMIT fsync 之后还要等多数派水位追平，
+            # 才把成功报给客户端。超时抛 40003（结果未知），不回滚。
+            self._commit_barrier = QuorumCommitBarrier(quorum, timeout=sync_timeout)
+            db.set_commit_barrier(self._commit_barrier)
+        else:
+            self._commit_barrier = None
         return db
 
     def _make_lease_keeper(
@@ -580,6 +600,10 @@ class Replica:
             renew=renew,
             on_failure=failure_handler,
         )
+
+    def commit_barrier(self) -> QuorumCommitBarrier | None:
+        """当前的提交屏障（`sync_replication=True` 时非空）。"""
+        return self._commit_barrier
 
     @property
     def last_heartbeat_errors(self) -> list[str]:

@@ -449,10 +449,22 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 `heartbeat()` 里的 `observe_lsn(leader_lsn)` 只用于投票安全（拒绝落后候选），
 不参与水位计算。
 
-水位只解决"**提升谁**"的问题，不改变"**什么时候算提交**"：新主的写入仍然只要求
-本地 WAL fsync，不要求多数派确认（同步复制）。也就是说 `quorum_commit_lsn` 是
-"集群已知的安全上界"，而不是"每笔写的提交条件"。真正的多数派提交需要
-`append_entries` 风格的日志协商 + commit index，属于下一阶段。
+水位默认只解决"**提升谁**"的问题：写入仍然只要求本地 WAL fsync。
+`Replica.promote_with_quorum(sync_replication=True, heartbeat_interval=...)` 可以把它
+升级成"**少数派都不算提交**"：
+
+- 屏障 `QuorumCommitBarrier` 挂在 `TransactionManager` 上，在本地 COMMIT 记录
+  fsync 之后、返回成功之前被调用，等 `quorum_commit_lsn >= 本事务的 commit_lsn`；
+- 超时抛 `CommitOutcomeUnknown`（SQLSTATE `40003`），**不回滚**：数据已经本地落盘，
+  把它当成"没写进去"才是真正的错误。调用方应重新读一次确认，或交给幂等重试；
+- 只读事务（包括自动提交的 `SELECT`）不经过屏障，否则每次查询都要等水位；
+- 必须配心跳循环：水位由 `heartbeat_round` 推进，没有心跳就等于每笔写都等超时，
+  所以 `sync_replication=True` 而 `heartbeat_interval is None` 会在提升前被直接拒绝。
+
+它仍然是**没有日志协商**的同步复制：没有 `append_entries` 的任期/前缀一致性检查，
+长期失联的旧 leader 复辟后仍可能写进一些"多数派没收到"的记录（共享 fence + 租约
+负责挡住这类写入）。要做到 Raft 级别的正确性，需要日志协商 + commit index，
+属于下一阶段。
 
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
@@ -469,9 +481,9 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - 自动提升已有连续失败阈值、多数派投票、TTL 写租约、heartbeat RPC 和多数派
-  续租，并有轻量版提交水位（`quorum_commit_lsn`）挡住"提升落后副本"；但仍没有
-  日志复制协商与同步复制，网络分区时仍可能双写。fencing 依赖共享 marker
-  和租约文件；客户端重定向已做 MVP；
+  续租，并有轻量版提交水位（`quorum_commit_lsn`）挡住"提升落后副本"，可选开
+  同步复制（多数派追上才回 COMMIT，超时给 `40003` 结果未知）；但仍没有日志复制
+  协商，网络分区时仍可能双写。fencing 依赖共享 marker 和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
   JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；

@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1112 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1120 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -287,7 +287,8 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 自动提升租约：`ReplicationMonitor(quorum=..., lease_path=...)` 把投票、租约、心跳续租和写围栏串到自动提升路径
 - [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写，回调异常记录到 `last_callback_error` 且不会终止后台线程
 - [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
-- [ ] 同步复制（多数派持久化后才算提交）：需要 `append_entries` 风格的日志协商与 commit index
+- [x] 同步复制（可选）：`sync_replication=True` 时 COMMIT 要等多数派水位追平，超时给 `40003`（结果未知、不回滚），只读事务不受影响
+- [ ] Raft 级日志协商：`append_entries` 任期/前缀一致性检查 + commit index
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。
