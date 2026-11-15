@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 from ..errors import StorageError
-from .wal import HEADER_SIZE, LogRecord, WAL
+from .wal import HEADER_SIZE, LogRecord, WAL, WALCorruptionError
 
 _SEGMENT_RE = re.compile(r"^wal-(\d{20})\.log$")
 
@@ -46,6 +46,8 @@ def _read_segment(path: Path) -> tuple[list[LogRecord], int]:
     while pos + HEADER_SIZE <= len(data):
         try:
             record, next_pos = LogRecord.decode(data, pos)
+        except WALCorruptionError:
+            raise
         except StorageError:
             break
         records.append(record)
@@ -210,6 +212,8 @@ class SegmentedWAL(WAL):
             while pos + HEADER_SIZE <= len(data):
                 try:
                     record, next_pos = LogRecord.decode(data, pos)
+                except WALCorruptionError:
+                    raise
                 except StorageError:
                     break
                 if record.lsn >= start_lsn:

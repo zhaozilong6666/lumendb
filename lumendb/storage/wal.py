@@ -23,6 +23,11 @@ from typing import Iterator
 from ..errors import StorageError
 from .page import PAGE_SIZE
 
+
+class WALCorruptionError(StorageError):
+    """完整记录的校验和/结构损坏；不能当成"崩溃残尾"静默丢弃。"""
+
+
 # u64 lsn + u32 xid + u8 type + u32 payload_len = 17 字节
 _HEADER = struct.Struct("<QIBI")
 HEADER_SIZE = _HEADER.size
@@ -88,7 +93,7 @@ class LogRecord:
             expected = _CRC.unpack_from(buf, end)[0]
             actual = zlib.crc32(bytes(buf[pos - HEADER_SIZE : end])) & 0xFFFFFFFF
             if expected != actual:
-                raise StorageError(
+                raise WALCorruptionError(
                     "WAL 记录 CRC 校验失败",
                     detail=f"lsn={lsn} expect=0x{expected:08x} actual=0x{actual:08x}",
                 )
@@ -295,6 +300,10 @@ class WAL:
         while pos + HEADER_SIZE <= len(buf):
             try:
                 rec, pos = LogRecord.decode(buf, pos)
+            except WALCorruptionError:
+                # 完整记录校验失败 = 介质/内容损坏，不能当成崩溃残尾吞掉；
+                # 否则恢复会静默丢掉损坏点之后所有已提交记录。
+                raise
             except StorageError:
                 # 日志尾巴被截断（崩溃时正在写），丢弃残尾
                 break

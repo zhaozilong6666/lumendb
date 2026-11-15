@@ -85,6 +85,24 @@ class TestAppendAndRead:
         assert len(rec.encode()) == HEADER_SIZE + len(rec.payload)
         assert end == len(rec.encode())
 
+    def test_corruption_in_the_middle_is_not_treated_as_a_tail(self, wal_path):
+        """完整记录 CRC 坏了必须报错，不能静默丢掉后面的已提交记录。"""
+        from lumendb.errors import StorageError
+
+        wal = WAL(wal_path)
+        wal.append(1, LogType.BEGIN)
+        bad_lsn = wal.append(1, LogType.UPDATE, b"payload")
+        wal.append(1, LogType.COMMIT)
+        wal.flush()
+        wal.close()
+        raw = wal_path.read_bytes()
+        # 从第二条记录的 payload 第一个字节开始翻转一位
+        offset = len(LogRecord(1, 1, LogType.BEGIN, b"").encode()) + HEADER_SIZE
+        corrupted = raw[:offset] + bytes([raw[offset] ^ 0x01]) + raw[offset + 1:]
+        wal_path.write_bytes(corrupted)
+        with pytest.raises(StorageError, match="CRC"):
+            WAL(wal_path).read_all()
+
     def test_records_survive_reopen(self, wal_path):
         wal = WAL(wal_path)
         wal.append(9, LogType.BEGIN)
