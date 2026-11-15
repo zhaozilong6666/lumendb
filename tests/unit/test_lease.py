@@ -175,6 +175,9 @@ class _NoopQuorum:
             Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(1)
         return 1
 
+    def renew_lease(self, last_lsn, *, lease_path, lease_ttl=10.0, now=None):
+        return Lease(lease_path, self.node_id, ttl=lease_ttl).renew(now=now)
+
 
 def test_promote_with_quorum_starts_lease_keeper(tmp_path):
     primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
@@ -187,6 +190,7 @@ def test_promote_with_quorum_starts_lease_keeper(tmp_path):
             lease_path=lease_path,
             lease_ttl=0.4,
             lease_keeper_interval=0.05,
+            lease_renew_with_quorum=True,
         )
         first = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
         time.sleep(0.15)
