@@ -206,12 +206,19 @@ class Lease:
 class LeaseKeeper:
     """后台续租线程；只负责续租，不负责重新 acquire。"""
 
-    def __init__(self, lease: Lease, interval: float | None = None) -> None:
+    def __init__(
+        self,
+        lease: Lease,
+        interval: float | None = None,
+        *,
+        renew=None,
+    ) -> None:
         self.lease = lease
         self.interval = max(
             0.05,
             float(interval) if interval is not None else lease.ttl / 3,
         )
+        self._renew = renew if renew is not None else lease.renew
         self.last_error: str | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -241,7 +248,7 @@ class LeaseKeeper:
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             try:
-                self.lease.renew()
+                self._renew()
                 self.last_error = None
             except (NotSupportedError, StorageError) as exc:
                 self.last_error = str(exc)

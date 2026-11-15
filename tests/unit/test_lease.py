@@ -149,6 +149,24 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
     finally:
         keeper.stop()
 
+
+def test_lease_keeper_uses_renew_callback(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=0.4)
+    lease.acquire(term=1)
+    calls = []
+
+    def renew():
+        calls.append(1)
+        return lease.renew()
+
+    keeper = LeaseKeeper(lease, interval=0.05, renew=renew).start()
+    try:
+        time.sleep(0.12)
+        assert calls
+        assert keeper.last_error is None
+    finally:
+        keeper.stop()
+
 class _NoopQuorum:
     node_id = "n0"
 

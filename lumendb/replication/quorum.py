@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,45 @@ class QuorumClient:
                 pass
 
 
+    @staticmethod
+    def heartbeat(
+        host: str,
+        port: int,
+        term: int,
+        leader_id: str,
+        last_lsn: int,
+        *,
+        timeout: float = 2.0,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "heartbeat",
+            "term": int(term),
+            "leader_id": str(leader_id),
+            "last_lsn": int(last_lsn),
+        }
+        if token is not None:
+            payload["token"] = token
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.settimeout(timeout)
+            sock.sendall(_encode_line(payload))
+            line = sock.makefile("rb").readline()
+            if not line:
+                raise StorageError("仲裁节点没有返回心跳响应")
+            data = _decode_line(line)
+            if data.get("type") == "error":
+                raise StorageError(str(data.get("message", "心跳失败")))
+            if data.get("type") != "heartbeat_response":
+                raise StorageError("仲裁节点返回了未知心跳响应")
+            return data
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class QuorumNode:
     """一个参与多数派投票的节点。
 
@@ -177,6 +217,8 @@ class QuorumNode:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._last_heartbeat_at: float | None = None
+        self._last_heartbeat_from: str | None = None
 
     def observe_lsn(self, lsn: int) -> None:
         """记录本节点已经追平到的 LSN；投票时用它拒绝落后的候选。"""
@@ -219,6 +261,82 @@ class QuorumNode:
                 "term": self.state.term,
                 "granted": True,
             }
+
+    def heartbeat(
+        self, term: int, leader_id: str, last_lsn: int
+    ) -> dict[str, Any]:
+        """更新 leader 心跳；旧任期不更新活跃时间，新任期推进节点任期。"""
+        leader = _validate_node_id(leader_id)
+        requested = max(0, int(term))
+        with self._lock:
+            if requested < self.state.term:
+                return {
+                    "type": "heartbeat_response",
+                    "term": self.state.term,
+                    "ok": False,
+                }
+            if requested > self.state.term:
+                self.state.term = requested
+                self.state.voted_for = None
+                self.state.save()
+            self.state.observe_lsn(int(last_lsn))
+            self._last_heartbeat_at = time.time()
+            self._last_heartbeat_from = leader
+            return {
+                "type": "heartbeat_response",
+                "term": self.state.term,
+                "ok": True,
+            }
+
+    def heartbeat_round(self, last_lsn: int) -> tuple[int, list[str]]:
+        """向 peers 发送当前任期心跳，返回 (ack 数, 错误列表)。"""
+        with self._lock:
+            term = self.state.term
+            acks = {self.node_id}
+            errors: list[str] = []
+        for peer_id, address in self.peers.items():
+            if peer_id == self.node_id:
+                continue
+            try:
+                response = QuorumClient.heartbeat(
+                    address[0],
+                    int(address[1]),
+                    term,
+                    self.node_id,
+                    int(last_lsn),
+                    timeout=self.timeout,
+                    token=self.token,
+                )
+            except (OSError, ValueError, StorageError) as exc:
+                errors.append(f"{peer_id}: {exc}")
+                continue
+            if response.get("ok") and int(response.get("term", 0)) <= term:
+                acks.add(peer_id)
+        return len(acks), errors
+
+    def renew_lease(
+        self,
+        last_lsn: int,
+        *,
+        lease_path: str | Path,
+        lease_ttl: float = 10.0,
+        now: float | None = None,
+    ) -> float:
+        """多数派心跳确认后续租；拿不到多数派就拒绝续租。"""
+        total_nodes = len(self.peers) + (0 if self.node_id in self.peers else 1)
+        majority = total_nodes // 2 + 1
+        acks, errors = self.heartbeat_round(last_lsn)
+        if acks < majority:
+            detail = (
+                f"heartbeats={acks}/{total_nodes} majority={majority}; "
+                + ("; ".join(errors) if errors else "no errors")
+            )
+            raise NotSupportedError(
+                "多数派心跳不足，拒绝续租",
+                detail=detail,
+            )
+        lease = Lease(lease_path, self.node_id, ttl=lease_ttl)
+        return lease.renew(now=now)
 
     def campaign(
         self,
@@ -344,19 +462,27 @@ class QuorumNode:
             request = _decode_line(line)
             if self.token is not None and request.get("token") != self.token:
                 conn.sendall(
-                    _encode_line({"type": "error", "message": "投票认证失败"})
+                    _encode_line({"type": "error", "message": "仲裁认证失败"})
                 )
                 return
-            if request.get("type") != "vote_request":
+            request_type = request.get("type")
+            if request_type == "vote_request":
+                response = self.request_vote(
+                    int(request.get("term", 0)),
+                    str(request.get("candidate_id", "")),
+                    int(request.get("last_lsn", 0)),
+                )
+            elif request_type == "heartbeat":
+                response = self.heartbeat(
+                    int(request.get("term", 0)),
+                    str(request.get("leader_id", "")),
+                    int(request.get("last_lsn", 0)),
+                )
+            else:
                 conn.sendall(
-                    _encode_line({"type": "error", "message": "未知投票请求"})
+                    _encode_line({"type": "error", "message": "未知仲裁请求"})
                 )
                 return
-            response = self.request_vote(
-                int(request.get("term", 0)),
-                str(request.get("candidate_id", "")),
-                int(request.get("last_lsn", 0)),
-            )
             conn.sendall(_encode_line(response))
         except (OSError, ValueError, StorageError) as exc:
             try:

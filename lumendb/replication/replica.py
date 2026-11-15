@@ -387,6 +387,7 @@ class Replica:
         lease_path: str | Path | None = None,
         lease_ttl: float = 10.0,
         lease_keeper_interval: float | None = None,
+        lease_renew_with_quorum: bool = False,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -395,7 +396,9 @@ class Replica:
         直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
         若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
         ``lease_path``，新主库会持有写租约，旧主库租约过期后自行停写。
-        指定 ``lease_keeper_interval`` 会启动后台续租线程，``close()`` 停止它。
+        指定 ``lease_keeper_interval`` 会启动后台续租线程；再指定
+        ``lease_renew_with_quorum=True`` 时，续租前必须先拿到多数派心跳。
+        ``close()`` 停止续租线程。
         """
         candidate_node = node_id or quorum.node_id
         self._stop_lease_keeper()
@@ -410,9 +413,18 @@ class Replica:
             node_id=candidate_node,
         )
         if lease_path is not None and lease_keeper_interval is not None:
+            renew = None
+            if lease_renew_with_quorum:
+                def renew():
+                    return quorum.renew_lease(
+                        self._applied_lsn,
+                        lease_path=lease_path,
+                        lease_ttl=lease_ttl,
+                    )
             self._lease_keeper = LeaseKeeper(
                 Lease(lease_path, candidate_node, ttl=lease_ttl),
                 interval=lease_keeper_interval,
+                renew=renew,
             ).start()
         return db
 

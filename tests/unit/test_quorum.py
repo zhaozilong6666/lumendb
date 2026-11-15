@@ -6,8 +6,8 @@ import pytest
 
 from lumendb.errors import NotSupportedError
 from lumendb.engine.database import Database
-from lumendb.replication import PromotionFence, Replica, ReplicationMonitor, WALServer
-from lumendb.replication.quorum import QuorumNode, VoteState
+from lumendb.replication import Lease, PromotionFence, Replica, ReplicationMonitor, WALServer
+from lumendb.replication.quorum import QuorumClient, QuorumNode, VoteState
 
 
 def _make_primary(tmp_path):
@@ -75,6 +75,56 @@ def test_higher_term_rejects_stale_candidate(tmp_path):
         stale = nodes[1].request_vote(2, "n0", 6)
         assert stale["term"] == 3
         assert stale["granted"] is False
+    finally:
+        _stop(nodes)
+
+
+def test_heartbeat_rpc_updates_peer_and_rejects_stale_term(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[0].campaign(last_lsn=10)
+        response = QuorumClient.heartbeat(
+            nodes[1].host, nodes[1].port, 1, "n0", 20
+        )
+        assert response["ok"] is True
+        assert nodes[1].state.last_lsn == 20
+        stale = QuorumClient.heartbeat(
+            nodes[1].host, nodes[1].port, 0, "n0", 30
+        )
+        assert stale["ok"] is False
+        assert stale["term"] == 1
+    finally:
+        _stop(nodes)
+
+
+def test_quorum_lease_renewal_requires_majority(tmp_path):
+    nodes = _cluster(tmp_path)
+    lease_path = tmp_path / "lease.json"
+    try:
+        nodes[0].campaign(
+            last_lsn=10,
+            lease_path=lease_path,
+            lease_ttl=30,
+        )
+        initial = Lease(lease_path, "n0", ttl=30).read()["expires_at"]
+        renewed = nodes[0].renew_lease(
+            10,
+            lease_path=lease_path,
+            lease_ttl=30,
+            now=initial - 1,
+        )
+        assert renewed > initial
+        after_renew = Lease(lease_path, "n0", ttl=30).read()["expires_at"]
+        nodes[1].stop()
+        nodes[2].stop()
+        with pytest.raises(NotSupportedError, match="多数派心跳不足"):
+            nodes[0].renew_lease(
+                10,
+                lease_path=lease_path,
+                lease_ttl=30,
+                now=initial + 1,
+            )
+        assert Lease(lease_path, "n0", ttl=30).read()["expires_at"] == after_renew
     finally:
         _stop(nodes)
 
