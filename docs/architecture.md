@@ -327,10 +327,16 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它不做自动选举，
 也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
 
+**多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn` 的
+状态下响应 `vote_request`；`campaign()` 需要拿到集群多数票，投票节点拒绝
+比自己 LSN 落后的候选。`Replica.promote_with_quorum()` 先拿票再切换读写。
+它没有 leader 心跳、任期租约或日志协商，不能单独处理“主库还活着但网络
+分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
+
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
-它不重定向客户端，也不处理“主库其实还活着但网络分区”的脑裂；共享 fence
-是唯一的防双写约束。
+客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
+但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence 兜底。
 
 当前边界（也是下一步）：
 
@@ -338,15 +344,16 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
   但槽位目录只属于一个主库数据目录，没有跨节点槽位复制；主库重启时用
   `Database(wal_retain_lsn=min_slot(...))` 在恢复和自动 checkpoint 之前
   恢复保留点，避免启动顺序造成误回收；
-- 基准备份已分块传输，但仍是完整全量拷贝；没有增量/压缩基准备份
-  （WAL 响应行支持可选 zlib 压缩，基准备份内容本身未做增量）；
+- 基准备份已分块传输，但仍是完整全量拷贝；页级增量基准备份已做 MVP
+  （`snapshot_pages(base_lsn)` 只传 pageLSN 大于基础 LSN 的页），基准备份
+  内容本身的压缩仍未做；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
-- 自动提升只有连续失败阈值，没有心跳租约/仲裁和客户端重定向；fencing 依赖
-  共享 marker，网络分区时仍可能双写；
+- 自动提升只有连续失败阈值；多数派投票已做 MVP，但没有心跳任期租约，网络
+  分区时仍可能双写。fencing 依赖共享 marker；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
-  JSON 中传输，默认只应监听本机或可信网络；
+  JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；
 - 副本单线程 apply，查询与 apply 不应并发；提升是手动操作，fencing 只覆盖
   共享 marker，没有自动租约。
 

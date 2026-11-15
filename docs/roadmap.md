@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1036 passed。
+- 全量测试：1042 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -148,14 +148,23 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 返回 `rebuilt`，失败才返回 `needs_attention`，不会自动提升。
 `ReplicationMonitor.start()` 可在后台线程按 `poll_interval` 周期跟随，
 `stop()` 停止；`promoted` / `needs_attention` 会让后台循环退出。没有心跳
-租约和客户端重定向，网络分区下仍要求共享 fence。
+租约；客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
+网络分区下仍要求共享 fence。
+
+**多数派投票 MVP**：`QuorumNode.campaign()` 递增任期，向 `peers` 发送
+`vote_request`，只有拿到集群多数票才写提升 fence；投票节点持久化
+`term/voted_for/last_lsn`，会拒绝落后于自己 LSN 的候选，也会拒绝旧任期。
+`Replica.promote_with_quorum()` 把投票和切换读写串起来，投票失败时副本保持
+只读。这不是完整 Raft：没有 leader 心跳、没有任期租约、没有日志复制协商；
+网络分区时多数派不可达会明确失败，但不能自动判断旧主库是否还活着。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
 - 自动故障切换的 **MVP 已做**（`ReplicationMonitor` 连续网络失败后自动
   `promote` + 共享 fence），客户端重定向 MVP 已做（`WALServer(redirect_to=...)` + `RedirectError`，
-  `ReplicationMonitor` 会跟随最多 3 次），租约/仲裁和网络分区下的双写防护
-  仍未完成。
+  `ReplicationMonitor` 会跟随最多 3 次），多数派投票 MVP 已做
+  （`QuorumNode.campaign()` / `Replica.promote_with_quorum()`），但任期租约、
+  心跳和网络分区下的双写防护仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
   - **认证/压缩/TLS 已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)`
     在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
@@ -185,8 +194,9 @@ fencing。
 **当前状态**：上述三条已补齐；延迟/吞吐与丢失窗口的实测见
 [`docs/replication-bench.md`](replication-bench.md)，多区间页 diff 已把同一
 场景的副本延迟从 13.9 MB 降到 1.1 MB，响应行压缩和标准库 TLS 已作为可选
-传输层落地。租约/仲裁和副本查询/apply 并发仍未完成（客户端重定向、增量基准备份
-已做 MVP），因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
+传输层落地。多数派投票、客户端重定向、增量基准备份已做 MVP；任期租约、
+网络分区双写防护和副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP
+验收”，不能标“生产就绪”。
 
 ## 明确不做
 

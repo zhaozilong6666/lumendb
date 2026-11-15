@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1036 个自动化测试**（`python -m pytest tests -q`，约 40–60 秒，视机器负载而定），覆盖页格式、WAL 与恢复、
+- **1042 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -271,7 +271,9 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 复制槽：副本 ack 的 `confirmed_lsn` 原子持久化，`Database(wal_retain_lsn=...)` 在启动恢复前恢复保留点
 - [x] 手动提升 fencing：副本提升时原子写 marker，旧主通过写回调拒绝写入
 - [x] 自动提升 MVP：`ReplicationMonitor` 连续网络失败后 `promote`
-- [ ] 客户端重定向、租约/仲裁与真实网络分区防护
+- [x] 客户端重定向：`WALServer(redirect_to=...)`、`WALClient(follow_redirects=True)`、监控器自动跟随
+- [x] 多数派投票 MVP：`QuorumNode.campaign()` 需要多数票才写提升 fence；投票持久化任期并拒绝落后候选
+- [ ] 任期租约/心跳与真实网络分区下的双写防护
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。
