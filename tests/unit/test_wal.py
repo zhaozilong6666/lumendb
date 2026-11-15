@@ -15,7 +15,9 @@ from lumendb.storage.page import PAGE_SIZE, PageType
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.txn import TransactionManager, TxnState
 from lumendb.storage.wal import (
+    CRC_SIZE,
     HEADER_SIZE,
+    LogRecord,
     LogType,
     WAL,
     decode_checkpoint,
@@ -46,7 +48,7 @@ class TestAppendAndRead:
         lsn1 = wal.append(1, LogType.BEGIN)
         lsn2 = wal.append(1, LogType.COMMIT)
         wal.flush()
-        assert lsn2 - lsn1 == HEADER_SIZE  # BEGIN 无 payload
+        assert lsn2 - lsn1 == HEADER_SIZE + CRC_SIZE  # BEGIN 无 payload
         recs = wal.read_all()
         assert [r.lsn for r in recs] == [lsn1, lsn2]
         assert recs[0].rtype == LogType.BEGIN
@@ -65,6 +67,23 @@ class TestAppendAndRead:
         assert page_id == 7
         assert decoded == image
         wal.close()
+
+    def test_record_crc_rejects_a_flipped_payload_byte(self):
+        from lumendb.errors import StorageError
+
+        rec = LogRecord(10, 3, LogType.UPDATE, b"before/after")
+        raw = bytearray(rec.encode())
+        raw[HEADER_SIZE] ^= 0x01
+        with pytest.raises(StorageError, match="CRC"):
+            LogRecord.decode(bytes(raw), 0)
+
+    def test_legacy_record_without_crc_keeps_its_length(self):
+        rec = LogRecord(10, 3, LogType.UPDATE, b"payload", has_crc=False)
+        decoded, end = LogRecord.decode(rec.encode(), 0)
+        assert decoded.has_crc is False
+        assert decoded.rtype == LogType.UPDATE
+        assert len(rec.encode()) == HEADER_SIZE + len(rec.payload)
+        assert end == len(rec.encode())
 
     def test_records_survive_reopen(self, wal_path):
         wal = WAL(wal_path)

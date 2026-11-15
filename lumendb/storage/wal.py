@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import struct
 import threading
+import zlib
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -25,6 +26,12 @@ from .page import PAGE_SIZE
 # u64 lsn + u32 xid + u8 type + u32 payload_len = 17 字节
 _HEADER = struct.Struct("<QIBI")
 HEADER_SIZE = _HEADER.size
+
+# 旧日志记录没有校验和；新记录用 rtype 的最高位表示"尾部带 4 字节 CRC"。
+# 这样旧 WAL 仍能按原长度读取，新 WAL 又能拒绝介质位翻转。
+_CRC_FLAG = 0x80
+_CRC = struct.Struct("<I")
+CRC_SIZE = _CRC.size
 
 
 class LogType(IntEnum):
@@ -43,27 +50,50 @@ class LogRecord:
     xid: int
     rtype: int
     payload: bytes
+    #: 新记录默认带 CRC；从旧 WAL 解出的记录保留 False，以便重算长度/重编码。
+    has_crc: bool = True
 
     @property
     def is_update_like(self) -> bool:
         return self.rtype in (LogType.UPDATE, LogType.CLR, LogType.PAGE_IMAGE)
 
     def encode(self) -> bytes:
-        return _HEADER.pack(self.lsn, self.xid, self.rtype, len(self.payload)) + self.payload
+        type_field = int(self.rtype) | (_CRC_FLAG if self.has_crc else 0)
+        body = _HEADER.pack(self.lsn, self.xid, type_field, len(self.payload)) + self.payload
+        if not self.has_crc:
+            return body
+        return body + _CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
 
     @classmethod
     def decode(cls, buf: bytes, pos: int) -> tuple["LogRecord", int]:
         if pos + HEADER_SIZE > len(buf):
             raise StorageError("WAL 记录头被截断")
-        lsn, xid, rtype, plen = _HEADER.unpack_from(buf, pos)
+        lsn, xid, type_field, plen = _HEADER.unpack_from(buf, pos)
         pos += HEADER_SIZE
+        has_crc = bool(type_field & _CRC_FLAG)
+        rtype = type_field & ~_CRC_FLAG
         if pos + plen > len(buf):
             raise StorageError(
                 "WAL 记录体被截断",
                 detail=f"lsn={lsn} payload_len={plen}",
             )
         payload = bytes(buf[pos : pos + plen])
-        return cls(lsn, xid, rtype, payload), pos + plen
+        end = pos + plen
+        if has_crc:
+            if end + CRC_SIZE > len(buf):
+                raise StorageError(
+                    "WAL 记录 CRC 被截断",
+                    detail=f"lsn={lsn} payload_len={plen}",
+                )
+            expected = _CRC.unpack_from(buf, end)[0]
+            actual = zlib.crc32(bytes(buf[pos - HEADER_SIZE : end])) & 0xFFFFFFFF
+            if expected != actual:
+                raise StorageError(
+                    "WAL 记录 CRC 校验失败",
+                    detail=f"lsn={lsn} expect=0x{expected:08x} actual=0x{actual:08x}",
+                )
+            end += CRC_SIZE
+        return cls(lsn, xid, rtype, payload, has_crc=has_crc), end
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +326,7 @@ __all__ = [
     "LogRecord",
     "LogType",
     "HEADER_SIZE",
+    "CRC_SIZE",
     "encode_page_update",
     "decode_page_update",
     "encode_checkpoint",
