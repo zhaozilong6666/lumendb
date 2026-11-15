@@ -372,12 +372,15 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它单独使用时不做自动选举，
 也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
 
-**多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn` 的
-状态下响应 `vote_request`；`campaign()` 需要拿到集群多数票，投票节点拒绝
-比自己 LSN 落后的候选。`Replica.promote_with_quorum()` 先拿票再切换读写。
-它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，但没有日志复制
-协商，不能单独处理“主库还活着但网络分区”的脑裂；提升后仍依赖共享 fence
-挡住旧主库。
+**多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn/last_term`
+的状态下响应 `vote_request`；`campaign()` 需要拿到集群多数票，投票节点按
+Raft 的 `(last_term, last_lsn)` 字典序拒绝落后候选（同 LSN 但最后日志任期
+更旧的候选也会被拒）。`observe_applied(lsn, term=...)` 在记录已复制进度时
+一并记录日志任期；心跳只更新"听到过"的 `last_lsn`，**不会**把 leader 的当前
+任期写成日志任期，否则日志相同的节点会互相拒绝。`Replica.promote_with_quorum()`
+先拿票再切换读写。它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，
+但没有 `append_entries` 的逐条日志协商，也不能单独处理“主库还活着但网络
+分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写进共享文件。主库每次写语句前调用 `lease.assert_writable`，超过 TTL
@@ -440,8 +443,10 @@ read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` �
 - 每个节点把**真正复制到**的 LSN 记在 `VoteState.match_lsn`，心跳响应会带上它；
 - leader 每轮心跳收集"自己 + 各 peer 的 `match_lsn`"，取第 `majority` 大的值作为
   `quorum_commit_lsn`（三节点即"第二大的那个"），并持久化（只前进不后退）；
+  心跳请求同时携带 leader 的 `commit_lsn`，follower 也会保存，换主时新候选
+  不必从 0 开始猜水位；
 - `campaign()` 在投票前先比一次：`candidate_lsn < quorum_commit_lsn` 直接拒绝提升，
-  提示先追平 WAL 或做一次增量基准备份。
+  提示先追平 WAL（或做一次增量基准备份）再发起。
 
 `match_lsn` 必须与 `last_lsn` 分开，这是这条协议唯一的坑：`last_lsn` 是"听到过
 的最高 LSN"，一个只投票不带数据的 witness 节点收到 leader 心跳后也会把它抬到
@@ -462,9 +467,11 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
   所以 `sync_replication=True` 而 `heartbeat_interval is None` 会在提升前被直接拒绝。
 
 它仍然是**没有日志协商**的同步复制：没有 `append_entries` 的任期/前缀一致性检查，
-长期失联的旧 leader 复辟后仍可能写进一些"多数派没收到"的记录（共享 fence + 租约
-负责挡住这类写入）。要做到 Raft 级别的正确性，需要日志协商 + commit index，
-属于下一阶段。
+也没有逐条日志的 per-entry term；长期失联的旧 leader 复辟后仍可能写进一些
+"多数派没收到"的记录（共享 fence + 租约负责挡住这类写入）。当前的
+`(last_term, last_lsn)` 投票只能防止"同 LSN 但更旧任期"的候选直接当选，
+`last_term` 来自 `observe_applied` 上报时携带的任期，是近似值。要做到 Raft
+级别的正确性，仍需要日志协商 + commit index，属于下一阶段。
 
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
@@ -480,10 +487,11 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
   内容本身的压缩仍未做；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
-- 自动提升已有连续失败阈值、多数派投票、TTL 写租约、heartbeat RPC 和多数派
-  续租，并有轻量版提交水位（`quorum_commit_lsn`）挡住"提升落后副本"，可选开
-  同步复制（多数派追上才回 COMMIT，超时给 `40003` 结果未知）；但仍没有日志复制
-  协商，网络分区时仍可能双写。fencing 依赖共享 marker 和租约文件；客户端重定向已做 MVP；
+- 自动提升已有连续失败阈值、多数派投票、`(last_term,last_lsn)` 投票比较、TTL
+  写租约、heartbeat RPC 和多数派续租，并有轻量版提交水位（`quorum_commit_lsn`）
+  挡住"提升落后副本"，可选开同步复制（多数派追上才回 COMMIT，超时给 `40003`
+  结果未知）；但仍没有 `append_entries` 日志协商和逐条 per-entry term，网络分区
+  时仍可能双写。fencing 依赖共享 marker 和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
   JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；
