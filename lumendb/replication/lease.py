@@ -286,7 +286,7 @@ class LeaseKeeper:
         with self._lock:
             thread = self._thread
             self._thread = None
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self.interval + 0.5))
 
     def _run(self) -> None:

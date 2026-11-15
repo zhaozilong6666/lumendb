@@ -346,7 +346,8 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
 在后台续租；`Replica.promote_with_quorum(..., lease_keeper_interval=...)`
 可在提升后自动启动 keeper，`Replica.close()` 停止它；提升后的新主库
 用 `LeaseFence`（租约 + 当前任期）作为 `write_fence`，租约丢失或观察到
-更高任期即拒绝写；旧主库收到更高任期心跳后也会立即停写。
+更高任期即拒绝写；旧主库收到更高任期心跳后也会立即停写；keeper 续租失败可回调 `Replica.step_down()`
+自动切回只读。
 崩溃留下的锁文件不会被自动清理，必须人工确认。
 
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
