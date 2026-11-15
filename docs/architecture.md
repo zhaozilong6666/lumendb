@@ -341,7 +341,9 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 接到提升路径。它依赖共享文件和大致同步的墙钟，仍不是 quorum heartbeat
 lease：没有心跳 RPC、没有租约续期仲裁，时钟漂移会直接改变安全窗口。
 `Lease` 的 acquire/renew/release 用 `<lease>.lock` 串行化，`LeaseKeeper`
-在后台续租；崩溃留下的锁文件不会被自动清理，必须人工确认。
+在后台续租；`Replica.promote_with_quorum(..., lease_keeper_interval=...)`
+可在提升后自动启动 keeper，`Replica.close()` 停止它；崩溃留下的锁文件
+不会被自动清理，必须人工确认。
 
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。

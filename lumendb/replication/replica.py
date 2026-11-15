@@ -29,6 +29,7 @@ from ..storage.page import PageType
 from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
 from .fence import PromotionFence
+from .lease import Lease, LeaseKeeper
 
 
 class Replica:
@@ -53,6 +54,7 @@ class Replica:
         self._applied_lsn = applied_lsn
         # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
         self._lock = threading.RLock()
+        self._lease_keeper: LeaseKeeper | None = None
         self._write_marker()
 
     # ------------------------------------------------------------------
@@ -277,6 +279,17 @@ class Replica:
         with self._lock:
             return self.db.execute_one(sql, params)
 
+    def close(self) -> None:
+        """停止后台续租并关闭数据库句柄。"""
+        self._stop_lease_keeper()
+        self.db.close()
+
+    def _stop_lease_keeper(self) -> None:
+        keeper = self._lease_keeper
+        self._lease_keeper = None
+        if keeper is not None:
+            keeper.stop()
+
     def rebase_from_server(
         self,
         host: str,
@@ -373,6 +386,7 @@ class Replica:
         fence_path: str | Path | None = None,
         lease_path: str | Path | None = None,
         lease_ttl: float = 10.0,
+        lease_keeper_interval: float | None = None,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -381,17 +395,26 @@ class Replica:
         直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
         若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
         ``lease_path``，新主库会持有写租约，旧主库租约过期后自行停写。
+        指定 ``lease_keeper_interval`` 会启动后台续租线程，``close()`` 停止它。
         """
+        candidate_node = node_id or quorum.node_id
+        self._stop_lease_keeper()
         quorum.campaign(
             self._applied_lsn,
             fence_path=fence_path,
             lease_path=lease_path,
             lease_ttl=lease_ttl,
         )
-        return self.promote(
+        db = self.promote(
             fence_path=fence_path,
-            node_id=node_id or quorum.node_id,
+            node_id=candidate_node,
         )
+        if lease_path is not None and lease_keeper_interval is not None:
+            self._lease_keeper = LeaseKeeper(
+                Lease(lease_path, candidate_node, ttl=lease_ttl),
+                interval=lease_keeper_interval,
+            ).start()
+        return db
 
     def promote(
         self,
