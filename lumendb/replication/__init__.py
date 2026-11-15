@@ -1,6 +1,6 @@
 """复制层：物理 WAL 流与只读副本。"""
 
-from .failover import ReplicationMonitor
+from .failover import MonitorState, ReplicationMonitor
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
 from .quorum import HeartbeatLoop, QuorumClient, QuorumNode, VoteState
@@ -11,6 +11,7 @@ __all__ = [
     "HeartbeatLoop",
     "Lease",
     "LeaseFence",
+    "MonitorState",
     "PromotionFence",
     "QuorumClient",
     "QuorumNode",

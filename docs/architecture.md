@@ -389,17 +389,51 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
 `LeaseKeeper(renew=...)` 可把后台续租切到 quorum 路径。它仍依赖共享文件
 和大致同步的墙钟，不是完整的 Raft leader lease，时钟漂移会改变安全窗口。
 `Lease` 的 acquire/renew/release 用 `<lease>.lock` 串行化，`LeaseKeeper`
-在后台续租；`Replica.promote_with_quorum(..., lease_keeper_interval=...)`
-可在提升后自动启动 keeper，`Replica.close()` 停止它；提升后的新主库
+在后台续租；`Replica.promote_with_quorum(...)` 在提升后自动启动 keeper
+（默认周期 `ttl / 3`，可用 `lease_keeper_interval` 覆盖、`lease_keeper_auto=False`
+关掉）；`Replica.close()` / `step_down()` 先停心跳、再停 keeper；提升后的新主库
 用 `LeaseFence`（租约 + 当前任期）作为 `write_fence`，租约丢失或观察到
 更高任期即拒绝写；旧主库收到更高任期心跳后也会立即停写；keeper 续租失败可回调 `Replica.step_down()`
 自动切回只读；`Lease.renew(term=...)` 在节点任期高于租约任期时拒绝续租。
-崩溃留下的锁文件不会被自动清理，必须人工确认。
+
+**写围栏的三个检查点（缺一不可）**：
+
+1. **语句入口、且在 `Database._write_lock` 之内**（`Database._run`）——在锁外检查的话，
+   等锁期间租约可能已过期，这一笔写还会落盘；
+2. **提交点**（`TransactionManager.commit`，追加 COMMIT 记录之前）——一条长语句
+   （如百万行 `INSERT ... SELECT`）可以跨过租约到期，入口检查拦不住它；
+   只读事务（`txn.wrote == False`）跳过检查，旧主库降级后仍要能当只读观察者；
+3. **线协议路径**（`server/pgwire.py` 的 DML 与 COMMIT 分支）——会话直接调
+   `Executor.run`，**不经过** `Database._run`；漏掉这里，被 fence 的旧主库挂上
+   pgwire 后 psql 仍然能写。`Database.assert_writable()` 是这三个入口的统一实现。
+
+**心跳接线**：`promote_with_quorum(heartbeat_interval=...)` 在提升后启动
+`HeartbeatLoop`，观察到的更高任期会推进本节点任期并回调 `on_higher_term`；
+不提供回调时，`lease_loss_stepdown=True` 会直接 `step_down()`。没有心跳循环时，
+新主库的任期视图永远不动，`LeaseFence` 的"观察到更高任期就停写"实际上不会触发。
+
+**心跳扇出**：`heartbeat_round()` 用线程池并发向 peers 发 `heartbeat`，总耗时约等于
+单个 `timeout` 而不是 `N × timeout`（串行扇出会让一个挂死的 peer 把租约推到过期）；
+结果按 peer 声明顺序回收，`last_acks` / `last_errors` 语义不变；
+`abort_on_higher_term=True` 时看到更高任期就取消还没发出的请求。
+
+**锁文件与租约文件是两件事**：`<lease>.lock` 是 OS advisory lock
+（`storage/filelock.py`，进程退出/崩溃即释放，不会"残留"）；真正会残留的是
+**租约 JSON**（`holder` / `term` / `expires_at`），这是有意的 TTL 语义：崩溃节点的
+租约必须等到 `expires_at` 之后才能被抢占，否则会出现两个写者。租约里的时间是
+**墙钟**，跨主机时钟漂移会直接改变安全窗口——部署要求各节点时钟偏移小于 `ttl / 3`，
+并且不应把租约文件放在不可靠的跨网络文件系统上。
 
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
 传入 `lease_path` 等参数时，自动提升也走 `promote_with_quorum`，把租约、
 心跳续租和写围栏一并装到新主库。
+
+`ReplicationMonitor` 有显式状态机（`MonitorState.following / promoting / promoted /
+read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` 会通过
+`add_step_down_listener` 把 monitor 的状态扣回 `needs_attention`
+（`poll()` 也随即返回 `needs_attention`），不会继续对外报 `promoted`。
+
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
 
@@ -602,6 +636,9 @@ Binder 每执行一条语句重建一次。CTE 注册表是语句级作用域，
   读到未提交数据。`ReadyForQuery` 按状态回 `I` / `T` / `E`；事务内出错后
   只能 `ROLLBACK`，此时 `COMMIT` 按 PostgreSQL 语义等价于回滚；连接断开时
   未提交事务自动中止。
+
+所有写语句（简单查询与扩展查询、显式事务与隐式事务）都先过
+`Database.assert_writable()`：写围栏不是"主库自己记得检查"，而是每个入口都必须过的一道闸。
 
 多连接共享同一个 `Database`，服务端用一把 asyncio 锁把**单条语句**串行化；
 事务之间的隔离由每个会话自己的 `Transaction` 与 MVCC 提供。

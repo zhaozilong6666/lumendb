@@ -16,10 +16,12 @@ MVCC 可见性。记录可以直接来自同进程的 ``primary.wal``，也可�
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import ssl
 import threading
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
@@ -31,6 +33,9 @@ from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
+from .quorum import HeartbeatLoop
+
+_log = logging.getLogger(__name__)
 
 
 class Replica:
@@ -56,6 +61,9 @@ class Replica:
         # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
         self._lock = threading.RLock()
         self._lease_keeper: LeaseKeeper | None = None
+        self._heartbeat: HeartbeatLoop | None = None
+        #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
+        self._step_down_listeners: list[Callable[[str], None]] = []
         self._write_marker()
 
     # ------------------------------------------------------------------
@@ -281,17 +289,25 @@ class Replica:
             return self.db.execute_one(sql, params)
 
     def close(self) -> None:
-        """停止后台续租并关闭数据库句柄。"""
-        self._stop_lease_keeper()
+        """停止后台线程并关闭数据库句柄。"""
+        self._stop_background()
         self.db.close()
 
-    def step_down(self) -> Database:
-        """停止续租并切回只读，用于租约丢失后的自停写。
+    def add_step_down_listener(self, callback: Callable[[str], None]) -> None:
+        """注册降级观察者（``ReplicationMonitor`` 用它把状态改成 needs_attention）。"""
+        self._step_down_listeners.append(callback)
 
-        该回调可能在 keeper 线程中被调用；``LeaseKeeper.stop`` 会识别当前
-        线程，避免线程 join 自己。调用后新的写语句会因 ``read_only`` 失败。
+    def step_down(self, reason: str = "lease lost") -> Database:
+        """停心跳、停续租、切回只读，用于租约丢失/观察到更高任期后的自停写。
+
+        该回调可能在 keeper 或心跳线程中被调用；两个 ``stop()`` 都会识别
+        当前线程，避免线程 join 自己。``Database.close()`` 在 ``_write_lock``
+        内完成，所以会等在途写语句结束，不会把页写到已关闭的句柄上。
+
+        停止顺序是**先心跳、再 keeper**：反过来的话，心跳线程会在降级之后
+        继续以 leader 身份发消息，把旧任期推给 peer。
         """
-        self._stop_lease_keeper()
+        self._stop_background()
         with self._lock:
             self.db.close()
             self.db = Database(
@@ -299,9 +315,20 @@ class Replica:
                 read_only=True,
                 checkpoint_wal_bytes=0,
             )
-            return self.db
+            db = self.db
+        for callback in list(self._step_down_listeners):
+            try:
+                callback(reason)
+            except Exception:  # noqa: BLE001 - 观察者不能影响降级本身
+                _log.exception("step_down 观察者抛错：%r", callback)
+        return db
 
-    def _stop_lease_keeper(self) -> None:
+    def _stop_background(self) -> None:
+        """先停心跳、再停续租。"""
+        heartbeat = self._heartbeat
+        self._heartbeat = None
+        if heartbeat is not None:
+            heartbeat.stop()
         keeper = self._lease_keeper
         self._lease_keeper = None
         if keeper is not None:
@@ -404,9 +431,12 @@ class Replica:
         lease_path: str | Path | None = None,
         lease_ttl: float = 10.0,
         lease_keeper_interval: float | None = None,
+        lease_keeper_auto: bool = True,
         lease_renew_with_quorum: bool = False,
         lease_loss_callback: Callable[[LeaseKeeper], None] | None = None,
         lease_loss_stepdown: bool = False,
+        heartbeat_interval: float | None = None,
+        on_higher_term: Callable[[int], None] | None = None,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -416,14 +446,22 @@ class Replica:
         若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
         ``lease_path``，新主库会持有写租约，并把 ``LeaseFence``（租约 + 当前
         任期）装到新主库的写路径上，租约失效或观察到更高任期后主库自行拒绝
-        写入。指定 ``lease_keeper_interval`` 会启动后台续租线程；再指定
-        ``lease_renew_with_quorum=True`` 时，续租前必须先拿到多数派心跳。
-        ``lease_loss_callback`` 在 keeper 续租失败时调用，可用于上层告警；
-        ``lease_loss_stepdown=True`` 时还会自动切回只读，让旧主库立即停写。
-        ``close()`` 停止续租线程。
+        写入。
+
+        后台线程（``close()`` / ``step_down()`` 会先停心跳、再停 keeper）：
+
+        * **续租**：``lease_keeper_interval`` 指定周期；不指定时按
+          ``lease_keeper_auto``（默认开）用 ``ttl / 3`` 自动启动。给了
+          ``lease_path`` 却不续租，新主库会在 TTL 到点后自行停写——这是有意
+          的护栏，但通常不是调用方想要的，所以默认替你起 keeper。
+          ``lease_renew_with_quorum=True`` 时续租前必须先拿到多数派心跳。
+        * **心跳**：``heartbeat_interval`` 非空时启动 :class:`HeartbeatLoop`，
+          维持 leader 活跃度并观察任期。观察到更高任期时调用
+          ``on_higher_term(term)``；未提供时若 ``lease_loss_stepdown`` 为真就
+          直接 ``step_down()``，否则只记录在 ``last_heartbeat_errors``。
         """
         candidate_node = node_id or quorum.node_id
-        self._stop_lease_keeper()
+        self._stop_background()
         quorum.campaign(
             self._applied_lsn,
             fence_path=fence_path,
@@ -435,52 +473,99 @@ class Replica:
             if lease_path is not None
             else None
         )
-        fence = (
-            LeaseFence(
-                lease,
-                lambda: getattr(getattr(quorum, "state", None), "term", None),
-            )
-            if lease is not None
-            else None
-        )
+        term_of = lambda: getattr(getattr(quorum, "state", None), "term", None)
+        fence = LeaseFence(lease, term_of) if lease is not None else None
         db = self.promote(
             fence_path=fence_path,
             write_fence=fence.assert_writable if fence is not None else None,
             node_id=candidate_node,
         )
-        if lease is not None and lease_keeper_interval is not None:
-            def renew():
-                term = getattr(getattr(quorum, "state", None), "term", None)
-                return lease.renew(term=term)
 
-            if lease_renew_with_quorum:
-                def renew():
-                    return quorum.renew_lease(
-                        self._applied_lsn,
-                        lease_path=lease_path,
-                        lease_ttl=lease_ttl,
-                    )
+        if lease is not None:
+            interval = lease_keeper_interval
+            if interval is None and lease_keeper_auto:
+                interval = max(0.05, lease_ttl / 3)
+            if interval is None:
+                warnings.warn(
+                    "给了 lease_path 但没有启动续租线程：主库会在租约 TTL 到期后"
+                    "自行停写。传 lease_keeper_interval，或确认这是你要的护栏。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                self._lease_keeper = self._make_lease_keeper(
+                    lease=lease,
+                    interval=interval,
+                    quorum=quorum,
+                    lease_path=lease_path,
+                    lease_ttl=lease_ttl,
+                    lease_renew_with_quorum=lease_renew_with_quorum,
+                    lease_loss_callback=lease_loss_callback,
+                    lease_loss_stepdown=lease_loss_stepdown,
+                    term_of=term_of,
+                ).start()
 
-            def on_loss(keeper):
-                try:
-                    if lease_loss_callback is not None:
-                        lease_loss_callback(keeper)
-                finally:
-                    if lease_loss_stepdown:
-                        self.step_down()
-
-            failure_handler = (
-                on_loss
-                if lease_loss_callback is not None or lease_loss_stepdown
-                else None
-            )
-            self._lease_keeper = LeaseKeeper(
-                lease,
-                interval=lease_keeper_interval,
-                renew=renew,
-                on_failure=failure_handler,
+        if heartbeat_interval is not None:
+            callback = on_higher_term
+            if callback is None and lease_loss_stepdown:
+                callback = lambda term: self.step_down(f"observed higher term {term}")
+            self._heartbeat = HeartbeatLoop(
+                quorum,
+                lambda: self._applied_lsn,
+                interval=heartbeat_interval,
+                on_higher_term=callback,
             ).start()
         return db
+
+    def _make_lease_keeper(
+        self,
+        *,
+        lease: Lease,
+        interval: float,
+        quorum,
+        lease_path,
+        lease_ttl: float,
+        lease_renew_with_quorum: bool,
+        lease_loss_callback: Callable[[LeaseKeeper], None] | None,
+        lease_loss_stepdown: bool,
+        term_of,
+    ) -> LeaseKeeper:
+        def renew():
+            return lease.renew(term=term_of())
+
+        if lease_renew_with_quorum:
+            def renew():
+                return quorum.renew_lease(
+                    self._applied_lsn,
+                    lease_path=lease_path,
+                    lease_ttl=lease_ttl,
+                )
+
+        def on_loss(keeper):
+            try:
+                if lease_loss_callback is not None:
+                    lease_loss_callback(keeper)
+            finally:
+                if lease_loss_stepdown:
+                    self.step_down(f"lease lost: {keeper.last_error}")
+
+        failure_handler = (
+            on_loss
+            if lease_loss_callback is not None or lease_loss_stepdown
+            else None
+        )
+        return LeaseKeeper(
+            lease,
+            interval=interval,
+            renew=renew,
+            on_failure=failure_handler,
+        )
+
+    @property
+    def last_heartbeat_errors(self) -> list[str]:
+        """最近一轮心跳的错误（没有心跳线程时为空）。"""
+        heartbeat = self._heartbeat
+        return list(heartbeat.last_errors) if heartbeat is not None else []
 
     def promote(
         self,
@@ -496,6 +581,9 @@ class Replica:
         上拒绝，形成最小的防双写约束。``write_fence`` 可把 lease/guard 装到
         新主库的写路径上。没有自动选举和网络租约。
         """
+        # 提升会替换数据库句柄：旧句柄上的心跳/续租线程必须先停，
+        # 否则它们会继续用旧租约/旧任期对外发消息。
+        self._stop_background()
         with self._lock:
             if fence_path is not None:
                 PromotionFence(fence_path, node_id=node_id).promote(

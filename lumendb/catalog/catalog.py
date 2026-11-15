@@ -128,6 +128,7 @@ class Catalog:
         self._loaded = True
 
     def persist(self, txn: Transaction) -> None:
+        txn.wrote = True
         payload = json.dumps(
             {
                 "version": CATALOG_VERSION,

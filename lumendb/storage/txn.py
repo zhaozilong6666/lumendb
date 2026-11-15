@@ -17,7 +17,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..errors import TransactionAbortedError, TransactionError
 from .pager import DiskManager
@@ -85,6 +85,10 @@ class Transaction:
     #: ——一个只写 1 行的语句也会变成 O(全库行数)。保守取并集即可：多扫一张表
     #: 只是浪费，不会漏判。
     touched_tables: set[str] = field(default_factory=set)
+    #: 本事务是否真的写过页。提交点复检写围栏时用它区分"只读事务"：
+    #: 自动提交的 SELECT 也会 begin/commit 一对，不能因为旧主被 fence 掉
+    #: 就连读都不让做。
+    wrote: bool = False
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:
@@ -110,11 +114,15 @@ class TransactionManager:
         wal: WAL,
         buffer_pool: Optional["BufferPoolManager"] = None,
         locks: Optional["LockManager"] = None,
+        write_fence: Optional[Callable[[], None]] = None,
     ) -> None:
         self._disk = disk
         self._wal = wal
         self._bp = buffer_pool
         self._locks = locks
+        #: 写围栏回调（租约/任期/提升 marker）。它在**提交点**再检查一次：
+        #: 语句入口的检查不足以保证安全和，一条长语句可以膜越租约到期。
+        self._write_fence = write_fence
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
@@ -162,6 +170,11 @@ class TransactionManager:
     def commit(self, txn: Transaction) -> None:
         with self._lock:
             txn.require_active()
+            # [Review-Fix] 提交点复检写围栏：租约/任期可能在语句执行期间
+            # 已经过期或被更高的任期取代。此处抛错 → COMMIT 记录不会被
+            # 追加，调用方 abort，没有“已持久化的已提交事务”产生。
+            if self._write_fence is not None and txn.wrote:
+                self._write_fence()
             txn.last_lsn = self._wal.commit(txn.xid)
             self._commit_queue.append((txn, txn.last_lsn))
             if self._commit_leader:

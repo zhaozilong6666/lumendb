@@ -316,10 +316,16 @@ class PGWireServer:
             return Result(tag="RELEASE")
 
         if session.txn is not None:
+            # [Review-Fix] 线协议会话不经过 Database._run，写围栏必须在这里
+            # 单独调用；提交点还有 TransactionManager.commit 的复检兜底。
+            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                database.assert_writable()
             return database.executor.run(statement, session.txn, params)
 
         txn = database.txns.begin()
         try:
+            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                database.assert_writable()
             result = database.executor.run(statement, txn, params)
             # [Review-Fix] 隐式事务的提交点同样要补检延迟约束。否则单条
             # ``INSERT INTO child ...`` 就能写入一条没有父行的引用：

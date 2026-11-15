@@ -91,7 +91,9 @@ class Database:
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
-        self.txns = TransactionManager(self.disk, self.wal, self.bp, self.locks)
+        self.txns = TransactionManager(
+            self.disk, self.wal, self.bp, self.locks, write_fence=self._write_fence
+        )
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
         self._checkpoint_every_commits = max(0, checkpoint_every_commits)
         self._commits_since_checkpoint = 0
@@ -114,6 +116,21 @@ class Database:
         )
 
         self._txn: Optional[Transaction] = None
+        self._closed = False
+
+    # ------------------------------------------------------------------
+
+    def assert_writable(self) -> None:
+        """写围栏的**唯一入口**。
+
+        任何新增写路径都必须调用它：``Database._run``、``PGWireServer``
+        的 DML/COMMIT 分支，以及 ``TransactionManager.commit``（提交点
+        复检，见那里的注释）。只在一个地方检查的后果已经出现过两次：
+        线协议会话直接调 ``executor.run``，绕过了 ``Database._run``。
+        """
+        fence = self._write_fence
+        if fence is not None:
+            fence()
 
     # ------------------------------------------------------------------
 
@@ -141,19 +158,23 @@ class Database:
     # ------------------------------------------------------------------
 
     def _run(self, statement, params: Optional[list[Any]] = None) -> Result:
+        if self._closed:
+            raise StorageError(
+                "数据库已关闭",
+                hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+            )
         if self._read_only and not _is_read_only_statement(statement):
             raise NotSupportedError(
                 "只读副本拒绝写入",
                 hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
             )
-        if (
-            not self._read_only
-            and self._write_fence is not None
-            and type(statement).__name__ not in _PURE_READ_STATEMENTS
-        ):
-            self._write_fence()
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             with self._write_lock:
+                # [Review-Fix] 围栏检查必须在拿到 _write_lock **之后**：
+                # 只在语句入口检查时，等锁期间租约可能已经过期/换主，
+                # 而这一笔写会带着过期租约落盘。
+                if not self._read_only:
+                    self.assert_writable()
                 return self._run_unlocked(statement, params)
         return self._run_unlocked(statement, params)
 
@@ -337,15 +358,25 @@ class Database:
         self._maybe_checkpoint()
 
     def close(self) -> None:
-        if self._txn is not None:
-            self.txns.abort(self._txn)
-            self._txn = None
-        try:
-            self.bp.flush_all()
-        finally:
-            self.bp.close()
-            self.wal.close()
-            self.disk.close()
+        """关闭数据库句柄。
+
+        [Review-Fix] 关闭必须与写语句互斥：并发降级（``Replica.step_down``）
+        会在另一个线程里调到这里，若直接 ``flush_all`` + 关 fd，正在执行的
+        语句会把页写到已经关闭的句柄上。
+        """
+        with self._write_lock:
+            if self._closed:
+                return  # 幂等：step_down() 之后 Replica.close() 还会再调一次
+            self._closed = True
+            if self._txn is not None:
+                self.txns.abort(self._txn)
+                self._txn = None
+            try:
+                self.bp.flush_all()
+            finally:
+                self.bp.close()
+                self.wal.close()
+                self.disk.close()
 
     def __enter__(self) -> "Database":
         return self

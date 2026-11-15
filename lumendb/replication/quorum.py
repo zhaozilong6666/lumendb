@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -188,6 +189,27 @@ class QuorumClient:
                 pass
 
 
+def _send_heartbeat(
+    host: str,
+    port: int,
+    term: int,
+    leader_id: str,
+    last_lsn: int,
+    timeout: float,
+    token: str | None,
+) -> dict[str, Any]:
+    """线程池里发一次心跳；把 ``QuorumClient.heartbeat`` 的关键字参数摊平。"""
+    return QuorumClient.heartbeat(
+        host,
+        port,
+        term,
+        leader_id,
+        last_lsn,
+        timeout=timeout,
+        token=token,
+    )
+
+
 class QuorumNode:
     """一个参与多数派投票的节点。
 
@@ -289,32 +311,75 @@ class QuorumNode:
                 "ok": True,
             }
 
-    def heartbeat_round(self, last_lsn: int) -> tuple[int, list[str]]:
-        """向 peers 发送当前任期心跳，返回 (ack 数, 错误列表)。
+    def heartbeat_round(
+        self,
+        last_lsn: int,
+        *,
+        abort_on_higher_term: bool = False,
+    ) -> tuple[int, list[str]]:
+        """向 peers 并发发送当前任期心跳，返回 (ack 数, 错误列表)。
 
         如果 peer 返回更高任期，本节点立即推进任期并清空投票；这使旧主库
         在租约到期前就能从下一次写围栏检查中发现自己已经过期。
+
+        并发扇出：以前是逐节点同步发，N 个 peer 里只要有一个慢节点，整轮
+        就要等 N × timeout；而这一轮的结果决定租约能不能续，慢租约直接
+        把主库推到"自己停写"。现在总耗时约等于单个 timeout。结果按 peer
+        声明顺序回收，`last_acks` / `last_errors` 的语义不变（测试仍然按
+        串行语义断言）。
+
+        ``abort_on_higher_term=True`` 时，一旦某个 peer 回了更高任期，就
+        取消还没开始的请求（已经发出的只能等它超时），用于尽快降级。
         """
         with self._lock:
             term = self.state.term
-            acks = {self.node_id}
-            errors: list[str] = []
+            peers = [
+                (peer_id, address)
+                for peer_id, address in self.peers.items()
+                if peer_id != self.node_id
+            ]
+        acks = {self.node_id}
+        outcomes: dict[str, tuple[dict | None, BaseException | None]] = {}
         highest_term = term
-        for peer_id, address in self.peers.items():
-            if peer_id == self.node_id:
-                continue
-            try:
-                response = QuorumClient.heartbeat(
-                    address[0],
-                    int(address[1]),
-                    term,
-                    self.node_id,
-                    int(last_lsn),
-                    timeout=self.timeout,
-                    token=self.token,
-                )
-            except (OSError, ValueError, StorageError) as exc:
+        if peers:
+            with ThreadPoolExecutor(
+                max_workers=len(peers), thread_name_prefix="lumendb-heartbeat"
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        _send_heartbeat,
+                        address[0],
+                        int(address[1]),
+                        term,
+                        self.node_id,
+                        int(last_lsn),
+                        self.timeout,
+                        self.token,
+                    ): peer_id
+                    for peer_id, address in peers
+                }
+                for future, peer_id in list(futures.items()):
+                    try:
+                        outcomes[peer_id] = (future.result(), None)
+                    except (OSError, ValueError, StorageError) as exc:
+                        outcomes[peer_id] = (None, exc)
+                    response = outcomes[peer_id][0]
+                    if (
+                        abort_on_higher_term
+                        and response is not None
+                        and max(0, int(response.get("term", 0))) > term
+                    ):
+                        for pending in futures:
+                            pending.cancel()
+
+        errors: list[str] = []
+        for peer_id, _address in peers:
+            response, exc = outcomes.get(peer_id, (None, None))
+            if exc is not None:
                 errors.append(f"{peer_id}: {exc}")
+                continue
+            if response is None:
+                errors.append(f"{peer_id}: 请求被取消")
                 continue
             response_term = max(0, int(response.get("term", 0)))
             if response_term > highest_term:

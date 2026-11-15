@@ -17,11 +17,27 @@ from __future__ import annotations
 import ssl
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 
 from ..errors import NotSupportedError, RedirectError, StorageError
 from .replica import Replica
 from .wal_stream import WALClient
+
+
+class MonitorState(str, Enum):
+    """跟随器的显式状态。
+
+    ``poll()`` 的返回值保持向后兼容（``healthy`` / ``degraded`` / ``promoted``
+    / ``rebuilt`` / ``needs_attention``），但内部状态更细：调用方需要区分
+    "已经提升但后来被降级"和"从未提升"时看 ``monitor.state``。
+    """
+
+    FOLLOWING = "following"      # 正在追主库
+    PROMOTING = "promoting"      # 正在投票/提升
+    PROMOTED = "promoted"        # 已提升且可写
+    READ_ONLY = "read_only"      # 曾被提升，现在被降级为只读
+    NEEDS_ATTENTION = "needs_attention"  # 需要人工介入
 
 
 class ReplicationMonitor:
@@ -49,6 +65,8 @@ class ReplicationMonitor:
         lease_keeper_interval: float | None = None,
         lease_renew_with_quorum: bool = False,
         lease_loss_stepdown: bool = False,
+        lease_keeper_auto: bool = True,
+        heartbeat_interval: float | None = None,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -70,18 +88,27 @@ class ReplicationMonitor:
         self.lease_keeper_interval = lease_keeper_interval
         self.lease_renew_with_quorum = lease_renew_with_quorum
         self.lease_loss_stepdown = lease_loss_stepdown
+        self.lease_keeper_auto = lease_keeper_auto
+        self.heartbeat_interval = heartbeat_interval
         self.max_failures = max(1, int(max_failures))
         self.timeout = timeout
         self.max_records = max_records
         self.failures = 0
         self.promoted = False
+        self.state = MonitorState.FOLLOWING
         self.last_error: str | None = None
         self.redirects = 0
+        self.demotions = 0
+        # 降级由 Replica 的 keeper/心跳线程触发，monitor 必须能被"反向通知"，
+        # 否则 lease 丢失后它会一直认为自己是 promoted 的主库。
+        self.replica.add_step_down_listener(self._handle_step_down)
 
     def poll(self) -> str:
         """执行一轮跟随；返回 ``healthy`` / ``degraded`` / ``promoted`` / ``needs_attention``。"""
-        if self.promoted:
+        if self.state is MonitorState.PROMOTED:
             return "promoted"
+        if self.state in (MonitorState.READ_ONLY, MonitorState.NEEDS_ATTENTION):
+            return "needs_attention"
         try:
             WALClient(
                 self.host,
@@ -106,6 +133,8 @@ class ReplicationMonitor:
             )
             self.failures = 0
             self.last_error = None
+            if self.state is MonitorState.FOLLOWING:
+                pass
             return "healthy"
         except RedirectError as exc:
             self.redirects += 1
@@ -173,6 +202,7 @@ class ReplicationMonitor:
             self._thread = None
 
     def _promote(self) -> bool:
+        self.state = MonitorState.PROMOTING
         try:
             if self.quorum is not None:
                 self.replica.promote_with_quorum(
@@ -181,8 +211,10 @@ class ReplicationMonitor:
                     lease_path=self.lease_path,
                     lease_ttl=self.lease_ttl,
                     lease_keeper_interval=self.lease_keeper_interval,
+                    lease_keeper_auto=self.lease_keeper_auto,
                     lease_renew_with_quorum=self.lease_renew_with_quorum,
                     lease_loss_stepdown=self.lease_loss_stepdown,
+                    heartbeat_interval=self.heartbeat_interval,
                     node_id=self.quorum.node_id,
                 )
             else:
@@ -192,9 +224,18 @@ class ReplicationMonitor:
                 )
         except (NotSupportedError, StorageError) as exc:
             self.last_error = str(exc)
+            self.state = MonitorState.NEEDS_ATTENTION
             return False
         self.promoted = True
+        self.state = MonitorState.PROMOTED
         return True
+
+    def _handle_step_down(self, reason: str) -> None:
+        """Replica 被降级时把状态扣回 needs_attention，而不是继续报 promoted。"""
+        self.demotions += 1
+        self.promoted = False
+        self.state = MonitorState.NEEDS_ATTENTION
+        self.last_error = f"stepped down: {reason}"
 
 
 __all__ = ["ReplicationMonitor"]

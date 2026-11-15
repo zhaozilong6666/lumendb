@@ -291,6 +291,7 @@ class HeapFile:
 
     def insert(self, txn: Transaction, values: Sequence[Any]) -> RID:
         txn.require_active()
+        txn.wrote = True
         payload = encode_record(
             self.table.columns,
             values,
@@ -330,6 +331,7 @@ class HeapFile:
     def update(self, txn: Transaction, root_rid: RID, values: Sequence[Any]) -> RID:
         """写一条新版本，返回新版本的 RID。"""
         txn.require_active()
+        txn.wrote = True
         newest = self._latest_version_rid(root_rid)
         # 必须从"当前快照可见"的版本出发，而不是从 newest 出发：
         # abort 只写 ABORT 记录、不做进程内 undo，newest 可能仍指向一个
@@ -412,6 +414,7 @@ class HeapFile:
     def delete(self, txn: Transaction, root_rid: RID) -> int:
         """把当前可见版本标记为已删除，返回受影响行数（0 或 1）。"""
         txn.require_active()
+        txn.wrote = True
         try:
             newest = self._latest_version_rid(root_rid)
         except StorageError:
@@ -443,6 +446,7 @@ class HeapFile:
         （执行器里的 ``VACUUM`` 就是这么做的）。
         """
         txn.require_active()
+        txn.wrote = True
         active = self._txns.active_xids
         if len(active) > 1:
             raise StorageError(
@@ -542,6 +546,7 @@ class HeapFile:
         索引由调用方重建（执行器的 ``TRUNCATE`` 会做），返回清空前的行数估计。
         """
         txn.require_active()
+        txn.wrote = True
         removed = self.table.row_count_hint
         page_id = self.table.root_page
         while page_id != INVALID_PAGE_ID:
