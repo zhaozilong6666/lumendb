@@ -196,8 +196,25 @@ class WAL:
         # 多个提交线程可能同时追加；文件写入与 pending 必须成组保护。
         self._lock = threading.RLock()
         if self._size:
-            for record in self.iter_records(1):
-                self._last_lsn = record.lsn
+            valid_end = 0
+            try:
+                for record in self.iter_records(1):
+                    self._last_lsn = record.lsn
+                    # LSN 是字节偏移 + 1；旧记录 has_crc=False 时 encode() 仍是原长度。
+                    valid_end = record.lsn - 1 + len(record.encode())
+            except BaseException:
+                self._fh.close()
+                raise
+            if valid_end < self._size:
+                # 崩溃可能留下半条记录。如果只把 _next_lsn 指到“文件末尾+1”，
+                # 新记录会写在残尾之后，下一次恢复会在残尾处停下，静默丢掉
+                # 崩溃后写入的所有记录。这里把残尾截掉，保证追加区连续。
+                self._fh.close()
+                with open(self.path, "r+b") as fh:
+                    fh.truncate(valid_end)
+                self._fh = open(self.path, "ab")
+                self._size = valid_end
+                self._next_lsn = valid_end + 1
 
     # -- 属性 ---------------------------------------------------------------
 

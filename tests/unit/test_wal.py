@@ -178,7 +178,16 @@ class TestDurability:
         wal2 = WAL(wal_path)
         recs = wal2.read_all()
         assert len(recs) == 2
+        # 残尾必须被截掉：否则下一次 append 会写在残尾之后，重启后
+        # iter_records 在残尾处停下，静默丢掉崩溃后写入的记录。
+        wal2.append(2, LogType.BEGIN)
+        wal2.flush()
+        assert len(wal2.read_all()) == 3
         wal2.close()
+
+        wal3 = WAL(wal_path)
+        assert len(wal3.read_all()) == 3
+        wal3.close()
 
 
 class TestWalRuleSupport:
