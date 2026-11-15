@@ -142,6 +142,20 @@ def test_campaign_pre_vote_rejects_older_last_term(tmp_path):
         _stop(nodes)
 
 
+def test_pre_vote_stops_on_a_peer_with_higher_term(tmp_path):
+    """一个 peer 的任期更高，就说明本轮意向过时；不能靠剩余票凑多数派。"""
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[2].state.term = 9
+        nodes[2].state.save()
+        with pytest.raises(NotSupportedError, match="观察到更高任期"):
+            nodes[0].campaign(0, pre_vote=True)
+        # 预投票不改任期，候选仍停留在原值
+        assert nodes[0].state.term == 0
+    finally:
+        _stop(nodes)
+
+
 def test_heartbeat_rpc_updates_peer_and_rejects_stale_term(tmp_path):
     nodes = _cluster(tmp_path)
     try:

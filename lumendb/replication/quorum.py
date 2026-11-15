@@ -661,6 +661,7 @@ class QuorumNode:
                 if peer_id != self.node_id
             ]
         errors: list[str] = []
+        highest_term = term
         for peer_id, address in peers:
             try:
                 response = QuorumClient.request_vote(
@@ -677,8 +678,19 @@ class QuorumNode:
             except (OSError, ValueError, StorageError) as exc:
                 errors.append(f"{peer_id}: {exc}")
                 continue
+            peer_term = int(response.get("term", 0))
+            if peer_term > highest_term:
+                highest_term = peer_term
             if response.get("granted"):
                 votes.add(peer_id)
+        if highest_term > term:
+            # 预投票本身不推进任期；但看到更高任期就说明本轮意向已经过时，
+            # 不能拿其余节点的票硬凑多数派。
+            raise NotSupportedError(
+                "预投票观察到更高任期，放弃本次提升",
+                detail=f"observed_term={highest_term} proposed_term={term}",
+                hint="等更高任期的主库完成选举，或重新读取水位后再发起",
+            )
         if len(votes) < majority:
             detail = (
                 f"pre_votes={len(votes)}/{total_nodes} majority={majority}; "
@@ -785,6 +797,12 @@ class QuorumNode:
                 self.state.term = highest_term
                 self.state.voted_for = None
                 self.state.save()
+            # 这些"授予票数"是上一任期的票，不能拿它们宣布本轮当选。
+            raise NotSupportedError(
+                "投票观察到更高任期，放弃本次提升",
+                detail=f"observed_term={highest_term} proposed_term={term}",
+                hint="让本节点跟随更高任期，再由下一轮选举决定主库",
+            )
 
         if len(votes) < majority:
             detail = (
