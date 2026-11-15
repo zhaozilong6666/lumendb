@@ -366,6 +366,25 @@ class Replica:
                 except OSError:
                     pass
 
+    def promote_with_quorum(
+        self,
+        quorum,
+        *,
+        fence_path: str | Path | None = None,
+        node_id: str | None = None,
+    ) -> Database:
+        """先拿到多数派投票，再执行 :meth:`promote`。
+
+        ``quorum`` 是 :class:`lumendb.replication.quorum.QuorumNode`；投票失败会
+        直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
+        若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入。
+        """
+        quorum.campaign(self._applied_lsn)
+        return self.promote(
+            fence_path=fence_path,
+            node_id=node_id or quorum.node_id,
+        )
+
     def promote(
         self,
         *,

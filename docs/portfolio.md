@@ -72,7 +72,9 @@
 >   在语句入口拒绝写入，`lag_lsn` 量化延迟；基准备份用 `Database.snapshot`
 >   冻结写路径、先 checkpoint 再读数据文件，手动提升用共享 `PromotionFence`
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
-> - 1036 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+>   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
+>   持久化任期并拒绝落后候选，失败时副本保持只读；
+> - 1042 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -157,8 +159,10 @@
 >   entry, quantifies lag with `lag_lsn`; base backup freezes the write path
 >   with `Database.snapshot`, and manual promotion uses a shared
 >   `PromotionFence` marker to stop the old primary from writing;
->   `ReplicationMonitor` promotes after consecutive network failures.
-> - 1036 automated tests including crash-injection and a 20-seed randomized
+>   `ReplicationMonitor` promotes after consecutive network failures; a
+>   `QuorumNode` campaign needs a majority of persisted votes before promotion,
+>   and a failed campaign leaves the replica read-only.
+> - 1042 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
