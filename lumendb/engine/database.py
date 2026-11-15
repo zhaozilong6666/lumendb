@@ -6,6 +6,7 @@ CLI 与 PostgreSQL 协议服务端都只依赖这一层，它们不需要知道�
 from __future__ import annotations
 
 import threading
+import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -30,6 +31,8 @@ from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
 from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result
+
+_log = logging.getLogger(__name__)
 
 _READ_ONLY_STATEMENTS = {
     "Query",
@@ -401,6 +404,14 @@ class Database:
             if self._txn is not None:
                 self.txns.abort(self._txn)
                 self._txn = None
+            # 线协议事务不经过 self._txn；不 abort 它们会在 close 之后继续
+            # 持有写者锁/未提交页，甚至把 COMMIT 写进已关闭的 WAL。
+            try:
+                aborted = self.txns.abort_all()
+                if aborted:
+                    _log.info("关闭数据库时回滚了 %s 个活动事务", aborted)
+            except Exception:
+                _log.exception("关闭数据库时回滚活动事务失败")
             try:
                 self.bp.flush_all()
             finally:

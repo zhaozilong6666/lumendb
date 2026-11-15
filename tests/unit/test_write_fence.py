@@ -134,3 +134,18 @@ class TestClosedDatabase:
         db.close()
         with pytest.raises(StorageError, match="已关闭"):
             _run(server, session, "INSERT INTO t VALUES (1)")
+
+    def test_close_aborts_an_idle_wire_transaction(self, env):
+        """关闭时线上事务不挂在 Database._txn 上，也必须被回滚。"""
+        from lumendb.storage.txn import TxnState
+
+        db, _ = env
+        server = PGWireServer(db)
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "INSERT INTO t VALUES (1)")
+        txn = session.txn
+        assert txn is not None and txn.state is TxnState.ACTIVE
+        db.close()
+        assert txn.state is TxnState.ABORTED
+        assert txn.first_lsn is not None

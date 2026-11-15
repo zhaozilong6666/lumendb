@@ -130,6 +130,9 @@ class TransactionManager:
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
+        #: 活动事务对象表。线协议事务不一定挂在 Database._txn 上；关闭数据库
+        #: 时需要能逐个 abort，否则它们会继续持有写者锁/未提交页。
+        self._txns: dict[int, Transaction] = {}
         #: 活跃事务的 BEGIN LSN；checkpoint 回收 WAL 时必须保留到这里。
         self._active_starts: dict[int, int] = {}
         self._current: Optional[Transaction] = None
@@ -165,6 +168,7 @@ class TransactionManager:
             txn = Transaction(xid=xid, snapshot_xid=xid, active_at_start=active_at_start)
             self._states[xid] = TxnState.ACTIVE
             self._active.add(xid)
+            self._txns[xid] = txn
             txn.first_lsn = self._wal.begin(xid)
             txn.last_lsn = txn.first_lsn
             self._active_starts[xid] = txn.first_lsn
@@ -261,6 +265,7 @@ class TransactionManager:
         self._states[txn.xid] = TxnState.COMMITTED
         self._active.discard(txn.xid)
         self._active_starts.pop(txn.xid, None)
+        self._txns.pop(txn.xid, None)
         if self._bp is not None:
             self._bp.clear_undo(txn.xid)
         txn.undo_log.clear()
@@ -326,10 +331,27 @@ class TransactionManager:
             self._states[txn.xid] = TxnState.ABORTED
             self._active.discard(txn.xid)
             self._active_starts.pop(txn.xid, None)
+            self._txns.pop(txn.xid, None)
             if self._current is txn:
                 self._current = None
             self._release_locks(txn.xid)
             self._prune_states()
+
+    def abort_all(self) -> int:
+        """回滚所有仍处于 ACTIVE 的事务；返回回滚数量。
+
+        数据库关闭/降级时必须先把它们 abort：否则 pgwire 事务可以继续持有
+        写者锁、未提交页和延迟约束状态，在 close 之后才 COMMIT。
+        """
+        with self._lock:
+            pending = [
+                txn
+                for txn in self._txns.values()
+                if txn.state is TxnState.ACTIVE
+            ]
+        for txn in pending:
+            self.abort(txn)
+        return len(pending)
 
     # -- SAVEPOINT ---------------------------------------------------------
 

@@ -27,6 +27,7 @@ from ..errors import (
     LumenError,
     NotSupportedError,
     ProtocolError,
+    StorageError,
     TransactionError,
     UndefinedParameterError,
 )
@@ -141,7 +142,8 @@ class PGWireServer:
         finally:
             if session.txn is not None:
                 try:
-                    self.database.txns.abort(session.txn)
+                    with self.database._write_lock:
+                        self.database.txns.abort(session.txn)
                 except Exception:  # pragma: no cover
                     pass
                 session.txn = None
@@ -255,47 +257,56 @@ class PGWireServer:
         """执行一条已经解析好的语句，并维护会话事务状态。"""
         database = session.database
         if isinstance(statement, Begin):
-            if session.txn is not None:
-                raise TransactionError(
-                    "已经在事务中", hint="先 COMMIT 或 ROLLBACK"
-                )
-            session.txn = database.txns.begin()
-            session.failed = False
-            return Result(tag="BEGIN")
-        if isinstance(statement, (Commit, Rollback)):
-            if session.txn is None:
-                raise TransactionError("没有活动事务")
-            txn = session.txn
-            session.txn = None
-            if isinstance(statement, Commit) and not session.failed:
-                # [Review-Fix] 线协议提交必须走与进程内提交相同的延迟约束
-                # 校验，否则 DEFERRABLE INITIALLY DEFERRED 的外键/唯一约束在
-                # psql/pgwire 连接上完全失效：提交时静默写入悬空引用。
-                try:
-                    database.executor.validate_deferred_foreign_keys(txn)
-                    database.executor.validate_deferred_unique_constraints(txn)
-                except BaseException:
-                    database.txns.abort(txn)
-                    raise
-                database.txns.commit(txn)
-                database.maybe_checkpoint()
-                result = Result(tag="COMMIT")
-            else:
-                # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
-                database.txns.abort(txn)
+            with database._write_lock:
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if session.txn is not None:
+                    raise TransactionError(
+                        "已经在事务中", hint="先 COMMIT 或 ROLLBACK"
+                    )
+                session.txn = database.txns.begin()
                 session.failed = False
-                result = Result(tag="ROLLBACK")
-            # 门户在事务结束时关闭；预处理语句仍然保留。
-            session.portals.clear()
-            return result
+                return Result(tag="BEGIN")
+        if isinstance(statement, (Commit, Rollback)):
+            with database._write_lock:
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if session.txn is None:
+                    raise TransactionError("没有活动事务")
+                txn = session.txn
+                session.txn = None
+                if isinstance(statement, Commit) and not session.failed:
+                    # [Review-Fix] 线协议提交必须走与进程内提交相同的延迟约束
+                    # 校验，否则 DEFERRABLE INITIALLY DEFERRED 的外键/唯一约束在
+                    # psql/pgwire 连接上完全失效：提交时静默写入悬空引用。
+                    try:
+                        database.executor.validate_deferred_foreign_keys(txn)
+                        database.executor.validate_deferred_unique_constraints(txn)
+                    except BaseException:
+                        database.txns.abort(txn)
+                        raise
+                    database.txns.commit(txn)
+                    database.maybe_checkpoint()
+                    result = Result(tag="COMMIT")
+                else:
+                    # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
+                    database.txns.abort(txn)
+                    session.failed = False
+                    result = Result(tag="ROLLBACK")
+                # 门户在事务结束时关闭；预处理语句仍然保留。
+                session.portals.clear()
+                return result
 
         if isinstance(statement, RollbackToSavepoint):
-            if session.txn is None:
-                raise TransactionError("ROLLBACK TO 必须在事务中执行")
-            database.txns.rollback_to(session.txn, statement.name)
-            session.failed = False
-            session.portals.clear()
-            return Result(tag="ROLLBACK")
+            with database._write_lock:
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if session.txn is None:
+                    raise TransactionError("ROLLBACK TO 必须在事务中执行")
+                database.txns.rollback_to(session.txn, statement.name)
+                session.failed = False
+                session.portals.clear()
+                return Result(tag="ROLLBACK")
 
         if session.failed:
             raise TransactionError(
@@ -304,45 +315,58 @@ class PGWireServer:
             )
 
         if isinstance(statement, Savepoint):
-            if session.txn is None:
-                raise TransactionError("SAVEPOINT 必须在事务中执行")
-            database.txns.savepoint(session.txn, statement.name)
-            return Result(tag="SAVEPOINT")
+            with database._write_lock:
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if session.txn is None:
+                    raise TransactionError("SAVEPOINT 必须在事务中执行")
+                database.txns.savepoint(session.txn, statement.name)
+                return Result(tag="SAVEPOINT")
 
         if isinstance(statement, ReleaseSavepoint):
-            if session.txn is None:
-                raise TransactionError("RELEASE 必须在事务中执行")
-            database.txns.release(session.txn, statement.name)
-            return Result(tag="RELEASE")
+            with database._write_lock:
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if session.txn is None:
+                    raise TransactionError("RELEASE 必须在事务中执行")
+                database.txns.release(session.txn, statement.name)
+                return Result(tag="RELEASE")
 
         if session.txn is not None:
             # [Review-Fix] 线协议会话不经过 Database._run，写围栏必须在这里
             # 单独调用；提交点还有 TransactionManager.commit 的复检兜底。
             if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-                database.assert_writable()
+                # 写语句要与 Database.close()/降级互斥；否则 close 在 flush
+                # 之后仍可能有一条 INSERT 把页写到已关闭的句柄上。
+                with database._write_lock:
+                    database.assert_writable()
+                    return database.executor.run(statement, session.txn, params)
             return database.executor.run(statement, session.txn, params)
 
-        txn = database.txns.begin()
-        try:
-            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-                database.assert_writable()
-            result = database.executor.run(statement, txn, params)
-            # [Review-Fix] 隐式事务的提交点同样要补检延迟约束。否则单条
-            # ``INSERT INTO child ...`` 就能写入一条没有父行的引用：
-            # 校验被"延迟"了，而这条路径上根本没有人来补检。
-            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-                database.executor.validate_deferred_foreign_keys(txn)
-                database.executor.validate_deferred_unique_constraints(txn)
-        except BaseException:
-            database.txns.abort(txn)
-            # 隐式事务失败后同样没有仍然有效的门户。
+        with database._write_lock:
+            if database._closed:
+                raise StorageError("数据库已关闭")
+            txn = database.txns.begin()
+            try:
+                if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                    database.assert_writable()
+                result = database.executor.run(statement, txn, params)
+                # [Review-Fix] 隐式事务的提交点同样要补检延迟约束。否则单条
+                # ``INSERT INTO child ...`` 就能写入一条没有父行的引用：
+                # 校验被"延迟"了，而这条路径上根本没有人来补检。
+                if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                    database.executor.validate_deferred_foreign_keys(txn)
+                    database.executor.validate_deferred_unique_constraints(txn)
+            except BaseException:
+                database.txns.abort(txn)
+                # 隐式事务失败后同样没有仍然有效的门户。
+                session.portals.clear()
+                raise
+            database.txns.commit(txn)
+            database.maybe_checkpoint()
+            # 语句级隐式事务结束，关闭本次事务创建的门户。
             session.portals.clear()
-            raise
-        database.txns.commit(txn)
-        database.maybe_checkpoint()
-        # 语句级隐式事务结束，关闭本次事务创建的门户。
-        session.portals.clear()
-        return result
+            return result
 
     def _run_statements(
         self, session: Session, sql: str, params: Optional[list[Any]] = None
