@@ -341,7 +341,8 @@ class PGWireServer:
                 with database._write_lock:
                     database.assert_writable()
                     return database.executor.run(statement, session.txn, params)
-            return database.executor.run(statement, session.txn, params)
+            with database.read_guard():
+                return database.executor.run(statement, session.txn, params)
 
         with database._write_lock:
             if database._closed:

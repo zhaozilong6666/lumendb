@@ -149,3 +149,29 @@ class TestClosedDatabase:
         db.close()
         assert txn.state is TxnState.ABORTED
         assert txn.first_lsn is not None
+
+    def test_close_waits_for_an_active_reader(self, env):
+        """close 不能把仍在扫页的 SELECT 关在门外。"""
+        import threading
+        import time
+
+        db, _ = env
+        entered = threading.Event()
+        release = threading.Event()
+
+        def reader() -> None:
+            with db.read_guard():
+                entered.set()
+                release.wait(3)
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        assert entered.wait(2)
+        close_thread = threading.Thread(target=db.close)
+        close_thread.start()
+        time.sleep(0.05)
+        assert close_thread.is_alive(), "close 必须等 reader 退出"
+        release.set()
+        reader_thread.join(2)
+        close_thread.join(3)
+        assert not close_thread.is_alive()

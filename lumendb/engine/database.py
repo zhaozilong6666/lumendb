@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import logging
+import contextlib
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -98,6 +99,9 @@ class Database:
         #: 关闭标志：放在 TransactionManager 之前，提交点围栏回调在初始化
         #: 阶段就能安全读取它。
         self._closed = False
+        #: 正在执行的只读语句数；close() 要等它们退出再关磁盘句柄。
+        self._readers = 0
+        self._readers_cv = threading.Condition(self._write_lock)
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
         self.txns = TransactionManager(
@@ -159,6 +163,29 @@ class Database:
         if fence is not None:
             fence()
 
+    @contextlib.contextmanager
+    def read_guard(self):
+        """只读语句的关闭互斥门。
+
+        close() 只拿 ``_write_lock`` 时，一个正在扫描页的 SELECT 仍可能在
+        flush/close 之后碰到已关闭的 DiskManager/buffer pool。这里用同一个
+        锁做 reader 计数：close 置位 ``_closed`` 后等所有在途读者退出。
+        """
+        with self._readers_cv:
+            if self._closed:
+                raise StorageError(
+                    "数据库已关闭",
+                    hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+                )
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._readers_cv:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._readers_cv.notify_all()
+
     # ------------------------------------------------------------------
 
     @property
@@ -209,7 +236,8 @@ class Database:
                 if not self._read_only:
                     self.assert_writable()
                 return self._run_unlocked(statement, params)
-        return self._run_unlocked(statement, params)
+        with self.read_guard():
+            return self._run_unlocked(statement, params)
 
     def _run_unlocked(
         self, statement, params: Optional[list[Any]] = None
@@ -401,6 +429,11 @@ class Database:
             if self._closed:
                 return  # 幂等：step_down() 之后 Replica.close() 还会再调一次
             self._closed = True
+            # 先等只读语句退出，再 abort 事务/关闭句柄；反过来的话，一个
+            # 正在扫描页的 SELECT 可能在 undo 之后继续用已失效的页。
+            self._readers_cv.notify_all()
+            while self._readers:
+                self._readers_cv.wait()
             if self._txn is not None:
                 self.txns.abort(self._txn)
                 self._txn = None
