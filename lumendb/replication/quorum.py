@@ -22,6 +22,7 @@ from typing import Any
 
 from ..errors import NotSupportedError, StorageError
 from .fence import PromotionFence
+from .lease import Lease
 
 _NODE_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
@@ -220,9 +221,18 @@ class QuorumNode:
             }
 
     def campaign(
-        self, last_lsn: int, *, fence_path: str | Path | None = None
+        self,
+        last_lsn: int,
+        *,
+        fence_path: str | Path | None = None,
+        lease_path: str | Path | None = None,
+        lease_ttl: float = 10.0,
     ) -> int:
-        """争取多数派投票；成功返回任期，失败抛 ``NotSupportedError``。"""
+        """争取多数派投票；成功返回任期，失败抛 ``NotSupportedError``。
+
+        若给了 ``lease_path``，拿到多数票后还必须获取写租约；租约仍被旧主库
+        持有时不会抢占，候选节点需要等 TTL 过期后再重试。
+        """
         candidate_lsn = max(0, int(last_lsn))
         with self._lock:
             term = self.state.term + 1
@@ -274,6 +284,8 @@ class QuorumNode:
                 detail=detail,
             )
 
+        if lease_path is not None:
+            Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(term)
         if fence_path is not None:
             PromotionFence(fence_path, node_id=self.node_id).promote(candidate_lsn)
         return term

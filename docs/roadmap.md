@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1044 passed。
+- 全量测试：1050 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -157,16 +157,24 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 `Replica.promote_with_quorum()` 把投票和切换读写串起来，投票失败时副本保持
 只读。`ReplicationMonitor(quorum=...)` 的自动提升也走这条路径；没有多数票时
 返回 `needs_attention`，不会退化成单机提升。这不是完整 Raft：没有 leader 心跳、
-没有任期租约、没有日志复制协商；
-网络分区时多数派不可达会明确失败，但不能自动判断旧主库是否还活着。
+没有 quorum 租约续期、没有日志复制协商；网络分区时多数派不可达会明确失败，
+但不能自动判断旧主库是否还活着。
+
+**写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
+原子写入共享文件。主库每笔写语句前通过 `Database(write_fence=lease.assert_writable)`
+检查租约，超过 TTL 没有 `renew` 就自行停写；候选节点必须等旧租约过期才能
+`acquire`。`QuorumNode.campaign(lease_path=...)` 在多数票之后获取租约，
+`Replica.promote_with_quorum(lease_path=...)` 把租约接到提升路径。它依赖
+共享文件和大致同步的墙钟，不是 quorum heartbeat lease；时钟漂移会改变
+安全窗口。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
 - 自动故障切换的 **MVP 已做**（`ReplicationMonitor` 连续网络失败后自动
   `promote` + 共享 fence），客户端重定向 MVP 已做（`WALServer(redirect_to=...)` + `RedirectError`，
-  `ReplicationMonitor` 会跟随最多 3 次），多数派投票 MVP 已做
-  （`QuorumNode.campaign()` / `Replica.promote_with_quorum()`），但任期租约、
-  心跳和网络分区下的双写防护仍未完成。
+  `ReplicationMonitor` 会跟随最多 3 次），多数派投票和 TTL 写租约 MVP 已做
+  （`QuorumNode.campaign()` / `Replica.promote_with_quorum()` / `Lease`），但
+  心跳 RPC、quorum 续租和网络分区下的双写防护仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
   - **认证/压缩/TLS 已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)`
     在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
@@ -196,9 +204,9 @@ fencing。
 **当前状态**：上述三条已补齐；延迟/吞吐与丢失窗口的实测见
 [`docs/replication-bench.md`](replication-bench.md)，多区间页 diff 已把同一
 场景的副本延迟从 13.9 MB 降到 1.1 MB，响应行压缩和标准库 TLS 已作为可选
-传输层落地。多数派投票、客户端重定向、增量基准备份已做 MVP；任期租约、
-网络分区双写防护和副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP
-验收”，不能标“生产就绪”。
+传输层落地。多数派投票、客户端重定向、增量基准备份和 TTL 写租约已做 MVP；
+心跳 RPC / quorum 续租、网络分区双写防护和副本查询/apply 并发仍未完成，
+因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
 
