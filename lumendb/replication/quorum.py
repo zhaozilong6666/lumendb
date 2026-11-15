@@ -350,7 +350,7 @@ class QuorumNode:
                 detail=detail,
             )
         lease = Lease(lease_path, self.node_id, ttl=lease_ttl)
-        return lease.renew(now=now)
+        return lease.renew(now=now, term=self.state.term)
 
     def campaign(
         self,

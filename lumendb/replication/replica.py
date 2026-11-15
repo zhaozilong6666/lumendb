@@ -449,7 +449,10 @@ class Replica:
             node_id=candidate_node,
         )
         if lease is not None and lease_keeper_interval is not None:
-            renew = None
+            def renew():
+                term = getattr(getattr(quorum, "state", None), "term", None)
+                return lease.renew(term=term)
+
             if lease_renew_with_quorum:
                 def renew():
                     return quorum.renew_lease(

@@ -247,3 +247,13 @@ def test_heartbeat_round_steps_down_on_higher_term(tmp_path):
         assert acks >= 1
     finally:
         _stop(nodes)
+
+
+def test_renew_lease_rejects_stale_term(tmp_path):
+    node = QuorumNode("n0", state_path=tmp_path / "vote.json")
+    lease_path = tmp_path / "lease.json"
+    node.campaign(0, lease_path=lease_path, lease_ttl=30)
+    node.state.term += 1
+    node.state.save()
+    with pytest.raises(NotSupportedError, match="任期已过期"):
+        node.renew_lease(0, lease_path=lease_path, lease_ttl=30)

@@ -146,13 +146,18 @@ class Lease:
             self._write(self.node_id, term, expires_at)
             return expires_at
 
-    def renew(self, *, now: float | None = None) -> float:
+    def renew(self, *, now: float | None = None, term: int | None = None) -> float:
         """续租；只有当前持有者且租约未过期时才能续。"""
         with self._exclusive():
             current_time = time.time() if now is None else float(now)
             current = self.read()
             if current is None:
                 raise NotSupportedError("租约不存在，不能续租")
+            if term is not None and int(term) > int(current["term"]):
+                raise NotSupportedError(
+                    "本节点任期已过期，拒绝续租",
+                    detail=f"observed_term={term} lease_term={current['term']}",
+                )
             if current.get("holder") != self.node_id:
                 raise NotSupportedError(
                     "租约不属于当前节点，不能续租",
