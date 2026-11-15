@@ -20,6 +20,7 @@ import os
 import shutil
 import ssl
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from ..engine.database import Database
@@ -388,6 +389,7 @@ class Replica:
         lease_ttl: float = 10.0,
         lease_keeper_interval: float | None = None,
         lease_renew_with_quorum: bool = False,
+        lease_loss_callback: Callable[[LeaseKeeper], None] | None = None,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -395,9 +397,11 @@ class Replica:
         ``quorum`` 是 :class:`lumendb.replication.quorum.QuorumNode`；投票失败会
         直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
         若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
-        ``lease_path``，新主库会持有写租约，旧主库租约过期后自行停写。
-        指定 ``lease_keeper_interval`` 会启动后台续租线程；再指定
+        ``lease_path``，新主库会持有写租约，并把 ``lease.assert_writable``
+        装到新主库的写路径上，租约失效后主库自行拒绝写入。指定
+        ``lease_keeper_interval`` 会启动后台续租线程；再指定
         ``lease_renew_with_quorum=True`` 时，续租前必须先拿到多数派心跳。
+        ``lease_loss_callback`` 在 keeper 续租失败时调用，可用于上层告警。
         ``close()`` 停止续租线程。
         """
         candidate_node = node_id or quorum.node_id
@@ -408,11 +412,17 @@ class Replica:
             lease_path=lease_path,
             lease_ttl=lease_ttl,
         )
+        lease = (
+            Lease(lease_path, candidate_node, ttl=lease_ttl)
+            if lease_path is not None
+            else None
+        )
         db = self.promote(
             fence_path=fence_path,
+            write_fence=lease.assert_writable if lease is not None else None,
             node_id=candidate_node,
         )
-        if lease_path is not None and lease_keeper_interval is not None:
+        if lease is not None and lease_keeper_interval is not None:
             renew = None
             if lease_renew_with_quorum:
                 def renew():
@@ -422,9 +432,10 @@ class Replica:
                         lease_ttl=lease_ttl,
                     )
             self._lease_keeper = LeaseKeeper(
-                Lease(lease_path, candidate_node, ttl=lease_ttl),
+                lease,
                 interval=lease_keeper_interval,
                 renew=renew,
+                on_failure=lease_loss_callback,
             ).start()
         return db
 
@@ -433,12 +444,14 @@ class Replica:
         *,
         fence_path: str | Path | None = None,
         node_id: str = "replica",
+        write_fence: Callable[[], None] | None = None,
     ) -> Database:
         """关闭只读句柄并以读写模式重新打开，完成手动提升。
 
         若给出 ``fence_path``，先原子写入提升 marker；旧主库如果配置了同一
         路径的 ``PromotionFence.assert_writable`` 写回调，就会在下一笔写语句
-        上拒绝，形成最小的防双写约束。没有自动选举和网络租约。
+        上拒绝，形成最小的防双写约束。``write_fence`` 可把 lease/guard 装到
+        新主库的写路径上。没有自动选举和网络租约。
         """
         with self._lock:
             if fence_path is not None:
@@ -450,6 +463,7 @@ class Replica:
                 self.path,
                 read_only=False,
                 checkpoint_wal_bytes=0,
+                write_fence=write_fence,
             )
             return self.db
 

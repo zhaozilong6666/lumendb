@@ -167,6 +167,28 @@ def test_lease_keeper_uses_renew_callback(tmp_path):
     finally:
         keeper.stop()
 
+
+def test_lease_keeper_calls_on_failure(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=0.4)
+    lease.acquire(term=1)
+    failures = []
+
+    def renew():
+        raise NotSupportedError("quorum lost")
+
+    keeper = LeaseKeeper(
+        lease,
+        interval=0.05,
+        renew=renew,
+        on_failure=lambda item: failures.append(item.last_error),
+    ).start()
+    try:
+        time.sleep(0.12)
+        assert failures
+        assert keeper.lost is True
+    finally:
+        keeper.stop()
+
 class _NoopQuorum:
     node_id = "n0"
 
@@ -196,6 +218,26 @@ def test_promote_with_quorum_starts_lease_keeper(tmp_path):
         time.sleep(0.15)
         renewed = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
         assert renewed > first
+    finally:
+        replica.close()
+        primary.close()
+
+
+def test_promoted_primary_enforces_lease_write_fence(tmp_path):
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    replica = Replica.bootstrap(primary, tmp_path / "replica")
+    lease_path = tmp_path / "lease.json"
+    try:
+        replica.promote_with_quorum(
+            _NoopQuorum(),
+            lease_path=lease_path,
+            lease_ttl=30,
+        )
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        Lease(lease_path, "n0", ttl=30).release()
+        with pytest.raises(NotSupportedError, match="没有有效写租约"):
+            replica.execute_one("INSERT INTO t VALUES (2)")
     finally:
         replica.close()
         primary.close()
