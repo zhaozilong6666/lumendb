@@ -285,6 +285,22 @@ class Replica:
         self._stop_lease_keeper()
         self.db.close()
 
+    def step_down(self) -> Database:
+        """停止续租并切回只读，用于租约丢失后的自停写。
+
+        该回调可能在 keeper 线程中被调用；``LeaseKeeper.stop`` 会识别当前
+        线程，避免线程 join 自己。调用后新的写语句会因 ``read_only`` 失败。
+        """
+        self._stop_lease_keeper()
+        with self._lock:
+            self.db.close()
+            self.db = Database(
+                self.path,
+                read_only=True,
+                checkpoint_wal_bytes=0,
+            )
+            return self.db
+
     def _stop_lease_keeper(self) -> None:
         keeper = self._lease_keeper
         self._lease_keeper = None
@@ -390,6 +406,7 @@ class Replica:
         lease_keeper_interval: float | None = None,
         lease_renew_with_quorum: bool = False,
         lease_loss_callback: Callable[[LeaseKeeper], None] | None = None,
+        lease_loss_stepdown: bool = False,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
@@ -401,7 +418,8 @@ class Replica:
         任期）装到新主库的写路径上，租约失效或观察到更高任期后主库自行拒绝
         写入。指定 ``lease_keeper_interval`` 会启动后台续租线程；再指定
         ``lease_renew_with_quorum=True`` 时，续租前必须先拿到多数派心跳。
-        ``lease_loss_callback`` 在 keeper 续租失败时调用，可用于上层告警。
+        ``lease_loss_callback`` 在 keeper 续租失败时调用，可用于上层告警；
+        ``lease_loss_stepdown=True`` 时还会自动切回只读，让旧主库立即停写。
         ``close()`` 停止续租线程。
         """
         candidate_node = node_id or quorum.node_id
@@ -439,11 +457,25 @@ class Replica:
                         lease_path=lease_path,
                         lease_ttl=lease_ttl,
                     )
+
+            def on_loss(keeper):
+                try:
+                    if lease_loss_callback is not None:
+                        lease_loss_callback(keeper)
+                finally:
+                    if lease_loss_stepdown:
+                        self.step_down()
+
+            failure_handler = (
+                on_loss
+                if lease_loss_callback is not None or lease_loss_stepdown
+                else None
+            )
             self._lease_keeper = LeaseKeeper(
                 lease,
                 interval=lease_keeper_interval,
                 renew=renew,
-                on_failure=lease_loss_callback,
+                on_failure=failure_handler,
             ).start()
         return db
 

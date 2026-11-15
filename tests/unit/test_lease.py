@@ -242,6 +242,31 @@ def test_promote_with_quorum_starts_lease_keeper(tmp_path):
         primary.close()
 
 
+def test_promote_with_quorum_steps_down_on_lease_loss(tmp_path):
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    replica = Replica.bootstrap(primary, tmp_path / "replica")
+    lease_path = tmp_path / "lease.json"
+    try:
+        replica.promote_with_quorum(
+            _NoopQuorum(),
+            lease_path=lease_path,
+            lease_ttl=0.4,
+            lease_keeper_interval=0.05,
+            lease_loss_stepdown=True,
+        )
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        assert replica.db._read_only is False
+        Lease(lease_path, "n0", ttl=0.4).release()
+        time.sleep(0.3)
+        assert replica.db._read_only is True
+        with pytest.raises(NotSupportedError, match="只读"):
+            replica.execute_one("INSERT INTO t VALUES (2)")
+    finally:
+        replica.close()
+        primary.close()
+
+
 def test_promoted_primary_rejects_writes_after_higher_term(tmp_path):
     primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
