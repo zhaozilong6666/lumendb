@@ -6,7 +6,7 @@ import pytest
 
 from lumendb.errors import NotSupportedError
 from lumendb.engine.database import Database
-from lumendb.replication import PromotionFence, Replica
+from lumendb.replication import PromotionFence, Replica, ReplicationMonitor, WALServer
 from lumendb.replication.quorum import QuorumNode, VoteState
 
 
@@ -118,4 +118,67 @@ def test_replica_promotes_only_after_quorum(tmp_path):
     finally:
         _stop(nodes)
         replica.db.close()
+        primary.close()
+
+
+def test_monitor_uses_quorum_for_auto_promotion(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    primary.execute_one("INSERT INTO t VALUES (1)")
+    server = WALServer(primary).start()
+    replica = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        server.stop()
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+        )
+        assert monitor.poll() == "promoted"
+        replica.execute_one("INSERT INTO t VALUES (2)")
+        assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
+    finally:
+        _stop(nodes)
+        if replica is not None:
+            replica.db.close()
+        server.stop()
+        primary.close()
+
+
+def test_monitor_refuses_promotion_without_quorum(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        nodes[1].stop()
+        nodes[2].stop()
+        server.stop()
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+        )
+        assert monitor.poll() == "needs_attention"
+        assert replica.db._read_only is True
+    finally:
+        _stop(nodes)
+        if replica is not None:
+            replica.db.close()
+        server.stop()
         primary.close()

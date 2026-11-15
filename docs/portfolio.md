@@ -74,7 +74,7 @@
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
 >   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
 >   持久化任期并拒绝落后候选，失败时副本保持只读；
-> - 1042 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 1044 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -162,7 +162,7 @@
 >   `ReplicationMonitor` promotes after consecutive network failures; a
 >   `QuorumNode` campaign needs a majority of persisted votes before promotion,
 >   and a failed campaign leaves the replica read-only.
-> - 1042 automated tests including crash-injection and a 20-seed randomized
+> - 1044 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
