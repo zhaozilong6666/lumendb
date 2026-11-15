@@ -73,8 +73,9 @@
 >   冻结写路径、先 checkpoint 再读数据文件，手动提升用共享 `PromotionFence`
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
 >   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
->   持久化任期并拒绝落后候选，失败时副本保持只读；
-> - 1044 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+>   持久化任期并拒绝落后候选，失败时副本保持只读；`Lease` 用 TTL 约束旧主库
+>   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约；
+> - 1050 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -161,8 +162,10 @@
 >   `PromotionFence` marker to stop the old primary from writing;
 >   `ReplicationMonitor` promotes after consecutive network failures; a
 >   `QuorumNode` campaign needs a majority of persisted votes before promotion,
->   and a failed campaign leaves the replica read-only.
-> - 1044 automated tests including crash-injection and a 20-seed randomized
+>   and a failed campaign leaves the replica read-only; a file-backed `Lease`
+>   with a TTL makes the old primary self-fence once it stops renewing, while a
+>   candidate waits for the old lease to expire before acquiring it.
+> - 1050 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

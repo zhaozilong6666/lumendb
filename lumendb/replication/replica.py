@@ -371,15 +371,23 @@ class Replica:
         quorum,
         *,
         fence_path: str | Path | None = None,
+        lease_path: str | Path | None = None,
+        lease_ttl: float = 10.0,
         node_id: str | None = None,
     ) -> Database:
         """先拿到多数派投票，再执行 :meth:`promote`。
 
         ``quorum`` 是 :class:`lumendb.replication.quorum.QuorumNode`；投票失败会
         直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
-        若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入。
+        若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
+        ``lease_path``，新主库会持有写租约，旧主库租约过期后自行停写。
         """
-        quorum.campaign(self._applied_lsn)
+        quorum.campaign(
+            self._applied_lsn,
+            fence_path=fence_path,
+            lease_path=lease_path,
+            lease_ttl=lease_ttl,
+        )
         return self.promote(
             fence_path=fence_path,
             node_id=node_id or quorum.node_id,

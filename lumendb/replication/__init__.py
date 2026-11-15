@@ -2,11 +2,13 @@
 
 from .failover import ReplicationMonitor
 from .fence import PromotionFence
+from .lease import Lease
 from .quorum import QuorumClient, QuorumNode, VoteState
 from .replica import Replica
 from .wal_stream import WALClient, WALServer, read_slot
 
 __all__ = [
+    "Lease",
     "PromotionFence",
     "QuorumClient",
     "QuorumNode",

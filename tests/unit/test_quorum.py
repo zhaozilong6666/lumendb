@@ -121,6 +121,7 @@ def test_replica_promotes_only_after_quorum(tmp_path):
         primary.close()
 
 
+
 def test_monitor_uses_quorum_for_auto_promotion(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
