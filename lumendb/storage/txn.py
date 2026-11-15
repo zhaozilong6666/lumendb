@@ -13,6 +13,7 @@ LumenDB 的并发控制只有一套机制：**快照隔离（snapshot isolation�
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -24,11 +25,17 @@ from .wal import WAL
 
 if TYPE_CHECKING:  # pragma: no cover
     from .bufferpool import BufferPoolManager
+    from .lock import LockManager
     from .record import RID
+
+_log = logging.getLogger(__name__)
 
 #: 事务号预留块大小。崩溃后重启时，下一个 xid 从这个块的边界继续，
 #: 保证不会复用已经写进记录头的事务号。
 XID_RESERVE_BLOCK = 1024
+
+#: 事务结局表保留的最近条目数。见 ``TransactionManager._prune_states``。
+STATE_RETAIN = 1024
 
 
 class TxnState(IntEnum):
@@ -72,6 +79,12 @@ class Transaction:
     )
     #: ``SET CONSTRAINTS`` 对当前事务生效的约束时机覆盖。
     constraint_modes: dict[str, str] = field(default_factory=dict)
+    #: 本事务写过（或 DDL 改过）的表名。
+    #:
+    #: 提交前补检延迟 UNIQUE 时要按表扫描，没有这个集合就只能"每张表都扫一遍"
+    #: ——一个只写 1 行的语句也会变成 O(全库行数)。保守取并集即可：多扫一张表
+    #: 只是浪费，不会漏判。
+    touched_tables: set[str] = field(default_factory=set)
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:
@@ -96,10 +109,12 @@ class TransactionManager:
         disk: DiskManager,
         wal: WAL,
         buffer_pool: Optional["BufferPoolManager"] = None,
+        locks: Optional["LockManager"] = None,
     ) -> None:
         self._disk = disk
         self._wal = wal
         self._bp = buffer_pool
+        self._locks = locks
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
@@ -210,8 +225,37 @@ class TransactionManager:
             self._bp.clear_undo(txn.xid)
         txn.undo_log.clear()
         txn.savepoints.clear()
+        txn.touched_tables.clear()
         if self._current is txn:
             self._current = None
+        self._release_locks(txn.xid)
+        self._prune_states()
+
+    def _release_locks(self, xid: int) -> None:
+        """事务结束时释放它持有的全部锁（写者锁在这里被交出）。"""
+        if self._locks is not None:
+            self._locks.release_all(xid)
+
+    def _prune_states(self) -> None:
+        """回收事务结局表里的陈旧条目，避免长跑服务端无界增长。
+
+        不变量：只有 ``xid < 最老活跃事务`` 的结局才可能被丢掉。原因有两条：
+        1. 更新的事务的快照号更大，``_committed_before`` 对未知 xid 的结论
+           是"已经结束且已提交"——对已提交事务正好正确；
+        2. 已回滚事务的页写在 abort / 崩溃恢复时已经被物理撤销，不会留下
+           带该 xmin 的可见记录，所以"当成已提交"也不会让回滚的数据复活。
+
+        额外保留 ``STATE_RETAIN`` 条最近条目，为 ``state_of`` 的调用方
+        （并发写检测、副本重放）留出回溯窗口。
+        """
+        if len(self._states) <= STATE_RETAIN * 2:
+            return
+        floor = self._next_xid
+        if self._active:
+            floor = min(self._active)
+        floor = max(0, floor - STATE_RETAIN)
+        for xid in [x for x in self._states if x < floor]:
+            del self._states[xid]
 
     def abort(self, txn: Transaction) -> None:
         with self._lock:
@@ -228,8 +272,14 @@ class TransactionManager:
                 try:
                     undo()
                 except Exception:  # pragma: no cover - 撤销本身不应改变事务结局
-                    pass
+                    # 吞掉但要留痕：静默失败会让目录停在半回滚状态，
+                    # 事后只能靠恢复日志猜当时发生了什么。
+                    _log.exception(
+                        "事务 %s 的目录 undo 回调抛错，目录可能已偏离回滚前的状态",
+                        txn.xid,
+                    )
             txn.savepoints.clear()
+            txn.touched_tables.clear()
             txn.last_lsn = self._wal.abort(txn.xid)
             self._wal.flush()
             txn.state = TxnState.ABORTED
@@ -238,6 +288,8 @@ class TransactionManager:
             self._active_starts.pop(txn.xid, None)
             if self._current is txn:
                 self._current = None
+            self._release_locks(txn.xid)
+            self._prune_states()
 
     # -- SAVEPOINT ---------------------------------------------------------
 
@@ -350,24 +402,50 @@ class TransactionManager:
             return True
         return state is TxnState.COMMITTED
 
+    def _committed_now(self, xid: int, txn: Transaction) -> bool:
+        """[Review-Fix] 引用完整性用的可见性：只看"现在是否已提交"。
+
+        普通快照读必须坚持 ``snapshot_xid`` 的可见性；但外键校验（PostgreSQL
+        的 RI 触发器用的是 ``SnapshotDirty``）不能被快照冻住，否则：
+
+        * 父行由并发事务提交后，本事务的快照看不见它 → 合法的子行插入被
+          误判成 23503（实测复现）；
+        * 删除父行时看不见并发事务刚提交的子行 → 提交后留下悬空引用。
+
+        因此 RI 路径把"已提交"当作可见，未提交/已回滚仍不可见。
+        """
+        if xid == 0:
+            return True
+        if xid == txn.xid:
+            return True
+        state = self._states.get(xid)
+        if state is None:
+            # 早于本进程的事务：恢复阶段已把 loser 的修改 undo 掉，
+            # 剩下的必然已提交。
+            return xid < txn.snapshot_xid
+        return state is TxnState.COMMITTED
+
     def is_visible(
         self,
         txn: Transaction,
         xmin: int,
         xmax: int,
         flags: int = 0,
+        *,
+        ri: bool = False,
     ) -> bool:
         from .record import FLAG_ABORTED
 
         if flags & FLAG_ABORTED:
             return False
-        if not self._committed_before(xmin, txn):
+        check = self._committed_now if ri else self._committed_before
+        if not check(xmin, txn):
             return False
         if xmax == 0:
             return True
         if xmax == txn.xid:
             return False  # 自己删除的，自己看不见
-        return not self._committed_before(xmax, txn)
+        return not check(xmax, txn)
 
     # -- 恢复支持 -----------------------------------------------------------
 

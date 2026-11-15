@@ -176,4 +176,31 @@ def row_resource(table: str, root_rid) -> tuple:
     return ("row", table, root_rid[0], root_rid[1])
 
 
-__all__ = ["LockManager", "LockMode", "LockTimeoutError", "row_resource"]
+#: 事务级写者锁的资源标识。
+#:
+#: 为什么需要它（而不是只用行锁）：
+#: 1. 目录（`catalog/*`）是"单根指针 + 页链"，任何写语句提交前都会 persist
+#:    一次，两条并发写事务必然命中同一批目录字节；行锁挡不住这种冲突，
+#:    而物理 undo 又无法按事务区分字节来源。
+#: 2. 唯一索引的项会在 DELETE 时被**物理删除**，并发的 INSERT 因此看不到
+#:    未提交的键；如果删除方回滚，索引项会被恢复，主键就重复了。
+#: 3. 索引还缺 xmin/xmax，多个写者之间的可见性无法按版本区分。
+#:
+#: 结论：这一版的并发模型是"读并发、写单写者"——写事务之间用 40001
+#: 快速失败，而不是排队等待。失败而不是等待的另一个原因是线协议在单条
+#: 语句外还持有一把 asyncio 锁：在这里阻塞会把别的连接的提交也一起卡死。
+WRITER_RESOURCE = ("writer", "*")
+
+
+def writer_resource() -> tuple:
+    return WRITER_RESOURCE
+
+
+__all__ = [
+    "LockManager",
+    "LockMode",
+    "LockTimeoutError",
+    "row_resource",
+    "WRITER_RESOURCE",
+    "writer_resource",
+]

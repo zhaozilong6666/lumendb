@@ -204,6 +204,13 @@ class TestSessionIsolation:
         db.close()
 
     def test_two_connections_can_open_transactions_simultaneously(self, tmp_path):
+        """两个连接可以同时处于事务中；但写事务之间是单写者，冲突快速失败。
+
+        [Review-Fix] 早期版本允许两个事务同时写同一张表并双双提交——实测那
+        会让目录页、唯一索引项和版本链互相踩，恢复时还会把已提交的数据
+        undo 掉。现在的语义是：BEGIN 可以并发；第二个写语句得到 40001，
+        由应用层重试。读（含快照读）不受影响。
+        """
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         server = PGWireServer(db)
@@ -212,11 +219,21 @@ class TestSessionIsolation:
             c1 = await _connect(port)
             c2 = await _connect(port)
             await _query(c1[0], c1[1], "BEGIN")
-            await _query(c2[0], c2[1], "BEGIN")  # 不能报“已经在事务中”
+            assert _ready_status(await _query(c2[0], c2[1], "BEGIN")) == b"T"
             await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
-            await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
+
+            conflict = await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
+            err = next((p for k, p in conflict if k == b"E"), None)
+            assert err is not None, "第二个写事务必须被拒绝，而不是静默写入"
+            assert b"40001" in err  # serialization_failure
+
+            # 失败的事务回滚后，写者锁归还，重试即可成功。
+            await _query(c2[0], c2[1], "ROLLBACK")
             await _query(c1[0], c1[1], "COMMIT")
+            await _query(c2[0], c2[1], "BEGIN")
+            await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
             await _query(c2[0], c2[1], "COMMIT")
+
             msgs = await _query(c2[0], c2[1], "SELECT COUNT(*) FROM t")
             rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
             assert rows == [["2"]]
@@ -788,6 +805,35 @@ class TestExtendedQuery:
 
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
+
+    def test_read_only_database_rejects_writes_over_the_wire(self, tmp_path):
+        """只读副本的写入保护必须在执行器入口，而不是只在 Database._run。
+
+        线协议会话直接调用 ``database.executor.run``；如果只读检查只写在
+        ``Database._run``，给副本挂上 pgwire 就等于开了写入口。
+        """
+        path = tmp_path / "db"
+        db = Database(path)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.close()
+
+        replica = Database(path, read_only=True)
+        server = PGWireServer(replica)
+
+        async def body(port):
+            reader, writer = await _connect(port)
+            msgs = await _query(reader, writer, "INSERT INTO t VALUES (1)")
+            err = next((p for k, p in msgs if k == b"E"), None)
+            assert err is not None, "只读副本不能通过线协议写入"
+            assert b"25006" in err or b"0A000" in err
+            rows = [_parse_data_row(p) for k, p in await _query(
+                reader, writer, "SELECT COUNT(*) FROM t") if k == b"D"]
+            assert rows == [["0"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(replica, [], {"handler": server._handle, "body": body}))
+        replica.close()
 
     def test_update_command_tag(self, tmp_path):
         db = Database(tmp_path / "db")

@@ -23,6 +23,7 @@ from ..sql.ast import (
 )
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
+from ..storage.lock import LockManager
 from ..storage.pager import DiskManager
 from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager
@@ -88,7 +89,9 @@ class Database:
         if wal_retain_lsn > 0 and isinstance(self.wal, SegmentedWAL):
             self.wal.retain_lsn = wal_retain_lsn
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
-        self.txns = TransactionManager(self.disk, self.wal, self.bp)
+        #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
+        self.locks = LockManager()
+        self.txns = TransactionManager(self.disk, self.wal, self.bp, self.locks)
         self._checkpoint_wal_bytes = checkpoint_wal_bytes
         self._checkpoint_every_commits = max(0, checkpoint_every_commits)
         self._commits_since_checkpoint = 0
@@ -100,7 +103,15 @@ class Database:
 
         self.catalog = Catalog(CatalogStore(self.bp))
         self.catalog.load()
-        self.executor = Executor(self.bp, self.catalog, self.txns, self.wal, self.disk)
+        self.executor = Executor(
+            self.bp,
+            self.catalog,
+            self.txns,
+            self.wal,
+            self.disk,
+            self.locks,
+            read_only=self._read_only,
+        )
 
         self._txn: Optional[Transaction] = None
 
@@ -211,8 +222,12 @@ class Database:
         txn = self.txns.begin()
         try:
             result = self.executor.run(statement, txn, params)
-            self.executor.validate_deferred_foreign_keys(txn)
-            self.executor.validate_deferred_unique_constraints(txn)
+            # [Review-Fix] 延迟约束只可能被写语句弄坏；对 SELECT / EXPLAIN /
+            # SHOW 也跑一遍补检，会让一次纯读变成 O(全库行数) 的扫描，而且在
+            # 库中已存在重复键时把读请求也判成 23505（实测）。
+            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                self.executor.validate_deferred_foreign_keys(txn)
+                self.executor.validate_deferred_unique_constraints(txn)
         except BaseException:
             self.txns.abort(txn)
             raise

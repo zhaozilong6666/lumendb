@@ -36,7 +36,7 @@ from .record import (
     encode_record,
     rid_tuple,
 )
-from .txn import Transaction, TransactionManager
+from .txn import Transaction, TransactionManager, TxnState
 
 #: 一页最多能放多少槽位（受页头之后的目录空间限制）
 _MAX_SLOTS = (PAGE_SIZE - 32) // 4
@@ -204,9 +204,9 @@ class HeapFile:
             return None
         return page, rec
 
-    def _visible(self, txn: Transaction, rec: DecodedRecord) -> bool:
+    def _visible(self, txn: Transaction, rec: DecodedRecord, *, ri: bool = False) -> bool:
         h = rec.header
-        return self._txns.is_visible(txn, h.xmin, h.xmax, h.flags)
+        return self._txns.is_visible(txn, h.xmin, h.xmax, h.flags, ri=ri)
 
     def resolve_root(self, rid: RID, header: RecordHeader) -> RID:
         """给定任意版本，返回该逻辑行的根 RID。"""
@@ -227,8 +227,14 @@ class HeapFile:
         finally:
             self._release(page)
 
-    def find_version(self, txn: Transaction, rid: RID) -> Optional[Tuple[RID, DecodedRecord]]:
-        """从一个 RID 出发，沿版本链回溯，找到对 txn 可见的那个版本。"""
+    def find_version(
+        self, txn: Transaction, rid: RID, *, ri: bool = False
+    ) -> Optional[Tuple[RID, DecodedRecord]]:
+        """从一个 RID 出发，沿版本链回溯，找到对 txn 可见的那个版本。
+
+        ``ri=True`` 时改用引用完整性可见性（"已提交即可见"），外键校验
+        与级联收集必须走这条路径，否则并发提交的父/子行会被漏掉。
+        """
         cur: Optional[RID] = rid
         visited = 0
         while cur is not None and visited < 10_000:
@@ -237,7 +243,7 @@ class HeapFile:
                 return None
             page, rec = got
             try:
-                if self._visible(txn, rec):
+                if self._visible(txn, rec, ri=ri):
                     return cur, rec
                 cur = rec.header.prev_rid
             finally:
@@ -245,13 +251,17 @@ class HeapFile:
             visited += 1
         return None
 
-    def get(self, txn: Transaction, root_rid: RID) -> Optional[list[Any]]:
+    def get(
+        self, txn: Transaction, root_rid: RID, *, ri: bool = False
+    ) -> Optional[list[Any]]:
         """按根 RID 取当前快照下可见的那一版。索引查找最终都会走到这里。"""
         newest = self.newest_rid(root_rid)
-        found = self.find_version(txn, newest)
+        found = self.find_version(txn, newest, ri=ri)
         return found[1].values if found else None
 
-    def scan(self, txn: Transaction) -> Iterator[Tuple[RID, list[Any]]]:
+    def scan(
+        self, txn: Transaction, *, ri: bool = False
+    ) -> Iterator[Tuple[RID, list[Any]]]:
         """顺序扫描所有可见行，产出 ``(根 RID, 值列表)``。
 
         产出根 RID 而不是物理 RID，是因为索引与后续 UPDATE/DELETE 都按根 RID
@@ -264,7 +274,7 @@ class HeapFile:
             try:
                 for slot in range(page.nslots):
                     rec = self._decode(page, slot)
-                    if rec is None or not self._visible(txn, rec):
+                    if rec is None or not self._visible(txn, rec, ri=ri):
                         continue
                     root = self.resolve_root((page_id, slot), rec.header)
                     yield root, rec.values
@@ -309,10 +319,13 @@ class HeapFile:
             self._release(page, dirty=True)
 
     def _latest_version_rid(self, root_rid: RID) -> RID:
-        """不判可见性，直接拿链上最新的物理版本。"""
-        newest = self.newest_rid(root_rid)
-        # newest 本身可能就是最新；沿 prev 正向没有指针，所以 newest 就是最新
-        return newest
+        """不判可见性，直接拿链上最新的物理版本。
+
+        版本链是单向的：新版本用 ``prev`` 指回旧版本，根记录用 ``newest``
+        指向当前链头。所以"最新"就是根记录的 ``newest``（根自己没被更新过
+        时 ``newest`` 为空，此时根即最新）。
+        """
+        return self.newest_rid(root_rid)
 
     def update(self, txn: Transaction, root_rid: RID, values: Sequence[Any]) -> RID:
         """写一条新版本，返回新版本的 RID。"""
@@ -326,6 +339,11 @@ class HeapFile:
         if found is None:
             raise StorageError(f"要更新的行 {root_rid} 不存在")
         old_rid, old_rec = found
+        # [Review-Fix] First-updater-wins：如果链头的最新版本不是本事务应该
+        # 改写的那一版，说明另一个事务在快照之后写过这一行。继续写会覆盖根
+        # 记录的 xmax/newest，把对方的版本变成不可达垃圾，而两个版本都没有
+        # xmax，于是同一个逻辑行会同时可见（实测 SELECT 出两行）。
+        self._raise_if_concurrent_write(txn, newest, old_rid, root_rid)
         old_header = old_rec.header
 
         payload = encode_record(
@@ -361,6 +379,36 @@ class HeapFile:
 
         return new_rid
 
+    def _raise_if_concurrent_write(
+        self, txn: Transaction, newest: RID, target: RID, root_rid: RID
+    ) -> None:
+        """[Review-Fix] 检测"快照之后有别人写过这一行"。
+
+        ``newest`` 是链头，``target`` 是本事务按快照决定要写的版本。两者不同
+        说明链上存在一个不属于本事务的更新版本；只有它是已回滚版本时才可以
+        安全忽略（进程内 abort 会撤销页写，崩溃恢复会把它的输出 undo 掉）。
+        """
+        if newest == target:
+            return
+        got = self._read_rid(newest)
+        if got is None:
+            return
+        page, rec = got
+        try:
+            other = rec.header.xmin
+            state = self._txns.state_of(other)
+        finally:
+            self._release(page)
+        if other == txn.xid or state is TxnState.ABORTED:
+            return
+        from ..errors import SerializationError
+
+        raise SerializationError(
+            f"行 {root_rid} 已被另一事务更新",
+            detail=f"并发事务 xid={other}，当前事务快照 {txn.snapshot_xid}",
+            hint="重试整个事务；快照隔离下写写冲突必须由应用层重试",
+        )
+
     def delete(self, txn: Transaction, root_rid: RID) -> int:
         """把当前可见版本标记为已删除，返回受影响行数（0 或 1）。"""
         txn.require_active()
@@ -373,6 +421,7 @@ class HeapFile:
         if found is None:
             return 0
         rid, rec = found
+        self._raise_if_concurrent_write(txn, newest, rid, root_rid)
         page = self._fetch(rid[0])
         try:
             self._set_xmax(txn, page, rid[1], txn.xid)

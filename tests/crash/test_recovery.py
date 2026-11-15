@@ -16,6 +16,7 @@ from lumendb.datatypes import DataType, TypeSpec
 from lumendb.engine.database import Database
 from lumendb.storage.bufferpool import BufferPoolManager
 from lumendb.storage.heap import HeapFile
+from lumendb.storage.page import Page
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.recovery import RecoveryManager
 from lumendb.storage.txn import TransactionManager
@@ -212,6 +213,76 @@ class TestCommittedSurvives:
         rows = list(HeapFile(h2.bp, h2.cat.get_table("t"), h2.txns).scan(reader))
         h2.txns.commit(reader)
         assert [r[1][0] for r in rows] == [1]
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+
+class TestConditionalUndo:
+    """undo 不能把已被更高 LSN 的已提交事务覆盖的字节改回去。
+
+    这是恢复层最容易被忽略的一条：ARIES 靠写锁保证"两个事务不会写同一字节
+    区间"，而 LumenDB 的并发控制不总是能提供这个前提。没有条件 undo 时，
+    loser 的 before image 会把赢家已提交的写入抹掉（实测：已提交的 UPDATE
+    和已提交的 CREATE TABLE 都会在崩溃恢复后消失）。
+    """
+
+    @staticmethod
+    def _write(handle, txn, pid: int, offset: int, old: bytes, new: bytes) -> None:
+        page = handle.bp.fetch_page(pid)
+        try:
+            handle.bp.log_page_update(txn.xid, page, offset, old, new)
+            page.buf[offset : offset + len(new)] = new
+            handle.bp.mark_dirty(page)
+        finally:
+            handle.bp.unpin(pid, dirty=True)
+
+    def test_loser_undo_keeps_higher_lsn_committed_write(self, db_path):
+        h = open_db(db_path)
+        page = h.bp.new_page(Page)
+        pid = page.page_id
+        h.bp.unpin(pid, dirty=True)
+
+        loser = h.txns.begin()
+        self._write(h, loser, pid, 128, bytes(4), b"AAAA")
+
+        winner = h.txns.begin()
+        self._write(h, winner, pid, 128, b"AAAA", b"BBBB")
+        h.txns.commit(winner)
+
+        crash(h)
+
+        h2 = open_db(db_path)
+        reader = h2.bp.fetch_page(pid)
+        try:
+            assert bytes(reader.buf[128:132]) == b"BBBB", (
+                "loser 的 undo 覆盖了已提交事务的写入"
+            )
+        finally:
+            h2.bp.unpin(pid)
+        assert h2.txns.state_of(loser.xid).name == "ABORTED"
+        h2.bp.close()
+        h2.wal.close()
+        h2.dm.close()
+
+    def test_loser_undo_still_reverts_its_own_write(self, db_path):
+        """条件 undo 不能因为"跳过"而让 loser 自己的写入留下来。"""
+        h = open_db(db_path)
+        page = h.bp.new_page(Page)
+        pid = page.page_id
+        h.bp.unpin(pid, dirty=True)
+
+        loser = h.txns.begin()
+        self._write(h, loser, pid, 256, bytes(4), b"ZZZZ")
+
+        crash(h)
+
+        h2 = open_db(db_path)
+        reader = h2.bp.fetch_page(pid)
+        try:
+            assert bytes(reader.buf[256:260]) == bytes(4)
+        finally:
+            h2.bp.unpin(pid)
         h2.bp.close()
         h2.wal.close()
         h2.dm.close()

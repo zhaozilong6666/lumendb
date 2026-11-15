@@ -78,10 +78,25 @@ from ..storage.heap import HeapFile
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.record import RID
 from ..storage.recovery import RecoveryManager
+from ..storage.lock import LockManager, LockMode, writer_resource
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: 不需要写者锁的语句：纯读、事务/会话控制，以及只读目录查询。
+#: ``SET CONSTRAINTS`` 只改事务内存状态，``CHECKPOINT`` 由显式调用方负责。
+_NON_WRITING_STATEMENTS = frozenset(
+    {
+        "Query",
+        "Select",
+        "Explain",
+        "ShowTables",
+        "ShowViews",
+        "SetConstraints",
+        "Checkpoint",
+    }
+)
 from ..plan.binder import AggregateAccumulatorGroup, Binder, Schema, SchemaColumn
 from ..plan.nodes import (
     _CURRENT_OUTER,
@@ -127,11 +142,17 @@ class Executor:
         txns: TransactionManager,
         wal: WAL,
         disk=None,
+        locks: Optional[LockManager] = None,
+        read_only: bool = False,
     ) -> None:
         self._bp = buffer_pool
         self._catalog = catalog
         self._txns = txns
         self._wal = wal
+        self._locks = locks if locks is not None else LockManager()
+        #: 只读副本标记。必须在执行器入口再拦一次：线协议会话直接调用
+        #: ``Executor.run``，绕过了 ``Database._run`` 里的只读检查。
+        self._read_only = read_only
         self._disk = disk if disk is not None else getattr(buffer_pool, "disk", None)
         self._txn: Optional[Transaction] = None
         #: EXPLAIN ANALYZE 期间按节点累计的执行统计
@@ -157,6 +178,15 @@ class Executor:
         params: Optional[list[Any]] = None,
     ) -> Result:
         self._txn = txn
+        if self._read_only and type(stmt).__name__ not in _NON_WRITING_STATEMENTS:
+            from ..errors import NotSupportedError
+
+            raise NotSupportedError(
+                "只读副本拒绝写入",
+                detail=f"语句 {type(stmt).__name__} 不是只读语句",
+                hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
+            )
+        self._acquire_writer_lock(stmt, txn)
         self._params = list(params) if params else []
         self._recursive_rows = {}
         # Binder 保存 CTE 作用域和参数；每条语句必须从干净的作用域开始，
@@ -252,6 +282,34 @@ class Executor:
     # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
+
+    def _acquire_writer_lock(self, stmt: Statement, txn: Transaction) -> None:
+        """[Review-Fix] 单写者事务模型：写语句必须持有事务级写者锁。
+
+        为什么是"快速失败"而不是排队等待：线协议在单条语句之外还持有一把
+        asyncio 锁，如果这里阻塞等锁，等待者会连带把持锁事务的 COMMIT
+        一起卡死。所以并发写直接给 40001，让应用层重试。
+
+        这把锁挡住了行锁挡不住的那一类冲突：目录页（任何写语句提交前都会
+        persist 一次）、唯一索引项的物理删除、以及没有 xmin 的多写者可见性。
+        """
+        if type(stmt).__name__ in _NON_WRITING_STATEMENTS:
+            return
+        if not self._locks.try_acquire(txn.xid, writer_resource(), LockMode.EXCLUSIVE):
+            holder = next(
+                (x for x in self._locks.holders(writer_resource()) if x != txn.xid),
+                None,
+            )
+            from ..errors import SerializationError
+
+            raise SerializationError(
+                "另一个事务正在写这个数据库",
+                detail=(
+                    f"LumenDB 当前是单写者模型：写事务之间用 40001 快速失败，"
+                    f"而不是排队等待（持锁事务 xid={holder}，本事务 {txn.xid}）"
+                ),
+                hint="等另一个事务 COMMIT / ROLLBACK 后重试本事务",
+            )
 
     def describe(self, stmt: Statement, params: Optional[list[Any]] = None) -> list[ColumnMeta]:
         """只绑定、不执行，返回语句的结果列。
@@ -3210,6 +3268,7 @@ class Executor:
     ) -> list[Any]:
         """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。"""
         old_tuple = tuple(old_values)
+        txn.touched_tables.add(table.name)
         prepared = self._prepare_values(table, None, new_values)
         self._check_checks(table, prepared)
         self._check_foreign_keys(table, prepared, txn)
@@ -3466,6 +3525,7 @@ class Executor:
             self._check_constraints(table, prepared, txn)
 
         self._check_foreign_keys(table, prepared, txn)
+        txn.touched_tables.add(table.name)
         rid = heap.insert(txn, prepared)
         for idx in table.indexes.values():
             tree = self._tree_for(table, idx)
@@ -3649,6 +3709,7 @@ class Executor:
                 table, values, txn, deleted_rids, processing, deferred
             )
             self._delete_index_entries(table, values, txn, rid)
+            txn.touched_tables.add(table.name)
             if ret_fns:
                 returned.append(
                     tuple(fn(EvalContext(old_tuple)) for fn in ret_fns)
@@ -3915,13 +3976,13 @@ class Executor:
         if index is not None:
             tree = self._tree_for(table, index)
             for rid in tree.lookup(txn, list(key)):
-                values = heap.get(txn, rid)
+                values = heap.get(txn, rid, ri=True)
                 if values is not None and all(
                     values[pos] == value
                     for pos, value in zip(positions, key)
                 ):
                     return True
-        for _rid, values in heap.scan(txn):
+        for _rid, values in heap.scan(txn, ri=True):
             if all(
                 values[pos] == value
                 for pos, value in zip(positions, key)
@@ -3932,8 +3993,17 @@ class Executor:
     def validate_deferred_unique_constraints(
         self, txn: Transaction, *, only_names: Optional[set[str]] = None
     ) -> None:
-        """提交前补检延迟 UNIQUE / PRIMARY KEY，失败由事务层 abort。"""
+        """提交前补检延迟 UNIQUE / PRIMARY KEY，失败由事务层 abort。
+
+        [Review-Fix] 只扫本事务写过的表：没有写过的表不可能被本事务弄成重复。
+        之前的实现是"每张表都全扫一遍"，并且被自动提交路径对**每条语句**
+        （包括 SELECT）调用，读操作因此变成了 O(全库行数) 的全表扫描。
+        """
+        if not txn.touched_tables:
+            return
         for table in self._catalog.list_tables():
+            if table.name not in txn.touched_tables:
+                continue
             deferred = [
                 idx
                 for idx in table.indexes.values()
@@ -3973,7 +4043,7 @@ class Executor:
                 table = self._catalog.get_table(table_name)
             except TableNotFoundError:
                 continue
-            values = HeapFile(self._bp, table, self._txns).get(txn, rid)
+            values = HeapFile(self._bp, table, self._txns).get(txn, rid, ri=True)
             if values is None:
                 continue
             self._check_foreign_keys(
@@ -4075,7 +4145,7 @@ class Executor:
             if ref_index is not None:
                 tree = self._tree_for(ref_table, ref_index)
                 for rid in tree.lookup(txn, list(local_key)):
-                    ref_values = ref_heap.get(txn, rid)
+                    ref_values = ref_heap.get(txn, rid, ri=True)
                     if ref_values is not None and all(
                         ref_values[pos] == value
                         for pos, value in zip(ref_positions, local_key)
@@ -4083,7 +4153,7 @@ class Executor:
                         found = True
                         break
             if not found:
-                for _rid, ref_values in ref_heap.scan(txn):
+                for _rid, ref_values in ref_heap.scan(txn, ri=True):
                     if all(
                         ref_values[pos] == value
                         for pos, value in zip(ref_positions, local_key)
@@ -4128,7 +4198,7 @@ class Executor:
         if child_index is not None:
             tree = self._tree_for(child, child_index)
             for rid in tree.lookup(txn, list(key)):
-                child_values = child_heap.get(txn, rid)
+                child_values = child_heap.get(txn, rid, ri=True)
                 if child_values is None:
                     continue
                 if all(
@@ -4137,7 +4207,7 @@ class Executor:
                 ):
                     yield rid, child_values
             return
-        for rid, child_values in child_heap.scan(txn):
+        for rid, child_values in child_heap.scan(txn, ri=True):
             child_key = tuple(
                 child_values[child.column_index(name)] for name in fk.columns
             )
@@ -4240,52 +4310,11 @@ class Executor:
                         child, child_values, txn, deleted, processing, deferred
                     )
                     self._delete_index_entries(child, child_values, txn, child_rid)
+                    txn.touched_tables.add(child.name)
                     child_heap.delete(txn, child_rid)
                     txn.deferred_fk_rows.discard((child.name, child_rid))
                     processing.discard(ident)
                     deleted.add(ident)
-
-    def _check_referenced_by(
-        self,
-        table: TableDef,
-        values: list[Any],
-        txn: Transaction,
-        *,
-        skip_rid: Optional[RID] = None,
-    ) -> None:
-        """RESTRICT：被其他表（或自身）的外键引用的键不能被删除/改掉。"""
-        for ref_table in self._catalog.list_tables():
-            for fk in ref_table.foreign_keys.values():
-                if fk.ref_table != table.name:
-                    continue
-                key = tuple(
-                    values[table.column_index(name)] for name in fk.ref_columns
-                )
-                if any(value is None for value in key):
-                    continue
-                ref_heap = HeapFile(self._bp, ref_table, self._txns)
-                for rid, child_values in ref_heap.scan(txn):
-                    if (
-                        ref_table.name == table.name
-                        and skip_rid is not None
-                        and rid == skip_rid
-                    ):
-                        continue
-                    child_key = tuple(
-                        child_values[ref_table.column_index(name)]
-                        for name in fk.columns
-                    )
-                    if any(value is None for value in child_key):
-                        continue
-                    if child_key == key:
-                        raise ForeignKeyViolationError(
-                            f"外键约束 {fk.name!r} 阻止修改/删除被引用行",
-                            detail=(
-                                f"表 {ref_table.name} 中仍有行引用 "
-                                f"{table.name}.{fk.ref_columns} = {key}"
-                            ),
-                            hint="先 DELETE/UPDATE 引用行，或不要改被引用键",
-                        )
 
     def _check_constraints(
         self,

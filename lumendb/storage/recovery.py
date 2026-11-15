@@ -135,9 +135,17 @@ class RecoveryManager:
             for rec in reversed(records):
                 if rec.rtype != LogType.UPDATE or rec.xid not in losers:
                     continue
-                page_id, offset, old, _new = decode_page_update(rec.payload)
+                page_id, offset, old, new = decode_page_update(rec.payload)
                 page = self._bp.fetch_page(page_id)
                 try:
+                    # [Review-Fix] 条件 undo：只有页面上仍是本记录的 after
+                    # image 时才回滚。若同一字节区间已被更高 LSN 的已提交
+                    # 事务改写，说明 loser 的修改早就被别人覆盖了；这时写回
+                    # before image 会把已提交的数据抹掉（实测：两个事务先后
+                    # 更新同一行，loser 的 undo 把赢家的 newest 指针改回去，
+                    # 已提交的更新直接消失）。
+                    if bytes(page.buf[offset : offset + len(new)]) != new:
+                        continue
                     page.buf[offset : offset + len(old)] = old
                     # 关键：推进 pageLSN，防止下次 redo 把撤销结果覆盖回去
                     page.page_lsn = rec.lsn

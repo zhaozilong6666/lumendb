@@ -70,6 +70,10 @@ _TYPLEN_BY_TYPE = {
 }
 
 
+#: 纯读语句：不需要在提交点补检延迟约束。
+_PURE_READ_STATEMENTS = {"Query", "Select", "Explain", "ShowTables", "ShowViews"}
+
+
 @dataclass
 class PreparedStatement:
     name: str
@@ -264,6 +268,15 @@ class PGWireServer:
             txn = session.txn
             session.txn = None
             if isinstance(statement, Commit) and not session.failed:
+                # [Review-Fix] 线协议提交必须走与进程内提交相同的延迟约束
+                # 校验，否则 DEFERRABLE INITIALLY DEFERRED 的外键/唯一约束在
+                # psql/pgwire 连接上完全失效：提交时静默写入悬空引用。
+                try:
+                    database.executor.validate_deferred_foreign_keys(txn)
+                    database.executor.validate_deferred_unique_constraints(txn)
+                except BaseException:
+                    database.txns.abort(txn)
+                    raise
                 database.txns.commit(txn)
                 database.maybe_checkpoint()
                 result = Result(tag="COMMIT")
@@ -308,6 +321,12 @@ class PGWireServer:
         txn = database.txns.begin()
         try:
             result = database.executor.run(statement, txn, params)
+            # [Review-Fix] 隐式事务的提交点同样要补检延迟约束。否则单条
+            # ``INSERT INTO child ...`` 就能写入一条没有父行的引用：
+            # 校验被"延迟"了，而这条路径上根本没有人来补检。
+            if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                database.executor.validate_deferred_foreign_keys(txn)
+                database.executor.validate_deferred_unique_constraints(txn)
         except BaseException:
             database.txns.abort(txn)
             # 隐式事务失败后同样没有仍然有效的门户。

@@ -67,6 +67,13 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 2. **redo**：从 checkpoint 的 `redo_lsn` 起重放所有日志，`pageLSN >= lsn` 的页跳过；
 3. **undo**：对活跃事务（loser）按 LSN 逆序应用 before image，并写 CLR 防止二次回滚。
 
+undo 是**条件式的**：只有当页面上仍是该记录的 after image 时，才写回 before image。
+ARIES 靠写锁保证"两个事务不会写同一字节区间"，而本引擎的并发控制并不总能提供这个
+前提；不加这个条件，loser 的 before image 会把赢家**已提交**的写入抹掉（实测：已提交
+的 `UPDATE` 和已提交的 `CREATE TABLE` 都会在崩溃恢复后消失）。代价与收益写在
+`tests/crash/test_recovery.py::TestConditionalUndo` 里：自己的写入会被撤销，被更高
+LSN 覆盖的字节保留赢家的值。
+
 恢复结束后写一个 checkpoint，把 `checkpoint_lsn` 记入元数据页。分段 WAL 会在
 checkpoint 落盘后回收旧段；恢复只读取保留下来的段，仍然从
 `checkpoint_lsn` 之后开始 redo。
@@ -82,9 +89,37 @@ checkpoint 落盘后回收旧段；恢复只读取保留下来的段，仍然从
 
 - 单调递增的 `xid`，`xmin/xmax` 写在每行头部；
 - 快照 = (自己的 xid, 活跃事务列表)。可见性：`xmin` 已提交且不在快照活跃集，且 `xmax` 未提交或已回滚；
-- 写写冲突用行级锁（`S`/`X`），等待图 DFS 检测环，成环时中止发起等待的事务；
 - 隔离级别固定为**快照隔离**，不提供 `SET TRANSACTION ISOLATION LEVEL`
   切换（会明确报 `NotSupportedError`）。既然只有一种语义，就不假装有多种。
+
+**并发模型：读并发 + 单写者事务。** 写语句在 `Executor.run` 里申请一把事务级写者锁
+（`storage/lock.py` 的 `WRITER_RESOURCE`），从第一条写语句持到 `COMMIT`/`ROLLBACK`；
+第二个写事务拿到 `SerializationError`（SQLSTATE `40001`），由应用层重试。
+读语句不取锁，照旧走自己的 MVCC 快照，所以读写、读读都不互相阻塞。
+
+选择"快速失败"而不是"排队等锁"有两个具体原因：
+
+1. 线协议在单条语句之外还持有一把 asyncio 锁，在语句内部阻塞等锁会把持锁事务的
+   `COMMIT` 一起卡死（真实死锁，且等待图看不见它）；
+2. 行锁挡不住这一类冲突：目录是"单根指针 + 页链"，任何写语句提交前都会 persist
+   一次；唯一索引项在 `DELETE` 时被**物理删除**，并发 `INSERT` 看不到它，删除方回滚
+   后索引项恢复就变成主键重复。这两件事必须靠事务级互斥，而不是行��。
+
+**写写冲突的第二道防线：first-updater-wins。** 写者锁只能挡住"同时"写，挡不住
+"我先提交、你带着旧快照再写"。所以 `HeapFile.update/delete` 会检查链头的物理版本
+是否就是本事务要改的那一版：不是，且不属于已回滚事务，就直接 `40001`，而不会覆盖
+根记录的 `xmax`/`newest`。没有这道检查时，两个旧快照写者的结果是一个逻辑行出现
+两个可见版本（`SELECT` 出两行），而不是报错。
+
+**引用完整性用自己的可见性。** `TransactionManager.is_visible(..., ri=True)` 对应
+PostgreSQL RI 触发器的 `SnapshotDirty`：外键校验与级联收集把"已提交"当作可见，
+不看本事务的 `snapshot_xid`。否则父行被并发事务提交后，合法的子行插入会被误判成
+`23503`；删除父行时也会漏掉并发提交的子行，留下悬空引用。
+
+**当前边界（诚实版）**：`storage/lock.py` 已经实现了行级 `S`/`X` 锁与等待图 DFS
+死锁检测，但只被 `tests/unit/test_lock.py` 使用，**没有接入写路径**；
+所以本版本的写并发度是 1，而不是"行级并发"。接入它需要同时把语句级的
+`Database._write_lock` 收窄到物理写，否则两者叠加会产生等待图看不见的等待环。
 
 DDL 不止改磁盘页，还会原地修改内存里的 `Catalog` 对象。因此 `Catalog` 的
 建表/删表/建索引/删索引/重命名/加列都会把一个逆操作登记到 `txn.undo_log`；
@@ -190,7 +225,13 @@ PRIMARY KEY：CHECK 直接删除目录对象；唯一/主键通过 `IndexDef.con
 直接抛 `ForeignKeyViolationError`（SQLSTATE `23503`）；否则优先用被引用列上的
 `UNIQUE` / `PRIMARY` B+ 树索引做点查，索引项不可见或缺失时再回落到被引用表扫描；
 两步都找不到完整匹配行时抛 `ForeignKeyViolationError`。因此每次写入不必扫描整张
-父表，同时保留索引异常时的正确性兜底。`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
+父表，同时保留索引异常时的正确性兜底。这条路径上的所有 heap 读取（父行点查、
+父行兜底扫描、子行收集 `_fk_child_rows`、提交前补检）都必须带 `ri=True`，即
+引用完整性可见性（"已提交即可见"，等同 PostgreSQL RI 触发器的 `SnapshotDirty`）。
+用普通快照可见性会让并发提交的父/子行"不存在"：合法插入误报 `23503`，删除父行
+时漏掉子行而留下悬空引用。
+
+`INSERT`、`INSERT ... SELECT`、`DEFAULT VALUES`、upsert 和
 `UPDATE` 都走同一入口；`UPDATE` 改被引用键时由 `_plan_referenced_updates` 收集所有
 引用表（自引用时跳过当前 RID）：子表外键列有精确索引时走 B+ 树点查，否则扫描整张
 子表。`RESTRICT` 直接报错，`CASCADE` 收集待更新子行，
@@ -211,9 +252,13 @@ DEFERRED` 的 `INSERT` / `UPDATE` 存在性检查在 DML 路径跳过，执行�
 `Transaction.constraint_modes`，后续写入按覆盖后的时机决定是否立即检查；
 `IMMEDIATE` 会先对已积压的行/父键执行一次强制补检，失败则不改变模式。
 `SAVEPOINT` 记录这三个延迟状态并在 `ROLLBACK TO` 时一并恢复，避免已撤销的检查
-或模式泄漏到提交阶段。`Database` 在 `COMMIT`（以及自动提交语句的提交点）调用
-`executor.validate_deferred_foreign_keys`：前者按当前行重跑外键检查，后者确认
-被引用键是否已恢复或子行是否已清理；失败则 `abort`，WAL/页 undo 恢复。`RESTRICT`
+或模式泄漏到提交阶段。`Database` 与 `PGWireServer` 在 `COMMIT`（以及自动提交语句的
+提交点）都调用 `executor.validate_deferred_foreign_keys` / `validate_deferred_unique_constraints`：
+前者按当前行重跑外键检查，后者确认被引用键是否已恢复或子行是否已清理；失败则
+`abort`，WAL/页 undo 恢复。**两条提交路径必须同时维护**：曾经线协议路径漏了这两个
+调用，导致 `DEFERRABLE INITIALLY DEFERRED` 在 psql 上完全失效（单条 INSERT 就能
+写入没有父行的引用，`tests/unit/test_concurrency.py` 里有回归用例）。纯读语句不进入
+这两个补检，否则一次 `SELECT` 会变成全库扫描，并可能返回 `23505`。`RESTRICT`
 始终立即，`CASCADE` / `SET NULL` / `SET DEFAULT` 动作也立即执行。
 `DROP TABLE` / `ALTER TABLE ... DROP COLUMN ... CASCADE` / `ALTER COLUMN TYPE ... CASCADE`
 在删除外键或约束索引时同步清理 `constraint_modes`，避免同一事务内同名重建的约束继承旧覆盖；事务回滚
