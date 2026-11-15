@@ -158,6 +158,13 @@ def test_lease_rejects_stale_term(tmp_path):
         lease.assert_writable(term=2)
 
 
+def test_lease_renew_rejects_stale_term(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=30)
+    lease.acquire(term=1)
+    with pytest.raises(NotSupportedError, match="任期已过期"):
+        lease.renew(term=2)
+
+
 def test_lease_fence_tracks_observed_term(tmp_path):
     lease = Lease(tmp_path / "lease.json", "n0", ttl=30)
     lease.acquire(term=1)
