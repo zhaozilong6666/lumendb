@@ -338,8 +338,10 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 没有 `renew` 就自行拒绝写入；候选节点必须等旧租约过期才能 `acquire`，
 不会在旧主库仍持租约时抢占。`QuorumNode.campaign(lease_path=...)` 在拿到
 多数票后同时获取租约，`Replica.promote_with_quorum(lease_path=...)` 把它
-接到提升路径。它依赖共享文件和大致同步的墙钟，仍不是 quorum heartbeat
-lease：没有心跳 RPC、没有租约续期仲裁，时钟漂移会直接改变安全窗口。
+接到提升路径。`QuorumNode.heartbeat_round()` 向 peers 发送 `heartbeat`
+RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
+`LeaseKeeper(renew=...)` 可把后台续租切到 quorum 路径。它仍依赖共享文件
+和大致同步的墙钟，不是完整的 Raft leader lease，时钟漂移会改变安全窗口。
 `Lease` 的 acquire/renew/release 用 `<lease>.lock` 串行化，`LeaseKeeper`
 在后台续租；`Replica.promote_with_quorum(..., lease_keeper_interval=...)`
 可在提升后自动启动 keeper，`Replica.close()` 停止它；崩溃留下的锁文件
@@ -348,7 +350,7 @@ lease：没有心跳 RPC、没有租约续期仲裁，时钟漂移会直接改�
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
-但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence 兜底。
+但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
 
 当前边界（也是下一步）：
 

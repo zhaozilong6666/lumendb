@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1053 passed。
+- 全量测试：1056 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -157,7 +157,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 `Replica.promote_with_quorum()` 把投票和切换读写串起来，投票失败时副本保持
 只读。`ReplicationMonitor(quorum=...)` 的自动提升也走这条路径；没有多数票时
 返回 `needs_attention`，不会退化成单机提升。这不是完整 Raft：没有 leader 心跳、
-没有 quorum 租约续期、没有日志复制协商；网络分区时多数派不可达会明确失败，
+基础 heartbeat RPC 与多数派续租已做 MVP，但仍没有日志复制协商；网络分区时多数派不可达会明确失败，
 但不能自动判断旧主库是否还活着。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
@@ -165,8 +165,10 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 检查租约，超过 TTL 没有 `renew` 就自行停写；候选节点必须等旧租约过期才能
 `acquire`。`QuorumNode.campaign(lease_path=...)` 在多数票之后获取租约，
 `Replica.promote_with_quorum(lease_path=...)` 把租约接到提升路径。它依赖
-共享文件和大致同步的墙钟，不是 quorum heartbeat lease；时钟漂移会改变
-安全窗口。`Lease` 用 `<lease>.lock` 串行化 acquire/renew/release，
+共享文件和大致同步的墙钟，不是完整的 quorum heartbeat lease；时钟漂移会
+改变安全窗口。`QuorumNode.heartbeat_round()` 向 peers 发送 `heartbeat`
+RPC，`renew_lease()` 只有拿到多数派确认才续租；`LeaseKeeper(renew=...)`
+可把续租切换到 quorum 路径。`Lease` 用 `<lease>.lock` 串行化 acquire/renew/release，
 `LeaseKeeper` 在后台按 TTL 比例续租；进程崩溃留下的锁文件按失败关闭处理。
 `Replica.promote_with_quorum(..., lease_keeper_interval=...)` 可在提升后
 自动启动 keeper，`Replica.close()` 会先停止续租再关闭数据库句柄。
@@ -177,7 +179,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
   `promote` + 共享 fence），客户端重定向 MVP 已做（`WALServer(redirect_to=...)` + `RedirectError`，
   `ReplicationMonitor` 会跟随最多 3 次），多数派投票和 TTL 写租约 MVP 已做
   （`QuorumNode.campaign()` / `Replica.promote_with_quorum()` / `Lease`），但
-  心跳 RPC、quorum 续租和网络分区下的双写防护仍未完成。
+  完整 leader 选举、日志复制协商和网络分区下的双写防护仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
   - **认证/压缩/TLS 已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)`
     在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
