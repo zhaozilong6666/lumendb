@@ -30,7 +30,7 @@ from ..storage.page import PageType
 from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
 from .fence import PromotionFence
-from .lease import Lease, LeaseKeeper
+from .lease import Lease, LeaseFence, LeaseKeeper
 
 
 class Replica:
@@ -397,9 +397,9 @@ class Replica:
         ``quorum`` 是 :class:`lumendb.replication.quorum.QuorumNode`；投票失败会
         直接抛 ``NotSupportedError``，副本保持只读。投票成功后才切换读写，
         若给了 ``fence_path``，旧主库仍能通过 fence 拒绝写入；若给了
-        ``lease_path``，新主库会持有写租约，并把 ``lease.assert_writable``
-        装到新主库的写路径上，租约失效后主库自行拒绝写入。指定
-        ``lease_keeper_interval`` 会启动后台续租线程；再指定
+        ``lease_path``，新主库会持有写租约，并把 ``LeaseFence``（租约 + 当前
+        任期）装到新主库的写路径上，租约失效或观察到更高任期后主库自行拒绝
+        写入。指定 ``lease_keeper_interval`` 会启动后台续租线程；再指定
         ``lease_renew_with_quorum=True`` 时，续租前必须先拿到多数派心跳。
         ``lease_loss_callback`` 在 keeper 续租失败时调用，可用于上层告警。
         ``close()`` 停止续租线程。
@@ -417,9 +417,17 @@ class Replica:
             if lease_path is not None
             else None
         )
+        fence = (
+            LeaseFence(
+                lease,
+                lambda: getattr(getattr(quorum, "state", None), "term", None),
+            )
+            if lease is not None
+            else None
+        )
         db = self.promote(
             fence_path=fence_path,
-            write_fence=lease.assert_writable if lease is not None else None,
+            write_fence=fence.assert_writable if fence is not None else None,
             node_id=candidate_node,
         )
         if lease is not None and lease_keeper_interval is not None:

@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -166,14 +167,24 @@ class Lease:
             self._write(self.node_id, int(current["term"]), expires_at)
             return expires_at
 
-    def assert_writable(self, *, now: float | None = None) -> None:
-        """Database 的写回调：不是当前持有者或已过期就拒绝写入。"""
+    def assert_writable(
+        self,
+        *,
+        now: float | None = None,
+        term: int | None = None,
+    ) -> None:
+        """Database 的写回调：不是当前持有者、已过期或任期落后就拒绝写入。"""
         current_time = time.time() if now is None else float(now)
         current = self.read()
         if current is None:
             raise NotSupportedError(
                 "没有有效写租约，拒绝写入",
                 hint="主库必须先 acquire 或 renew 租约",
+            )
+        if term is not None and int(term) > int(current["term"]):
+            raise NotSupportedError(
+                "本节点任期已过期，旧主库必须停止写入",
+                detail=f"observed_term={term} lease_term={current['term']}",
             )
         if current.get("holder") != self.node_id:
             raise NotSupportedError(
@@ -201,6 +212,32 @@ class Lease:
                 self.path.unlink()
             except FileNotFoundError:
                 pass
+
+
+class LeaseFence:
+    """把租约和本节点当前任期组合成 ``Database.write_fence``。
+
+    ``term_provider`` 通常返回 ``QuorumNode.state.term``。旧主库收到更高任期
+    心跳后，即使租约还没过期，下一笔写也会立即被拒绝，不必等到 TTL。
+    """
+
+    def __init__(
+        self,
+        lease: Lease,
+        term_provider: Callable[[], int] | None = None,
+    ) -> None:
+        self.lease = lease
+        self._term_provider = term_provider
+
+    def assert_writable(self) -> None:
+        term = None
+        if self._term_provider is not None:
+            raw = self._term_provider()
+            term = int(raw) if raw is not None else None
+        self.lease.assert_writable(term=term)
+
+    def __call__(self) -> None:
+        self.assert_writable()
 
 
 class LeaseKeeper:
@@ -280,4 +317,4 @@ class LeaseKeeper:
         self.stop()
 
 
-__all__ = ["Lease", "LeaseKeeper"]
+__all__ = ["Lease", "LeaseFence", "LeaseKeeper"]

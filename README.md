@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1058 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1062 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -276,7 +276,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 写租约 MVP：`Lease` 以 TTL 约束旧主库写入，`campaign(lease_path=...)` 在多数票后获取租约
 - [x] 租约串行化与续租：`Lease` 用 `<lease>.lock` 串行化 acquire/renew/release，`LeaseKeeper` 后台续租
 - [x] 心跳 RPC / 多数派续租 MVP：`QuorumNode.heartbeat_round()` 统计心跳，`renew_lease()` 只有多数派确认才续租
-- [x] 提升后写围栏：`promote_with_quorum(lease_path=...)` 把 `lease.assert_writable` 装到新主库，租约丢失即拒绝写入
+- [x] 提升后写围栏：`promote_with_quorum(lease_path=...)` 把 `lease.assert_writable` 装到新主库，租约丢失或观察到更高任期即拒绝写入
 - [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见

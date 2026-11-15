@@ -233,3 +233,17 @@ def test_monitor_refuses_promotion_without_quorum(tmp_path):
             replica.db.close()
         server.stop()
         primary.close()
+
+
+def test_heartbeat_round_steps_down_on_higher_term(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].state.term = 7
+        nodes[1].state.save()
+        acks, errors = nodes[0].heartbeat_round(0)
+        assert nodes[0].state.term == 7
+        assert nodes[0].state.voted_for is None
+        assert any("higher term" in item for item in errors)
+        assert acks >= 1
+    finally:
+        _stop(nodes)
