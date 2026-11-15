@@ -151,6 +151,7 @@ class QuorumClient:
         *,
         timeout: float = 2.0,
         token: str | None = None,
+        pre_vote: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "type": "vote_request",
@@ -158,6 +159,8 @@ class QuorumClient:
             "candidate_id": candidate_id,
             "last_lsn": int(last_lsn),
         }
+        if pre_vote:
+            payload["pre_vote"] = True
         if token is not None:
             payload["token"] = token
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -357,11 +360,35 @@ class QuorumNode:
             return self.state.commit_lsn
 
     def request_vote(
-        self, term: int, candidate_id: str, last_lsn: int
+        self,
+        term: int,
+        candidate_id: str,
+        last_lsn: int,
+        pre_vote: bool = False,
     ) -> dict[str, Any]:
+        """处理投票/预投票。
+
+        预投票（``pre_vote=True``）只回答"如果现在投票，会不会投给你"，
+        **不写任何状态**：不改任期、不记 voted_for。这样少数派分区里的节点
+        反复尝试提升时，不会把自己的任期越推越高，也就不会在分区恢复后
+        用更高的任期把健康的主库逼停。
+        """
         candidate = _validate_node_id(candidate_id)
         requested = max(0, int(term))
         candidate_lsn = max(0, int(last_lsn))
+        if pre_vote:
+            with self._lock:
+                would_grant = (
+                    requested >= self.state.term
+                    and self.state.voted_for in (None, candidate)
+                    and candidate_lsn >= self.state.last_lsn
+                )
+                return {
+                    "type": "vote_response",
+                    "term": self.state.term,
+                    "granted": bool(would_grant),
+                    "pre_vote": True,
+                }
         with self._lock:
             if requested < self.state.term:
                 return {
@@ -555,6 +582,49 @@ class QuorumNode:
         lease = Lease(lease_path, self.node_id, ttl=lease_ttl)
         return lease.renew(now=now, term=self.state.term)
 
+    def _pre_vote(self, candidate_lsn: int) -> None:
+        """预投票：只探询意向，不改任期/投票。多数派不通过就抛错。"""
+        with self._lock:
+            term = self.state.term + 1
+            votes = {self.node_id}
+            total_nodes = len(self.peers) + (
+                0 if self.node_id in self.peers else 1
+            )
+            majority = total_nodes // 2 + 1
+            peers = [
+                (peer_id, address)
+                for peer_id, address in self.peers.items()
+                if peer_id != self.node_id
+            ]
+        errors: list[str] = []
+        for peer_id, address in peers:
+            try:
+                response = QuorumClient.request_vote(
+                    address[0],
+                    int(address[1]),
+                    term,
+                    self.node_id,
+                    candidate_lsn,
+                    timeout=self.timeout,
+                    token=self.token,
+                    pre_vote=True,
+                )
+            except (OSError, ValueError, StorageError) as exc:
+                errors.append(f"{peer_id}: {exc}")
+                continue
+            if response.get("granted"):
+                votes.add(peer_id)
+        if len(votes) < majority:
+            detail = (
+                f"pre_votes={len(votes)}/{total_nodes} majority={majority}; "
+                + ("; ".join(errors) if errors else "no errors")
+            )
+            raise NotSupportedError(
+                "预投票未通过多数派，未推进任期",
+                detail=detail,
+                hint="确认 peers 可达后再发起提升；任期保持原值，不会干扰现有主库",
+            )
+
     def campaign(
         self,
         last_lsn: int,
@@ -562,6 +632,7 @@ class QuorumNode:
         fence_path: str | Path | None = None,
         lease_path: str | Path | None = None,
         lease_ttl: float = 10.0,
+        pre_vote: bool = True,
     ) -> int:
         """争取多数派投票；成功返回任期，失败抛 ``NotSupportedError``。
 
@@ -581,6 +652,9 @@ class QuorumNode:
                 ),
                 hint="先让副本追平 WAL（或做一次增量基准备份）再发起提升",
             )
+        if pre_vote:
+            # 先问一轮"会不会投我"，拿不到多数就**不推进任期**直接返回。
+            self._pre_vote(candidate_lsn)
         with self._lock:
             term = self.state.term + 1
             self.state.term = term
@@ -702,6 +776,7 @@ class QuorumNode:
                     int(request.get("term", 0)),
                     str(request.get("candidate_id", "")),
                     int(request.get("last_lsn", 0)),
+                    bool(request.get("pre_vote", False)),
                 )
             elif request_type == "status":
                 response = self.status()

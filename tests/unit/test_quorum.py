@@ -72,12 +72,23 @@ def test_campaign_wins_majority_and_writes_fence(tmp_path):
 
 
 def test_campaign_refuses_without_majority(tmp_path):
+    """拿不到多数派时必须拒绝提升，而且**不能推进任期**。
+
+    预投票（pre-vote）先探询意向：失败就保持原任期返回，避免分区里的节点
+    反复重试把自己的任期越推越高，恢复后把健康的主库逼停。
+    """
     nodes = _cluster(tmp_path)
     try:
         nodes[1].stop()
         nodes[2].stop()
-        with pytest.raises(NotSupportedError, match="多数派投票失败"):
+        term_before = nodes[0].state.term
+        with pytest.raises(NotSupportedError, match="预投票未通过多数派"):
             nodes[0].campaign(last_lsn=10)
+        assert nodes[0].state.term == term_before, "预投票失败不能推进任期"
+        # 显式关掉预投票时仍然走旧路径：先推任期再投票，失败报"多数派投票失败"
+        with pytest.raises(NotSupportedError, match="多数派投票失败"):
+            nodes[0].campaign(last_lsn=10, pre_vote=False)
+        assert nodes[0].state.term == term_before + 1
     finally:
         _stop(nodes)
 
@@ -363,5 +374,29 @@ def test_heartbeat_loop_survives_callback_error(tmp_path):
             assert loop.last_acks >= 1
         finally:
             loop.stop()
+    finally:
+        _stop(nodes)
+
+
+def test_pre_vote_does_not_touch_vote_state(tmp_path):
+    """预投票只回答意向：不改任期、不记 voted_for、不落盘。"""
+    nodes = _cluster(tmp_path)
+    try:
+        before = (nodes[1].state.term, nodes[1].state.voted_for)
+        response = nodes[1].request_vote(5, "n0", 100, pre_vote=True)
+        assert response["pre_vote"] is True
+        assert response["granted"] is True  # 会投给它
+        assert (nodes[1].state.term, nodes[1].state.voted_for) == before
+    finally:
+        _stop(nodes)
+
+
+def test_pre_vote_rejects_a_lagging_candidate(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].observe_lsn(500)
+        response = nodes[1].request_vote(1, "n0", 100, pre_vote=True)
+        assert response["granted"] is False
+        assert nodes[1].state.term == 0
     finally:
         _stop(nodes)
