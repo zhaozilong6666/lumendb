@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1066 passed。
+- 全量测试：1067 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -147,8 +147,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 逻辑错误（槽位已回收）先尝试 `rebase_from_server` 页级增量重建，成功
 返回 `rebuilt`，失败才返回 `needs_attention`，不会自动提升。
 `ReplicationMonitor.start()` 可在后台线程按 `poll_interval` 周期跟随，
-`stop()` 停止；`promoted` / `needs_attention` 会让后台循环退出。没有心跳
-租约；客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
+`stop()` 停止；`promoted` / `needs_attention` 会让后台循环退出。heartbeat RPC、
+多数派续租和 `LeaseKeeper` 已做 MVP；客户端重定向已做 MVP
+（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 网络分区下仍要求共享 fence。
 
 **多数派投票 MVP**：`QuorumNode.campaign()` 递增任期，向 `peers` 发送
@@ -158,9 +159,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 只读。`ReplicationMonitor(quorum=...)` 的自动提升也走这条路径；没有多数票时
 返回 `needs_attention`，不会退化成单机提升。传入 `lease_path` / `lease_ttl` /
 `lease_keeper_interval` 时，监控器会把租约和写围栏一并带到自动提升后的主库，
-避免“自动提升成功但新主库没有租约围栏”的接线缺口。这不是完整 Raft：没有 leader 心跳、
-基础 heartbeat RPC 与多数派续租已做 MVP，但仍没有日志复制协商；网络分区时多数派不可达会明确失败，
-但不能自动判断旧主库是否还活着。
+避免“自动提升成功但新主库没有租约围栏”的接线缺口。这不是完整 Raft：已有
+基础 heartbeat RPC、独立 `HeartbeatLoop` 与多数派续租，但仍没有日志复制协商；
+网络分区时多数派不可达会明确失败，但不能自动判断旧主库是否还活着。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写入共享文件。主库每笔写语句前通过 `Database(write_fence=lease.assert_writable)`
@@ -179,7 +180,8 @@ RPC，`renew_lease()` 只有拿到多数派确认才续租；`LeaseKeeper(renew=
 keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直接
 `step_down()` 切回只读；keeper 的本地续租也把当前任期传给 `Lease.renew()`，
 任期落后时续租失败，不会继续持有旧任期租约。`heartbeat_round()` 收到更高任期响应会推进本地
-任期并清空投票，为旧主库自动停写提供任期依据。
+任期并清空投票，为旧主库自动停写提供任期依据；独立 `HeartbeatLoop` 可在后台
+周期发送心跳并在观察到更高任期时回调上层停写。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
@@ -217,9 +219,9 @@ fencing。
 **当前状态**：上述三条已补齐；延迟/吞吐与丢失窗口的实测见
 [`docs/replication-bench.md`](replication-bench.md)，多区间页 diff 已把同一
 场景的副本延迟从 13.9 MB 降到 1.1 MB，响应行压缩和标准库 TLS 已作为可选
-传输层落地。多数派投票、客户端重定向、增量基准备份和 TTL 写租约已做 MVP；
-心跳 RPC / quorum 续租、网络分区双写防护和副本查询/apply 并发仍未完成，
-因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
+传输层落地。多数派投票、客户端重定向、增量基准备份、TTL 写租约和
+heartbeat RPC / quorum 续租已做 MVP；日志复制协商、网络分区双写防护和
+副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
 

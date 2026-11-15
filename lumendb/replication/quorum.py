@@ -1,7 +1,7 @@
 """跨节点多数派投票，给手动/自动提升加一道仲裁。
 
-这不是完整的 Raft：没有 leader 心跳、没有任期租约、没有日志复制协商，
-只实现“一个副本想提升，必须先拿到集群多数派的投票”。它解决的是
+这不是完整的 Raft：已有 heartbeat RPC、多数派续租和独立 ``HeartbeatLoop``，
+但仍没有日志复制协商，也没有基于随机超时的完整 leader 选举。它解决的是
 **两个副本同时提升、各自写自己的 fence** 的问题；网络分区期间如果多数派
 不可达，候选节点会明确失败，而不是在本地单方面提升。
 
@@ -18,6 +18,7 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -505,4 +506,73 @@ class QuorumNode:
                 pass
 
 
-__all__ = ["QuorumClient", "QuorumNode", "VoteState"]
+class HeartbeatLoop:
+    """后台 leader 心跳循环：定期向 peers 发 ``heartbeat``。
+
+    与 :class:`lumendb.replication.lease.LeaseKeeper` 分开：lease keeper 负责续租，
+    本类只维护 leader 活跃度和任期视图。观察到更高任期时调用
+    ``on_higher_term(term)``，上层可据此停写或降级。
+    """
+
+    def __init__(
+        self,
+        node: QuorumNode,
+        last_lsn: Callable[[], int],
+        *,
+        interval: float = 0.5,
+        on_higher_term: Callable[[int], None] | None = None,
+    ) -> None:
+        self.node = node
+        self.last_lsn = last_lsn
+        self.interval = max(0.05, float(interval))
+        self.on_higher_term = on_higher_term
+        self.last_acks = 0
+        self.last_errors: list[str] = []
+        self.last_observed_term = node.state.term
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "HeartbeatLoop":
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="lumendb-heartbeat-loop",
+                daemon=True,
+            )
+            self._thread.start()
+            return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.interval + 0.5))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            term_before = self.node.state.term
+            try:
+                acks, errors = self.node.heartbeat_round(self.last_lsn())
+            except (OSError, ValueError, StorageError) as exc:
+                acks, errors = 0, [str(exc)]
+            self.last_acks = acks
+            self.last_errors = errors
+            term_after = self.node.state.term
+            self.last_observed_term = term_after
+            if term_after > term_before and self.on_higher_term is not None:
+                self.on_higher_term(term_after)
+
+    def __enter__(self) -> "HeartbeatLoop":
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.stop()
+
+
+__all__ = ["HeartbeatLoop", "QuorumClient", "QuorumNode", "VoteState"]
