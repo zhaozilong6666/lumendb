@@ -12,13 +12,17 @@
   协商。它只把“旧主库永久写”缩小成“最多写一个 TTL 窗口”。
 - ``acquire`` 不会抢占仍然有效的租约，即使候选任期更高；调用方需要等旧
   租约过期，或先确认旧主库已经停止。
+- ``acquire`` / ``renew`` / ``release`` 用 ``<lease>.lock`` 做跨进程串行化；
+  进程崩溃留下的锁文件不会被自动删除，必须人工确认后清理，避免误抢。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..errors import NotSupportedError, StorageError
@@ -33,10 +37,13 @@ class Lease:
         node_id: str,
         *,
         ttl: float = 10.0,
+        lock_timeout: float = 5.0,
     ) -> None:
         self.path = Path(path)
         self.node_id = str(node_id)
         self.ttl = max(0.1, float(ttl))
+        self.lock_timeout = max(0.05, float(lock_timeout))
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
 
     def read(self) -> dict | None:
         try:
@@ -55,6 +62,41 @@ class Lease:
             "term": max(0, int(raw.get("term", 0))),
             "expires_at": float(raw.get("expires_at", 0.0)),
         }
+
+    @contextmanager
+    def _exclusive(self):
+        """用 O_EXCL 锁文件把 acquire/renew/release 串行化。
+
+        锁文件残留时按失败关闭处理：不会自动删除未知进程留下的锁。
+        """
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.lock_timeout
+        fd = None
+        while True:
+            try:
+                fd = os.open(
+                    self.lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise StorageError(
+                        "租约锁等待超时，可能存在残留锁文件",
+                        detail=str(self.lock_path),
+                    )
+                time.sleep(0.01)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            yield
+        finally:
+            try:
+                os.close(fd)
+            finally:
+                try:
+                    self.lock_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _write(self, holder: str, term: int, expires_at: float) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,50 +119,52 @@ class Lease:
         now: float | None = None,
     ) -> float:
         """获取租约；仍有效的其他持有者会让这次获取失败。"""
-        current_time = time.time() if now is None else float(now)
-        current = self.read()
-        if current is not None:
-            holder = current.get("holder")
-            if (
-                holder
-                and holder != self.node_id
-                and float(current["expires_at"]) > current_time
-            ):
-                raise NotSupportedError(
-                    "租约仍被其他节点持有，拒绝抢占",
-                    detail=(
-                        f"holder={holder} expires_at={current['expires_at']} "
-                        f"now={current_time}"
-                    ),
-                )
-            if int(current["term"]) > int(term):
-                raise NotSupportedError(
-                    "租约任期比候选任期更高，拒绝回退",
-                    detail=f"lease_term={current['term']} requested={term}",
-                )
-        expires_at = current_time + self.ttl
-        self._write(self.node_id, term, expires_at)
-        return expires_at
+        with self._exclusive():
+            current_time = time.time() if now is None else float(now)
+            current = self.read()
+            if current is not None:
+                holder = current.get("holder")
+                if (
+                    holder
+                    and holder != self.node_id
+                    and float(current["expires_at"]) > current_time
+                ):
+                    raise NotSupportedError(
+                        "租约仍被其他节点持有，拒绝抢占",
+                        detail=(
+                            f"holder={holder} expires_at={current['expires_at']} "
+                            f"now={current_time}"
+                        ),
+                    )
+                if int(current["term"]) > int(term):
+                    raise NotSupportedError(
+                        "租约任期比候选任期更高，拒绝回退",
+                        detail=f"lease_term={current['term']} requested={term}",
+                    )
+            expires_at = current_time + self.ttl
+            self._write(self.node_id, term, expires_at)
+            return expires_at
 
     def renew(self, *, now: float | None = None) -> float:
         """续租；只有当前持有者且租约未过期时才能续。"""
-        current_time = time.time() if now is None else float(now)
-        current = self.read()
-        if current is None:
-            raise NotSupportedError("租约不存在，不能续租")
-        if current.get("holder") != self.node_id:
-            raise NotSupportedError(
-                "租约不属于当前节点，不能续租",
-                detail=f"holder={current.get('holder')} node={self.node_id}",
-            )
-        if float(current["expires_at"]) <= current_time:
-            raise NotSupportedError(
-                "租约已经过期，不能续租；必须重新 acquire",
-                detail=f"expires_at={current['expires_at']} now={current_time}",
-            )
-        expires_at = current_time + self.ttl
-        self._write(self.node_id, int(current["term"]), expires_at)
-        return expires_at
+        with self._exclusive():
+            current_time = time.time() if now is None else float(now)
+            current = self.read()
+            if current is None:
+                raise NotSupportedError("租约不存在，不能续租")
+            if current.get("holder") != self.node_id:
+                raise NotSupportedError(
+                    "租约不属于当前节点，不能续租",
+                    detail=f"holder={current.get('holder')} node={self.node_id}",
+                )
+            if float(current["expires_at"]) <= current_time:
+                raise NotSupportedError(
+                    "租约已经过期，不能续租；必须重新 acquire",
+                    detail=f"expires_at={current['expires_at']} now={current_time}",
+                )
+            expires_at = current_time + self.ttl
+            self._write(self.node_id, int(current["term"]), expires_at)
+            return expires_at
 
     def assert_writable(self, *, now: float | None = None) -> None:
         """Database 的写回调：不是当前持有者或已过期就拒绝写入。"""
@@ -144,18 +188,73 @@ class Lease:
 
     def release(self) -> None:
         """当前持有者主动释放租约；删除失败时保留文件，让 TTL 兜底。"""
-        current = self.read()
-        if current is None:
-            return
-        if current.get("holder") != self.node_id:
-            raise NotSupportedError(
-                "租约不属于当前节点，不能释放",
-                detail=f"holder={current.get('holder')} node={self.node_id}",
+        with self._exclusive():
+            current = self.read()
+            if current is None:
+                return
+            if current.get("holder") != self.node_id:
+                raise NotSupportedError(
+                    "租约不属于当前节点，不能释放",
+                    detail=f"holder={current.get('holder')} node={self.node_id}",
+                )
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class LeaseKeeper:
+    """后台续租线程；只负责续租，不负责重新 acquire。"""
+
+    def __init__(self, lease: Lease, interval: float | None = None) -> None:
+        self.lease = lease
+        self.interval = max(
+            0.05,
+            float(interval) if interval is not None else lease.ttl / 3,
+        )
+        self.last_error: str | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "LeaseKeeper":
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="lumendb-lease-keeper",
+                daemon=True,
             )
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+            self._thread.start()
+            return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        if thread is not None:
+            thread.join(timeout=max(1.0, self.interval + 0.5))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.lease.renew()
+                self.last_error = None
+            except (NotSupportedError, StorageError) as exc:
+                self.last_error = str(exc)
+                return
+            except BaseException as exc:  # noqa: BLE001 - keep keeper alive-ish
+                self.last_error = str(exc)
+                return
+
+    def __enter__(self) -> "LeaseKeeper":
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.stop()
 
 
-__all__ = ["Lease"]
+__all__ = ["Lease", "LeaseKeeper"]

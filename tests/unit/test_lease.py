@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import NotSupportedError, StorageError
-from lumendb.replication import Lease, Replica, WALServer
+from lumendb.replication import Lease, LeaseKeeper, Replica, WALServer
 from lumendb.replication.quorum import QuorumNode
 
 
@@ -127,3 +128,23 @@ def test_replica_promote_with_quorum_holds_lease(tmp_path):
             replica.db.close()
         server.stop()
         primary.close()
+
+def test_lease_lock_times_out_when_lock_file_exists(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=10, lock_timeout=0.05)
+    lease.lock_path.write_text("stale", encoding="utf-8")
+    with pytest.raises(StorageError, match="锁"):
+        lease.acquire(term=1, now=0)
+
+
+def test_lease_keeper_renews_until_stopped(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=0.4)
+    lease.acquire(term=1)
+    first = lease.read()["expires_at"]
+    keeper = LeaseKeeper(lease, interval=0.05).start()
+    try:
+        time.sleep(0.15)
+        renewed = lease.read()["expires_at"]
+        assert renewed > first
+        assert keeper.last_error is None
+    finally:
+        keeper.stop()

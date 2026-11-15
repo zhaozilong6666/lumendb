@@ -2,7 +2,7 @@
 
 from .failover import ReplicationMonitor
 from .fence import PromotionFence
-from .lease import Lease
+from .lease import Lease, LeaseKeeper
 from .quorum import QuorumClient, QuorumNode, VoteState
 from .replica import Replica
 from .wal_stream import WALClient, WALServer, read_slot
