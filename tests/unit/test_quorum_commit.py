@@ -319,3 +319,51 @@ class TestStatusRpc:
             assert QuorumClient.status(node.host, node.port, token="s3cret")["node_id"] == "n0"
         finally:
             node.stop()
+
+
+class TestHeartbeatSurvivesRestart:
+    def test_status_reports_the_last_leader_after_restart(self, tmp_path):
+        """节点重启后仍要能报出"最近一次心跳来自谁"。
+
+        只放内存的版本重启后就什么都不知道了，排障时分不清"主库没发心跳"
+        和"我重启过"——这是上一轮 review 明确点出的缺口。
+        """
+        from lumendb.replication.quorum import QuorumClient
+
+        state_path = tmp_path / "n0.vote.json"
+        node = QuorumNode(
+            "n0",
+            state_path=state_path,
+            heartbeat_persist_interval=0.0,  # 每次心跳都落盘，便于断言
+        ).start()
+        try:
+            node.heartbeat(3, "primary", 120, commit_lsn=100)
+            status = QuorumClient.status(node.host, node.port)
+            assert status["last_heartbeat_from"] == "primary"
+            assert status["last_heartbeat_at"]
+        finally:
+            node.stop()
+
+        restarted = QuorumNode(
+            "n0", state_path=state_path, heartbeat_persist_interval=0.0
+        ).start()
+        try:
+            status = QuorumClient.status(restarted.host, restarted.port)
+            assert status["last_heartbeat_from"] == "primary"
+            assert status["commit_lsn"] == 100
+            assert status["last_heartbeat_at"] == pytest.approx(
+                node.state.last_heartbeat_at
+            )
+        finally:
+            restarted.stop()
+
+    def test_stale_heartbeat_is_not_overwritten_by_an_older_term(self, tmp_path):
+        node = QuorumNode("n0", state_path=tmp_path / "n0.vote.json")
+        try:
+            node.heartbeat(5, "new-leader", 200, commit_lsn=180)
+            accepted = node.heartbeat(4, "old-leader", 100)
+            assert accepted["ok"] is False
+            assert node.state.last_heartbeat_from == "new-leader"
+            assert node.state.commit_lsn == 180
+        finally:
+            node.stop()

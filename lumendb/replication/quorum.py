@@ -76,6 +76,13 @@ class VoteState:
         self.match_term = 0
         #: 多数派确认过的提交水位（本节点目前知道的上界）。
         self.commit_lsn = 0
+        #: 最近一次 leader 心跳（落盘）。只放内存的话，节点重启后
+        #: `status` 会报"从没收到过心跳"，排障时分不清"主库没发"和
+        #: "我重启过"——这正是上一轮 review 指出的缺口。
+        self.last_heartbeat_at: float = 0.0
+        self.last_heartbeat_from: str | None = None
+        #: 上次把心跳写盘的时间，用于把 fsync 频率限制在 persist_interval 内。
+        self._persisted_heartbeat_at: float = 0.0
         self._lock = threading.RLock()
         self._load()
 
@@ -99,6 +106,12 @@ class VoteState:
         self.match_lsn = max(0, int(raw.get("match_lsn", 0)))
         self.match_term = max(0, int(raw.get("match_term", 0)))
         self.commit_lsn = max(0, int(raw.get("commit_lsn", 0)))
+        self.last_heartbeat_at = max(0.0, float(raw.get("last_heartbeat_at", 0.0)))
+        from_leader = raw.get("last_heartbeat_from")
+        self.last_heartbeat_from = (
+            str(from_leader) if from_leader is not None else None
+        )
+        self._persisted_heartbeat_at = self.last_heartbeat_at
 
     def save(self) -> None:
         with self._lock:
@@ -113,6 +126,8 @@ class VoteState:
                 "match_lsn": int(self.match_lsn),
                 "match_term": int(self.match_term),
                 "commit_lsn": int(self.commit_lsn),
+                "last_heartbeat_at": round(float(self.last_heartbeat_at), 6),
+                "last_heartbeat_from": self.last_heartbeat_from,
             }
             tmp = self.path.with_name(self.path.name + ".tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -158,6 +173,26 @@ class VoteState:
                     self.last_term = max(0, int(term))
                 changed = True
             if changed:
+                self.save()
+
+    def observe_heartbeat(
+        self, leader: str, at: float, *, persist_interval: float = 5.0
+    ) -> None:
+        """记录最近一次 leader 心跳（落盘，但限制 fsync 频率）。
+
+        心跳每 `interval` 秒就来一次，每条都 fsync 会把仲裁节点变成写热点；
+        所以只在"来源变了"或"距上次落盘超过 ``persist_interval``"时写盘。
+        内存里的值始终是最新的，`status` 读到的是最新值。
+        """
+        with self._lock:
+            self.last_heartbeat_at = float(at)
+            self.last_heartbeat_from = str(leader)
+            if (
+                self.last_heartbeat_from is not None
+                and self.last_heartbeat_at - self._persisted_heartbeat_at
+                >= max(0.0, float(persist_interval))
+            ) or self._persisted_heartbeat_at == 0.0:
+                self._persisted_heartbeat_at = self.last_heartbeat_at
                 self.save()
 
     def observe_commit(self, lsn: int) -> None:
@@ -345,6 +380,7 @@ class QuorumNode:
         state_path: str | Path | None = None,
         token: str | None = None,
         timeout: float = 2.0,
+        heartbeat_persist_interval: float = 5.0,
     ) -> None:
         self.node_id = _validate_node_id(node_id)
         self.host = host
@@ -357,8 +393,10 @@ class QuorumNode:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
-        self._last_heartbeat_at: float | None = None
-        self._last_heartbeat_from: str | None = None
+        self.heartbeat_persist_interval = max(0.0, float(heartbeat_persist_interval))
+        # 从持久化状态恢复：重启后的 status 不应该谎称"从没收到过心跳"。
+        self._last_heartbeat_at = self.state.last_heartbeat_at or None
+        self._last_heartbeat_from = self.state.last_heartbeat_from
 
     def observe_lsn(self, lsn: int) -> None:
         """记录本节点已经追平到的 LSN；投票时用它拒绝落后的候选。"""
@@ -481,8 +519,10 @@ class QuorumNode:
                 "match_lsn": self.state.match_lsn,
                 "match_term": self.state.match_term,
                 "commit_lsn": self.state.commit_lsn,
-                "last_heartbeat_at": self._last_heartbeat_at,
-                "last_heartbeat_from": self._last_heartbeat_from,
+                # 从 state 读：节点重启后这里仍然能报出最近一次心跳来源
+                # （内存字段重启即丢，那正是排障最需要的信息）。
+                "last_heartbeat_at": self.state.last_heartbeat_at or None,
+                "last_heartbeat_from": self.state.last_heartbeat_from,
                 "peers": sorted(
                     pid for pid in self.peers if pid != self.node_id
                 ),
@@ -515,8 +555,12 @@ class QuorumNode:
             # 多数派水位随心跳传播，候选提升前才能读到集群已知的 commit_lsn；
             # 只存在 leader 本地的话，换主时闸门会退化成 0。
             self.state.observe_commit(int(commit_lsn))
-            self._last_heartbeat_at = time.time()
+            now = time.time()
+            self._last_heartbeat_at = now
             self._last_heartbeat_from = leader
+            self.state.observe_heartbeat(
+                leader, now, persist_interval=self.heartbeat_persist_interval
+            )
             return {
                 "type": "heartbeat_response",
                 "term": self.state.term,
