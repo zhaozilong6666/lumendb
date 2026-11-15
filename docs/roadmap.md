@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1068 passed。
+- 全量测试：1136 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -220,7 +220,10 @@ fencing。
 [`docs/replication-bench.md`](replication-bench.md)，多区间页 diff 已把同一
 场景的副本延迟从 13.9 MB 降到 1.1 MB，响应行压缩和标准库 TLS 已作为可选
 传输层落地。多数派投票、客户端重定向、增量基准备份、TTL 写租约和
-heartbeat RPC / quorum 续租已做 MVP；日志复制协商、网络分区双写防护和
+heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
+`(last_term,last_lsn)` 字典序，心跳会把多数派提交水位带给 follower，
+更高任期会让候选放弃本轮提升；关闭/降级与在途 SQL 的竞争也已收口
+（close 等待只读语句、回滚线上事务）。日志复制协商、网络分区双写防护和
 副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
