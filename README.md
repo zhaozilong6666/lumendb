@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1067 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1068 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -280,7 +280,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 租约丢失自动降级：`lease_loss_stepdown=True` 时 keeper 续租失败自动 `step_down()`，主库切回只读
 - [x] 任期感知续租：`Lease.renew(term=...)` 与 `QuorumNode.renew_lease()` 拒绝用更高任期节点续旧任期租约
 - [x] 自动提升租约：`ReplicationMonitor(quorum=..., lease_path=...)` 把投票、租约、心跳续租和写围栏串到自动提升路径
-- [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写
+- [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写，回调异常记录到 `last_callback_error` 且不会终止后台线程
 - [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见

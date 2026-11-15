@@ -321,3 +321,29 @@ def test_heartbeat_loop_reports_higher_term(tmp_path):
             loop.stop()
     finally:
         _stop(nodes)
+
+
+def test_heartbeat_loop_survives_callback_error(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].state.term = 7
+        nodes[1].state.save()
+
+        def bad_callback(term):
+            raise RuntimeError("boom")
+
+        loop = HeartbeatLoop(
+            nodes[0],
+            lambda: 0,
+            interval=0.05,
+            on_higher_term=bad_callback,
+        ).start()
+        try:
+            time.sleep(0.2)
+            assert nodes[0].state.term == 7
+            assert loop.last_callback_error == "boom"
+            assert loop.last_acks >= 1
+        finally:
+            loop.stop()
+    finally:
+        _stop(nodes)
