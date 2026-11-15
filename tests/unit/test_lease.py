@@ -129,7 +129,6 @@ def test_replica_promote_with_quorum_holds_lease(tmp_path):
         server.stop()
         primary.close()
 
-
 def test_lease_lock_times_out_when_lock_file_exists(tmp_path):
     lease = Lease(tmp_path / "lease.json", "n0", ttl=10, lock_timeout=0.05)
     lease.lock_path.write_text("stale", encoding="utf-8")

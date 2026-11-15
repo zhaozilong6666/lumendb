@@ -324,8 +324,8 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 
 **手动提升 fencing**：`PromotionFence` 是一个共享文件 marker，副本提升时
 原子写入 `promoted_node` 和 `lsn`；旧主库通过 `Database(write_fence=...)`
-在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它单独使用时不做
-自动选举，也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
+在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它单独使用时不做自动选举，
+也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
 
 **多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn` 的
 状态下响应 `vote_request`；`campaign()` 需要拿到集群多数票，投票节点拒绝
@@ -346,7 +346,7 @@ lease：没有心跳 RPC、没有租约续期仲裁，时钟漂移会直接改�
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
-但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence 和 TTL 租约兜底。
+但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence 兜底。
 
 当前边界（也是下一步）：
 
