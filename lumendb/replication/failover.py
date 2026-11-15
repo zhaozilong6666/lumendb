@@ -7,7 +7,7 @@
 3. 如果给了 ``fence_path``，提升前先写共享 marker，旧主库通过
    ``PromotionFence.assert_writable`` 拒绝后续写入。
 
-没有心跳租约、没有多数派仲裁、没有客户端重定向。它的定位是“单副本、
+没有心跳租约；多数派投票和客户端重定向已做 MVP。它的定位是“单副本、
 共享 fence 文件”的自动提升 MVP；网络分区时如果两个节点看不到同一个
 fence 文件，仍可能双写，部署时必须明确这一点。
 """
@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from ..errors import RedirectError, StorageError
+from ..errors import NotSupportedError, RedirectError, StorageError
 from .replica import Replica
 from .wal_stream import WALClient
 
@@ -43,6 +43,7 @@ class ReplicationMonitor:
         replica_id: str | None = None,
         auto_rebase: bool = True,
         poll_interval: float = 1.0,
+        quorum=None,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -53,6 +54,7 @@ class ReplicationMonitor:
         self.server_hostname = server_hostname
         self.replica_id = replica_id
         self.auto_rebase = auto_rebase
+        self.quorum = quorum
         self.poll_interval = max(0.05, float(poll_interval))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -129,8 +131,9 @@ class ReplicationMonitor:
             self.failures += 1
             self.last_error = str(exc)
             if self.failures >= self.max_failures:
-                self._promote()
-                return "promoted"
+                if self._promote():
+                    return "promoted"
+                return "needs_attention"
             return "degraded"
 
     def start(self, interval: float | None = None) -> "ReplicationMonitor":
@@ -159,12 +162,24 @@ class ReplicationMonitor:
             self._thread.join(timeout=2)
             self._thread = None
 
-    def _promote(self) -> None:
-        self.replica.promote(
-            fence_path=self.fence_path,
-            node_id=self.node_id,
-        )
+    def _promote(self) -> bool:
+        try:
+            if self.quorum is not None:
+                self.replica.promote_with_quorum(
+                    self.quorum,
+                    fence_path=self.fence_path,
+                    node_id=self.quorum.node_id,
+                )
+            else:
+                self.replica.promote(
+                    fence_path=self.fence_path,
+                    node_id=self.node_id,
+                )
+        except (NotSupportedError, StorageError) as exc:
+            self.last_error = str(exc)
+            return False
         self.promoted = True
+        return True
 
 
 __all__ = ["ReplicationMonitor"]
