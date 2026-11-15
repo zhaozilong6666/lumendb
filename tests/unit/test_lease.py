@@ -148,3 +148,33 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
         assert keeper.last_error is None
     finally:
         keeper.stop()
+
+
+class _NoopQuorum:
+    node_id = "n0"
+
+    def campaign(self, last_lsn, *, fence_path=None, lease_path=None, lease_ttl=10.0):
+        if lease_path is not None:
+            Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(1)
+        return 1
+
+
+def test_promote_with_quorum_starts_lease_keeper(tmp_path):
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    replica = Replica.bootstrap(primary, tmp_path / "replica")
+    lease_path = tmp_path / "lease.json"
+    try:
+        replica.promote_with_quorum(
+            _NoopQuorum(),
+            lease_path=lease_path,
+            lease_ttl=0.4,
+            lease_keeper_interval=0.05,
+        )
+        first = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
+        time.sleep(0.15)
+        renewed = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
+        assert renewed > first
+    finally:
+        replica.close()
+        primary.close()
