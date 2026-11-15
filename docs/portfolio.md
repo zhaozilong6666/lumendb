@@ -21,6 +21,8 @@
 > - 实现 B+ 树索引（分裂、范围扫描、空节点塌陷），随机插入/删除与内存
 >   `dict` 对照校验，并用全树不变量检查兜底；
 > - 实现 WAL 与 ARIES 风格 redo/undo 恢复，以 pageLSN 保证重放幂等；
+>   新 WAL 记录带 CRC32（rtype 高位标记、兼容无 CRC 旧记录），完整记录校验
+>   失败会拒绝恢复而不会被当成崩溃残尾静默截断；
 >   用"绕过缓冲池直接写数据页"的方式模拟断电，验证已提交数据存活、
 >   未提交数据回滚；
 > - 显式 `ROLLBACK` 不只写 abort 日志：Buffer Pool 按事务记录页的 before image，
@@ -78,7 +80,7 @@
 >   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；
 > - 处理降级/关闭与在途 SQL 的竞争：`close()` 先等待只读语句退出，再回滚线上未提交事务并关闭句柄；
 >   pgwire 的写/COMMIT/SAVEPOINT 路径与 `Database._write_lock` 对齐，避免 step_down 之后仍有写落到已关闭的 WAL。
-> - 1136 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 1139 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -91,9 +93,11 @@
 > - Implemented a B+ tree index (node splits, range scans, empty-node collapse),
 >   cross-validated against an in-memory `dict` plus whole-tree invariant checks.
 > - Built a WAL with ARIES-style redo/undo recovery; pageLSN makes replay
->   idempotent. Crash safety is verified by bypassing the buffer pool and writing
->   pages directly, then reopening and asserting committed rows survive while
->   uncommitted ones roll back.
+>   idempotent. New records carry a CRC32 (high bit of rtype, legacy frames
+>   stay readable); a complete-record checksum failure aborts recovery instead
+>   of being silently treated as a torn tail. Crash safety is verified by
+>   bypassing the buffer pool and writing pages directly, then reopening and
+>   asserting committed rows survive while uncommitted ones roll back.
 > - Explicit ROLLBACK restores page before-images in reverse order and writes
 >   CLRs to advance pageLSN; catalog table/index root pointers and catalog_root
 >   are restored too, so TRUNCATE, VACUUM and DDL are rollback-safe across reopen.
@@ -175,7 +179,7 @@
 > - Close/step-down races are explicit: `close()` waits for active readers,
 >   aborts live wire transactions, and pgwire write/COMMIT/savepoint paths use
 >   the same write lock, so no statement can land on a closed WAL.
-> - 1136 automated tests including crash-injection and a 20-seed randomized
+> - 1139 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
