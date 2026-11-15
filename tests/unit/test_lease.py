@@ -10,7 +10,7 @@ import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import NotSupportedError, StorageError
-from lumendb.replication import Lease, LeaseKeeper, Replica, WALServer
+from lumendb.replication import Lease, LeaseFence, LeaseKeeper, Replica, WALServer
 from lumendb.replication.quorum import QuorumNode
 
 
@@ -150,6 +150,25 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
         keeper.stop()
 
 
+def test_lease_rejects_stale_term(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=30)
+    lease.acquire(term=1)
+    lease.assert_writable(term=1)
+    with pytest.raises(NotSupportedError, match="任期已过期"):
+        lease.assert_writable(term=2)
+
+
+def test_lease_fence_tracks_observed_term(tmp_path):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=30)
+    lease.acquire(term=1)
+    observed = [1]
+    fence = LeaseFence(lease, lambda: observed[0])
+    fence.assert_writable()
+    observed[0] = 2
+    with pytest.raises(NotSupportedError, match="任期已过期"):
+        fence.assert_writable()
+
+
 def test_lease_keeper_uses_renew_callback(tmp_path):
     lease = Lease(tmp_path / "lease.json", "n0", ttl=0.4)
     lease.acquire(term=1)
@@ -218,6 +237,23 @@ def test_promote_with_quorum_starts_lease_keeper(tmp_path):
         time.sleep(0.15)
         renewed = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
         assert renewed > first
+    finally:
+        replica.close()
+        primary.close()
+
+
+def test_promoted_primary_rejects_writes_after_higher_term(tmp_path):
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    replica = Replica.bootstrap(primary, tmp_path / "replica")
+    lease_path = tmp_path / "lease.json"
+    quorum = QuorumNode("n0", state_path=tmp_path / "vote.json")
+    try:
+        replica.promote_with_quorum(quorum, lease_path=lease_path, lease_ttl=30)
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        quorum.state.term += 1
+        with pytest.raises(NotSupportedError, match="任期已过期"):
+            replica.execute_one("INSERT INTO t VALUES (2)")
     finally:
         replica.close()
         primary.close()

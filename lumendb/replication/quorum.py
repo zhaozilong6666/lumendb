@@ -289,11 +289,16 @@ class QuorumNode:
             }
 
     def heartbeat_round(self, last_lsn: int) -> tuple[int, list[str]]:
-        """向 peers 发送当前任期心跳，返回 (ack 数, 错误列表)。"""
+        """向 peers 发送当前任期心跳，返回 (ack 数, 错误列表)。
+
+        如果 peer 返回更高任期，本节点立即推进任期并清空投票；这使旧主库
+        在租约到期前就能从下一次写围栏检查中发现自己已经过期。
+        """
         with self._lock:
             term = self.state.term
             acks = {self.node_id}
             errors: list[str] = []
+        highest_term = term
         for peer_id, address in self.peers.items():
             if peer_id == self.node_id:
                 continue
@@ -310,8 +315,17 @@ class QuorumNode:
             except (OSError, ValueError, StorageError) as exc:
                 errors.append(f"{peer_id}: {exc}")
                 continue
-            if response.get("ok") and int(response.get("term", 0)) <= term:
+            response_term = max(0, int(response.get("term", 0)))
+            if response_term > highest_term:
+                highest_term = response_term
+            if response.get("ok") and response_term <= term:
                 acks.add(peer_id)
+        if highest_term > term:
+            with self._lock:
+                self.state.term = highest_term
+                self.state.voted_for = None
+                self.state.save()
+            errors.append(f"observed higher term {highest_term}")
         return len(acks), errors
 
     def renew_lease(

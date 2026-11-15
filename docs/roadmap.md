@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1058 passed。
+- 全量测试：1062 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -172,9 +172,10 @@ RPC，`renew_lease()` 只有拿到多数派确认才续租；`LeaseKeeper(renew=
 `LeaseKeeper` 在后台按 TTL 比例续租；进程崩溃留下的锁文件按失败关闭处理。
 `Replica.promote_with_quorum(..., lease_keeper_interval=...)` 可在提升后
 自动启动 keeper，`Replica.close()` 会先停止续租再关闭数据库句柄。
-提升时还会把 `lease.assert_writable` 装到新主库的 `write_fence`，
-租约被释放或过期后写语句立即失败；`lease_loss_callback` 可接收 keeper
-续租失败通知。
+提升时还会把 `LeaseFence` 装到新主库的 `write_fence`，租约被释放、过期，
+或本节点观察到更高任期后写语句立即失败；`lease_loss_callback` 可接收
+keeper 续租失败通知。`heartbeat_round()` 收到更高任期响应会推进本地任期
+并清空投票，为旧主库自动停写提供任期依据。
 
 **尚未完成，不能把第 4 层宣布为整体完成**：
 
