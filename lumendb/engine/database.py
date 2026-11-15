@@ -133,7 +133,7 @@ class Database:
     ) -> None:
         """安装/替换同步复制的提交屏障（提升之后由 ``Replica`` 安装）。"""
         self._commit_barrier = barrier
-        self.txns._commit_barrier = barrier
+        self.txns.set_commit_barrier(barrier)
 
     def assert_writable(self) -> None:
         """写围栏的**唯一入口**。

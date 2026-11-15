@@ -210,6 +210,12 @@ class TransactionManager:
         # 会把同批其它提交一起卡住。
         self._await_majority(txn)
 
+    def set_commit_barrier(
+        self, barrier: Optional[Callable[[int], None]]
+    ) -> None:
+        """替换提交屏障（None 表示关闭同步复制）。"""
+        self._commit_barrier = barrier
+
     def _await_majority(self, txn: Transaction) -> None:
         barrier = self._commit_barrier
         if barrier is None or not txn.wrote:
