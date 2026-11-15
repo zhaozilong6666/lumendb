@@ -63,11 +63,17 @@ class VoteState:
         #: 本节点**听到过**的最高 LSN（心跳/投票里学到的集群进度）。
         #: 用它拒绝落后的候选，不代表本节点真的持有这些数据。
         self.last_lsn = 0
+        #: ``last_lsn`` 处日志条目的任期（Raft 投票比较的第二维）。
+        #: 只有 LSN 不够：同 LSN 但任期更旧的候选不能拿到票，否则旧 leader
+        #: 的尾段可以覆盖新任期已经协商过的日志。
+        self.last_term = 0
         #: 本节点**真正复制到**的 LSN。心跳把它报给 leader，用来算多数派水位。
         #: 与 ``last_lsn`` 分开是必须的：一个只投票不带数据的 witness 节点
         #: 也能听到集群进度，如果拿它当 match_lsn，leader 会误以为多数派
         #: 已经持有该 LSN，从而允许提升一个落后的副本。
         self.match_lsn = 0
+        #: ``match_lsn`` 处日志条目的任期。
+        self.match_term = 0
         #: 多数派确认过的提交水位（本节点目前知道的上界）。
         self.commit_lsn = 0
         self._lock = threading.RLock()
@@ -89,7 +95,9 @@ class VoteState:
         voted_for = raw.get("voted_for")
         self.voted_for = str(voted_for) if voted_for is not None else None
         self.last_lsn = max(0, int(raw.get("last_lsn", 0)))
+        self.last_term = max(0, int(raw.get("last_term", 0)))
         self.match_lsn = max(0, int(raw.get("match_lsn", 0)))
+        self.match_term = max(0, int(raw.get("match_term", 0)))
         self.commit_lsn = max(0, int(raw.get("commit_lsn", 0)))
 
     def save(self) -> None:
@@ -101,7 +109,9 @@ class VoteState:
                 "term": int(self.term),
                 "voted_for": self.voted_for,
                 "last_lsn": int(self.last_lsn),
+                "last_term": int(self.last_term),
                 "match_lsn": int(self.match_lsn),
+                "match_term": int(self.match_term),
                 "commit_lsn": int(self.commit_lsn),
             }
             tmp = self.path.with_name(self.path.name + ".tmp")
@@ -114,14 +124,19 @@ class VoteState:
             os.replace(tmp, self.path)
 
     def observe_lsn(self, lsn: int) -> None:
-        """记录"听到过"的最高 LSN（投票安全用，不代表持有数据）。"""
+        """记录"听到过"的最高 LSN（投票安全用，不代表持有数据）。
+
+        注意这里**不能**顺手把 leader 的任期写成 ``last_term``：心跳只说明
+        leader 当前任期，不说明该 LSN 处日志条目的任期。把 leader term 当成
+        last_term 会让一个日志相同的节点拒绝合法候选。
+        """
         with self._lock:
             value = max(0, int(lsn))
             if value > self.last_lsn:
                 self.last_lsn = value
                 self.save()
 
-    def observe_applied(self, lsn: int) -> None:
+    def observe_applied(self, lsn: int, term: int | None = None) -> None:
         """记录本节点***真正复制到***的 LSN；心跳会把它报给 leader。
 
         真正 apply 到某个 LSN，意味着本节点既持有它、也"听到过"它；因此
@@ -134,9 +149,13 @@ class VoteState:
             changed = False
             if value > self.match_lsn:
                 self.match_lsn = value
+                if term is not None:
+                    self.match_term = max(0, int(term))
                 changed = True
             if value > self.last_lsn:
                 self.last_lsn = value
+                if term is not None:
+                    self.last_term = max(0, int(term))
                 changed = True
             if changed:
                 self.save()
@@ -161,6 +180,7 @@ class QuorumClient:
         candidate_id: str,
         last_lsn: int,
         *,
+        last_term: int = 0,
         timeout: float = 2.0,
         token: str | None = None,
         pre_vote: bool = False,
@@ -170,6 +190,7 @@ class QuorumClient:
             "term": int(term),
             "candidate_id": candidate_id,
             "last_lsn": int(last_lsn),
+            "last_term": int(last_term),
         }
         if pre_vote:
             payload["pre_vote"] = True
@@ -344,10 +365,10 @@ class QuorumNode:
         with self._lock:
             self.state.observe_lsn(lsn)
 
-    def observe_applied(self, lsn: int) -> None:
+    def observe_applied(self, lsn: int, term: int | None = None) -> None:
         """记录本节点**真正复制到**的 LSN；心跳响应会带上它，用于算水位。"""
         with self._lock:
-            self.state.observe_applied(lsn)
+            self.state.observe_applied(lsn, term=term)
 
     def observe_commit(self, lsn: int) -> None:
         """记录已知的多数派提交水位（由心跳轮次或上层运维工具推进）。"""
@@ -380,6 +401,7 @@ class QuorumNode:
         term: int,
         candidate_id: str,
         last_lsn: int,
+        last_term: int = 0,
         pre_vote: bool = False,
     ) -> dict[str, Any]:
         """处理投票/预投票。
@@ -392,12 +414,22 @@ class QuorumNode:
         candidate = _validate_node_id(candidate_id)
         requested = max(0, int(term))
         candidate_lsn = max(0, int(last_lsn))
+        candidate_term = max(0, int(last_term))
+
+        def log_is_newer_or_equal() -> bool:
+            # Raft 的投票安全性比较的是 (last_term, last_lsn)，不是单独的 LSN。
+            # 同 LSN 下任期更旧的候选必须被拒绝；否则旧 leader 已经写过、
+            # 新任期尚未协商的尾段可能被它重新当选后覆盖。
+            if candidate_term != self.state.last_term:
+                return candidate_term > self.state.last_term
+            return candidate_lsn >= self.state.last_lsn
+
         if pre_vote:
             with self._lock:
                 would_grant = (
                     requested >= self.state.term
                     and self.state.voted_for in (None, candidate)
-                    and candidate_lsn >= self.state.last_lsn
+                    and log_is_newer_or_equal()
                 )
                 return {
                     "type": "vote_response",
@@ -422,7 +454,7 @@ class QuorumNode:
                     "term": self.state.term,
                     "granted": False,
                 }
-            if candidate_lsn < self.state.last_lsn:
+            if not log_is_newer_or_equal():
                 return {
                     "type": "vote_response",
                     "term": self.state.term,
@@ -445,7 +477,9 @@ class QuorumNode:
                 "term": self.state.term,
                 "voted_for": self.state.voted_for,
                 "last_lsn": self.state.last_lsn,
+                "last_term": self.state.last_term,
                 "match_lsn": self.state.match_lsn,
+                "match_term": self.state.match_term,
                 "commit_lsn": self.state.commit_lsn,
                 "last_heartbeat_at": self._last_heartbeat_at,
                 "last_heartbeat_from": self._last_heartbeat_from,
@@ -488,6 +522,7 @@ class QuorumNode:
                 "term": self.state.term,
                 "ok": True,
                 "match_lsn": self.state.match_lsn,
+                "match_term": self.state.match_term,
                 "commit_lsn": self.state.commit_lsn,
             }
 
@@ -614,6 +649,7 @@ class QuorumNode:
         """预投票：只探询意向，不改任期/投票。多数派不通过就抛错。"""
         with self._lock:
             term = self.state.term + 1
+            candidate_term = self.state.last_term
             votes = {self.node_id}
             total_nodes = len(self.peers) + (
                 0 if self.node_id in self.peers else 1
@@ -633,6 +669,7 @@ class QuorumNode:
                     term,
                     self.node_id,
                     candidate_lsn,
+                    last_term=candidate_term,
                     timeout=self.timeout,
                     token=self.token,
                     pre_vote=True,
@@ -708,6 +745,7 @@ class QuorumNode:
             # 先问一轮"会不会投我"，拿不到多数就**不推进任期**直接返回。
             self._pre_vote(candidate_lsn)
         with self._lock:
+            candidate_term = self.state.last_term
             term = self.state.term + 1
             self.state.term = term
             self.state.voted_for = self.node_id
@@ -729,6 +767,7 @@ class QuorumNode:
                     term,
                     self.node_id,
                     candidate_lsn,
+                    last_term=candidate_term,
                     timeout=self.timeout,
                     token=self.token,
                 )
@@ -758,7 +797,7 @@ class QuorumNode:
             )
 
         # 候选现在确定持有到 candidate_lsn 的数据，记录下来供后续水位计算。
-        self.observe_applied(candidate_lsn)
+        self.observe_applied(candidate_lsn, term=candidate_term)
         if lease_path is not None:
             Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(term)
         if fence_path is not None:
@@ -828,6 +867,7 @@ class QuorumNode:
                     int(request.get("term", 0)),
                     str(request.get("candidate_id", "")),
                     int(request.get("last_lsn", 0)),
+                    int(request.get("last_term", 0)),
                     bool(request.get("pre_vote", False)),
                 )
             elif request_type == "status":

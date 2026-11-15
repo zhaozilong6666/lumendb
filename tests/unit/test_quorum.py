@@ -106,6 +106,42 @@ def test_higher_term_rejects_stale_candidate(tmp_path):
         _stop(nodes)
 
 
+def test_vote_compares_last_term_before_lsn(tmp_path):
+    """同 LSN 但任期更旧的候选不能拿到票（Raft 的 (last_term,last_lsn) 规则）。"""
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].observe_applied(100, term=5)
+        assert nodes[1].state.last_term == 5
+        # 心跳只带 leader 当前任期，不能把它污染成日志条目的任期
+        nodes[1].heartbeat(5, "n0", 100)
+        assert nodes[1].state.last_term == 5
+        # 120 的 LSN 更大，但最后日志任期 4 比本地 5 旧 → 拒绝
+        stale = nodes[1].request_vote(6, "n2", 120, last_term=4)
+        assert stale["granted"] is False
+        # 同任期下 LSN 更大 → 可以授予
+        newer = nodes[1].request_vote(6, "n2", 120, last_term=5)
+        assert newer["granted"] is True
+        # 预投票同样执行 prefix/term 检查，且不改任期
+        term_before = nodes[1].state.term
+        pre = nodes[1].request_vote(7, "n3", 120, last_term=4, pre_vote=True)
+        assert pre["granted"] is False
+        assert nodes[1].state.term == term_before
+    finally:
+        _stop(nodes)
+
+
+def test_campaign_pre_vote_rejects_older_last_term(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[0].observe_applied(100, term=6)
+        nodes[2].observe_applied(100, term=6)
+        nodes[1].observe_applied(100, term=5)
+        with pytest.raises(NotSupportedError, match="预投票未通过多数派"):
+            nodes[1].campaign(100)
+    finally:
+        _stop(nodes)
+
+
 def test_heartbeat_rpc_updates_peer_and_rejects_stale_term(tmp_path):
     nodes = _cluster(tmp_path)
     try:

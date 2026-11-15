@@ -290,7 +290,8 @@ class Replica:
         node = getattr(self, "_quorum_node", None)
         if node is not None:
             try:
-                node.observe_applied(self._applied_lsn)
+                term = getattr(getattr(node, "state", None), "term", 0)
+                node.observe_applied(self._applied_lsn, term=term)
             except (AttributeError, OSError):
                 pass
 
@@ -329,7 +330,8 @@ class Replica:
         if not hasattr(quorum, "observe_applied"):
             return
         self._quorum_node = quorum
-        quorum.observe_applied(self._applied_lsn)
+        term = getattr(getattr(quorum, "state", None), "term", 0)
+        quorum.observe_applied(self._applied_lsn, term=term)
 
     # ------------------------------------------------------------------
 
