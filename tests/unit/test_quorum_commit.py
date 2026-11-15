@@ -196,3 +196,37 @@ class TestReplicaReportsAppliedLsn:
                 loop.stop()
         finally:
             _stop(nodes)
+
+
+class TestStatusRpc:
+    def test_status_exposes_the_watermark_over_the_wire(self, tmp_path):
+        """运维排查"水位为什么不前进"必须能从网络读到这些字段。"""
+        from lumendb.replication.quorum import QuorumClient
+
+        node = QuorumNode("n0", state_path=tmp_path / "n0.vote.json").start()
+        try:
+            node.observe_applied(42)
+            node.observe_commit(30)
+            node.observe_lsn(99)
+            status = QuorumClient.status(node.host, node.port)
+            assert status["node_id"] == "n0"
+            assert status["match_lsn"] == 42
+            assert status["commit_lsn"] == 30
+            assert status["last_lsn"] == 99
+            assert status["type"] == "status_response"
+        finally:
+            node.stop()
+
+    def test_status_rejects_a_bad_token(self, tmp_path):
+        from lumendb.errors import StorageError
+        from lumendb.replication.quorum import QuorumClient
+
+        node = QuorumNode(
+            "n0", state_path=tmp_path / "n0.vote.json", token="s3cret"
+        ).start()
+        try:
+            with pytest.raises(StorageError, match="认证"):
+                QuorumClient.status(node.host, node.port, token="wrong")
+            assert QuorumClient.status(node.host, node.port, token="s3cret")["node_id"] == "n0"
+        finally:
+            node.stop()

@@ -181,6 +181,41 @@ class QuorumClient:
 
 
     @staticmethod
+    def status(
+        host: str,
+        port: int,
+        *,
+        timeout: float = 2.0,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """读取仲裁节点状态：任期、投票、`match_lsn` / `commit_lsn`、最近心跳。
+
+        只读操作，不会推进任期或投票。运维排查"为什么提升被拒""水位为什么不
+        前进"时，先看这个接口，再看主库日志。
+        """
+        payload: dict[str, Any] = {"type": "status"}
+        if token is not None:
+            payload["token"] = token
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.settimeout(timeout)
+            sock.sendall(_encode_line(payload))
+            line = sock.makefile("rb").readline()
+            if not line:
+                raise StorageError("仲裁节点没有返回状态响应")
+            data = _decode_line(line)
+            if data.get("type") == "error":
+                raise StorageError(str(data.get("message", "状态查询失败")))
+            if data.get("type") != "status_response":
+                raise StorageError("仲裁节点返回了未知状态响应")
+            return data
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    @staticmethod
     def heartbeat(
         host: str,
         port: int,
@@ -217,6 +252,18 @@ class QuorumClient:
                 sock.close()
             except OSError:
                 pass
+
+
+def _request_status(
+    host: str,
+    port: int,
+    timeout: float,
+    token: str | None,
+) -> dict[str, Any]:
+    """读取一个仲裁节点的状态快照（只读，不改任期）。"""
+    return QuorumClient.status(
+        host, port, timeout=timeout, token=token
+    )
 
 
 def _send_heartbeat(
@@ -344,6 +391,24 @@ class QuorumNode:
                 "type": "vote_response",
                 "term": self.state.term,
                 "granted": True,
+            }
+
+    def status(self) -> dict[str, Any]:
+        """返回本节点状态快照（供 `QuorumClient.status` 使用）。"""
+        with self._lock:
+            return {
+                "type": "status_response",
+                "node_id": self.node_id,
+                "term": self.state.term,
+                "voted_for": self.state.voted_for,
+                "last_lsn": self.state.last_lsn,
+                "match_lsn": self.state.match_lsn,
+                "commit_lsn": self.state.commit_lsn,
+                "last_heartbeat_at": self._last_heartbeat_at,
+                "last_heartbeat_from": self._last_heartbeat_from,
+                "peers": sorted(
+                    pid for pid in self.peers if pid != self.node_id
+                ),
             }
 
     def heartbeat(
@@ -638,6 +703,8 @@ class QuorumNode:
                     str(request.get("candidate_id", "")),
                     int(request.get("last_lsn", 0)),
                 )
+            elif request_type == "status":
+                response = self.status()
             elif request_type == "heartbeat":
                 response = self.heartbeat(
                     int(request.get("term", 0)),
