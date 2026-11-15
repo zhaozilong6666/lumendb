@@ -324,7 +324,7 @@ WAL 流，但证书分发、轮换、双向认证仍属于部署层。
 
 **手动提升 fencing**：`PromotionFence` 是一个共享文件 marker，副本提升时
 原子写入 `promoted_node` 和 `lsn`；旧主库通过 `Database(write_fence=...)`
-在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它不做自动选举，
+在每笔写语句前检查 marker，发现别人已提升就拒绝写入。它单独使用时不做自动选举，
 也没有租约/超时仲裁，只覆盖“两个节点能看到同一个文件”的部署。
 
 **多数派投票 MVP**：`QuorumNode` 在持久化 `term/voted_for/last_lsn` 的
