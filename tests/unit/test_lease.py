@@ -149,7 +149,6 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
     finally:
         keeper.stop()
 
-
 class _NoopQuorum:
     node_id = "n0"
 
