@@ -61,7 +61,8 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
           lumendb.data / lumendb.wal
 ```
 
-详细设计见 [`docs/architecture.md`](docs/architecture.md)、[`docs/storage-format.md`](docs/storage-format.md)。
+详细设计见 [`docs/architecture.md`](docs/architecture.md)、[`docs/storage-format.md`](docs/storage-format.md)；
+部署与排障（租约/fence/水位/故障剧本）见 [`docs/operations.md`](docs/operations.md)。
 
 ## 快速开始
 
