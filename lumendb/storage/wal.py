@@ -197,14 +197,18 @@ class WAL:
         self._lock = threading.RLock()
         if self._size:
             valid_end = 0
+            last_record = None
             try:
                 for record in self.iter_records(1):
                     self._last_lsn = record.lsn
-                    # LSN 是字节偏移 + 1；旧记录 has_crc=False 时 encode() 仍是原长度。
-                    valid_end = record.lsn - 1 + len(record.encode())
+                    last_record = record
             except BaseException:
                 self._fh.close()
                 raise
+            if last_record is not None:
+                # LSN 是字节偏移 + 1；旧记录 has_crc=False 时 encode() 仍是原长度。
+                # 只需要重编码最后一条来算有效末尾，避免启动时复制整段历史 payload。
+                valid_end = last_record.lsn - 1 + len(last_record.encode())
             if valid_end < self._size:
                 # 崩溃可能留下半条记录。如果只把 _next_lsn 指到“文件末尾+1”，
                 # 新记录会写在残尾之后，下一次恢复会在残尾处停下，静默丢掉
