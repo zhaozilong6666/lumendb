@@ -43,6 +43,20 @@ def _stop(nodes):
         node.stop()
 
 
+def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    """轮询等待条件成立。
+
+    心跳循环跑在后台线程里，固定 ``sleep(0.2)`` 在负载高的机器上会假失败
+    （CI 上偶发过一次）。这里改成"最多等 timeout，条件成立就返回"。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_campaign_wins_majority_and_writes_fence(tmp_path):
     nodes = _cluster(tmp_path)
     try:
@@ -312,10 +326,10 @@ def test_heartbeat_loop_reports_higher_term(tmp_path):
             on_higher_term=seen.append,
         ).start()
         try:
-            time.sleep(0.2)
-            assert seen
+            assert _wait_for(lambda: seen and nodes[0].state.term == 7), (
+                f"心跳循环没有观察到更高任期：term={nodes[0].state.term} seen={seen}"
+            )
             assert seen[-1] >= 7
-            assert nodes[0].state.term == 7
             assert loop.last_acks >= 1
         finally:
             loop.stop()
@@ -339,9 +353,13 @@ def test_heartbeat_loop_survives_callback_error(tmp_path):
             on_higher_term=bad_callback,
         ).start()
         try:
-            time.sleep(0.2)
-            assert nodes[0].state.term == 7
-            assert loop.last_callback_error == "boom"
+            assert _wait_for(
+                lambda: nodes[0].state.term == 7
+                and loop.last_callback_error == "boom"
+            ), (
+                "回调异常没有被记录："
+                f"term={nodes[0].state.term} err={loop.last_callback_error!r}"
+            )
             assert loop.last_acks >= 1
         finally:
             loop.stop()

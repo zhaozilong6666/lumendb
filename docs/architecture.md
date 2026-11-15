@@ -434,6 +434,26 @@ read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` �
 `add_step_down_listener` 把 monitor 的状态扣回 `needs_attention`
 （`poll()` 也随即返回 `needs_attention`），不会继续对外报 `promoted`。
 
+**多数派提交水位（轻量版）**：只有 WAL 流 + 槽位 ACK 时，提升一个落后副本会
+静默丢掉主库已提交、但还没发出去的尾段。这里用一层最小协议补上这个判断：
+
+- 每个节点把**真正复制到**的 LSN 记在 `VoteState.match_lsn`，心跳响应会带上它；
+- leader 每轮心跳收集"自己 + 各 peer 的 `match_lsn`"，取第 `majority` 大的值作为
+  `quorum_commit_lsn`（三节点即"第二大的那个"），并持久化（只前进不后退）；
+- `campaign()` 在投票前先比一次：`candidate_lsn < quorum_commit_lsn` 直接拒绝提升，
+  提示先追平 WAL 或做一次增量基准备份。
+
+`match_lsn` 必须与 `last_lsn` 分开，这是这条协议唯一的坑：`last_lsn` 是"听到过
+的最高 LSN"，一个只投票不带数据的 witness 节点收到 leader 心跳后也会把它抬到
+leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数派已持有"，闸门形同虚设。
+`heartbeat()` 里的 `observe_lsn(leader_lsn)` 只用于投票安全（拒绝落后候选），
+不参与水位计算。
+
+水位只解决"**提升谁**"的问题，不改变"**什么时候算提交**"：新主的写入仍然只要求
+本地 WAL fsync，不要求多数派确认（同步复制）。也就是说 `quorum_commit_lsn` 是
+"集群已知的安全上界"，而不是"每笔写的提交条件"。真正的多数派提交需要
+`append_entries` 风格的日志协商 + commit index，属于下一阶段。
+
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
 
@@ -449,7 +469,8 @@ read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` �
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
   保护；备份期间主库写语句被串行化，读查询不受影响；
 - 自动提升已有连续失败阈值、多数派投票、TTL 写租约、heartbeat RPC 和多数派
-  续租；但仍没有日志复制协商，网络分区时仍可能双写。fencing 依赖共享 marker
+  续租，并有轻量版提交水位（`quorum_commit_lsn`）挡住"提升落后副本"；但仍没有
+  日志复制协商与同步复制，网络分区时仍可能双写。fencing 依赖共享 marker
   和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文

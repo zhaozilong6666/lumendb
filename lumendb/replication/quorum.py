@@ -60,7 +60,16 @@ class VoteState:
         self.path = Path(path) if path is not None else None
         self.term = 0
         self.voted_for: str | None = None
+        #: 本节点**听到过**的最高 LSN（心跳/投票里学到的集群进度）。
+        #: 用它拒绝落后的候选，不代表本节点真的持有这些数据。
         self.last_lsn = 0
+        #: 本节点**真正复制到**的 LSN。心跳把它报给 leader，用来算多数派水位。
+        #: 与 ``last_lsn`` 分开是必须的：一个只投票不带数据的 witness 节点
+        #: 也能听到集群进度，如果拿它当 match_lsn，leader 会误以为多数派
+        #: 已经持有该 LSN，从而允许提升一个落后的副本。
+        self.match_lsn = 0
+        #: 多数派确认过的提交水位（本节点目前知道的上界）。
+        self.commit_lsn = 0
         self._lock = threading.RLock()
         self._load()
 
@@ -80,6 +89,8 @@ class VoteState:
         voted_for = raw.get("voted_for")
         self.voted_for = str(voted_for) if voted_for is not None else None
         self.last_lsn = max(0, int(raw.get("last_lsn", 0)))
+        self.match_lsn = max(0, int(raw.get("match_lsn", 0)))
+        self.commit_lsn = max(0, int(raw.get("commit_lsn", 0)))
 
     def save(self) -> None:
         with self._lock:
@@ -90,6 +101,8 @@ class VoteState:
                 "term": int(self.term),
                 "voted_for": self.voted_for,
                 "last_lsn": int(self.last_lsn),
+                "match_lsn": int(self.match_lsn),
+                "commit_lsn": int(self.commit_lsn),
             }
             tmp = self.path.with_name(self.path.name + ".tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -101,10 +114,27 @@ class VoteState:
             os.replace(tmp, self.path)
 
     def observe_lsn(self, lsn: int) -> None:
+        """记录"听到过"的最高 LSN（投票安全用，不代表持有数据）。"""
         with self._lock:
             value = max(0, int(lsn))
             if value > self.last_lsn:
                 self.last_lsn = value
+                self.save()
+
+    def observe_applied(self, lsn: int) -> None:
+        """记录本节点***真正复制到***的 LSN；心跳会把它报给 leader。"""
+        with self._lock:
+            value = max(0, int(lsn))
+            if value > self.match_lsn:
+                self.match_lsn = value
+                self.save()
+
+    def observe_commit(self, lsn: int) -> None:
+        """推进多数派提交水位（只前进，不后退）。"""
+        with self._lock:
+            value = max(0, int(lsn))
+            if value > self.commit_lsn:
+                self.commit_lsn = value
                 self.save()
 
 
@@ -248,6 +278,37 @@ class QuorumNode:
         with self._lock:
             self.state.observe_lsn(lsn)
 
+    def observe_applied(self, lsn: int) -> None:
+        """记录本节点**真正复制到**的 LSN；心跳响应会带上它，用于算水位。"""
+        with self._lock:
+            self.state.observe_applied(lsn)
+
+    def observe_commit(self, lsn: int) -> None:
+        """记录已知的多数派提交水位（由心跳轮次或上层运维工具推进）。"""
+        with self._lock:
+            self.state.observe_commit(lsn)
+
+    @property
+    def quorum_commit_lsn(self) -> int:
+        """本节点目前知道的"多数派已持有"的 LSN 上界。"""
+        return self.state.commit_lsn
+
+    def _majority(self) -> int:
+        total = len(self.peers) + (0 if self.node_id in self.peers else 1)
+        return total // 2 + 1
+
+    def _advance_commit_lsn(self, self_lsn: int, matches: dict[str, int]) -> int:
+        """用"自己 + 本轮报上来的 match_lsn"算多数派水位，并推进持久化。"""
+        lsns = [max(0, int(self_lsn))] + [max(0, int(v)) for v in matches.values()]
+        majority = self._majority()
+        if len(lsns) < majority:
+            return self.quorum_commit_lsn
+        lsns.sort(reverse=True)
+        watermark = lsns[majority - 1]
+        with self._lock:
+            self.state.observe_commit(watermark)
+            return self.state.commit_lsn
+
     def request_vote(
         self, term: int, candidate_id: str, last_lsn: int
     ) -> dict[str, Any]:
@@ -302,6 +363,8 @@ class QuorumNode:
                 self.state.term = requested
                 self.state.voted_for = None
                 self.state.save()
+            # 注意：``last_lsn`` 只进 "听到过" 水位（用于拒绝落后候选），
+            # 不进 ``match_lsn``——leader 的心跳不代表本节点持有这些数据。
             self.state.observe_lsn(int(last_lsn))
             self._last_heartbeat_at = time.time()
             self._last_heartbeat_from = leader
@@ -309,6 +372,7 @@ class QuorumNode:
                 "type": "heartbeat_response",
                 "term": self.state.term,
                 "ok": True,
+                "match_lsn": self.state.match_lsn,
             }
 
     def heartbeat_round(
@@ -338,8 +402,12 @@ class QuorumNode:
                 for peer_id, address in self.peers.items()
                 if peer_id != self.node_id
             ]
+        # 我自己确实持有到 last_lsn（这是本地 WAL 的位置），登记成 match_lsn，
+        # 这样即使之后角色变化，本节点报出的进度也是真实的。
+        self.observe_applied(last_lsn)
         acks = {self.node_id}
         outcomes: dict[str, tuple[dict | None, BaseException | None]] = {}
+        matches: dict[str, int] = {}
         highest_term = term
         if peers:
             with ThreadPoolExecutor(
@@ -386,12 +454,16 @@ class QuorumNode:
                 highest_term = response_term
             if response.get("ok") and response_term <= term:
                 acks.add(peer_id)
+                matches[peer_id] = int(response.get("match_lsn", 0))
         if highest_term > term:
             with self._lock:
                 self.state.term = highest_term
                 self.state.voted_for = None
                 self.state.save()
             errors.append(f"observed higher term {highest_term}")
+        # 多数派水位：自己和 peers 的 match_lsn 取第 majority 大的值。
+        # 只有拿到多数派响应时才推进；不足多数派时保持原水位不动。
+        self._advance_commit_lsn(last_lsn, matches)
         return len(acks), errors
 
     def renew_lease(
@@ -432,6 +504,18 @@ class QuorumNode:
         持有时不会抢占，候选节点需要等 TTL 过期后再重试。
         """
         candidate_lsn = max(0, int(last_lsn))
+        # [P2] 提升闸门：候选必须至少追平"多数派已提交水位"。没有这道闸门时，
+        # 提升一个落后副本会静默丢掉主库已经提交、但还没发给它的尾段。
+        known_commit = self.quorum_commit_lsn
+        if candidate_lsn < known_commit:
+            raise NotSupportedError(
+                "候选落后于多数派已提交水位，拒绝提升",
+                detail=(
+                    f"candidate_lsn={candidate_lsn} "
+                    f"quorum_commit_lsn={known_commit}"
+                ),
+                hint="先让副本追平 WAL（或做一次增量基准备份）再发起提升",
+            )
         with self._lock:
             term = self.state.term + 1
             self.state.term = term
@@ -482,6 +566,8 @@ class QuorumNode:
                 detail=detail,
             )
 
+        # 候选现在确定持有到 candidate_lsn 的数据，记录下来供后续水位计算。
+        self.observe_applied(candidate_lsn)
         if lease_path is not None:
             Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(term)
         if fence_path is not None:
@@ -595,6 +681,8 @@ class HeartbeatLoop:
         self.last_errors: list[str] = []
         self.last_callback_error: str | None = None
         self.last_observed_term = node.state.term
+        #: 最近一轮心跳之后本节点知道的多数派提交水位。
+        self.last_quorum_commit_lsn = node.quorum_commit_lsn
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -629,6 +717,7 @@ class HeartbeatLoop:
                 acks, errors = 0, [str(exc)]
             self.last_acks = acks
             self.last_errors = errors
+            self.last_quorum_commit_lsn = self.node.quorum_commit_lsn
             term_after = self.node.state.term
             self.last_observed_term = term_after
             if term_after > term_before and self.on_higher_term is not None:

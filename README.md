@@ -220,7 +220,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1101 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1112 个自动化测试**（`python -m pytest tests -q`，约 20–90 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -283,9 +283,11 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 提升后的后台生命周期：`promote_with_quorum` 自动起续租线程（默认 `ttl/3`）并可启用心跳循环，`close()`/`step_down()` 先停心跳再停 keeper
 - [x] 跟随器状态机：`MonitorState.following/promoting/promoted/read_only/needs_attention`，租约丢失降级后不再报 `promoted`
 - [x] 心跳并发扇出：`heartbeat_round` 用线程池发送，总耗时约等于单个 timeout 而不是 `N × timeout`
+- [x] 多数派提交水位（轻量版）：副本上报 `match_lsn`，leader 维护 `quorum_commit_lsn`，`campaign()` 拒绝落后于水位的候选（`tests/unit/test_quorum_commit.py`）
 - [x] 自动提升租约：`ReplicationMonitor(quorum=..., lease_path=...)` 把投票、租约、心跳续租和写围栏串到自动提升路径
 - [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写，回调异常记录到 `last_callback_error` 且不会终止后台线程
 - [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
+- [ ] 同步复制（多数派持久化后才算提交）：需要 `append_entries` 风格的日志协商与 commit index
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。

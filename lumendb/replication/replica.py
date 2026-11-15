@@ -62,6 +62,8 @@ class Replica:
         self._lock = threading.RLock()
         self._lease_keeper: LeaseKeeper | None = None
         self._heartbeat: HeartbeatLoop | None = None
+        #: 本副本对应的仲裁节点；用来把复制进度（match_lsn）报给 leader。
+        self._quorum_node = None
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
         self._write_marker()
@@ -281,6 +283,21 @@ class Replica:
         tmp = self.path / "replica.lsn.tmp"
         tmp.write_text(str(self._applied_lsn), encoding="utf-8")
         os.replace(tmp, marker)
+        # 把"本副本真正复制到哪"告诉仲裁节点：leader 的心跳响应/水位计算
+        # 依赖这个值，而它和"听到过"的 last_lsn 不是一回事。
+        node = self._quorum_node
+        if node is not None:
+            try:
+                node.observe_applied(self._applied_lsn)
+            except (AttributeError, OSError):
+                pass
+
+    def attach_quorum(self, quorum) -> None:
+        """绑定仲裁节点：之后每次 apply 推进都会 `observe_applied`。"""
+        if not hasattr(quorum, "observe_applied"):
+            return
+        self._quorum_node = quorum
+        quorum.observe_applied(self._applied_lsn)
 
     # ------------------------------------------------------------------
 
@@ -462,6 +479,9 @@ class Replica:
         """
         candidate_node = node_id or quorum.node_id
         self._stop_background()
+        # 先把自己的复制进度登记到仲裁节点，再投票：水位计算和提升闸门都
+        # 需要知道"候选到底持有到哪"。
+        self.attach_quorum(quorum)
         quorum.campaign(
             self._applied_lsn,
             fence_path=fence_path,
