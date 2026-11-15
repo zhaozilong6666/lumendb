@@ -344,8 +344,9 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
 和大致同步的墙钟，不是完整的 Raft leader lease，时钟漂移会改变安全窗口。
 `Lease` 的 acquire/renew/release 用 `<lease>.lock` 串行化，`LeaseKeeper`
 在后台续租；`Replica.promote_with_quorum(..., lease_keeper_interval=...)`
-可在提升后自动启动 keeper，`Replica.close()` 停止它；崩溃留下的锁文件
-不会被自动清理，必须人工确认。
+可在提升后自动启动 keeper，`Replica.close()` 停止它；提升后的新主库
+用 `lease.assert_writable` 作为 `write_fence`，租约丢失即拒绝写。
+崩溃留下的锁文件不会被自动清理，必须人工确认。
 
 **自动提升 MVP**：`ReplicationMonitor.poll()` 先 `status`、再拉一批 WAL；
 连续 `max_failures` 次网络错误后调用 `Replica.promote(fence_path=...)`。

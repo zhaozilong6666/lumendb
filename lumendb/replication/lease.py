@@ -212,6 +212,7 @@ class LeaseKeeper:
         interval: float | None = None,
         *,
         renew=None,
+        on_failure=None,
     ) -> None:
         self.lease = lease
         self.interval = max(
@@ -219,10 +220,16 @@ class LeaseKeeper:
             float(interval) if interval is not None else lease.ttl / 3,
         )
         self._renew = renew if renew is not None else lease.renew
+        self._on_failure = on_failure
         self.last_error: str | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+
+    @property
+    def lost(self) -> bool:
+        """续租失败后为 True；表示当前节点不应再作为可写主库。"""
+        return self.last_error is not None
 
     def start(self) -> "LeaseKeeper":
         with self._lock:
@@ -251,11 +258,20 @@ class LeaseKeeper:
                 self._renew()
                 self.last_error = None
             except (NotSupportedError, StorageError) as exc:
-                self.last_error = str(exc)
+                self._notify_failure(str(exc))
                 return
             except BaseException as exc:  # noqa: BLE001 - keep keeper alive-ish
-                self.last_error = str(exc)
+                self._notify_failure(str(exc))
                 return
+
+    def _notify_failure(self, message: str) -> None:
+        self.last_error = message
+        if self._on_failure is None:
+            return
+        try:
+            self._on_failure(self)
+        except BaseException as exc:  # noqa: BLE001 - callback must not mask loss
+            self.last_error = f"{message}; on_failure: {exc}"
 
     def __enter__(self) -> "LeaseKeeper":
         return self.start()
