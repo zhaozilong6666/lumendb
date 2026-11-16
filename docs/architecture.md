@@ -342,7 +342,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 复制流的每个 WAL 记录额外携带 `has_crc` / `crc`：CRC32 覆盖逻辑帧头和
 payload（不覆盖帧尾自身的 CRC 字段），接收端在反序列化时校验；不带 `crc`
-的旧服务端仍可通信。基准备份的单个响应、流式分块和增量页也带 `crc`，
+的旧服务端仍可通信。更老的服务端连 `has_crc` 都不发送，接收端必须按
+`has_crc=False` 解码，否则本地重编码会多出 4 字节，破坏后续记录的 LSN
+连续性。基准备份的单个响应、流式分块和增量页也带 `crc`，
 客户端在写页文件前校验。`Replica.apply` 还会用上一帧的
 `lsn + len(record.encode())` 计算下一条记录应有的字节边界，发现批次跳过
 记录时抛 `StorageError`，不把 `replica.lsn` 静默推过缺口；基准备份和
