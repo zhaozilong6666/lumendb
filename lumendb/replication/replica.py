@@ -372,10 +372,10 @@ class Replica:
         if current > int(getattr(self, "_applied_lsn", 0)):
             self._applied_lsn = current
             wal = getattr(self.db, "wal", None)
+            next_lsn = int(getattr(self, "_next_lsn", current + 1))
             if wal is not None:
-                self._next_lsn = max(
-                    int(self._next_lsn), int(getattr(wal, "next_lsn", 0))
-                )
+                next_lsn = max(next_lsn, int(getattr(wal, "next_lsn", 0)))
+            self._next_lsn = next_lsn
             # 写路径的 WAL 进度不是复制 apply 的连续边界。
             self._expected_end_lsn = 0
             self._write_marker()
@@ -392,6 +392,68 @@ class Replica:
         if setter is not None:
             # append_entries 的条目直接走同一套物理重放，不另造一条执行路径。
             setter(self.apply)
+
+    def push_entries_to_peers(
+        self,
+        quorum,
+        *,
+        max_entries: int = 1000,
+    ) -> dict[str, int]:
+        """把本地 WAL 的下一批记录通过 append_entries 推给 peers。
+
+        这是 leader 侧的显式推送，不是自动心跳驱动：调用方先做一轮
+        ``heartbeat_round`` 填好每个 peer 的 ``last_matches``，再调用本方法。
+        只处理下一批；失败/前缀不匹配时返回 0 并留下 peer 的已知位置，交由
+        下一次调用或 WAL 流回填。没有分歧尾巴截断，也没有逐条任期。
+        """
+        db = getattr(self, "db", None)
+        if db is None or getattr(db, "_read_only", True):
+            raise TransactionError("只有可写主库才能推送 append_entries")
+        limit = max(1, min(1000, int(max_entries)))
+        node = self._quorum_node
+        if node is None or not hasattr(node, "last_matches"):
+            raise TransactionError("没有绑定仲裁节点，无法推送 append_entries")
+        from .quorum import QuorumClient
+        from .wal_stream import _record_to_json
+
+        pushed: dict[str, int] = {}
+        for peer_id, (host, port) in dict(getattr(node, "peers", {})).items():
+            if peer_id == node.node_id:
+                continue
+            if peer_id not in node.last_matches:
+                continue
+            prev_lsn = int(node.last_matches[peer_id])
+            prev_term = int(node.last_match_terms.get(peer_id, 0))
+            records = list(db.wal.iter_records(prev_lsn + 1))[:limit]
+            if not records:
+                continue
+            entries = [_record_to_json(record) for record in records]
+            response = QuorumClient.append_entries(
+                host,
+                port,
+                int(node.state.term),
+                node.node_id,
+                prev_lsn,
+                prev_term,
+                entries,
+                commit_lsn=int(node.quorum_commit_lsn),
+                timeout=node.timeout,
+                token=node.token,
+            )
+            if response.get("ok"):
+                node.last_matches[peer_id] = int(response.get("match_lsn", 0))
+                node.last_match_terms[peer_id] = int(
+                    response.get("match_term", 0)
+                )
+                pushed[peer_id] = len(records)
+            elif response.get("reason") == "prefix_mismatch":
+                # 只记录对方真实前缀，下一次从那里再试；不在这里截断本地
+                # 日志（避免把 leader 自己的已提交尾巴误删）。
+                node.last_matches[peer_id] = int(response.get("match_lsn", 0))
+                node.last_match_terms[peer_id] = int(
+                    response.get("match_term", 0)
+                )
+        return pushed
 
     # ------------------------------------------------------------------
 
