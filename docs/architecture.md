@@ -401,9 +401,9 @@ Raft 的 `(last_term, last_lsn)` 字典序拒绝落后候选（同 LSN 但最后
 一并记录日志任期；心跳只更新"听到过"的 `last_lsn`，**不会**把 leader 的当前
 任期写成日志任期，否则日志相同的节点会互相拒绝。`Replica.promote_with_quorum()`
 先拿票再切换读写。它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，
-以及 prefix-checked `append_entries` MVP，但没有分歧尾巴截断、逐条任期和
-自动心跳驱动，也不能单独处理“主库还活着但网络分区”的脑裂；提升后仍依赖
-共享 fence 挡住旧主库。
+以及 prefix-checked `append_entries` MVP；提升后的心跳循环会每轮推一批
+entries，但没有分歧尾巴截断、逐条任期和完整 commit index，也不能单独处理
+“主库还活着但网络分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写进共享文件。主库每次写语句前调用 `lease.assert_writable`，超过 TTL
@@ -491,10 +491,11 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 
 它仍然**不是完整的 Raft 日志协商**：现在有 prefix-checked `append_entries`
 MVP（`QuorumClient` / `QuorumNode`，`prev_lsn/prev_term` 前缀检查，entries 走
-现有 CRC 解码并交给绑定的 `Replica.apply`），并且 `Replica.push_entries_to_peers`
-可以在一次显式调用中把本地 WAL 的下一批记录推给 peers；它依赖调用方先跑
-`heartbeat_round` 填好 peer 前缀，只推一批，不是后台自动驱动。仍有分歧尾巴
-截断/回填、逐条日志的 per-entry term，也没有完整的 commit index 协商。长期失联的旧
+现有 CRC 解码并交给绑定的 `Replica.apply`）；`Replica.push_entries_to_peers`
+可以在一次显式调用中把本地 WAL 的下一批记录推给 peers，`promote_with_quorum`
+启动的 `HeartbeatLoop` 会把它作为 push callback 每轮推一批，且推送前先过
+`db.assert_writable()`。但仍有分歧尾巴截断/回填、逐条日志的 per-entry term，
+也没有完整的 commit index 协商。长期失联的旧
 leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 fence + 租约负责
 挡住这类写入）。当前的 `(last_term, last_lsn)` 投票只能防止“同 LSN 但更旧
 任期”的候选直接当选，`last_term` 来自 `observe_applied` 上报时携带的任期，
@@ -517,8 +518,9 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 - 自动提升已有连续失败阈值、多数派投票、`(last_term,last_lsn)` 投票比较、TTL
   写租约、heartbeat RPC 和多数派续租，并有轻量版提交水位（`quorum_commit_lsn`）
   挡住"提升落后副本"，可选开同步复制（多数派追上才回 COMMIT，超时给 `40003`
-  结果未知）；已有 prefix-checked `append_entries` MVP，但缺分歧尾巴截断、
-  逐条 per-entry term 和心跳自动驱动，网络分区时仍可能双写。fencing 依赖共享
+  结果未知）；已有 prefix-checked `append_entries` MVP，提升后的心跳循环可每轮
+  推一批 entries，但仍缺分歧尾巴截断、逐条 per-entry term 和完整 commit index，
+  网络分区时仍可能双写。fencing 依赖共享
   marker 和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文

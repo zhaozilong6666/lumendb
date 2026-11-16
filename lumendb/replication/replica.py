@@ -49,8 +49,9 @@ class Replica:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         marker = self.path / "replica.lsn"
+        marker_exists = marker.exists()
         next_lsn = applied_lsn + 1
-        if marker.exists():
+        if marker_exists:
             try:
                 parts = marker.read_text(encoding="utf-8").split()
                 applied_lsn = int(parts[0] or "0")
@@ -91,7 +92,8 @@ class Replica:
         self._commit_barrier: QuorumCommitBarrier | None = None
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
-        self._write_marker()
+        if not marker_exists:
+            self._write_marker()
 
     # ------------------------------------------------------------------
 
@@ -409,6 +411,9 @@ class Replica:
         db = getattr(self, "db", None)
         if db is None or getattr(db, "_read_only", True):
             raise TransactionError("只有可写主库才能推送 append_entries")
+        # 自动推送也必须经过写围栏：租约丢失/观察到更高任期后，旧 leader
+        # 不能继续把本地日志推给副本。
+        db.assert_writable()
         limit = max(1, min(1000, int(max_entries)))
         node = self._quorum_node
         if node is None or not hasattr(node, "last_matches"):
@@ -706,6 +711,7 @@ class Replica:
                 lambda: self._current_lsn(),
                 interval=heartbeat_interval,
                 on_higher_term=callback,
+                push_entries=self.push_entries_to_peers,
             ).start()
 
         if sync_replication:

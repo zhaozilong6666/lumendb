@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..errors import NotSupportedError, StorageError
+from ..errors import NotSupportedError, StorageError, TransactionError
 from .fence import PromotionFence
 from .lease import Lease
 
@@ -1245,13 +1245,16 @@ class HeartbeatLoop:
         *,
         interval: float = 0.5,
         on_higher_term: Callable[[int], None] | None = None,
+        push_entries: Callable[[QuorumNode], dict[str, int]] | None = None,
     ) -> None:
         self.node = node
         self.last_lsn = last_lsn
         self.interval = max(0.05, float(interval))
         self.on_higher_term = on_higher_term
+        self.push_entries = push_entries
         self.last_acks = 0
         self.last_errors: list[str] = []
+        self.last_pushed: dict[str, int] = {}
         self.last_callback_error: str | None = None
         self.last_observed_term = node.state.term
         #: 最近一轮心跳之后本节点知道的多数派提交水位。
@@ -1293,6 +1296,18 @@ class HeartbeatLoop:
             self.last_quorum_commit_lsn = self.node.quorum_commit_lsn
             term_after = self.node.state.term
             self.last_observed_term = term_after
+            if (
+                self.push_entries is not None
+                and term_after == term_before
+            ):
+                try:
+                    self.last_pushed = self.push_entries(self.node)
+                except (OSError, ValueError, StorageError, TransactionError) as exc:
+                    # 推送失败不能拖垮心跳线程；下一次心跳仍会继续尝试。
+                    self.last_errors = [
+                        *self.last_errors,
+                        f"append_entries: {exc}",
+                    ]
             if term_after > term_before and self.on_higher_term is not None:
                 try:
                     self.on_higher_term(term_after)
