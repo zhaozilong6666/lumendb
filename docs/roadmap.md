@@ -221,7 +221,8 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
 - 基准备份已改为 `snapshot_file` + `backup_stream` 分块传输，不再把整个
   数据文件读成 bytes；页级增量基准备份已做：`snapshot_pages(base_lsn)`
   只导出 pageLSN 大于基础 LSN 的页，副本可在 WAL 已回收时重建文件。
-  基准备份内容本身的压缩仍未做。
+  基准备份的压缩已做：`WALClient(compress=True)` 会让 backup_stream /
+  incremental 的分块响应行同样走 zlib（压缩 roundtrip 有测试覆盖）。
 - 基准备份的写冻结依赖 `Database._write_lock`；它把主库写语句串行化，
   读查询仍可并发。跨进程/绕过 Database 的直接磁盘写不受保护。
 

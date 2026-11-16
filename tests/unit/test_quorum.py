@@ -848,6 +848,54 @@ def test_append_entries_detects_divergent_history_at_the_join_point(tmp_path):
         _stop(nodes)
 
 
+def test_append_entries_gap_demands_rebuild(tmp_path):
+    """重放时发现 WAL 缺口（记录不连续）= 追不平，同样要求重建而非死循环。"""
+    node = QuorumNode(
+        "n0",
+        state_path=tmp_path / "n0.vote.json",
+        timeout=1.0,
+    ).start()
+    try:
+        node.state.observe_applied(100, term=3)
+
+        def gap_applier(records):
+            raise StorageError(
+                "复制记录不连续，拒绝跳过缺失的 WAL",
+                detail="expected_lsn=104 got_lsn=200",
+            )
+
+        node.set_log_applier(gap_applier)
+        first = LogRecord(101, 7, LogType.BEGIN, b"")
+        rejected = node.append_entries(
+            3,
+            "leader",
+            100,
+            3,
+            [_record_to_json(first)],
+        )
+        assert rejected["ok"] is False
+        assert rejected["rebuild_required"] is True
+        assert rejected["reason"].startswith("日志缺口")
+
+        # 其他异常（坏批次）仍然只是普通拒绝，不触发重建。
+        def bad_applier(records):
+            raise ValueError("坏批次")
+
+        node.set_log_applier(bad_applier)
+        rejected = node.append_entries(
+            3,
+            "leader",
+            100,
+            3,
+            [_record_to_json(first)],
+        )
+        assert rejected["ok"] is False
+        assert not rejected.get("rebuild_required")
+        assert rejected["reason"].startswith("日志重放失败")
+    finally:
+        node.stop()
+
+
 def test_append_entries_divergence_is_visible_over_the_wire(tmp_path):
     """RPC 路径同样携带 entry_terms，并能把 rebuild_required 送回 leader。"""
     nodes = _cluster(tmp_path, count=2)

@@ -904,8 +904,16 @@ class QuorumNode:
                 except Exception as exc:  # noqa: BLE001 - 重放异常一律回退为拒绝
                     # 覆盖 StorageError 之外的意外异常（OSError/ValueError 等）：
                     # 不能让单个畸形批次把请求线程或整个服务循环打死。
+                    # 记录不连续（WAL 缺口）是"追不平"而非"坏批次"：同样
+                    # 要求重建，否则 leader 每轮重发同一批、follower 反复
+                    # 拒绝，形成死循环。
+                    rebuild = False
+                    if isinstance(exc, StorageError) and "不连续" in str(exc):
+                        rebuild = True
                     return self._append_rejection(
-                        f"日志重放失败: {exc}", term=self.state.term
+                        f"日志缺口: {exc}" if rebuild else f"日志重放失败: {exc}",
+                        term=self.state.term,
+                        rebuild_required=rebuild,
                     )
                 last_lsn = int(records[-1].lsn)
                 with self._lock:
