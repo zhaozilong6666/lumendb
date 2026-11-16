@@ -934,6 +934,9 @@ class QuorumNode:
                     # 连续重放"（例如落后到已回收区）。直接触发重建回调，
                     # 不要在这里按拼接点校验走 prefix_mismatch——那会让
                     # leader 每轮心跳重发、follower 反复拒绝。
+                    # 注意：回调在 _append_lock 内派发；契约要求回调只做
+                    # 异步派发（Replica._schedule_rebuild 启动后台线程后
+                    # 立即返回），不得在回调里做同步重活。
                     return self._rebuild_required_response(
                         previous, rebuild_host, rebuild_port
                     )
