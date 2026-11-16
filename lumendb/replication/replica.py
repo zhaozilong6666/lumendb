@@ -481,9 +481,15 @@ class Replica:
                 pushed[peer_id] = len(records)
                 self.last_push_rejections.pop(peer_id, None)
             else:
-                self.last_push_rejections[peer_id] = str(
-                    response.get("reason", "unknown")
-                )
+                reason = str(response.get("reason", "unknown"))
+                if self.last_push_rejections.get(peer_id) != reason:
+                    # 无人值守运行时的可观测性：拒绝原因首次出现或变化时
+                    # 记一条 warning，避免每轮心跳刷屏。
+                    _log.warning(
+                        "append_entries 被 %s 拒绝: %s (prev_lsn=%s)",
+                        peer_id, reason, prev_lsn,
+                    )
+                self.last_push_rejections[peer_id] = reason
                 if response.get("reason") == "prefix_mismatch":
                     # 只记录对方真实前缀，下一次从那里再试；不在这里截断本地
                     # 日志（避免把 leader 自己的已提交尾巴误删）。

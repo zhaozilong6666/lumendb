@@ -330,6 +330,47 @@ def test_monitor_promotion_starts_the_heartbeat_push(tmp_path):
         primary.close()
 
 
+def test_monitor_exposes_push_rejections(tmp_path):
+    """提升后 push 拒绝原因必须能从 monitor 读到（无人值守可观测性）。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        server.stop()
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        assert monitor.poll() == "promoted"
+        assert monitor.last_push_rejections == {}
+        reason = "日志分歧: lsn=1 本地任期 2，leader 任期 3"
+        replica.last_push_rejections["n9"] = reason
+        snapshot = monitor.last_push_rejections
+        assert snapshot == {"n9": reason}
+        # 返回的是快照，不是内部 dict 引用。
+        replica.last_push_rejections["n9"] = "别的"
+        assert snapshot["n9"] == reason
+        assert monitor.last_push_rejections == {"n9": "别的"}
+    finally:
+        _stop(nodes)
+        if replica is not None:
+            replica.close()
+        server.stop()
+        primary.close()
+
+
 def test_monitor_loop_survives_unexpected_poll_errors(tmp_path, monkeypatch):
     """poll() 抛未预期异常时后台轮询线程必须继续跑，而不是静默退出。"""
     primary = _make_primary(tmp_path)

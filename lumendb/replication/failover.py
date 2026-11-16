@@ -110,6 +110,17 @@ class ReplicationMonitor:
         # 否则 lease 丢失后它会一直认为自己是 promoted 的主库。
         self.replica.add_step_down_listener(self._handle_step_down)
 
+    @property
+    def last_push_rejections(self) -> dict[str, str]:
+        """提升后 push_entries_to_peers 最近被 peers 拒绝的原因（快照）。
+
+        follower 在同一 LSN 上看到不同任期（历史分叉）时会拒绝并要求
+        重建（``rebuild_required``）；无人值守运行时可以轮询这个字典
+        把卡住的副本暴露给告警/人工介入，原因变化时 replica 侧还会打
+        warning 日志。
+        """
+        return dict(getattr(self.replica, "last_push_rejections", {}))
+
     def poll(self) -> str:
         """执行一轮跟随；返回 ``healthy`` / ``degraded`` / ``promoted`` / ``needs_attention``。"""
         if self.state is MonitorState.PROMOTED:
