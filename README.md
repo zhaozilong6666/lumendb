@@ -289,9 +289,13 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 预投票（pre-vote）：`campaign()` 先探询意向，拿不到多数派就失败且**不推进任期**，避免分区节点把任期越推越高
 - [x] 自动提升租约：`ReplicationMonitor(quorum=..., lease_path=...)` 把投票、租约、心跳续租和写围栏串到自动提升路径
 - [x] 独立心跳循环：`HeartbeatLoop` 在后台持续向 peers 发心跳，观察到更高任期时回调上层停写，回调异常记录到 `last_callback_error` 且不会终止后台线程
-- [ ] 真实网络分区下的完整双写防护 / 自动 leader 选举
+- [x] 心跳超时自动竞选：`QuorumNode(election_timeout=...)` 看门狗在收不到 leader 心跳后自动发起竞选，双候选同窗竞争收敛到唯一主库（`test_two_candidates_pick_exactly_one_leader`）
+- [x] 逐条任期与拼接点校验：`VoteState.log_terms` 按 LSN 持久化任期分段，`append_entries(entry_terms=...)` 重放后逐条落段，拼接点 `(prev_lsn, prev_term)` 分歧拒绝并要求重建
+- [x] 分叉/缺口自动重建：leader 下发 `rebuild_from` 端点，follower 后台重新基准备份并对齐进度；提升后空 WAL 的缺口由 leader 主动发 `rebuild_hint`（`test_lagging_follower_gap_triggers_auto_rebuild`）
+- [x] 重启双写防护：`Database(fence_path=/lease_path=)` 打开即检共享 marker 并持续接进写路径，堵住"旧主库崩溃重启后双写"
+- [ ] 完整 commit index 协商与分歧尾巴截断（当前重建是唯一修复手段）
 - [x] 同步复制（可选）：`sync_replication=True` 时 COMMIT 要等多数派水位追平，超时给 `40003`（结果未知、不回滚），只读事务不受影响
-- [ ] Raft 级日志协商：`append_entries` 任期/前缀一致性检查 + commit index
+- [x] Raft 级日志协商（任期/前缀一致性检查）：`append_entries` 带逐条任期做前缀校验，任期分歧拒绝；缺 commit index（见上一条）
 
 长期分层路线、阶段依赖与“不青黄不接”的完成标准见
 [`docs/roadmap.md`](docs/roadmap.md)。
