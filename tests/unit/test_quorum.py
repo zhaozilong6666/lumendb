@@ -603,7 +603,100 @@ def test_append_entries_rejects_an_oversized_batch(tmp_path):
         _stop(nodes)
 
 
+def test_heartbeat_loop_pushes_multiple_batches_until_caught_up():
+    """落后超过一批的副本在同一轮心跳里连续推多批，而不是等下一轮。"""
+    calls = []
+
+    class FakeState:
+        term = 1
+
+    class FakeNode:
+        timeout = 1.0
+
+        def __init__(self):
+            self.state = FakeState()
+            self.peers = {}
+
+        @property
+        def quorum_commit_lsn(self):
+            return 0
+
+        def heartbeat_round(self, last_lsn, abort_on_higher_term=False):
+            return 1, []
+
+    node = FakeNode()
+    remaining = [{"n1": 1000}, {"n1": 1000}, {"n1": 300}, {}]
+
+    def push(_node):
+        calls.append(1)
+        result = remaining.pop(0)
+        if not result:
+            # 批次推完就停循环，避免下一轮把 last_pushed 重置成 {}。
+            loop._stop.set()
+        return result
+
+    loop = HeartbeatLoop(
+        node,
+        lambda: 5000,
+        push_entries=push,
+        interval=0.05,
+        max_batches_per_round=10,
+    )
+    loop.start()
+    try:
+        assert _wait_for(lambda: len(calls) >= 4, timeout=2.0), (
+            f"多批推送没有跑完：calls={len(calls)}"
+        )
+        assert loop.last_pushed == {"n1": 2300}
+    finally:
+        loop.stop()
+
+
+def test_heartbeat_loop_caps_batches_per_round():
+    calls = []
+
+    class FakeState:
+        term = 1
+
+    class FakeNode:
+        timeout = 1.0
+
+        def __init__(self):
+            self.state = FakeState()
+            self.peers = {}
+
+        @property
+        def quorum_commit_lsn(self):
+            return 0
+
+        def heartbeat_round(self, last_lsn, abort_on_higher_term=False):
+            return 1, []
+
+    def push(_node):
+        calls.append(1)
+        if len(calls) >= 2:
+            # 达到封顶后停循环，观察最后一轮累计值。
+            loop._stop.set()
+        return {"n1": 1000}
+
+    loop = HeartbeatLoop(
+        FakeNode(),
+        lambda: 5000,
+        push_entries=push,
+        interval=0.05,
+        max_batches_per_round=2,
+    )
+    loop.start()
+    try:
+        assert _wait_for(lambda: len(calls) >= 2, timeout=2.0)
+        assert len(calls) == 2, "每轮推送批次必须受 max_batches_per_round 封顶"
+        assert loop.last_pushed == {"n1": 2000}
+    finally:
+        loop.stop()
+
+
 def test_append_entries_survives_a_raising_applier(tmp_path):
+
     """applier 抛任意异常都回退成拒绝，且不打死节点的服务循环。"""
     nodes = _cluster(tmp_path)
     try:

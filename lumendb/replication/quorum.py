@@ -1272,12 +1272,16 @@ class HeartbeatLoop:
         interval: float = 0.5,
         on_higher_term: Callable[[int], None] | None = None,
         push_entries: Callable[[QuorumNode], dict[str, int]] | None = None,
+        max_batches_per_round: int = 10,
     ) -> None:
         self.node = node
         self.last_lsn = last_lsn
         self.interval = max(0.05, float(interval))
         self.on_higher_term = on_higher_term
         self.push_entries = push_entries
+        # 每轮心跳之后最多连续推多少批：落后副本不用等十几个心跳周期才能
+        # 追平，同时封顶防止单轮无限拉长（长期落后仍走 WAL 流/rebuild）。
+        self.max_batches_per_round = max(1, int(max_batches_per_round))
         self.last_acks = 0
         self.last_errors: list[str] = []
         self.last_pushed: dict[str, int] = {}
@@ -1336,7 +1340,16 @@ class HeartbeatLoop:
                 and term_after == term_before
             ):
                 try:
-                    self.last_pushed = self.push_entries(self.node)
+                    accumulated: dict[str, int] = {}
+                    for _ in range(self.max_batches_per_round):
+                        pushed = self.push_entries(self.node) or {}
+                        if not pushed:
+                            break
+                        for peer_id, count in pushed.items():
+                            accumulated[peer_id] = (
+                                accumulated.get(peer_id, 0) + count
+                            )
+                    self.last_pushed = accumulated
                 except Exception as exc:  # noqa: BLE001 - 后台线程不能因推送失败退出
                     # 推送失败（包括写围栏拒绝/租约丢失）不能拖垮心跳线程；
                     # 下一次心跳仍会继续尝试，上层可看 last_errors。

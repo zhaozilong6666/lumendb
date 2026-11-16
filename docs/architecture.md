@@ -401,7 +401,7 @@ Raft 的 `(last_term, last_lsn)` 字典序拒绝落后候选（同 LSN 但最后
 一并记录日志任期；心跳只更新"听到过"的 `last_lsn`，**不会**把 leader 的当前
 任期写成日志任期，否则日志相同的节点会互相拒绝。`Replica.promote_with_quorum()`
 先拿票再切换读写。它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，
-以及 prefix-checked `append_entries` MVP；提升后的心跳循环会每轮推一批
+以及 prefix-checked `append_entries` MVP；提升后的心跳循环每轮自动追推多批
 entries，但没有分歧尾巴截断、逐条任期和完整 commit index，也不能单独处理
 “主库还活着但网络分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
 
@@ -495,7 +495,8 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 MVP（`QuorumClient` / `QuorumNode`，`prev_lsn/prev_term` 前缀检查，entries 走
 现有 CRC 解码并交给绑定的 `Replica.apply`）；`Replica.push_entries_to_peers`
 可以在一次显式调用中把本地 WAL 的下一批记录推给 peers，`promote_with_quorum`
-启动的 `HeartbeatLoop` 会把它作为 push callback 每轮推一批，且推送前先过
+启动的 `HeartbeatLoop` 会把它作为 push callback 每轮心跳后自动推，一轮最多
+`max_batches_per_round` 批（默认 10），且推送前先过
 `db.assert_writable()`。但仍有分歧尾巴截断/回填、逐条日志的 per-entry term，
 也没有完整的 commit index 协商。长期失联的旧
 leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 fence + 租约负责

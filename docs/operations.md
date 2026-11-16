@@ -91,9 +91,11 @@ peer 的已知前缀，不会自动截断 leader 的尾巴。长期落后仍应�
 peer 的复制滞后。
 
 `promote_with_quorum(heartbeat_interval=...)` 启动的 `HeartbeatLoop` 会自动
-把 `push_entries_to_peers` 挂在每轮心跳之后；它仍只推一批，且所有推送都先过
-`db.assert_writable()`，租约丢失/更高任期后旧 leader 不会再推。没有完整
-commit index 协商，所以不能把“副本收到”直接当成“多数派已提交”。
+把 `push_entries_to_peers` 挂在每轮心跳之后；每轮最多连续推
+`max_batches_per_round` 批（默认 10 批，每批上限 1000 条），批次推完或
+peer 追平即停，且所有推送都先过 `db.assert_writable()`，租约丢失/更高任期
+后旧 leader 不会再推。没有完整 commit index 协商，所以不能把“副本收到”
+直接当成“多数派已提交”。
 
 ### 3.3 自动提升
 
