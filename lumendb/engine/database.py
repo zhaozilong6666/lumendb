@@ -72,10 +72,25 @@ class Database:
         write_fence: Optional[Callable[[], None]] = None,
         commit_barrier: Optional[Callable[[int], None]] = None,
         wal_retain_lsn: int = 0,
+        fence_path: str | Path | None = None,
+        node_id: str = "primary",
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        if fence_path is not None:
+            # 共享 fencing marker：旧主库崩溃重启后重新打开数据库时，必须
+            # 立即知道"别的节点已经被提升过"，否则裸 Database 打开不检查
+            # fence，重启后的旧主库会双写。非只读打开时立即校验；若调用方
+            # 没给更强的写围栏（租约），就把 fence 的 assert_writable 持续
+            # 接进写路径（每笔写重读 marker，别的节点后来提升也能立即停写）。
+            from ..replication.fence import PromotionFence
+
+            fence = PromotionFence(fence_path, node_id=node_id)
+            if not read_only:
+                fence.assert_writable()
+                if write_fence is None:
+                    write_fence = fence.assert_writable
         self._write_fence = write_fence
         #: 同步复制的提交屏障（参数是 COMMIT 记录的 LSN）。
         self._commit_barrier = commit_barrier

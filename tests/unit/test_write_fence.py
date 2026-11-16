@@ -119,6 +119,74 @@ class TestCommitPointRecheck:
         assert observed and all(observed), "围栏检查必须在 _write_lock 之内执行"
 
 
+class TestFencePathOnOpen:
+    """崩溃重启防护：旧主库重开数据库时必须感知共享 fence marker。
+
+    提升副本写 fence 后，旧主库进程重启、用同一 fence_path 重新打开
+    Database 时，打开即被拒绝（非只读）；只读打开放行（当观察者）。
+    打开时 fence 还没写、之后才被提升，则持续检查在下一笔写上拦住。
+    """
+
+    def test_open_rejects_when_fence_points_elsewhere(self, tmp_path):
+        from lumendb.replication.fence import PromotionFence
+
+        data = tmp_path / "old-primary"
+        fence_path = tmp_path / "fence.json"
+        db = Database(data)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        db.close()
+
+        PromotionFence(fence_path, node_id="new-leader").promote(lsn=100)
+        with pytest.raises(NotSupportedError, match="fence"):
+            Database(data, fence_path=fence_path, node_id="old-primary")
+
+    def test_open_read_only_is_allowed_as_observer(self, tmp_path):
+        from lumendb.replication.fence import PromotionFence
+
+        data = tmp_path / "old-primary"
+        fence_path = tmp_path / "fence.json"
+        db = Database(data)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.close()
+
+        PromotionFence(fence_path, node_id="new-leader").promote(lsn=100)
+        observer = Database(
+            data, read_only=True, fence_path=fence_path, node_id="old-primary"
+        )
+        assert observer.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+        observer.close()
+
+    def test_fence_written_after_open_blocks_the_next_write(self, tmp_path):
+        from lumendb.replication.fence import PromotionFence
+
+        data = tmp_path / "old-primary"
+        fence_path = tmp_path / "fence.json"
+        db = Database(data, fence_path=fence_path, node_id="old-primary")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        try:
+            db.execute_one("INSERT INTO t VALUES (1)")
+            PromotionFence(fence_path, node_id="new-leader").promote(lsn=100)
+            with pytest.raises(NotSupportedError, match="fence"):
+                db.execute_one("INSERT INTO t VALUES (2)")
+        finally:
+            db.close()
+
+    def test_open_when_fence_points_to_self_is_writable(self, tmp_path):
+        from lumendb.replication.fence import PromotionFence
+
+        data = tmp_path / "primary"
+        fence_path = tmp_path / "fence.json"
+        PromotionFence(fence_path, node_id="primary").promote(lsn=10)
+        db = Database(data, fence_path=fence_path, node_id="primary")
+        try:
+            db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+            db.execute_one("INSERT INTO t VALUES (1)")
+            assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            db.close()
+
+
 class TestClosedDatabase:
     def test_internal_write_after_close_is_rejected(self, env):
         db, _ = env

@@ -986,6 +986,8 @@ class Replica:
                 checkpoint_wal_bytes=0,
                 wal_segment_bytes=getattr(self, "_wal_segment_bytes", 1024 * 1024),
                 write_fence=write_fence,
+                fence_path=fence_path,
+                node_id=node_id,
             )
             self._seed_promoted_wal()
             self._adopt_local_lsn()
