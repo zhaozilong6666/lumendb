@@ -58,6 +58,10 @@ class Replica:
             wal_segment_bytes=wal_segment_bytes,
         )
         self._applied_lsn = applied_lsn
+        # 上一批最后一条记录之后的字节边界；用于拒绝中间有洞的复制流。
+        # 0 表示还没有在本进程内建立连续视图（首次 apply 允许从任意 LSN 开始，
+        # 例如基准备份之后的第一条记录）。
+        self._expected_end_lsn = 0
         # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
         self._lock = threading.RLock()
         self._lease_keeper: LeaseKeeper | None = None
@@ -218,6 +222,17 @@ class Replica:
             for record in records:
                 if record.lsn <= self._applied_lsn:
                     continue
+                if (
+                    self._expected_end_lsn
+                    and record.lsn != self._expected_end_lsn
+                ):
+                    raise StorageError(
+                        "复制记录不连续，拒绝跳过缺失的 WAL",
+                        detail=(
+                            f"expected_lsn={self._expected_end_lsn} "
+                            f"got_lsn={record.lsn}"
+                        ),
+                    )
                 if record.rtype == LogType.PAGE_IMAGE:
                     self._apply_page_image(record)
                 elif record.rtype in (LogType.UPDATE, LogType.CLR):
@@ -230,6 +245,7 @@ class Replica:
                     self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
                 # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
                 self._applied_lsn = record.lsn
+                self._expected_end_lsn = record.lsn + len(record.encode())
                 count += 1
 
             if count:
@@ -322,6 +338,8 @@ class Replica:
         current = self._current_lsn()
         if current > int(getattr(self, "_applied_lsn", 0)):
             self._applied_lsn = current
+            # 写路径的 WAL 进度不是复制 apply 的连续边界。
+            self._expected_end_lsn = 0
             self._write_marker()
         return int(getattr(self, "_applied_lsn", 0))
 
@@ -454,6 +472,9 @@ class Replica:
                     self.path, read_only=True, checkpoint_wal_bytes=0
                 )
                 self._applied_lsn = checkpoint_lsn
+                # 基准备份换了数据文件，旧进程内维护的“下一条记录边界”
+                # 已经不再对应新的 WAL 位置。
+                self._expected_end_lsn = 0
                 self._write_marker()
                 if replica_id is not None:
                     client.ack(checkpoint_lsn)

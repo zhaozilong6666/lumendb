@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import threading
 
 import pytest
@@ -15,12 +16,41 @@ from lumendb.replication import (
     WALClient,
     WALServer,
 )
+from lumendb.replication.wal_stream import _record_from_json, _record_to_json
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.page import PageType
+from lumendb.storage.wal import LogRecord, LogType
 
 
 def make_primary(tmp_path):
     return Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+
+
+class TestReplicationWalStream:
+    def test_record_crc_roundtrip_and_legacy_record(self):
+        rec = LogRecord(10, 3, LogType.UPDATE, b"before/after")
+        payload = _record_to_json(rec)
+        assert _record_from_json(payload) == rec
+
+        # 旧 WAL 记录 has_crc=False；复制到接收端后仍应保留旧编码长度。
+        old = LogRecord(10, 3, LogType.UPDATE, b"before/after", has_crc=False)
+        old_payload = _record_to_json(old)
+        decoded_old = _record_from_json(old_payload)
+        assert decoded_old == old
+        assert decoded_old.has_crc is False
+
+        # 旧版服务端不带 crc 字段时仍兼容。
+        legacy = dict(payload)
+        legacy.pop("crc")
+        assert _record_from_json(legacy) == rec
+
+    def test_record_crc_rejects_a_corrupted_network_payload(self):
+        rec = LogRecord(10, 3, LogType.UPDATE, b"before/after")
+        payload = _record_to_json(rec)
+        corrupted = dict(payload)
+        corrupted["payload"] = base64.b64encode(b"tampered").decode("ascii")
+        with pytest.raises(StorageError, match="CRC"):
+            _record_from_json(corrupted)
 
 
 class TestReplica:
@@ -34,6 +64,22 @@ class TestReplica:
             assert page[0] == 0  # PageType.FREE
         finally:
             dm.close()
+
+    def test_replica_rejects_a_gap_in_the_wal_stream(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        replica = Replica.bootstrap(primary, tmp_path / "replica")
+        try:
+            base = replica.applied_lsn
+            first = LogRecord(base + 1, 7, LogType.BEGIN, b"")
+            replica.apply([first])
+            gap = LogRecord(first.lsn + 500, 7, LogType.COMMIT, b"")
+            with pytest.raises(StorageError, match="不连续"):
+                replica.apply([gap])
+            assert replica.applied_lsn == first.lsn
+        finally:
+            replica.db.close()
+            primary.close()
 
     def test_bootstrap_apply_and_read_only(self, tmp_path):
         primary = make_primary(tmp_path)

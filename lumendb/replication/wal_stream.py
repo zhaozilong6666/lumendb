@@ -36,7 +36,20 @@ from pathlib import Path
 from typing import Iterable
 
 from ..errors import RedirectError, StorageError, TransactionError
-from ..storage.wal import LogRecord
+from ..storage.wal import CRC_SIZE, LogRecord
+
+
+def _record_crc(record: LogRecord) -> int:
+    """CRC over the logical frame, excluding the frame's own CRC field.
+
+    不能直接对 ``record.encode()`` 再算 CRC：那等于对“body || crc(body)”
+    求 CRC，CRC32 对 self-appending 的 residue 近似常量，改 payload 也可能
+    得到同一个值，根本检测不出损坏。
+    """
+    data = record.encode()
+    if record.has_crc:
+        data = data[:-CRC_SIZE]
+    return zlib.crc32(data) & 0xFFFFFFFF
 
 
 def _encode_line(payload: dict, compress: bool = False) -> bytes:
@@ -65,12 +78,16 @@ def _send_line(
 
 
 def _record_to_json(record: LogRecord) -> dict:
+    # 复制流也带校验和：JSON/base64 保护不了 payload 内的位翻转，接收端
+    # 在反序列化后必须能拒绝损坏记录，而不是把它当成合法 WAL 重放。
     return {
         "type": "record",
         "lsn": record.lsn,
         "xid": record.xid,
         "rtype": int(record.rtype),
         "payload": base64.b64encode(record.payload).decode("ascii"),
+        "has_crc": bool(record.has_crc),
+        "crc": _record_crc(record),
     }
 
 
@@ -86,12 +103,26 @@ def read_slot(path: str | Path) -> int:
 
 
 def _record_from_json(data: dict) -> LogRecord:
-    return LogRecord(
+    has_crc = bool(data.get("has_crc", True))
+    record = LogRecord(
         lsn=int(data["lsn"]),
         xid=int(data["xid"]),
         rtype=int(data["rtype"]),
         payload=base64.b64decode(data["payload"]),
+        has_crc=has_crc,
     )
+    if "crc" in data:
+        expected = int(data["crc"])
+        actual = _record_crc(record)
+        if expected != actual:
+            raise StorageError(
+                "复制记录 CRC 校验失败",
+                detail=(
+                    f"lsn={record.lsn} expect=0x{expected:08x} "
+                    f"actual=0x{actual:08x}"
+                ),
+            )
+    return record
 
 
 class WALServer:
