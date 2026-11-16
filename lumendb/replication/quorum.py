@@ -1347,7 +1347,7 @@ class HeartbeatLoop:
                 if self._stop.is_set():
                     break
             self.last_acks = acks
-            self.last_errors = errors
+            self.last_errors = errors[-32:]
             self.last_quorum_commit_lsn = self.node.quorum_commit_lsn
             term_after = self.node.state.term
             self.last_observed_term = term_after
@@ -1369,10 +1369,10 @@ class HeartbeatLoop:
                 except Exception as exc:  # noqa: BLE001 - 后台线程不能因推送失败退出
                     # 推送失败（包括写围栏拒绝/租约丢失）不能拖垮心跳线程；
                     # 下一次心跳仍会继续尝试，上层可看 last_errors。
-                    self.last_errors = [
-                        *self.last_errors,
-                        f"append_entries: {exc}",
-                    ]
+                    # 有界保留最近 32 条，长期失败的 peer 不会让列表无限增长。
+                    self.last_errors = (
+                        self.last_errors + [f"append_entries: {exc}"]
+                    )[-32:]
             if term_after > term_before and self.on_higher_term is not None:
                 try:
                     self.on_higher_term(term_after)
