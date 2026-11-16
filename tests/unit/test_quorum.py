@@ -505,6 +505,19 @@ def test_append_entries_rejects_a_stale_leader_term(tmp_path):
         _stop(nodes)
 
 
+def test_append_entries_rejects_an_oversized_batch(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        bogus = [
+            _record_to_json(LogRecord(1, 7, LogType.BEGIN, b""))
+        ] * 1001
+        response = nodes[0].append_entries(1, "leader", 0, 0, bogus)
+        assert response["ok"] is False
+        assert "条目过多" in response["reason"]
+    finally:
+        _stop(nodes)
+
+
 def test_append_entries_rejects_an_internal_gap(tmp_path):
     nodes = _cluster(tmp_path)
     try:
