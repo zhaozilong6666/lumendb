@@ -602,6 +602,8 @@ def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
         assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
         # 推送成功后多数派水位要立刻计入 peer 的 match_lsn，不等下一轮心跳。
         assert nodes[0].quorum_commit_lsn == batch[-1].lsn
+        # status 快照里能看到每个 peer 的复制位置，便于外部诊断滞后。
+        assert nodes[0].status()["peer_matches"]["n1"] == batch[-1].lsn
     finally:
         _stop(nodes)
         leader.db.close()

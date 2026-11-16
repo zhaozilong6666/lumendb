@@ -614,6 +614,14 @@ class QuorumNode:
                 "peers": sorted(
                     pid for pid in self.peers if pid != self.node_id
                 ),
+                # leader 视角最近一次心跳/推送后各 peer 已确认的复制位置，
+                # 诊断复制滞后用；心跳线程写入这些字段时不上锁，快照尽力而为。
+                "peer_matches": {
+                    pid: int(lsn) for pid, lsn in self.last_matches.items()
+                },
+                "peer_match_terms": {
+                    pid: int(term) for pid, term in self.last_match_terms.items()
+                },
             }
 
     def heartbeat(
