@@ -755,3 +755,62 @@ class TestReplica:
             PromotionFence(fence_path, node_id="b").promote(lsn=5)
         PromotionFence(fence_path, node_id="b").promote(lsn=11)
         assert PromotionFence(fence_path, node_id="b").read()["lsn"] == 11
+
+    def test_replica_resumes_after_server_restart(self, tmp_path):
+        """服务端重启（模拟网络中断）后副本从断点续传追平，槽位不阻塞。
+
+        场景：副本分两批拉 WAL，第一批拉到一半服务"宕机"；主库继续写入；
+        新 WALServer 用同一 slot 目录重启，副本继续拉取必须从
+        ``replica.lsn`` 断点接着应用，不重放已应用记录，也不被旧槽位
+        确认卡住。
+        """
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        for i in range(10):
+            primary.execute_one(f"INSERT INTO t VALUES ({i})")
+        slots = tmp_path / "slots"
+        server = WALServer(primary, slot_dir=slots).start()
+        replica = None
+        try:
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / "replica", replica_id="r1"
+            )
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(10,)]
+            for i in range(10, 40):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            # 第一批只拉 10 条——然后"网络中断"（服务端直接停止）。
+            applied = replica.replicate_from_server(
+                server.host, server.port, max_records=10, replica_id="r1"
+            )
+            assert applied == 10
+            server.stop()
+
+            # 中断期间主库继续写入；重启一个服务同一主库、同一槽位目录。
+            for i in range(40, 60):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            server = WALServer(primary, slot_dir=slots).start()
+            try:
+                # 断点续传：从 replica.lsn 接着拉，不重放前 10 条。
+                # 返回值是 WAL 记录数（一条 INSERT 会触多页多记录），
+                # 用行数与 lag 断言追平，不断言具体条数。
+                pulled = replica.replicate_from_server(
+                    server.host, server.port, replica_id="r1"
+                )
+                assert pulled > 0
+                assert replica.execute_one(
+                    "SELECT COUNT(*) FROM t"
+                ).rows == [(60,)]
+                # applied_lsn 是最后一条记录起始位置；从断点再拉一次
+                # 应返回 0（主库没有更多可发记录）才算追平。
+                assert (
+                    replica.replicate_from_server(
+                        server.host, server.port, replica_id="r1"
+                    )
+                    == 0
+                )
+            finally:
+                server.stop()
+        finally:
+            if replica is not None:
+                replica.db.close()
+            primary.close()

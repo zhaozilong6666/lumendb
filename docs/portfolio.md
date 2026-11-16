@@ -77,7 +77,7 @@
 >   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
 >   持久化任期并按 Raft 的 `(last_term, last_lsn)` 字典序拒绝落后或同 LSN
 >   但任期更旧的候选，失败时副本保持只读；`Lease` 用 TTL 约束旧主库
->   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；另有 prefix-checked `append_entries` MVP，能把带 CRC 的连续 WAL 条目推给已绑定 `Replica.apply` 的节点，但对分歧尾巴截断、逐条任期和心跳自动驱动仍未实现；
+>   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；`Database(fence_path=/lease_path=)` 打开时立即校验共享 marker 并持续接进写路径，堵住"旧主库崩溃重启后双写"的洞；另有 prefix-checked `append_entries`，能把带 CRC 的连续 WAL 条目按逐条任期推给已绑定 `Replica.apply` 的节点，拼接点任期分歧或 WAL 缺口自动触发基准备份重建（leader 侧还会主动下发 `rebuild_hint`），心跳超时自动触发竞选、双候选竞争收敛到唯一主库，仅分歧尾巴截断（重建替代）与完整 commit index 尚未实现；
 > - 处理降级/关闭与在途 SQL 的竞争：`close()` 先等待只读语句退出，再回滚线上未提交事务并关闭句柄；
 >   pgwire 的写/COMMIT/SAVEPOINT 路径与 `Database._write_lock` 对齐，避免 step_down 之后仍有写落到已关闭的 WAL。
 > - 1195 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
@@ -175,10 +175,15 @@
 >   with a TTL makes the old primary self-fence once it stops renewing, while a
 >   candidate waits for the old lease to expire before acquiring it. A
 >   `QuorumNode.heartbeat_round()` / `renew_lease()` path renews only after a
->   majority of heartbeat acknowledgements. A prefix-checked
->   `append_entries` MVP pushes contiguous CRC-protected records into a bound
->   `Replica.apply`; divergent-tail truncation, per-entry terms, and automatic
->   heartbeat-driven negotiation remain future work.
+>   majority of heartbeat acknowledgements. `Database(fence_path=, lease_path=)`
+>   re-checks the shared markers at open time and on every write, so a
+>   crashed-and-restarted old primary cannot silently resume as a second
+>   writer. A prefix-checked `append_entries` pushes contiguous CRC-protected
+>   records with per-entry terms into a bound `Replica.apply`; splice-point term
+>   divergence or a WAL gap triggers an automatic base-backup rebuild (the
+>   leader also proactively sends a `rebuild_hint`), heartbeat timeout drives
+>   automatic election and competing candidates converge on a single leader;
+>   divergent-tail truncation and a full commit index remain future work.
 > - Close/step-down races are explicit: `close()` waits for active readers,
 >   aborts live wire transactions, and pgwire write/COMMIT/savepoint paths use
 >   the same write lock, so no statement can land on a closed WAL.
