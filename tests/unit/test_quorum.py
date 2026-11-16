@@ -371,6 +371,76 @@ def test_monitor_exposes_push_rejections(tmp_path):
         primary.close()
 
 
+def test_diverged_follower_rebuilds_from_leader_hint(tmp_path):
+    """历史分叉的 follower 收到 leader 的重建端点后自动重新基准备份并追平。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    follower = None
+    rebuild_server = None
+    monitor = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        follower = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "follower"
+        )
+        server.stop()
+        follower.attach_quorum(nodes[1])
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        assert monitor.poll() == "promoted"
+        # 提升后的 leader 对外服务基准备份，供分叉 follower 自愈。
+        rebuild_server = WALServer(replica.db).start()
+        replica.rebuild_from = (rebuild_server.host, rebuild_server.port)
+        # 给 follower 编一段假任期：同一 LSN 上它以为任期是 999，leader 报
+        # 的是自己的任期 → 拼接点分叉 → 触发自动重建。
+        nodes[1].state.record_term(follower.applied_lsn, 999)
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        assert _wait_for(
+            lambda: follower.last_rebuild is not None
+            or follower.last_rebuild_error is not None,
+            timeout=10.0,
+        ), f"分叉 follower 没有完成自动重建 (error={follower.last_rebuild_error!r})"
+        assert follower.last_rebuild is not None, follower.last_rebuild_error
+        assert follower.last_rebuild_error is None
+        assert follower.last_rebuild["prev_lsn"] >= 1
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)],
+            timeout=5.0,
+        ), "重建后 follower 没有看到 leader 的数据"
+        # 重建后 append 链路应恢复：再写一条，follower 通过 append_entries 追上。
+        replica.execute_one("INSERT INTO t VALUES (2)")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)],
+            timeout=5.0,
+        ), "重建后 append_entries 链路没有恢复"
+    finally:
+        if monitor is not None:
+            monitor.stop()
+        if rebuild_server is not None:
+            rebuild_server.stop()
+        _stop(nodes)
+        if replica is not None:
+            replica.close()
+        if follower is not None:
+            follower.close()
+        server.stop()
+        primary.close()
+
+
 def test_monitor_loop_survives_unexpected_poll_errors(tmp_path, monkeypatch):
     """poll() 抛未预期异常时后台轮询线程必须继续跑，而不是静默退出。"""
     primary = _make_primary(tmp_path)

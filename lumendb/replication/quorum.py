@@ -228,6 +228,22 @@ class VoteState:
             if changed:
                 self.save()
 
+    def reset_progress(self, lsn: int) -> None:
+        """重建（rebase）后重置复制进度：match 对齐新基线、任期分段清空。
+
+        重建意味着本节点换了一整段历史：旧历史上的任期分段全部作废，
+        否则之后每次拼接点校验都会拿一段已经不存在的历史去拒绝 leader。
+        ``term`` / ``voted_for`` 保留——选举状态与日志进度无关。
+        """
+        with self._lock:
+            value = max(0, int(lsn))
+            self.log_terms.clear()
+            self.match_lsn = value
+            self.match_term = 0
+            if value > self.last_lsn:
+                self.last_lsn = value
+            self.save()
+
     def observe_heartbeat(
         self, leader: str, at: float, *, persist_interval: float = 5.0
     ) -> None:
@@ -351,6 +367,8 @@ class QuorumClient:
         *,
         commit_lsn: int = 0,
         entry_terms: list[Any] | None = None,
+        rebuild_host: str | None = None,
+        rebuild_port: int | None = None,
         timeout: float = 2.0,
         token: str | None = None,
     ) -> dict[str, Any]:
@@ -363,6 +381,8 @@ class QuorumClient:
 
         ``entry_terms`` 与 entries 等长（``None`` 表示 leader 不确定该条的
         任期）；follower 用它逐条记录精确任期，支撑拼接点分叉检测。
+        ``rebuild_host/rebuild_port`` 是 leader 服务的基准备份端点，follower
+        判定历史分叉时用它触发自动重建。
         """
         payload: dict[str, Any] = {
             "type": "append_entries",
@@ -375,6 +395,9 @@ class QuorumClient:
         }
         if entry_terms is not None:
             payload["entry_terms"] = list(entry_terms)
+        if rebuild_host:
+            payload["rebuild_host"] = str(rebuild_host)
+            payload["rebuild_port"] = int(rebuild_port or 0)
         if token is not None:
             payload["token"] = token
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -507,6 +530,10 @@ class QuorumNode:
         # append_entries 的重放是串行的；不能和 apply 并发。
         self._append_lock = threading.Lock()
         self._log_applier: Callable[[list[Any]], int] | None = None
+        #: 拼接点分叉（rebuild_required）时通知上层自愈的回调：
+        #: ``callback(rebuild_host, rebuild_port, prev_lsn)``。上层负责
+        #: 去重与执行（通常是从 leader 重新基准备份）；回调异常只记日志。
+        self.rebuild_callback: Callable[[str, int, int], None] | None = None
         #: 最近一轮心跳里各 peer 真正 apply 到的 LSN / 任期。leader 侧的
         #: ``push_entries_to_peers`` 从这里取得 append_entries 的 prev 边界。
         self.last_matches: dict[str, int] = {}
@@ -746,6 +773,8 @@ class QuorumNode:
         *,
         commit_lsn: int = 0,
         entry_terms: list[Any] | None = None,
+        rebuild_host: str | None = None,
+        rebuild_port: int | None = None,
     ) -> dict[str, Any]:
         """处理一批 append_entries。
 
@@ -759,7 +788,9 @@ class QuorumNode:
         支撑**拼接点任期校验**：同一 LSN、不同任期 = 两条历史分叉了，
         直接重放会把正确的已提交日志静默覆盖，所以拒绝并标记
         ``rebuild_required``。这里仍然没有日志截断/回填——分叉后的修复
-        手段是重新基准备份，而不是截断。
+        手段是重新基准备份，而不是截断。leader 可同时给出
+        ``rebuild_host/rebuild_port``（自己服务的基准备份端点），follower
+        判定分叉时会回调 ``rebuild_callback`` 触发自动重建。
         """
         leader = _validate_node_id(leader_id)
         requested = max(0, int(term))
@@ -813,12 +844,13 @@ class QuorumNode:
                     # 拼接点任期；本批 entry_terms 落盘后，之后每一次推进
                     # 都有精确任期可校验。
                     local_tail_term = previous_term
+                divergence: dict[str, Any] | None = None
                 if previous_term != local_tail_term:
                     # 前缀 LSN 一致但任期不一致：这不是"落后了重发就行"，
                     # 而是同一 LSN 上存在两条不同的历史。重放会把本节点
                     # 已提交的日志静默覆盖成分叉版本，唯一安全的修复是
                     # 重新基准备份。leader 端据此跳过该 peer 的推进。
-                    return self._append_rejection(
+                    divergence = self._append_rejection(
                         (
                             f"日志分歧: lsn={previous} 本地任期 "
                             f"{local_tail_term}，leader 任期 {previous_term}"
@@ -827,10 +859,24 @@ class QuorumNode:
                         rebuild_required=True,
                     )
                 applier = self._log_applier
-                if entries and applier is None:
+                if divergence is None and entries and applier is None:
                     return self._append_rejection(
                         "本节点没有绑定日志重放函数", term=self.state.term
                     )
+            if divergence is not None:
+                # 让上层有机会自愈（例如从 leader 重新基准备份）。在锁外、
+                # 返回响应前触发；回调要自己去重并异步执行。
+                callback = self.rebuild_callback
+                if callback is not None and rebuild_host:
+                    try:
+                        callback(
+                            str(rebuild_host),
+                            int(rebuild_port or 0),
+                            previous,
+                        )
+                    except Exception:  # noqa: BLE001 - 回调异常不能吞掉拒绝响应
+                        _log.exception("append_entries 分叉重建回调抛出异常")
+                return divergence
 
             records: list[Any] = []
             if entries:
@@ -1304,6 +1350,8 @@ class QuorumNode:
                     request.get("entries", []),
                     commit_lsn=int(request.get("commit_lsn", 0)),
                     entry_terms=request.get("entry_terms"),
+                    rebuild_host=request.get("rebuild_host"),
+                    rebuild_port=request.get("rebuild_port"),
                 )
             else:
                 conn.sendall(

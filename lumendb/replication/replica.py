@@ -24,6 +24,7 @@ import threading
 import warnings
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from ..engine.database import Database
 from ..errors import NotSupportedError, StorageError, TransactionError
@@ -97,6 +98,17 @@ class Replica:
         #: ``rebuild_required`` 的"日志分歧"条目意味着该 peer 与本主库在
         #: 同一 LSN 上有两条不同历史，需要重新基准备份才能继续同步。
         self.last_push_rejections: dict[str, str] = {}
+        #: 本节点作为 leader 时服务的基准备份端点 ``(host, port)``；非空时
+        #: 随 append_entries 发给 follower，follower 判定历史分叉后会据此
+        #: 自动重建（见 :meth:`_schedule_rebuild`）。
+        self.rebuild_from: tuple[str, int] | None = None
+        #: 最近一次自动重建记录（本节点作为 follower 重建自己），成功时
+        #: ``{host, port, prev_lsn, applied_lsn}``，失败原因在
+        #: ``last_rebuild_error``。
+        self.last_rebuild: dict[str, Any] | None = None
+        self.last_rebuild_error: str | None = None
+        self._rebuild_lock = threading.Lock()
+        self._rebuild_in_flight = False
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
         if not marker_exists:
@@ -401,6 +413,57 @@ class Replica:
         if setter is not None:
             # append_entries 的条目直接走同一套物理重放，不另造一条执行路径。
             setter(self.apply)
+        if hasattr(quorum, "rebuild_callback"):
+            # 本节点作为 follower 被 leader 判出历史分叉时，用 leader 给的
+            # 基准备份端点自动重建自己（后台执行、去重）。
+            quorum.rebuild_callback = self._schedule_rebuild
+
+    def _schedule_rebuild(self, host: str, port: int, prev_lsn: int) -> None:
+        """拼接点分叉后的自愈：从 leader 重新基准备份（后台线程，去重）。
+
+        由 ``QuorumNode.append_entries`` 的分叉分支回调；重建期间在途的
+        apply 会因锁竞争而排队，leader 侧短暂超时后下一轮心跳会重试。
+        """
+        with self._rebuild_lock:
+            if self._rebuild_in_flight:
+                return
+            self._rebuild_in_flight = True
+
+        def _rebuild() -> None:
+            try:
+                _log.warning(
+                    "检测到历史分叉（lsn=%s），从 %s:%s 重新基准备份",
+                    prev_lsn, host, port,
+                )
+                self.rebase_from_server(host, int(port))
+                with self._lock:
+                    applied = self._applied_lsn
+                node = getattr(self, "_quorum_node", None)
+                reset = getattr(
+                    getattr(node, "state", None), "reset_progress", None
+                )
+                if reset is not None:
+                    # 旧历史的 match/任期分段全部作废，否则 leader 下一轮
+                    # 推送会按旧位置发，永远 prefix_mismatch。
+                    reset(applied)
+                self.last_rebuild = {
+                    "host": host,
+                    "port": int(port),
+                    "prev_lsn": int(prev_lsn),
+                    "applied_lsn": applied,
+                }
+                self.last_rebuild_error = None
+                _log.info("分叉重建完成，新基线 lsn=%s", applied)
+            except Exception as exc:  # noqa: BLE001 - 重建失败不能打死后台线程
+                _log.exception("分叉重建失败: %s", exc)
+                self.last_rebuild_error = str(exc)
+            finally:
+                with self._rebuild_lock:
+                    self._rebuild_in_flight = False
+
+        threading.Thread(
+            target=_rebuild, name="lumendb-replica-rebuild", daemon=True
+        ).start()
 
     def push_entries_to_peers(
         self,
@@ -456,6 +519,7 @@ class Replica:
                 continue
             entries = [_record_to_json(record) for record in records]
             entry_terms = [node.state.term_at(record.lsn) for record in records]
+            rebuild_from = self.rebuild_from
             response = QuorumClient.append_entries(
                 host,
                 port,
@@ -466,6 +530,8 @@ class Replica:
                 entries,
                 commit_lsn=int(node.quorum_commit_lsn),
                 entry_terms=entry_terms,
+                rebuild_host=rebuild_from[0] if rebuild_from else None,
+                rebuild_port=rebuild_from[1] if rebuild_from else None,
                 timeout=node.timeout,
                 token=node.token,
             )

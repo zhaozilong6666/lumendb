@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1177 passed。
+- 全量测试：1179 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -168,9 +168,13 @@ per-entry term 已做：`VoteState.log_terms` 按 LSN 记录任期分段，
 `(prev_lsn, prev_term)` 与本地任期不一致时拒绝并要求重建
 （`rebuild_required`，原因记入 `Replica.last_push_rejections`），
 基准备份流不带任期、follower 无任期知识时首次接触信任 leader。
-仍没有分歧尾巴截断（重建才是修复手段，无自动重建闭环）和完整
-commit index 协商；网络分区时多数派不可达会明确失败，但不能自动判断
-旧主库是否还活着。
+自动重建闭环已做：leader 把 `rebuild_from` 基准备份端点随请求下发，
+follower 分叉时经 `QuorumNode.rebuild_callback` 后台重新基准备份并
+`reset_progress` 对齐 match/清空旧任期分段，重建后下一轮心跳自动
+恢复推送；拒绝原因变化会记 warning，`ReplicationMonitor` 可读
+`last_push_rejections` 快照。仍没有分歧尾巴截断（重建是唯一修复
+手段）和完整 commit index 协商；网络分区时多数派不可达会明确失败，
+但不能自动判断旧主库是否还活着。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写入共享文件。主库每笔写语句前通过 `Database(write_fence=lease.assert_writable)`
