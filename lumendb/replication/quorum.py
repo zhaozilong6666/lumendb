@@ -167,6 +167,23 @@ class VoteState:
                 self.last_lsn = value
                 self.save()
 
+    def observe_tail_term(self, lsn: int, term: int) -> None:
+        """记录 leader 显式携带的日志尾任期（心跳 ``last_term`` 字段）。
+
+        与 :meth:`observe_lsn` 不同，这里 term 是 leader 声称的"该 LSN 处
+        日志的任期"，可以直接参与投票比较：基准备份接入的 follower 没有
+        任期分段知识，不补这一笔的话它竞选时 ``last_term=0``，会被所有
+        有任期历史的节点拒绝，永远选不上。
+        """
+        with self._lock:
+            value = max(0, int(lsn))
+            t = max(0, int(term))
+            if t == 0:
+                return
+            if value >= self.last_lsn and t >= self.last_term:
+                self.last_term = t
+                self.save()
+
     def term_at(self, lsn: int) -> int | None:
         """返回 ``lsn`` 处本节点**已应用**日志的任期；未知（没记录过）返回 ``None``。
 
@@ -428,6 +445,7 @@ class QuorumClient:
         last_lsn: int,
         *,
         commit_lsn: int = 0,
+        last_term: int = 0,
         timeout: float = 2.0,
         token: str | None = None,
     ) -> dict[str, Any]:
@@ -437,6 +455,7 @@ class QuorumClient:
             "leader_id": str(leader_id),
             "last_lsn": int(last_lsn),
             "commit_lsn": int(commit_lsn),
+            "last_term": int(last_term),
         }
         if token is not None:
             payload["token"] = token
@@ -479,6 +498,7 @@ def _send_heartbeat(
     leader_id: str,
     last_lsn: int,
     commit_lsn: int,
+    last_term: int,
     timeout: float,
     token: str | None,
 ) -> dict[str, Any]:
@@ -490,6 +510,7 @@ def _send_heartbeat(
         leader_id,
         last_lsn,
         commit_lsn=commit_lsn,
+        last_term=last_term,
         timeout=timeout,
         token=token,
     )
@@ -534,6 +555,13 @@ class QuorumNode:
         #: ``callback(rebuild_host, rebuild_port, prev_lsn)``。上层负责
         #: 去重与执行（通常是从 leader 重新基准备份）；回调异常只记日志。
         self.rebuild_callback: Callable[[str, int, int], None] | None = None
+        #: 选举看门狗：作为 follower 超过 ``election_timeout`` 没收到
+        #: leader 心跳就回调 ``on_leader_lost``（上层通常是发起竞选）。
+        #: 从未收到过心跳（集群尚无 leader）同样超时触发。
+        self.election_timeout: float | None = None
+        self.on_leader_lost: Callable[[], None] | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
         #: 最近一轮心跳里各 peer 真正 apply 到的 LSN / 任期。leader 侧的
         #: ``push_entries_to_peers`` 从这里取得 append_entries 的 prev 边界。
         self.last_matches: dict[str, int] = {}
@@ -561,6 +589,56 @@ class QuorumNode:
     def set_log_applier(self, applier: Callable[[list[Any]], int] | None) -> None:
         """绑定 append_entries 的本地重放函数（通常是 ``Replica.apply``）。"""
         self._log_applier = applier
+
+    def start_election_watchdog(self) -> None:
+        """启动选举看门狗：follower 心跳超时回调 ``on_leader_lost``。
+
+        配置了 ``election_timeout`` 和回调才生效。从未收到过心跳（集群
+        尚无 leader）同样超时触发；节点自己成为 leader 后上层必须在
+        提升路径里停掉看门狗，否则它会把自己逼停（leader 收不到别人
+        的心跳）。
+        """
+        if self.election_timeout is None or self.on_leader_lost is None:
+            return
+        with self._lock:
+            if (
+                self._watchdog_thread is not None
+                and self._watchdog_thread.is_alive()
+            ):
+                return
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                name="lumendb-election-watchdog",
+                daemon=True,
+            )
+            self._watchdog_thread.start()
+
+    def stop_election_watchdog(self) -> None:
+        """停止选举看门狗（提升成功后必须调用，防自我逼停）。"""
+        with self._lock:
+            thread = self._watchdog_thread
+            self._watchdog_thread = None
+        self._watchdog_stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(self.election_timeout):
+            with self._lock:
+                last = self._last_heartbeat_at
+            if last is None:
+                # 从未收到过心跳：集群可能还没有 leader，超时同样触发。
+                callback = self.on_leader_lost
+            elif time.time() - last > self.election_timeout:
+                callback = self.on_leader_lost
+            else:
+                continue
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:  # noqa: BLE001 - 回调异常不能打死看门狗线程
+                    _log.exception("选举看门狗回调抛出异常")
 
     @property
     def quorum_commit_lsn(self) -> int:
@@ -639,10 +717,11 @@ class QuorumNode:
 
         if pre_vote:
             with self._lock:
+                # voted_for 是**当前任期**的真实投票，与"任期+1 会不会投"
+                # 无关：健康 leader 在任时全体节点都投过它，若预投票也
+                # 检查 voted_for，故障切换时 follower 永远过不了预投票。
                 would_grant = (
-                    requested >= self.state.term
-                    and self.state.voted_for in (None, candidate)
-                    and log_is_newer_or_equal()
+                    requested >= self.state.term and log_is_newer_or_equal()
                 )
                 return {
                     "type": "vote_response",
@@ -717,9 +796,12 @@ class QuorumNode:
         leader_id: str,
         last_lsn: int,
         commit_lsn: int = 0,
+        last_term: int = 0,
     ) -> dict[str, Any]:
         with self._append_lock:
-            return self._heartbeat_impl(term, leader_id, last_lsn, commit_lsn)
+            return self._heartbeat_impl(
+                term, leader_id, last_lsn, commit_lsn, last_term
+            )
 
     def _heartbeat_impl(
         self,
@@ -727,6 +809,7 @@ class QuorumNode:
         leader_id: str,
         last_lsn: int,
         commit_lsn: int = 0,
+        last_term: int = 0,
     ) -> dict[str, Any]:
         """更新 leader 心跳；旧任期不更新活跃时间，新任期推进节点任期。"""
         leader = _validate_node_id(leader_id)
@@ -745,6 +828,9 @@ class QuorumNode:
             # 注意：``last_lsn`` 只进 "听到过" 水位（用于拒绝落后候选），
             # 不进 ``match_lsn``——leader 的心跳不代表本节点持有这些数据。
             self.state.observe_lsn(int(last_lsn))
+            # leader 显式携带的日志尾任期：基准备份接入的 follower 没有
+            # 任期分段知识，靠这笔才能让投票比较里的 last_term 有意义。
+            self.state.observe_tail_term(int(last_lsn), int(last_term))
             # 多数派水位随心跳传播，候选提升前才能读到集群已知的 commit_lsn；
             # 只存在 leader 本地的话，换主时闸门会退化成 0。
             self.state.observe_commit(int(commit_lsn))
@@ -980,6 +1066,9 @@ class QuorumNode:
         with self._lock:
             term = self.state.term
             commit_lsn = self.state.commit_lsn
+            tail_term = self.state.term_at(int(last_lsn))
+            if tail_term is None:
+                tail_term = self.state.last_term
             peers = [
                 (peer_id, address)
                 for peer_id, address in self.peers.items()
@@ -1006,6 +1095,7 @@ class QuorumNode:
                         self.node_id,
                         int(last_lsn),
                         int(commit_lsn),
+                        int(tail_term),
                         self.timeout,
                         self.token,
                     ): peer_id
@@ -1274,6 +1364,7 @@ class QuorumNode:
 
     def stop(self) -> None:
         self._stop.set()
+        self.stop_election_watchdog()
         if self._sock is not None:
             try:
                 self._sock.close()

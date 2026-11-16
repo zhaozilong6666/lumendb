@@ -73,6 +73,7 @@ class ReplicationMonitor:
         sync_replication: bool = False,
         sync_timeout: float = 2.0,
         serve_on: tuple[str, int] | None = None,
+        election_timeout: float | None = None,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -101,6 +102,9 @@ class ReplicationMonitor:
         #: 提升成功后自动起 WALServer 的地址（None = 不起）；其他 follower
         #: 可以从这里追新主库，分叉 follower 也用它自动重建。
         self.serve_on = serve_on
+        #: 心跳超时驱动选举：follower 超过这么久没收到 leader 心跳就自动
+        #: campaign（走 quorum 看门狗）。None = 关闭，只靠 status 失败计数。
+        self.election_timeout = election_timeout
         #: 提升成功后由 monitor 启动的复制服务（未提升/未配置 serve_on 时为 None）。
         self.server: WALServer | None = None
         self.max_failures = max(1, int(max_failures))
@@ -206,6 +210,7 @@ class ReplicationMonitor:
         if interval is not None:
             self.poll_interval = max(0.05, float(interval))
         self._stop.clear()
+        self._start_election_watchdog()
 
         def loop() -> None:
             while not self._stop.wait(self.poll_interval):
@@ -230,6 +235,7 @@ class ReplicationMonitor:
 
     def stop(self) -> None:
         self._stop.set()
+        self._stop_election_watchdog()
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
@@ -270,8 +276,41 @@ class ReplicationMonitor:
             return False
         self.promoted = True
         self.state = MonitorState.PROMOTED
+        # 自己已经是 leader：心跳由自己发出，看门狗再等别人的心跳会
+        # 在超时后把新主库逼停，必须立刻停掉。
+        self._stop_election_watchdog()
         self._start_serving()
         return True
+
+    def _start_election_watchdog(self) -> None:
+        """接线 quorum 选举看门狗：心跳超时 → follower 自动竞选。
+
+        只有配置了 ``election_timeout`` 且副本挂在 quorum 上才生效。
+        看门狗回调直通 :meth:`_promote`，绕过 status 失败计数——主库
+        崩溃时 follower 的复制流连接可能还挂着（半开连接），只有心跳
+        超时才是可靠的"leader 失联"信号。
+        """
+        if self.election_timeout is None or self.quorum is None:
+            return
+        self.quorum.election_timeout = float(self.election_timeout)
+        self.quorum.on_leader_lost = self._on_leader_lost
+        self.quorum.start_election_watchdog()
+
+    def _stop_election_watchdog(self) -> None:
+        if self.quorum is not None and hasattr(
+            self.quorum, "stop_election_watchdog"
+        ):
+            self.quorum.stop_election_watchdog()
+            self.quorum.on_leader_lost = None
+
+    def _on_leader_lost(self) -> None:
+        """leader 心跳超时：只有仍在跟随状态才发起竞选。
+
+        PROMOTING（竞选进行中）不重复触发；_promote 失败会落到
+        NEEDS_ATTENTION，也不再自动重试，留给人工介入。
+        """
+        if self.state is MonitorState.FOLLOWING:
+            self._promote()
 
     def _start_serving(self) -> None:
         """提升成功后对外服务复制流，并把自己登记为分叉重建端点。

@@ -896,6 +896,38 @@ def test_append_entries_gap_demands_rebuild(tmp_path):
         node.stop()
 
 
+def test_election_watchdog_fires_when_leader_heartbeats_stop(tmp_path):
+    """follower 心跳超时 → on_leader_lost 回调；从未收到心跳同样触发。"""
+    node = QuorumNode(
+        "n0",
+        state_path=tmp_path / "n0.vote.json",
+        timeout=1.0,
+    ).start()
+    try:
+        fired = []
+
+        node.election_timeout = 0.2
+        node.on_leader_lost = lambda: fired.append(time.monotonic())
+        node.start_election_watchdog()
+
+        # 从未收到过心跳：集群可能还没有 leader，同样应超时触发。
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not fired:
+            time.sleep(0.02)
+        assert fired, "从未收到心跳时看门狗也必须触发"
+
+        # 收到心跳会重置计时：停止回调后先喂一次心跳，短暂窗口内不触发。
+        node.stop_election_watchdog()
+        node.on_leader_lost = lambda: fired.append("second")
+        node.election_timeout = 0.15
+        node.start_election_watchdog()
+        node.heartbeat(0, "leader", 0, commit_lsn=0)
+        node.stop_election_watchdog()
+        assert all(v != "second" for v in fired), "收到心跳后不应立即触发"
+    finally:
+        node.stop()
+
+
 def test_append_entries_divergence_is_visible_over_the_wire(tmp_path):
     """RPC 路径同样携带 entry_terms，并能把 rebuild_required 送回 leader。"""
     nodes = _cluster(tmp_path, count=2)

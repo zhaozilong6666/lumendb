@@ -949,9 +949,14 @@ class Replica:
         self._stop_background()
         with self._lock:
             if fence_path is not None:
-                PromotionFence(fence_path, node_id=node_id).promote(
-                    self._applied_lsn
-                )
+                fence = PromotionFence(fence_path, node_id=node_id)
+                fence.promote(self._applied_lsn)
+                # 没有显式 write_fence（租约等）时，默认把共享 fence 的
+                # assert_writable 接进写路径：每个主库写前都会重读 marker，
+                # 别的节点后来提升会立即让旧主库停写，而不是只有提升瞬间
+                # 写一次 marker 就再也不看。
+                if write_fence is None:
+                    write_fence = fence.assert_writable
             self.db.close()
             self.db = Database(
                 self.path,
