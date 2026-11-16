@@ -14,6 +14,7 @@ fence 文件，仍可能双写，部署时必须明确这一点。
 
 from __future__ import annotations
 
+import logging
 import ssl
 import threading
 import time
@@ -23,6 +24,8 @@ from pathlib import Path
 from ..errors import NotSupportedError, RedirectError, StorageError
 from .replica import Replica
 from .wal_stream import WALClient
+
+_log = logging.getLogger(__name__)
 
 
 class MonitorState(str, Enum):
@@ -189,7 +192,16 @@ class ReplicationMonitor:
 
         def loop() -> None:
             while not self._stop.wait(self.poll_interval):
-                status = self.poll()
+                try:
+                    status = self.poll()
+                except Exception as exc:  # noqa: BLE001 - 监控线程不能因单次异常退出
+                    # poll 已经处理了 OSError/StorageError/RedirectError；
+                    # 其余异常（协议解析、内存错误等）记录下来继续轮询，
+                    # 否则一次坏响应就会让自动切换永久失效。
+                    self.failures += 1
+                    self.last_error = f"poll crashed: {exc}"
+                    _log.exception("复制监控 poll 抛出未预期异常")
+                    continue
                 if status in ("promoted", "needs_attention"):
                     break
 

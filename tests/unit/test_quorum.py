@@ -329,6 +329,46 @@ def test_monitor_promotion_starts_the_heartbeat_push(tmp_path):
         primary.close()
 
 
+def test_monitor_loop_survives_unexpected_poll_errors(tmp_path, monkeypatch):
+    """poll() 抛未预期异常时后台轮询线程必须继续跑，而不是静默退出。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    monitor = None
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        server.stop()
+        import lumendb.replication.wal_stream as ws
+
+        def boom(self, *args, **kwargs):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(ws.WALClient, "status", boom)
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            max_failures=1,
+            timeout=0.2,
+            poll_interval=0.05,
+        )
+        monitor.start()
+        assert _wait_for(
+            lambda: monitor.last_error == "poll crashed: boom",
+            timeout=3.0,
+        ), f"监控线程没有记录未预期异常：last_error={monitor.last_error!r}"
+    finally:
+        if monitor is not None:
+            monitor.stop()
+        server.stop()
+        if replica is not None:
+            replica.db.close()
+        primary.close()
+
+
 def test_monitor_auto_promotion_uses_lease(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
