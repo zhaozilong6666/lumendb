@@ -269,8 +269,12 @@ fencing。
 heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 `(last_term,last_lsn)` 字典序，心跳会把多数派提交水位带给 follower，
 更高任期会让候选放弃本轮提升；关闭/降级与在途 SQL 的竞争也已收口
-（close 等待只读语句、回滚线上事务）。日志复制协商、网络分区双写防护和
-副本查询/apply 并发仍未完成，因此第 4 层只能标“MVP 验收”，不能标“生产就绪”。
+（close 等待只读语句、回滚线上事务）。日志协商已到 prefix-checked
+`append_entries` + 逐条任期 + 分叉/缺口自动重建（重建替代尾巴截断）；
+心跳超时自动竞选与双候选收敛已做；双写防护为共享 fence + TTL 租约 +
+重启打开即检（`fence_path`/`lease_path`）三层兜底，不是完整的多数派写
+确认。剩余差距：完整 commit index、副本查询与 apply 的并发调度，因此
+第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
 
