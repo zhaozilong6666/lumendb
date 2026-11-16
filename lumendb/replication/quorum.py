@@ -624,13 +624,22 @@ class QuorumNode:
             thread.join(timeout=2)
 
     def _watchdog_loop(self) -> None:
-        while not self._watchdog_stop.wait(self.election_timeout):
+        import random as _random
+
+        while True:
+            # 每次等待都加 ±35% 抖动：多个 follower 在同一时刻超时会同票
+            # 瓜分、谁都选不上；随机错开后赢家在下一轮把输家喂回跟随状态。
+            base = float(self.election_timeout or 0)
+            if base <= 0:
+                return
+            if self._watchdog_stop.wait(base * _random.uniform(0.85, 1.35)):
+                return
             with self._lock:
                 last = self._last_heartbeat_at
             if last is None:
                 # 从未收到过心跳：集群可能还没有 leader，超时同样触发。
                 callback = self.on_leader_lost
-            elif time.time() - last > self.election_timeout:
+            elif time.time() - last > base:
                 callback = self.on_leader_lost
             else:
                 continue
@@ -1606,9 +1615,18 @@ class HeartbeatLoop:
             self.last_quorum_commit_lsn = self.node.quorum_commit_lsn
             term_after = self.node.state.term
             self.last_observed_term = term_after
+            # term 没变也可能失去 leader 资格：本节点的仲裁节点在投票阶段
+            # 就改投了更高任期的候选（voted_for != 自己）。只看 term 变化
+            # 会漏掉"任期在投票请求里被直接推高"的窗口，形成双主静默共存。
+            my_id = getattr(self.node, "node_id", None)
+            lost_vote = getattr(self.node.state, "voted_for", None) not in (
+                None,
+                my_id,
+            )
             if (
                 self.push_entries is not None
                 and term_after == term_before
+                and not lost_vote
             ):
                 try:
                     accumulated: dict[str, int] = {}
@@ -1628,7 +1646,10 @@ class HeartbeatLoop:
                     self.last_errors = (
                         self.last_errors + [f"append_entries: {exc}"]
                     )[-32:]
-            if term_after > term_before and self.on_higher_term is not None:
+            if (
+                (term_after > term_before or lost_vote)
+                and self.on_higher_term is not None
+            ):
                 try:
                     self.on_higher_term(term_after)
                     self.last_callback_error = None

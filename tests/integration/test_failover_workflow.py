@@ -202,3 +202,86 @@ def test_heartbeat_timeout_drives_follower_promotion(tmp_path):
             node.stop()
         server.stop()
         primary.close()
+
+
+def test_two_candidates_pick_exactly_one_leader(tmp_path):
+    """两个 follower 同时超时竞选：必须选出恰一个 leader，另一个退出。
+
+    竞选失败方（票被瓜分）保持 FOLLOWING 并在下一个选举超时重试；赢家
+    提升后心跳会把输家的仲裁节点重新喂成跟随者，输家自然退出竞选，
+    不会出现两个主库或反复抢票的 livelock。
+    """
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    for i in range(5):
+        primary.execute_one(f"INSERT INTO t VALUES ({i})")
+    server = WALServer(primary).start()
+
+    nodes = [
+        QuorumNode(
+            f"n{i}",
+            state_path=tmp_path / f"n{i}.vote.json",
+            timeout=1.0,
+        ).start()
+        for i in range(3)
+    ]
+    peers = {n.node_id: (n.host, n.port) for n in nodes}
+    for node in nodes:
+        node.peers = {p: a for p, a in peers.items() if p != node.node_id}
+
+    fence_path = tmp_path / "fence.json"
+    replicas: list[Replica] = []
+    monitors: list[ReplicationMonitor] = []
+    try:
+        for i in (1, 2):
+            replica = Replica.bootstrap_from_server(
+                server.host, server.port, tmp_path / f"replica{i}"
+            )
+            replica.attach_quorum(nodes[i])
+            replicas.append(replica)
+            monitors.append(
+                ReplicationMonitor(
+                    replica,
+                    server.host,
+                    server.port,
+                    fence_path=fence_path,
+                    max_failures=100,
+                    timeout=0.2,
+                    quorum=nodes[i],
+                    lease_keeper_auto=False,
+                    election_timeout=0.3,
+                )
+            )
+        server.stop()
+        primary.close()
+        for monitor in monitors:
+            monitor.start(interval=0.1)
+
+        # 看门狗抖动错开两个候选；等一段时间后必须恰好一个当选。
+        assert _wait_for(lambda: sum(m.promoted for m in monitors) == 1, timeout=15.0), (
+            "两个候选应选出恰一个 leader"
+        )
+        # 双候选最终必须收敛：恰一个 leader，另一个停在非竞选状态
+        # （FOLLOWING=被心跳喂住，NEEDS_ATTENTION=曾被当选后被逼停）。
+        # 中途允许一次"高 LSN 候选后当选"的合法接管（fence 覆盖 +
+        # 旧主被 lost_vote 逼停），所以断言的是 2 秒观察窗内的稳态。
+        def settled() -> bool:
+            if sum(m.promoted for m in monitors) != 1:
+                return False
+            loser = next(m for m in monitors if not m.promoted)
+            return loser.state.name in ("FOLLOWING", "NEEDS_ATTENTION")
+
+        assert _wait_for(settled, timeout=15.0), (
+            f"双候选没有收敛到单主（{[(m.state.name, m.promoted) for m in monitors]}）"
+        )
+        time.sleep(2.0)  # 观察窗口：无第二个 promoted、无状态振荡
+        assert settled(), f"双候选在观察窗口内振荡（{[(m.state.name, m.promoted) for m in monitors]}）"
+    finally:
+        for monitor in monitors:
+            monitor.stop()
+        for replica in replicas:
+            replica.close()
+        for node in nodes:
+            node.stop()
+        server.stop()
+        primary.close()

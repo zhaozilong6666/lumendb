@@ -260,7 +260,18 @@ class ReplicationMonitor:
                     lease_keeper_auto=self.lease_keeper_auto,
                     lease_renew_with_quorum=self.lease_renew_with_quorum,
                     lease_loss_stepdown=self.lease_loss_stepdown,
-                    heartbeat_interval=self.heartbeat_interval,
+                    # 双候选同窗竞选时，对方可能以更高任期当选：心跳轮
+                    # 观察到更高任期就降级回只读，不留双主窗口。
+                    on_higher_term=self._on_higher_term,
+                    # 无人值守自动提升后必须有心跳维持 leader：没显式配置
+                    # 时用选举超时的一半，否则其他 follower 会再次超时，
+                    # 整个集群陷入反复选举。
+                    heartbeat_interval=self.heartbeat_interval
+                    or (
+                        self.election_timeout / 2.0
+                        if self.election_timeout
+                        else None
+                    ),
                     sync_replication=self.sync_replication,
                     sync_timeout=self.sync_timeout,
                     node_id=self.quorum.node_id,
@@ -272,7 +283,22 @@ class ReplicationMonitor:
                 )
         except (NotSupportedError, StorageError) as exc:
             self.last_error = str(exc)
-            self.state = MonitorState.NEEDS_ATTENTION
+            # 竞选类失败与"根本不能当主库"（持久化/闸门损坏）要分开：
+            # 前者在下一个选举超时重试——票被瓜分时输家回 FOLLOWING，
+            # 之后被赢家心跳重新喂住自然退出；fence 里已有更高提升 LSN
+            # 说明另一个主库更超前，正确动作同样是回去跟随它。
+            if self.quorum is not None and any(
+                marker in str(exc)
+                for marker in (
+                    "预投票",
+                    "投票",
+                    "多数派",
+                    "更高的提升 LSN",
+                )
+            ):
+                self.state = MonitorState.FOLLOWING
+            else:
+                self.state = MonitorState.NEEDS_ATTENTION
             return False
         self.promoted = True
         self.state = MonitorState.PROMOTED
@@ -336,6 +362,16 @@ class ReplicationMonitor:
         except OSError as exc:
             _log.warning("提升后起复制服务失败（follower 无法追流/重建）: %s", exc)
             self.last_error = f"serve failed: {exc}"
+
+    def _on_higher_term(self, term: int) -> None:
+        """心跳轮观察到更高任期：本节点已不再是 leader，自动降级。
+
+        双候选同时竞选时，一方会以更高任期当选；本主库的心跳从 peer
+        收到更高任期后必须停写，否则留下双主窗口。
+        """
+        if not self.promoted:
+            return
+        self.replica.step_down(f"观察到更高任期 {term}")
 
     def _handle_step_down(self, reason: str) -> None:
         """Replica 被降级时把状态扣回 needs_attention，而不是继续报 promoted。"""
