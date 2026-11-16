@@ -82,6 +82,9 @@ class Replica:
         # 0 表示还没有在本进程内建立连续视图（首次 apply 允许从任意 LSN 开始，
         # 例如基准备份之后的第一条记录）。
         self._expected_end_lsn = 0
+        # promote/step_down 重开数据库时沿用同一个分段大小，避免段文件混用
+        # 默认 1MB 与用户配置。
+        self._wal_segment_bytes = wal_segment_bytes
         # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
         self._lock = threading.RLock()
         self._lease_keeper: LeaseKeeper | None = None
@@ -504,6 +507,7 @@ class Replica:
                 self.path,
                 read_only=True,
                 checkpoint_wal_bytes=0,
+                wal_segment_bytes=getattr(self, "_wal_segment_bytes", 1024 * 1024),
             )
             db = self.db
         for callback in list(self._step_down_listeners):
@@ -814,6 +818,7 @@ class Replica:
                 self.path,
                 read_only=False,
                 checkpoint_wal_bytes=0,
+                wal_segment_bytes=getattr(self, "_wal_segment_bytes", 1024 * 1024),
                 write_fence=write_fence,
             )
             self._seed_promoted_wal()
