@@ -386,6 +386,7 @@ class QuorumClient:
         entry_terms: list[Any] | None = None,
         rebuild_host: str | None = None,
         rebuild_port: int | None = None,
+        rebuild_hint: bool = False,
         timeout: float = 2.0,
         token: str | None = None,
     ) -> dict[str, Any]:
@@ -399,7 +400,9 @@ class QuorumClient:
         ``entry_terms`` 与 entries 等长（``None`` 表示 leader 不确定该条的
         任期）；follower 用它逐条记录精确任期，支撑拼接点分叉检测。
         ``rebuild_host/rebuild_port`` 是 leader 服务的基准备份端点，follower
-        判定历史分叉时用它触发自动重建。
+        判定历史分叉时用它触发自动重建。``rebuild_hint`` 是 leader 的
+        主动信号："你的拼接点已低于我的 WAL 起点"，follower 直接走重建，
+        不再按 prefix_mismatch 反复拒绝。
         """
         payload: dict[str, Any] = {
             "type": "append_entries",
@@ -415,6 +418,8 @@ class QuorumClient:
         if rebuild_host:
             payload["rebuild_host"] = str(rebuild_host)
             payload["rebuild_port"] = int(rebuild_port or 0)
+        if rebuild_hint:
+            payload["rebuild_hint"] = True
         if token is not None:
             payload["token"] = token
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -870,6 +875,7 @@ class QuorumNode:
         entry_terms: list[Any] | None = None,
         rebuild_host: str | None = None,
         rebuild_port: int | None = None,
+        rebuild_hint: bool = False,
     ) -> dict[str, Any]:
         """处理一批 append_entries。
 
@@ -923,6 +929,14 @@ class QuorumNode:
                     self.state.term = requested
                     self.state.voted_for = None
                     self.state.save()
+                if rebuild_hint:
+                    # leader 主动告知"你的拼接点已低于我的 WAL 起点，无法
+                    # 连续重放"（例如落后到已回收区）。直接触发重建回调，
+                    # 不要在这里按拼接点校验走 prefix_mismatch——那会让
+                    # leader 每轮心跳重发、follower 反复拒绝。
+                    return self._rebuild_required_response(
+                        previous, rebuild_host, rebuild_port
+                    )
                 if previous != self.state.match_lsn:
                     return {
                         "type": "append_entries_response",
@@ -1051,6 +1065,26 @@ class QuorumNode:
             if rebuild_required:
                 response["rebuild_required"] = True
             return response
+
+    def _rebuild_required_response(
+        self,
+        previous: int,
+        rebuild_host: str | None,
+        rebuild_port: int | None,
+    ) -> dict[str, Any]:
+        """构造"要求重建"的响应并在返回前触发上层重建回调。"""
+        response = self._append_rejection(
+            "日志缺口: 拼接点低于 leader 的 WAL 起点",
+            term=self.state.term,
+            rebuild_required=True,
+        )
+        callback = self.rebuild_callback
+        if callback is not None and rebuild_host:
+            try:
+                callback(str(rebuild_host), int(rebuild_port or 0), previous)
+            except Exception:  # noqa: BLE001 - 回调异常不能吞掉拒绝响应
+                _log.exception("append_entries 缺口重建回调抛出异常")
+        return response
 
     def heartbeat_round(
         self,
@@ -1460,6 +1494,7 @@ class QuorumNode:
                     entry_terms=request.get("entry_terms"),
                     rebuild_host=request.get("rebuild_host"),
                     rebuild_port=request.get("rebuild_port"),
+                    rebuild_hint=bool(request.get("rebuild_hint")),
                 )
             else:
                 conn.sendall(

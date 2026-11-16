@@ -508,6 +508,7 @@ class Replica:
 
         pushed: dict[str, int] = {}
         now = time.monotonic()
+        rebuild_from = self.rebuild_from
         for peer_id, (host, port) in dict(getattr(node, "peers", {})).items():
             if peer_id == node.node_id:
                 continue
@@ -531,10 +532,31 @@ class Replica:
             )
             records = list(db.wal.iter_records(prev_lsn + 1))[:limit]
             if not records:
+                # peer 可能落后到本地 WAL 已无法连续供应的位置：本地拿不出
+                # 拼接点之后的记录（提升后新 WAL 从 applied 边界开始，或
+                # 旧段已回收），重发空批只会让 follower 干等。用本地已应用
+                # 位置判断：prev 落后于它且 WAL 没有可推的记录 = 缺口，
+                # 主动发一次 rebuild 信号让 follower 走基准备份自愈。
+                applied = int(getattr(self, "_applied_lsn", 0) or 0)
+                if applied > prev_lsn and rebuild_from is not None:
+                    QuorumClient.append_entries(
+                        host,
+                        port,
+                        node.state.term,
+                        node.node_id,
+                        prev_lsn,
+                        prev_term,
+                        [],
+                        rebuild_host=rebuild_from[0],
+                        rebuild_port=rebuild_from[1],
+                        rebuild_hint=True,
+                        timeout=node.timeout,
+                        token=getattr(node, "token", None),
+                    )
+                    self._push_backoff[peer_id] = now + 2.0
                 continue
             entries = [_record_to_json(record) for record in records]
             entry_terms = [node.state.term_at(record.lsn) for record in records]
-            rebuild_from = self.rebuild_from
             response = QuorumClient.append_entries(
                 host,
                 port,

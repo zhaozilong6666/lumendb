@@ -265,6 +265,87 @@ def test_partitioned_leader_stops_writing_when_lease_renew_fails(tmp_path):
         primary.close()
 
 
+def test_lagging_follower_gap_triggers_auto_rebuild(tmp_path):
+    """落后副本 + leader WAL 已越过它的拼接点 → gap → 自动重建追平。
+
+    这是 gap→rebuild 死循环修复（66e3a50）的端到端验收：follower 落后到
+    无法从 leader 的 WAL 连续重放时，拒绝一次（rebuild_required）而不是
+    每轮心跳重复拒绝，随后后台从 leader 基准备份端点重建，追上后正常
+    恢复推送。
+    """
+    primary = Database(
+        tmp_path / "primary", checkpoint_wal_bytes=0, wal_segment_bytes=1024
+    )
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    for i in range(5):
+        primary.execute_one(f"INSERT INTO t VALUES ({i})")
+    server = WALServer(primary).start()
+
+    nodes = [
+        QuorumNode(
+            f"n{i}",
+            state_path=tmp_path / f"n{i}.vote.json",
+            timeout=1.0,
+        ).start()
+        for i in range(3)
+    ]
+    peers = {n.node_id: (n.host, n.port) for n in nodes}
+    for node in nodes:
+        node.peers = {p: a for p, a in peers.items() if p != node.node_id}
+
+    follower = None
+    leader = None
+    leader_server = None
+    try:
+        # 1. follower 先接入，随后主库继续写、leader 再接入——两个副本的
+        #    拼接点天然不同（基准备份快照点），follower 落后于 leader。
+        follower = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "follower"
+        )
+        follower_lsn = follower.applied_lsn
+        for i in range(5, 105):
+            primary.execute_one(f"INSERT INTO t VALUES ({i})")
+        leader = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "leader"
+        )
+        assert leader.applied_lsn > follower_lsn
+
+        # 2. leader 提升并对外服务（重建端点指向它自己）。
+        leader.promote_with_quorum(
+            nodes[0],
+            fence_path=tmp_path / "fence.json",
+            lease_keeper_auto=False,
+            heartbeat_interval=0.05,
+        )
+        leader_server = WALServer(leader.db).start()
+        leader.rebuild_from = (leader_server.host, leader_server.port)
+
+        # 3. follower 挂进仲裁：下一轮 push 发现 gap，自动重建。
+        follower.attach_quorum(nodes[1])
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(105,)],
+            timeout=15.0,
+        ), (
+            "gap 后 follower 没有自动重建追平"
+            f"（applied={follower.applied_lsn}，leader={leader.applied_lsn}）"
+        )
+        assert follower.applied_lsn >= leader.applied_lsn
+        assert _wait_for(
+            lambda: follower.last_rebuild is not None, timeout=10.0
+        ), "重建没有真正发生过（last_rebuild 为空）"
+    finally:
+        if follower is not None:
+            follower.close()
+        if leader is not None:
+            leader.close()
+        if leader_server is not None:
+            leader_server.stop()
+        for node in nodes:
+            node.stop()
+        server.stop()
+        primary.close()
+
+
 def test_two_candidates_pick_exactly_one_leader(tmp_path):
     """两个 follower 同时超时竞选：必须选出恰一个 leader，另一个退出。
 
