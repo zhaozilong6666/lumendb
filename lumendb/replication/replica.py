@@ -102,6 +102,8 @@ class Replica:
         #: 随 append_entries 发给 follower，follower 判定历史分叉后会据此
         #: 自动重建（见 :meth:`_schedule_rebuild`）。
         self.rebuild_from: tuple[str, int] | None = None
+        #: 自动重建端点要求的共享 token（与 rebuild_from 配套）。
+        self.rebuild_token: str | None = None
         #: 最近一次自动重建记录（本节点作为 follower 重建自己），成功时
         #: ``{host, port, prev_lsn, applied_lsn}``，失败原因在
         #: ``last_rebuild_error``。
@@ -435,7 +437,9 @@ class Replica:
                     "检测到历史分叉（lsn=%s），从 %s:%s 重新基准备份",
                     prev_lsn, host, port,
                 )
-                self.rebase_from_server(host, int(port))
+                self.rebase_from_server(
+                    host, int(port), token=self.rebuild_token
+                )
                 with self._lock:
                     applied = self._applied_lsn
                 node = getattr(self, "_quorum_node", None)

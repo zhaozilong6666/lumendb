@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from lumendb.errors import NotSupportedError
+from lumendb.errors import NotSupportedError, StorageError
 from lumendb.engine.database import Database
 from lumendb.replication import HeartbeatLoop, Lease, PromotionFence, Replica, ReplicationMonitor, WALServer
 from lumendb.replication.quorum import QuorumClient, QuorumNode, VoteState
@@ -466,15 +466,25 @@ def test_monitor_serves_replication_stream_after_promotion(tmp_path):
             heartbeat_interval=0.05,
             lease_keeper_auto=False,
             serve_on=("127.0.0.1", 0),
+            token="secret",
         )
         assert monitor.poll() == "promoted"
         assert monitor.server is not None
         assert replica.rebuild_from == (monitor.server.host, monitor.server.port)
+        assert replica.rebuild_token == "secret"
         replica.execute_one("INSERT INTO t VALUES (1)")
         late_follower = Replica.bootstrap_from_server(
-            monitor.server.host, monitor.server.port, tmp_path / "late"
+            monitor.server.host,
+            monitor.server.port,
+            tmp_path / "late",
+            token="secret",
         )
         assert late_follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        # token 不匹配必须被拒绝，重建自愈不会在错误凭据上反复重试成功。
+        with pytest.raises(StorageError):
+            Replica.bootstrap_from_server(
+                monitor.server.host, monitor.server.port, tmp_path / "bad"
+            )
     finally:
         if monitor is not None:
             monitor.stop()

@@ -287,8 +287,10 @@ class ReplicationMonitor:
                 self.replica.db,
                 host=self.serve_on[0],
                 port=int(self.serve_on[1]),
+                token=self.token,
             ).start()
             self.replica.rebuild_from = (self.server.host, self.server.port)
+            self.replica.rebuild_token = self.token
             _log.info(
                 "提升完成，复制服务监听 %s:%s", self.server.host, self.server.port
             )
