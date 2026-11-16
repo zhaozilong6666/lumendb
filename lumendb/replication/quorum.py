@@ -79,6 +79,11 @@ class VoteState:
         self.match_term = 0
         #: 多数派确认过的提交水位（本节点目前知道的上界）。
         self.commit_lsn = 0
+        #: 本节点**已应用**日志的任期分段：``[[start_lsn, term], ...]``，
+        #: ``start_lsn`` 单调递增。append_entries 逐条带任期时精确记录，
+        #: 用于拼接点校验：同一 LSN 但任期不同说明两条历史分叉了。
+        #: 只增不删——任期分段不会因滞后心跳而回退。
+        self.log_terms: list[list[int]] = []
         #: 最近一次 leader 心跳（落盘）。只放内存的话，节点重启后
         #: `status` 会报"从没收到过心跳"，排障时分不清"主库没发"和
         #: "我重启过"——这正是上一轮 review 指出的缺口。
@@ -109,6 +114,13 @@ class VoteState:
         self.match_lsn = max(0, int(raw.get("match_lsn", 0)))
         self.match_term = max(0, int(raw.get("match_term", 0)))
         self.commit_lsn = max(0, int(raw.get("commit_lsn", 0)))
+        self.log_terms = []
+        for raw_pair in raw.get("log_terms", []) or []:
+            try:
+                start_lsn, term = raw_pair
+                self.log_terms.append([max(0, int(start_lsn)), max(0, int(term))])
+            except (TypeError, ValueError):
+                continue
         self.last_heartbeat_at = max(0.0, float(raw.get("last_heartbeat_at", 0.0)))
         from_leader = raw.get("last_heartbeat_from")
         self.last_heartbeat_from = (
@@ -129,6 +141,7 @@ class VoteState:
                 "match_lsn": int(self.match_lsn),
                 "match_term": int(self.match_term),
                 "commit_lsn": int(self.commit_lsn),
+                "log_terms": [list(pair) for pair in self.log_terms],
                 "last_heartbeat_at": round(float(self.last_heartbeat_at), 6),
                 "last_heartbeat_from": self.last_heartbeat_from,
             }
@@ -153,6 +166,43 @@ class VoteState:
             if value > self.last_lsn:
                 self.last_lsn = value
                 self.save()
+
+    def term_at(self, lsn: int) -> int | None:
+        """返回 ``lsn`` 处本节点**已应用**日志的任期；未知（没记录过）返回 ``None``。
+
+        这是拼接点校验的依据：leader 用它发送 ``prev_lsn`` 处的真实任期，
+        follower 用它核对"同一 LSN 是否来自同一历史"。**不要**用当前
+        ``term`` 代替：当前任期可能比该 LSN 处日志的任期新。
+        """
+        with self._lock:
+            value = max(0, int(lsn))
+            found: int | None = None
+            for start_lsn, term in self.log_terms:
+                if start_lsn <= value:
+                    found = int(term)
+                else:
+                    break
+            return found
+
+    def record_term(self, lsn: int, term: int) -> None:
+        """记录 ``lsn`` 处日志的任期（append_entries 逐条携带时精确记录）。
+
+        只追加不覆盖：任期分段是"这段历史长什么样"的事实，不能因为后来
+        听到滞后心跳就往回退。同任期自然合并，``lsn`` 不前进时忽略。
+        """
+        with self._lock:
+            value = max(0, int(lsn))
+            t = max(0, int(term))
+            if t == 0:
+                return
+            if self.log_terms:
+                last_start, last_term = self.log_terms[-1]
+                if last_term == t:
+                    return  # 同任期延续，不需要新分段
+                if value <= last_start:
+                    return  # 不能写入比已知分段更早的任期
+            self.log_terms.append([value, t])
+            self.save()
 
     def observe_applied(self, lsn: int, term: int | None = None) -> None:
         """记录本节点***真正复制到***的 LSN；心跳会把它报给 leader。
@@ -300,6 +350,7 @@ class QuorumClient:
         entries: list[dict[str, Any]],
         *,
         commit_lsn: int = 0,
+        entry_terms: list[Any] | None = None,
         timeout: float = 2.0,
         token: str | None = None,
     ) -> dict[str, Any]:
@@ -309,6 +360,9 @@ class QuorumClient:
         与本地已应用日志尾部是否一致，再通过绑定的 applier 重放 entries。
         它不替代 WAL 流，也不做 Raft 的日志截断/回填；leader 侧仍可用
         WAL 流把失联副本追上。
+
+        ``entry_terms`` 与 entries 等长（``None`` 表示 leader 不确定该条的
+        任期）；follower 用它逐条记录精确任期，支撑拼接点分叉检测。
         """
         payload: dict[str, Any] = {
             "type": "append_entries",
@@ -319,6 +373,8 @@ class QuorumClient:
             "entries": list(entries),
             "commit_lsn": int(commit_lsn),
         }
+        if entry_terms is not None:
+            payload["entry_terms"] = list(entry_terms)
         if token is not None:
             payload["token"] = token
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -689,14 +745,21 @@ class QuorumNode:
         entries: list[Any],
         *,
         commit_lsn: int = 0,
+        entry_terms: list[Any] | None = None,
     ) -> dict[str, Any]:
         """处理一批 append_entries。
 
         ``prev_lsn/prev_term`` 必须与本地已应用日志尾部完全一致；不匹配时
         返回 ``ok=False``，让 leader 从更早的位置重发。entries 是
         ``wal_stream._record_to_json`` 的字典，按顺序交给绑定的 applier
-        （通常是 ``Replica.apply``）。这里没有日志截断/回填，也没有把
-        entry 的任期逐个落盘；它只是把“前缀一致的追加”做成可校验的 RPC。
+        （通常是 ``Replica.apply``）。
+
+        ``entry_terms`` 是与 entries 等长的任期数组（可为 ``None`` 表示
+        leader 也不确定），follower 逐条记进 ``VoteState.log_terms``。它
+        支撑**拼接点任期校验**：同一 LSN、不同任期 = 两条历史分叉了，
+        直接重放会把正确的已提交日志静默覆盖，所以拒绝并标记
+        ``rebuild_required``。这里仍然没有日志截断/回填——分叉后的修复
+        手段是重新基准备份，而不是截断。
         """
         leader = _validate_node_id(leader_id)
         requested = max(0, int(term))
@@ -706,6 +769,18 @@ class QuorumNode:
             return self._append_rejection("entries 必须是数组")
         if len(entries) > 1000:
             return self._append_rejection("单次 append_entries 条目过多")
+        terms: list[int | None] = []
+        if entry_terms is not None:
+            if not isinstance(entry_terms, list) or len(entry_terms) != len(entries):
+                return self._append_rejection("entry_terms 必须与 entries 等长")
+            for raw_term in entry_terms:
+                if raw_term is None:
+                    terms.append(None)
+                    continue
+                try:
+                    terms.append(max(0, int(raw_term)))
+                except (TypeError, ValueError):
+                    return self._append_rejection("entry_terms 必须是整数数组")
 
         with self._append_lock:
             with self._lock:
@@ -722,10 +797,7 @@ class QuorumNode:
                     self.state.term = requested
                     self.state.voted_for = None
                     self.state.save()
-                if (
-                    previous != self.state.match_lsn
-                    or previous_term != self.state.match_term
-                ):
+                if previous != self.state.match_lsn:
                     return {
                         "type": "append_entries_response",
                         "term": self.state.term,
@@ -734,6 +806,26 @@ class QuorumNode:
                         "match_lsn": self.state.match_lsn,
                         "match_term": self.state.match_term,
                     }
+                local_tail_term = self.state.term_at(previous)
+                if local_tail_term is None:
+                    # follower 对这段历史没有任期知识（典型：刚通过基准备份
+                    # 同步，备份流不携带任期）。首次接触选择信任 leader 的
+                    # 拼接点任期；本批 entry_terms 落盘后，之后每一次推进
+                    # 都有精确任期可校验。
+                    local_tail_term = previous_term
+                if previous_term != local_tail_term:
+                    # 前缀 LSN 一致但任期不一致：这不是"落后了重发就行"，
+                    # 而是同一 LSN 上存在两条不同的历史。重放会把本节点
+                    # 已提交的日志静默覆盖成分叉版本，唯一安全的修复是
+                    # 重新基准备份。leader 端据此跳过该 peer 的推进。
+                    return self._append_rejection(
+                        (
+                            f"日志分歧: lsn={previous} 本地任期 "
+                            f"{local_tail_term}，leader 任期 {previous_term}"
+                        ),
+                        term=self.state.term,
+                        rebuild_required=True,
+                    )
                 applier = self._log_applier
                 if entries and applier is None:
                     return self._append_rejection(
@@ -772,6 +864,14 @@ class QuorumNode:
                 last_lsn = int(records[-1].lsn)
                 with self._lock:
                     self.state.observe_applied(last_lsn, term=requested)
+                    if terms:
+                        # 逐条精确记录任期分段；重放成功后才有意义，
+                        # 失败批次绝不能把任期记进去。
+                        for record, entry_term in zip(records, terms):
+                            if entry_term is not None:
+                                self.state.record_term(
+                                    int(record.lsn), int(entry_term)
+                                )
             with self._lock:
                 self.state.observe_commit(int(commit_lsn))
                 return {
@@ -784,10 +884,14 @@ class QuorumNode:
                 }
 
     def _append_rejection(
-        self, reason: str, *, term: int | None = None
+        self,
+        reason: str,
+        *,
+        term: int | None = None,
+        rebuild_required: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
-            return {
+            response: dict[str, Any] = {
                 "type": "append_entries_response",
                 "term": self.state.term if term is None else int(term),
                 "ok": False,
@@ -795,6 +899,9 @@ class QuorumNode:
                 "match_lsn": self.state.match_lsn,
                 "match_term": self.state.match_term,
             }
+            if rebuild_required:
+                response["rebuild_required"] = True
+            return response
 
     def heartbeat_round(
         self,
@@ -1196,6 +1303,7 @@ class QuorumNode:
                     int(request.get("prev_term", 0)),
                     request.get("entries", []),
                     commit_lsn=int(request.get("commit_lsn", 0)),
+                    entry_terms=request.get("entry_terms"),
                 )
             else:
                 conn.sendall(

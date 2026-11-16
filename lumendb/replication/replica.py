@@ -93,6 +93,10 @@ class Replica:
         self._quorum_node = None
         #: 同步复制的提交屏障（未开启时为 None）。
         self._commit_barrier: QuorumCommitBarrier | None = None
+        #: 最近一次推送被 peer 拒绝的原因：``{peer_id: reason}``。
+        #: ``rebuild_required`` 的"日志分歧"条目意味着该 peer 与本主库在
+        #: 同一 LSN 上有两条不同历史，需要重新基准备份才能继续同步。
+        self.last_push_rejections: dict[str, str] = {}
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
         if not marker_exists:
@@ -409,7 +413,14 @@ class Replica:
         leader 侧既可显式调用（先跑一轮 ``heartbeat_round`` 填好每个 peer 的
         ``last_matches``），也会被提升后的 ``HeartbeatLoop`` 每轮自动调用。
         只处理下一批；失败/前缀不匹配时返回 0 并留下 peer 的已知位置，交由
-        下一次调用或 WAL 流回填。没有分歧尾巴截断，也没有逐条任期。
+        下一次调用或 WAL 流回填。
+
+        每个 batch 附带逐条任期（``entry_terms``）与 leader 已知的
+        ``prev_lsn`` 处任期：follower 在同一 LSN 上看到不同任期会拒绝并
+        要求重建（``rebuild_required``），拒绝原因记在
+        ``last_push_rejections``。这里没有分歧尾巴截断——重建才是修复手段。
+        基准备份流不携带任期，follower 对那段历史没有任期知识，首次接触
+        会信任 leader 的拼接点任期（参见 ``QuorumNode.append_entries``）。
         """
         db = getattr(self, "db", None)
         if db is None or getattr(db, "_read_only", True):
@@ -431,11 +442,20 @@ class Replica:
             if peer_id not in node.last_matches:
                 continue
             prev_lsn = int(node.last_matches[peer_id])
-            prev_term = int(node.last_match_terms.get(peer_id, 0))
+            # 拼接点任期优先用 leader 自己的知识：peer 上报的 match_term
+            # 是"最近一批 leader 任期"的近似值，真正的分歧检测要靠
+            # "同一 LSN 的任期是否相同"。
+            known_term = node.state.term_at(prev_lsn)
+            prev_term = (
+                int(known_term)
+                if known_term is not None
+                else int(node.last_match_terms.get(peer_id, 0))
+            )
             records = list(db.wal.iter_records(prev_lsn + 1))[:limit]
             if not records:
                 continue
             entries = [_record_to_json(record) for record in records]
+            entry_terms = [node.state.term_at(record.lsn) for record in records]
             response = QuorumClient.append_entries(
                 host,
                 port,
@@ -445,6 +465,7 @@ class Replica:
                 prev_term,
                 entries,
                 commit_lsn=int(node.quorum_commit_lsn),
+                entry_terms=entry_terms,
                 timeout=node.timeout,
                 token=node.token,
             )
@@ -458,13 +479,20 @@ class Replica:
                     response.get("match_term", 0)
                 )
                 pushed[peer_id] = len(records)
-            elif response.get("reason") == "prefix_mismatch":
-                # 只记录对方真实前缀，下一次从那里再试；不在这里截断本地
-                # 日志（避免把 leader 自己的已提交尾巴误删）。
-                node.last_matches[peer_id] = int(response.get("match_lsn", 0))
-                node.last_match_terms[peer_id] = int(
-                    response.get("match_term", 0)
+                self.last_push_rejections.pop(peer_id, None)
+            else:
+                self.last_push_rejections[peer_id] = str(
+                    response.get("reason", "unknown")
                 )
+                if response.get("reason") == "prefix_mismatch":
+                    # 只记录对方真实前缀，下一次从那里再试；不在这里截断本地
+                    # 日志（避免把 leader 自己的已提交尾巴误删）。
+                    node.last_matches[peer_id] = int(response.get("match_lsn", 0))
+                    node.last_match_terms[peer_id] = int(
+                        response.get("match_term", 0)
+                    )
+                # rebuild_required（日志分歧）时保持 last_matches 不动：
+                # 该 peer 需要重新基准备份，盲目重发只会反复被拒。
         if pushed:
             # peer 已经真实 apply：立刻把它的 match_lsn 计入多数派水位，
             # 同步复制的屏障不用再等下一轮心跳。
@@ -694,6 +722,16 @@ class Replica:
             write_fence=fence.assert_writable if fence is not None else None,
             node_id=candidate_node,
         )
+
+        # 记录"新任期从哪个 LSN 开始写"：之后 leader 推送这批记录时，
+        # 每条都能报出精确任期，follower 才能在拼接点发现历史分叉。
+        # quorum 允许是轻量 mock（没有 state），这里按 duck-typing 兜底。
+        next_lsn = int(getattr(self, "_next_lsn", 0))
+        if next_lsn <= 0:
+            next_lsn = int(getattr(db.wal, "next_lsn", 0))
+        state = getattr(quorum, "state", None)
+        if next_lsn > 0 and state is not None and hasattr(state, "record_term"):
+            state.record_term(next_lsn, int(getattr(state, "term", 0)))
 
         if lease is not None:
             interval = lease_keeper_interval

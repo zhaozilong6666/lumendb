@@ -591,6 +591,136 @@ def test_append_entries_rejects_a_stale_leader_term(tmp_path):
         _stop(nodes)
 
 
+def test_vote_state_term_segments_persist_and_query(tmp_path):
+    path = tmp_path / "state.json"
+    state = VoteState(path)
+    assert state.term_at(50) is None
+    state.record_term(100, 3)
+    state.record_term(200, 3)  # 同任期延续：不新增分段
+    state.record_term(300, 5)
+    state.record_term(250, 4)  # LSN 不前进：忽略
+    assert state.log_terms == [[100, 3], [300, 5]]
+    assert state.term_at(99) is None
+    assert state.term_at(100) == 3
+    assert state.term_at(299) == 3
+    assert state.term_at(300) == 5
+    assert state.term_at(9999) == 5
+    reloaded = VoteState(path)
+    assert reloaded.log_terms == [[100, 3], [300, 5]]
+    assert reloaded.term_at(250) == 3
+
+
+def test_append_entries_records_exact_terms_from_entry_terms(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[0].set_log_applier(lambda records: len(records))
+        first = LogRecord(1, 7, LogType.BEGIN, b"")
+        second = LogRecord(first.lsn + len(first.encode()), 7, LogType.COMMIT, b"")
+        response = nodes[0].append_entries(
+            5,
+            "leader",
+            0,
+            0,
+            [_record_to_json(first), _record_to_json(second)],
+            commit_lsn=second.lsn,
+            entry_terms=[5, 5],
+        )
+        assert response["ok"] is True
+        assert nodes[0].state.term_at(first.lsn) == 5
+        assert nodes[0].state.term_at(second.lsn) == 5
+
+        # entry_terms 长度不一致必须被拒绝。
+        bad = nodes[0].append_entries(
+            5,
+            "leader",
+            second.lsn,
+            5,
+            [_record_to_json(LogRecord(101, 7, LogType.BEGIN, b""))],
+            entry_terms=[5, 5],
+        )
+        assert bad["ok"] is False
+        assert "entry_terms" in bad["reason"]
+    finally:
+        _stop(nodes)
+
+
+def test_append_entries_detects_divergent_history_at_the_join_point(tmp_path):
+    """同一 LSN、不同任期 = 两条历史分叉：拒绝重放并要求重建。"""
+    nodes = _cluster(tmp_path)
+    try:
+        applied = []
+        nodes[0].set_log_applier(lambda records: applied.extend(records) or len(records))
+        nodes[0].state.observe_applied(100, term=3)
+        first = LogRecord(101, 7, LogType.BEGIN, b"")
+        second = LogRecord(first.lsn + len(first.encode()), 7, LogType.COMMIT, b"")
+        ok = nodes[0].append_entries(
+            3,
+            "leader",
+            100,
+            3,
+            [_record_to_json(first), _record_to_json(second)],
+            commit_lsn=second.lsn,
+            entry_terms=[3, 3],
+        )
+        assert ok["ok"] is True
+        assert nodes[0].state.term_at(second.lsn) == 3
+
+        # leader 声称同一 LSN 处任期是 9：拼接点分歧，绝不能重放。
+        rejected = nodes[0].append_entries(
+            4,
+            "leader",
+            second.lsn,
+            9,
+            [],
+        )
+        assert rejected["ok"] is False
+        assert rejected["reason"].startswith("日志分歧")
+        assert rejected.get("rebuild_required") is True
+        assert len(applied) == 2, "分歧批次不得重放"
+    finally:
+        _stop(nodes)
+
+
+def test_append_entries_divergence_is_visible_over_the_wire(tmp_path):
+    """RPC 路径同样携带 entry_terms，并能把 rebuild_required 送回 leader。"""
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        nodes[1].set_log_applier(lambda records: len(records))
+        nodes[1].state.observe_applied(100, term=3)
+        first = LogRecord(101, 7, LogType.BEGIN, b"")
+        second = LogRecord(first.lsn + len(first.encode()), 7, LogType.COMMIT, b"")
+        response = QuorumClient.append_entries(
+            "127.0.0.1",
+            nodes[1].port,
+            3,
+            "n0",
+            100,
+            3,
+            [_record_to_json(first), _record_to_json(second)],
+            commit_lsn=second.lsn,
+            entry_terms=[3, 3],
+            timeout=1.0,
+        )
+        assert response["ok"] is True
+        assert nodes[1].state.term_at(second.lsn) == 3
+
+        divergent = QuorumClient.append_entries(
+            "127.0.0.1",
+            nodes[1].port,
+            4,
+            "n0",
+            second.lsn,
+            9,
+            [],
+            timeout=1.0,
+        )
+        assert divergent["ok"] is False
+        assert divergent.get("rebuild_required") is True
+        assert "日志分歧" in divergent["reason"]
+    finally:
+        _stop(nodes)
+
+
 def test_append_entries_rejects_an_oversized_batch(tmp_path):
     nodes = _cluster(tmp_path)
     try:
