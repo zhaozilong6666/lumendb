@@ -483,12 +483,14 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 - 必须配心跳循环：水位由 `heartbeat_round` 推进，没有心跳就等于每笔写都等超时，
   所以 `sync_replication=True` 而 `heartbeat_interval is None` 会在提升前被直接拒绝。
 
-它仍然是**没有日志协商**的同步复制：没有 `append_entries` 的任期/前缀一致性检查，
-也没有逐条日志的 per-entry term；长期失联的旧 leader 复辟后仍可能写进一些
-"多数派没收到"的记录（共享 fence + 租约负责挡住这类写入）。当前的
-`(last_term, last_lsn)` 投票只能防止"同 LSN 但更旧任期"的候选直接当选，
-`last_term` 来自 `observe_applied` 上报时携带的任期，是近似值。要做到 Raft
-级别的正确性，仍需要日志协商 + commit index，属于下一阶段。
+它仍然**不是完整的 Raft 日志协商**：现在有 prefix-checked `append_entries`
+MVP（`QuorumClient` / `QuorumNode`，`prev_lsn/prev_term` 前缀检查，entries 走
+现有 CRC 解码并交给绑定的 `Replica.apply`），但还没有分歧尾巴截断/回填、
+逐条日志的 per-entry term，也没有由 leader 心跳自动驱动。长期失联的旧
+leader 复辟后仍可能写进一些"多数派没收到"的记录（共享 fence + 租约负责
+挡住这类写入）。当前的 `(last_term, last_lsn)` 投票只能防止"同 LSN 但更旧
+任期"的候选直接当选，`last_term` 来自 `observe_applied` 上报时携带的任期，
+是近似值。要做到 Raft 级别的正确性，仍需要完整日志协商 + commit index。
 
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 但“主库其实还活着但网络分区”的脑裂仍只能靠共享 fence + 多数派续租兜底。
@@ -507,8 +509,9 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 - 自动提升已有连续失败阈值、多数派投票、`(last_term,last_lsn)` 投票比较、TTL
   写租约、heartbeat RPC 和多数派续租，并有轻量版提交水位（`quorum_commit_lsn`）
   挡住"提升落后副本"，可选开同步复制（多数派追上才回 COMMIT，超时给 `40003`
-  结果未知）；但仍没有 `append_entries` 日志协商和逐条 per-entry term，网络分区
-  时仍可能双写。fencing 依赖共享 marker 和租约文件；客户端重定向已做 MVP；
+  结果未知）；已有 prefix-checked `append_entries` MVP，但缺分歧尾巴截断、
+  逐条 per-entry term 和心跳自动驱动，网络分区时仍可能双写。fencing 依赖共享
+  marker 和租约文件；客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
   JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；
