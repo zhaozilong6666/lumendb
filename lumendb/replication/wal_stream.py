@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..errors import RedirectError, StorageError, TransactionError
+from ..storage.page import PAGE_SIZE
 from ..storage.wal import CRC_SIZE, LogRecord
 
 
@@ -123,7 +124,13 @@ def read_slot(path: str | Path) -> int:
 
 
 def _record_from_json(data: dict) -> LogRecord:
-    has_crc = bool(data.get("has_crc", True))
+    # 老版本服务端既不发送 has_crc，也不发送 crc；此时必须按“无 CRC 的
+    # 旧记录”解码，否则本地重新编码会多出 4 字节，LSN 边界和后续记录
+    # 的连续性都会被误判。
+    if "has_crc" in data:
+        has_crc = bool(data["has_crc"])
+    else:
+        has_crc = "crc" in data
     record = LogRecord(
         lsn=int(data["lsn"]),
         xid=int(data["xid"]),
@@ -673,6 +680,14 @@ class WALClient:
             elif data.get("type") == "page":
                 page_id = int(data["page_id"])
                 page_bytes = _decode_blob(data, what=f"增量页 {page_id}")
+                if len(page_bytes) != PAGE_SIZE:
+                    raise StorageError(
+                        "增量基准备份页大小不正确",
+                        detail=(
+                            f"page_id={page_id} bytes={len(page_bytes)} "
+                            f"expected={PAGE_SIZE}"
+                        ),
+                    )
                 (target / f"{page_id:08d}.page").write_bytes(page_bytes)
                 page_count += 1
             elif data.get("type") == "incremental_end":

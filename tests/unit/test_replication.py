@@ -49,6 +49,20 @@ class TestReplicationWalStream:
         legacy.pop("crc")
         assert _record_from_json(legacy) == rec
 
+        # 更老的服务端连 has_crc 都没有：不能默认成 True，否则本地重编码
+        # 会多出 4 字节 CRC，破坏与后续记录的 LSN 连续性。
+        older = LogRecord(10, 3, LogType.UPDATE, b"before/after", has_crc=False)
+        bare = {
+            "type": "record",
+            "lsn": older.lsn,
+            "xid": older.xid,
+            "rtype": int(older.rtype),
+            "payload": base64.b64encode(older.payload).decode("ascii"),
+        }
+        decoded_bare = _record_from_json(bare)
+        assert decoded_bare.has_crc is False
+        assert len(decoded_bare.encode()) == len(older.encode())
+
     def test_record_crc_rejects_a_corrupted_network_payload(self):
         rec = LogRecord(10, 3, LogType.UPDATE, b"before/after")
         payload = _record_to_json(rec)
