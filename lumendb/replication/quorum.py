@@ -500,6 +500,21 @@ class QuorumNode:
         last_term: int = 0,
         pre_vote: bool = False,
     ) -> dict[str, Any]:
+        # 与 append_entries 的 apply 串行：日志重放期间不能让一次投票/心跳
+        # 把任期抬高，否则一个已经过期的 leader 仍会把条目写进副本。
+        with self._append_lock:
+            return self._request_vote_impl(
+                term, candidate_id, last_lsn, last_term, pre_vote
+            )
+
+    def _request_vote_impl(
+        self,
+        term: int,
+        candidate_id: str,
+        last_lsn: int,
+        last_term: int = 0,
+        pre_vote: bool = False,
+    ) -> dict[str, Any]:
         """处理投票/预投票。
 
         预投票（``pre_vote=True``）只回答"如果现在投票，会不会投给你"，
@@ -587,6 +602,16 @@ class QuorumNode:
             }
 
     def heartbeat(
+        self,
+        term: int,
+        leader_id: str,
+        last_lsn: int,
+        commit_lsn: int = 0,
+    ) -> dict[str, Any]:
+        with self._append_lock:
+            return self._heartbeat_impl(term, leader_id, last_lsn, commit_lsn)
+
+    def _heartbeat_impl(
         self,
         term: int,
         leader_id: str,
