@@ -50,7 +50,13 @@ class Replica:
         self.path.mkdir(parents=True, exist_ok=True)
         marker = self.path / "replica.lsn"
         if marker.exists():
-            applied_lsn = int(marker.read_text().strip() or "0")
+            try:
+                applied_lsn = int(marker.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError) as exc:
+                raise StorageError(
+                    "副本复制进度文件损坏，拒绝从猜测的 LSN 继续",
+                    detail=str(marker),
+                ) from exc
         self.db = Database(
             self.path,
             read_only=True,
@@ -299,8 +305,21 @@ class Replica:
     def _write_marker(self) -> None:
         marker = self.path / "replica.lsn"
         tmp = self.path / "replica.lsn.tmp"
-        tmp.write_text(str(self._applied_lsn), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(str(self._applied_lsn))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, marker)
+        # 目录项本身也要落盘，否则崩溃后可能看到旧的 marker（会导致重放，
+        # 但不会丢已 flush 的页）；在没有目录 fsync 的平台上跳过。
+        try:
+            dir_fd = os.open(self.path, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         # 把"本副本真正复制到哪"告诉仲裁节点：leader 的心跳响应/水位计算
         # 依赖这个值，而它和"听到过"的 last_lsn 不是一回事。
         node = getattr(self, "_quorum_node", None)

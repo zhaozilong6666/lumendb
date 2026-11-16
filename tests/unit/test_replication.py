@@ -84,6 +84,13 @@ class TestReplicationWalStream:
 
 
 class TestReplica:
+    def test_replica_refuses_a_corrupted_marker(self, tmp_path):
+        path = tmp_path / "replica"
+        path.mkdir()
+        (path / "replica.lsn").write_text("garbage", encoding="utf-8")
+        with pytest.raises(StorageError, match="进度文件损坏"):
+            Replica(path)
+
     def test_disk_manager_ensure_page_extends_with_free_pages(self, tmp_path):
         dm = DiskManager(tmp_path / "lumendb.data")
         try:

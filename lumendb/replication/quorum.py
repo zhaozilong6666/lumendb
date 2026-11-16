@@ -723,6 +723,17 @@ class QuorumNode:
                     return self._append_rejection(
                         f"日志条目无法解码: {exc}", term=self.state.term
                     )
+                if records and records[0].lsn <= previous:
+                    return self._append_rejection(
+                        "日志条目没有越过 prev_lsn", term=self.state.term
+                    )
+                for previous_record, current_record in zip(records, records[1:]):
+                    if current_record.lsn != previous_record.lsn + len(
+                        previous_record.encode()
+                    ):
+                        return self._append_rejection(
+                            "日志条目内部不连续", term=self.state.term
+                        )
                 try:
                     applier(records)  # type: ignore[misc]
                 except StorageError as exc:

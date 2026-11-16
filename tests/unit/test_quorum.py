@@ -504,6 +504,27 @@ def test_append_entries_rejects_a_stale_leader_term(tmp_path):
         _stop(nodes)
 
 
+def test_append_entries_rejects_an_internal_gap(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        applied = []
+        nodes[0].set_log_applier(lambda records: applied.extend(records) or len(records))
+        first = LogRecord(1, 7, LogType.BEGIN, b"")
+        gap = LogRecord(first.lsn + len(first.encode()) + 100, 7, LogType.COMMIT, b"")
+        response = nodes[0].append_entries(
+            1,
+            "leader",
+            0,
+            0,
+            [_record_to_json(first), _record_to_json(gap)],
+        )
+        assert response["ok"] is False
+        assert response["reason"] == "日志条目内部不连续"
+        assert applied == []
+    finally:
+        _stop(nodes)
+
+
 def test_append_entries_rpc_roundtrip(tmp_path):
     nodes = _cluster(tmp_path)
     try:
