@@ -578,3 +578,27 @@ def test_append_entries_moves_a_real_replica_forward(tmp_path):
         node.stop()
         replica.db.close()
         primary.close()
+
+
+def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    follower = Replica.bootstrap(primary, tmp_path / "follower")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        follower.attach_quorum(nodes[1])
+        leader.promote()
+        leader.attach_quorum(nodes[0])
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        assert leader.db.wal.last_lsn > follower.applied_lsn
+
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed.get("n1", 0) > 0
+        assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower.db.close()
+        primary.close()

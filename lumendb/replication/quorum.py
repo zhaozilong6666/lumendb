@@ -447,6 +447,10 @@ class QuorumNode:
         # append_entries 的重放是串行的；不能和 apply 并发。
         self._append_lock = threading.Lock()
         self._log_applier: Callable[[list[Any]], int] | None = None
+        #: 最近一轮心跳里各 peer 真正 apply 到的 LSN / 任期。leader 侧的
+        #: ``push_entries_to_peers`` 从这里取得 append_entries 的 prev 边界。
+        self.last_matches: dict[str, int] = {}
+        self.last_match_terms: dict[str, int] = {}
         self.heartbeat_persist_interval = max(0.0, float(heartbeat_persist_interval))
         # 从持久化状态恢复：重启后的 status 不应该谎称"从没收到过心跳"。
         self._last_heartbeat_at = self.state.last_heartbeat_at or None
@@ -801,6 +805,7 @@ class QuorumNode:
         acks = {self.node_id}
         outcomes: dict[str, tuple[dict | None, BaseException | None]] = {}
         matches: dict[str, int] = {}
+        match_terms: dict[str, int] = {}
         highest_term = term
         if peers:
             with ThreadPoolExecutor(
@@ -849,6 +854,9 @@ class QuorumNode:
             if response.get("ok") and response_term <= term:
                 acks.add(peer_id)
                 matches[peer_id] = int(response.get("match_lsn", 0))
+                match_terms[peer_id] = int(response.get("match_term", 0))
+        self.last_matches = dict(matches)
+        self.last_match_terms = dict(match_terms)
         if highest_term > term:
             with self._lock:
                 self.state.term = highest_term
