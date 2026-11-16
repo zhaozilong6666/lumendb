@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import socket
 import time
 
 import pytest
@@ -724,6 +725,25 @@ def test_append_entries_survives_a_raising_applier(tmp_path):
         assert ack.get("ok") is True
     finally:
         _stop(nodes)
+
+
+def test_quorum_server_not_blocked_by_a_stalled_connection():
+    """一个只连不发的停滞连接不得挡住其他节点的投票/心跳。"""
+    node = QuorumNode("a", timeout=2.0).start()
+    stall = None
+    try:
+        stall = socket.create_connection((node.host, node.port), timeout=2.0)
+        started = time.monotonic()
+        ack = QuorumClient.heartbeat(
+            "127.0.0.1", node.port, 1, "a", 0, timeout=1.0
+        )
+        elapsed = time.monotonic() - started
+        assert ack.get("ok") is True, ack
+        assert elapsed < 0.8, f"心跳被停滞连接拖了 {elapsed:.2f}s"
+    finally:
+        if stall is not None:
+            stall.close()
+        node.stop()
 
 
 def test_append_entries_rejects_an_internal_gap(tmp_path):

@@ -447,6 +447,7 @@ class QuorumNode:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._handlers: list[threading.Thread] = []
         # append_entries 的重放是串行的；不能和 apply 并发。
         self._append_lock = threading.Lock()
         self._log_applier: Callable[[list[Any]], int] | None = None
@@ -1103,6 +1104,7 @@ class QuorumNode:
         self._sock.settimeout(0.2)
         self.host, self.port = self._sock.getsockname()
         self._stop.clear()
+        self._handlers: list[threading.Thread] = []
         self._thread = threading.Thread(
             target=self._serve, name=f"lumendb-quorum-{self.node_id}", daemon=True
         )
@@ -1120,6 +1122,8 @@ class QuorumNode:
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
+        for handler in list(self._handlers):
+            handler.join(timeout=1)
 
     def _serve(self) -> None:
         sock = self._sock
@@ -1132,15 +1136,27 @@ class QuorumNode:
                 continue
             except OSError:
                 break
+            # 每连接一个线程：串行处理会让一个死 peer 的停滞连接占满
+            # conn 超时窗口，把其他节点的投票/心跳全部拖到超时。
+            # _handle 内部路径（投票/心跳/append）都串行在 _append_lock
+            # 上，所以并发处理是安全的。
+            self._handlers[:] = [h for h in self._handlers if h.is_alive()]
+            handler = threading.Thread(
+                target=self._handle_conn, args=(conn,), daemon=True
+            )
+            self._handlers.append(handler)
+            handler.start()
+
+    def _handle_conn(self, conn: socket.socket) -> None:
+        try:
+            self._handle(conn)
+        except Exception:  # noqa: BLE001 - 单个坏请求不能打死服务线程
+            _log.exception("仲裁请求处理失败，连接已关闭")
+        finally:
             try:
-                self._handle(conn)
-            except Exception:  # noqa: BLE001 - 单个坏请求不能打死服务循环
-                _log.exception("仲裁请求处理失败，连接已关闭")
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                conn.close()
+            except OSError:
+                pass
 
     def _handle(self, conn: socket.socket) -> None:
         try:
