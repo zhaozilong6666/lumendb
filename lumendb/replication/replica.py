@@ -833,7 +833,13 @@ class Replica:
             return
         seed = getattr(wal, "seed_next_lsn", None)
         if seed is None:
-            return
+            # 空 WAL 又不能接边界（旧单文件 WAL 没有 seed 能力）：如果放行，
+            # 新主库会从 LSN 1 开始写，与已复制到高位的记录冲突，副本会
+            # 静默拒绝后续记录。宁可在这里失败，也不静默制造 LSN 回退。
+            raise NotSupportedError(
+                "提升后的空 WAL 无法接续复制边界",
+                hint="需要分段 WAL（wal_segment_bytes）的 seed_next_lsn 能力",
+            )
         next_lsn = max(1, int(self._next_lsn))
         if next_lsn <= 1:
             return

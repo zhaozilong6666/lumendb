@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import shutil
 import threading
 
 import pytest
@@ -692,6 +693,24 @@ class TestReplica:
         promoted.execute_one("INSERT INTO t VALUES (2, 'b')")
         assert promoted.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
         promoted.close()
+
+    def test_promote_refuses_a_legacy_empty_wal(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        replica_path = tmp_path / "replica"
+        boot = Replica.bootstrap(primary, replica_path)
+        boot.db.close()
+        # 用一个空的旧单文件 WAL 替换分段 WAL：Database 会走兼容分支，
+        # 而旧 WAL 没有 seed_next_lsn，提升必须失败而不是静默从 LSN 1 重开。
+        shutil.rmtree(replica_path / "wal")
+        (replica_path / "lumendb.wal").write_bytes(b"")
+        replica = Replica(replica_path)
+        try:
+            with pytest.raises(NotSupportedError, match="无法接续复制边界"):
+                replica.promote()
+        finally:
+            replica.db.close()
+            primary.close()
 
     def test_client_follows_server_redirect(self, tmp_path):
         primary = make_primary(tmp_path)
