@@ -152,6 +152,16 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 （`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），
 网络分区下仍要求共享 fence。
 
+**心跳超时驱动选举**：`ReplicationMonitor(election_timeout=...)` 在副本挂
+quorum 时启动 `QuorumNode` 选举看门狗——超过 `election_timeout` 收不到
+leader 心跳（或从未收到）就自动 campaign，覆盖"复制流连接半开挂住、
+status 不失败但 leader 已死"的场景。看门狗每轮等待带 ±35% 抖动，
+多个 follower 不会永远同票瓜分；提升成功后立刻停看门狗（leader 收不到
+别人的心跳，不能自我逼停）；未显式配置 `heartbeat_interval` 时用选举
+超时的一半自动维持心跳。竞选失败分两类：票不够 / fence 已有更高提升
+LSN 回 FOLLOWING、下个超时重试（输家被赢家心跳喂住自然退出）；持久化
+/闸门类失败才 NEEDS_ATTENTION。
+
 **多数派投票 MVP**：`QuorumNode.campaign()` 递增任期，向 `peers` 发送
 `vote_request`，只有拿到集群多数票才写提升 fence；投票节点持久化
 `term/voted_for/last_lsn`，会拒绝落后于自己 LSN 的候选，也会拒绝旧任期。
@@ -172,9 +182,16 @@ per-entry term 已做：`VoteState.log_terms` 按 LSN 记录任期分段，
 follower 分叉时经 `QuorumNode.rebuild_callback` 后台重新基准备份并
 `reset_progress` 对齐 match/清空旧任期分段，重建后下一轮心跳自动
 恢复推送；拒绝原因变化会记 warning，`ReplicationMonitor` 可读
-`last_push_rejections` 快照。仍没有分歧尾巴截断（重建是唯一修复
-手段）和完整 commit index 协商；网络分区时多数派不可达会明确失败，
-但不能自动判断旧主库是否还活着。
+`last_push_rejections` 快照。预投票不再检查 `voted_for`（那是当前任期的
+真实投票，检查会让故障切换永远过不了预投票）；leader 心跳携带
+`last_term`，基准备份接入的 follower 靠它补任期知识，否则竞选时
+`last_term=0` 会被有任期历史的节点拒绝、永远选不上。双候选同窗竞选
+已收敛：心跳轮检测到本节点的仲裁节点改投别人（`voted_for != 自己`）
+时旧主库立即降级，不留双主窗口；`fence_path` 在无租约时也默认把
+`assert_writable` 接进写路径，新主库提升后旧主库下一笔写即被拒。
+仍没有分歧尾巴截断（重建是唯一修复手段）和完整 commit index 协商；
+网络分区时多数派不可达会明确失败，双写防护靠共享 fence + TTL 租约
+两层兜底，不是完整的多数派写确认。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写入共享文件。主库每笔写语句前通过 `Database(write_fence=lease.assert_writable)`
