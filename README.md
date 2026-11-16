@@ -1,4 +1,4 @@
-﻿# LumenDB
+# LumenDB
 
 [![CI](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaozilong6666/lumendb/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
@@ -221,7 +221,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1173 个自动化测试**（`python -m pytest tests -q`，约 20–120 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1177 个自动化测试**（`python -m pytest tests -q`，约 20–120 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；

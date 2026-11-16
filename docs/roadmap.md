@@ -1,4 +1,4 @@
-﻿# LumenDB 路线图
+# LumenDB 路线图
 
 LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → 存储/复制”分层，
 每一层都必须先具备可验证的输入、明确的完成标准和回退路径，避免出现功能
@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1173 passed。
+- 全量测试：1177 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -162,8 +162,14 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 避免“自动提升成功但新主库没有租约围栏”的接线缺口。这不是完整 Raft：已有
 基础 heartbeat RPC、独立 `HeartbeatLoop` 与多数派续租，也有 prefix-checked
 `append_entries` MVP；`promote_with_quorum` 的心跳循环每轮会通过
-`push_entries_to_peers` 推一批记录，但仍没有分歧尾巴截断、逐条 per-entry term
-和完整 commit index 协商；网络分区时多数派不可达会明确失败，但不能自动判断
+`push_entries_to_peers` 推一批记录（一轮最多 10 批加速追平）。逐条
+per-entry term 已做：`VoteState.log_terms` 按 LSN 记录任期分段，
+`append_entries(entry_terms=...)` 重放成功后逐条落段，拼接点
+`(prev_lsn, prev_term)` 与本地任期不一致时拒绝并要求重建
+（`rebuild_required`，原因记入 `Replica.last_push_rejections`），
+基准备份流不带任期、follower 无任期知识时首次接触信任 leader。
+仍没有分歧尾巴截断（重建才是修复手段，无自动重建闭环）和完整
+commit index 协商；网络分区时多数派不可达会明确失败，但不能自动判断
 旧主库是否还活着。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
