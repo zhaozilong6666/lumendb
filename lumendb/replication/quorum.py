@@ -17,7 +17,7 @@ import os
 import re
 import socket
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -823,7 +823,7 @@ class QuorumNode:
                 for future, peer_id in list(futures.items()):
                     try:
                         outcomes[peer_id] = (future.result(), None)
-                    except (OSError, ValueError, StorageError) as exc:
+                    except (OSError, ValueError, StorageError, CancelledError) as exc:
                         outcomes[peer_id] = (None, exc)
                     response = outcomes[peer_id][0]
                     if (
