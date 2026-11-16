@@ -68,6 +68,11 @@ replica.promote_with_quorum(
 重新开始；旧版 `replica.lsn` 只有 applied LSN，提升前建议先做一次完整
 bootstrap 或记录精确边界。
 
+主库重启后要重新竞选提升时，必须走 `replica.close()` 再重新打开、再
+`promote_with_quorum(...)`：`close()` 会把本地 WAL 进度写回 `replica.lsn`。
+直接 `replica.db.close()` 会绕过这一步，重新竞选时把基准备份时的旧 LSN
+拿去和水位闸门比较，被“候选落后”拒绝（有测试钉住这个坑）。
+
 ### 3.2 日志追加（手动/自动）
 
 `append_entries` 不是独立的自动复制通道。需要手动让某个 peer 走日志追加
