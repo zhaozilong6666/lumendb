@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..errors import NotSupportedError, StorageError, TransactionError
+from ..errors import NotSupportedError, StorageError
 from .fence import PromotionFence
 from .lease import Lease
 
@@ -1302,8 +1302,9 @@ class HeartbeatLoop:
             ):
                 try:
                     self.last_pushed = self.push_entries(self.node)
-                except (OSError, ValueError, StorageError, TransactionError) as exc:
-                    # 推送失败不能拖垮心跳线程；下一次心跳仍会继续尝试。
+                except Exception as exc:  # noqa: BLE001 - 后台线程不能因推送失败退出
+                    # 推送失败（包括写围栏拒绝/租约丢失）不能拖垮心跳线程；
+                    # 下一次心跳仍会继续尝试，上层可看 last_errors。
                     self.last_errors = [
                         *self.last_errors,
                         f"append_entries: {exc}",
