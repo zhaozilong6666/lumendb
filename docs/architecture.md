@@ -401,8 +401,10 @@ Raft 的 `(last_term, last_lsn)` 字典序拒绝落后候选（同 LSN 但最后
 一并记录日志任期；心跳只更新"听到过"的 `last_lsn`，**不会**把 leader 的当前
 任期写成日志任期，否则日志相同的节点会互相拒绝。`Replica.promote_with_quorum()`
 先拿票再切换读写。它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，
-以及 prefix-checked `append_entries` MVP；提升后的心跳循环每轮自动追推多批
-entries，但没有分歧尾巴截断、逐条任期和完整 commit index，也不能单独处理
+以及 prefix-checked `append_entries`；提升后的心跳循环每轮自动追推多批
+entries，拼接点任期分歧与 WAL 缺口都会触发自动重建（leader 侧还会主动
+下发 `rebuild_hint`），逐条任期由 `VoteState.log_terms` 按 LSN 分段持久化；
+没有分歧尾巴截断（重建替代）和完整 commit index，也不能单独处理
 “主库还活着但网络分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
@@ -421,6 +423,15 @@ RPC，`renew_lease()` 只有拿到多数派确认才调用 `Lease.renew()`；
 用 `LeaseFence`（租约 + 当前任期）作为 `write_fence`，租约丢失或观察到
 更高任期即拒绝写；旧主库收到更高任期心跳后也会立即停写；keeper 续租失败可回调 `Replica.step_down()`
 自动切回只读；`Lease.renew(term=...)` 在节点任期高于租约任期时拒绝续租。
+
+**重启双写防护（打开即检）**：运行中的写围栏只挡"还活着的旧主库"——进程
+崩溃后重启、用裸 `Database(path)` 打开时，不知道共享 marker 的存在，恢复
+写入即成双主。`Database(fence_path=..., node_id=...)` 在非只读打开时立即
+校验 fence（指向别的节点就拒绝打开）；`Database(lease_path=...)` 校验租约
+（无主/他人持有/已过期一律拒，旧主库必须显式重新 `acquire` 才能恢复写）。
+两个检查都持续接进写路径（打开之后别人才提升的场景在下一笔写上被拦）；
+只读打开放行，被废黜的旧主库仍可当只读观察者。`Replica.promote()` 重开
+可写库时透传两个路径，提升后的新主库重启同样受自己写的 marker 保护。
 
 **写围栏的三个检查点（缺一不可）**：
 
@@ -497,7 +508,9 @@ MVP（`QuorumClient` / `QuorumNode`，`prev_lsn/prev_term` 前缀检查，entrie
 可以在一次显式调用中把本地 WAL 的下一批记录推给 peers，`promote_with_quorum`
 启动的 `HeartbeatLoop` 会把它作为 push callback 每轮心跳后自动推，一轮最多
 `max_batches_per_round` 批（默认 10），且推送前先过
-`db.assert_writable()`。但仍有分歧尾巴截断/回填、逐条日志的 per-entry term，
+`db.assert_writable()`。逐条日志的 per-entry term 已做
+（`VoteState.log_terms` 按 LSN 分段持久化，拼接点任期分歧拒绝并要求重建，
+leader 还主动下发 `rebuild_hint` 处理 WAL 缺口）。但仍有分歧尾巴截断/回填，
 也没有完整的 commit index 协商。长期失联的旧
 leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 fence + 租约负责
 挡住这类写入）。当前的 `(last_term, last_lsn)` 投票只能防止“同 LSN 但更旧
@@ -521,10 +534,11 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 - 自动提升已有连续失败阈值、多数派投票、`(last_term,last_lsn)` 投票比较、TTL
   写租约、heartbeat RPC 和多数派续租，并有轻量版提交水位（`quorum_commit_lsn`）
   挡住"提升落后副本"，可选开同步复制（多数派追上才回 COMMIT，超时给 `40003`
-  结果未知）；已有 prefix-checked `append_entries` MVP，提升后的心跳循环可每轮
-  推一批 entries，但仍缺分歧尾巴截断、逐条 per-entry term 和完整 commit index，
-  网络分区时仍可能双写。fencing 依赖共享
-  marker 和租约文件；客户端重定向已做 MVP；
+  结果未知）；已有 prefix-checked `append_entries`、逐条 per-entry term 与
+  gap→rebuild 自动闭环，提升后的心跳循环可每轮推一批 entries，但仍缺分歧
+  尾巴截断和完整 commit index，网络分区时仍可能双写。fencing 依赖共享
+  marker 和租约文件（重启双写防护：`fence_path`/`lease_path` 打开即检）；
+  客户端重定向已做 MVP；
 - 复制连接支持可选共享 token 校验和可选 TLS；服务端把 `SSLContext.verify_mode`
   设为 `CERT_REQUIRED` 并加载客户端 CA 即可双向认证。TLS 不配置时 token 在明文
   JSON 中传输，默认只应监听本机或可信网络；证书分发和轮换仍需部署层补齐；
