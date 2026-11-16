@@ -16,7 +16,12 @@ from lumendb.replication import (
     WALClient,
     WALServer,
 )
-from lumendb.replication.wal_stream import _record_from_json, _record_to_json
+from lumendb.replication.wal_stream import (
+    _crc32,
+    _decode_blob,
+    _record_from_json,
+    _record_to_json,
+)
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.page import PageType
 from lumendb.storage.wal import LogRecord, LogType
@@ -51,6 +56,17 @@ class TestReplicationWalStream:
         corrupted["payload"] = base64.b64encode(b"tampered").decode("ascii")
         with pytest.raises(StorageError, match="CRC"):
             _record_from_json(corrupted)
+
+    def test_transfer_blob_crc_rejects_a_corrupted_page(self):
+        raw = b"\x00" * 4096
+        good = {
+            "data": base64.b64encode(raw).decode("ascii"),
+            "crc": _crc32(raw),
+        }
+        assert _decode_blob(good, what="page") == raw
+        bad = dict(good, crc=(good["crc"] ^ 0xFFFFFFFF))
+        with pytest.raises(StorageError, match="CRC"):
+            _decode_blob(bad, what="page")
 
 
 class TestReplica:

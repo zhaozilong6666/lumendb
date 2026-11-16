@@ -39,6 +39,10 @@ from ..errors import RedirectError, StorageError, TransactionError
 from ..storage.wal import CRC_SIZE, LogRecord
 
 
+def _crc32(data: bytes) -> int:
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
 def _record_crc(record: LogRecord) -> int:
     """CRC over the logical frame, excluding the frame's own CRC field.
 
@@ -49,7 +53,23 @@ def _record_crc(record: LogRecord) -> int:
     data = record.encode()
     if record.has_crc:
         data = data[:-CRC_SIZE]
-    return zlib.crc32(data) & 0xFFFFFFFF
+    return _crc32(data)
+
+
+def _decode_blob(data: dict, *, what: str) -> bytes:
+    """解码 base64 传输块，并在带 ``crc`` 字段时校验内容。"""
+    raw = base64.b64decode(data["data"])
+    if "crc" in data:
+        expected = int(data["crc"])
+        actual = _crc32(raw)
+        if expected != actual:
+            raise StorageError(
+                f"{what} CRC 校验失败",
+                detail=(
+                    f"expect=0x{expected:08x} actual=0x{actual:08x}"
+                ),
+            )
+    return raw
 
 
 def _encode_line(payload: dict, compress: bool = False) -> bytes:
@@ -342,6 +362,7 @@ class WALServer:
                 "type": "backup",
                 "checkpoint_lsn": checkpoint_lsn,
                 "data": base64.b64encode(data).decode("ascii"),
+                "crc": _crc32(data),
             },
             compress=compress,
         )
@@ -374,6 +395,7 @@ class WALServer:
                         {
                             "type": "backup_chunk",
                             "data": base64.b64encode(chunk).decode("ascii"),
+                            "crc": _crc32(chunk),
                         },
                         compress=compress,
                     )
@@ -419,12 +441,14 @@ class WALServer:
             )
             for path in sorted(temp_dir.glob("*.page")):
                 page_id = int(path.stem)
+                page_data = path.read_bytes()
                 _send_line(
                     conn,
                     {
                         "type": "page",
                         "page_id": page_id,
-                        "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                        "data": base64.b64encode(page_data).decode("ascii"),
+                        "crc": _crc32(page_data),
                     },
                     compress=compress,
                 )
@@ -612,7 +636,7 @@ class WALClient:
                     {"type": "backup_stream", "chunk_size": chunk_size}
                 ):
                     if data.get("type") == "backup_chunk":
-                        fh.write(base64.b64decode(data["data"]))
+                        fh.write(_decode_blob(data, what="基准备份分块"))
                     elif data.get("type") == "backup_end":
                         checkpoint_lsn = int(data["checkpoint_lsn"])
                         break
@@ -648,9 +672,8 @@ class WALClient:
                 expected_count = int(data.get("page_count", 0))
             elif data.get("type") == "page":
                 page_id = int(data["page_id"])
-                (target / f"{page_id:08d}.page").write_bytes(
-                    base64.b64decode(data["data"])
-                )
+                page_bytes = _decode_blob(data, what=f"增量页 {page_id}")
+                (target / f"{page_id:08d}.page").write_bytes(page_bytes)
                 page_count += 1
             elif data.get("type") == "incremental_end":
                 checkpoint_lsn = int(data["checkpoint_lsn"])
@@ -668,7 +691,7 @@ class WALClient:
         for data in self._request({"type": "backup"}):
             if data.get("type") == "backup":
                 return (
-                    base64.b64decode(data["data"]),
+                    _decode_blob(data, what="基准备份"),
                     int(data["checkpoint_lsn"]),
                 )
         raise StorageError("主库没有返回基准备份")
