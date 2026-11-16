@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 
@@ -169,5 +170,36 @@ class TestReplicaSyncReplication:
             assert replica.commit_barrier() is not None
         finally:
             replica.close()
+            for node in nodes:
+                node.stop()
+
+    def test_sync_commit_waits_for_a_pushed_follower(self, tmp_path):
+        """2 节点：COMMIT 只有等心跳循环把 append_entries 推到真实副本并计入
+        多数派水位后才返回——这是同步复制走推送路径的端到端用例。"""
+        primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        leader = Replica.bootstrap(primary, tmp_path / "leader")
+        source = tmp_path / "leader"
+        leader.db.close()
+        shutil.copytree(source, tmp_path / "follower")
+        leader.db = Database(source, read_only=True, checkpoint_wal_bytes=0)
+        follower = Replica(tmp_path / "follower")
+        nodes = _cluster(tmp_path, count=2)
+        try:
+            follower.attach_quorum(nodes[1])
+            db = leader.promote_with_quorum(
+                nodes[0],
+                heartbeat_interval=0.05,
+                lease_keeper_auto=False,
+                sync_replication=True,
+                sync_timeout=5.0,
+            )
+            db.execute_one("INSERT INTO t VALUES (1)")
+            # 返回时多数派水位已覆盖 COMMIT，副本必然已经重放这批记录。
+            assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            leader.close()
+            follower.close()
+            primary.close()
             for node in nodes:
                 node.stop()
