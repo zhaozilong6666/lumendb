@@ -350,6 +350,10 @@ class Replica:
         self._quorum_node = quorum
         term = getattr(getattr(quorum, "state", None), "term", 0)
         quorum.observe_applied(self._applied_lsn, term=term)
+        setter = getattr(quorum, "set_log_applier", None)
+        if setter is not None:
+            # append_entries 的条目直接走同一套物理重放，不另造一条执行路径。
+            setter(self.apply)
 
     # ------------------------------------------------------------------
 

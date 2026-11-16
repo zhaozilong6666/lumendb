@@ -10,6 +10,8 @@ from lumendb.errors import NotSupportedError
 from lumendb.engine.database import Database
 from lumendb.replication import HeartbeatLoop, Lease, PromotionFence, Replica, ReplicationMonitor, WALServer
 from lumendb.replication.quorum import QuorumClient, QuorumNode, VoteState
+from lumendb.replication.wal_stream import _record_to_json
+from lumendb.storage.wal import LogRecord, LogType
 
 
 def _make_primary(tmp_path):
@@ -450,3 +452,108 @@ def test_pre_vote_rejects_a_lagging_candidate(tmp_path):
         assert nodes[1].state.term == 0
     finally:
         _stop(nodes)
+
+
+def test_append_entries_applies_a_contiguous_batch(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        applied = []
+        nodes[0].set_log_applier(lambda records: applied.extend(records) or len(records))
+        first = LogRecord(1, 7, LogType.BEGIN, b"")
+        second = LogRecord(
+            first.lsn + len(first.encode()), 7, LogType.COMMIT, b""
+        )
+        response = nodes[0].append_entries(
+            1,
+            "leader",
+            0,
+            0,
+            [_record_to_json(first), _record_to_json(second)],
+            commit_lsn=second.lsn,
+        )
+        assert response["ok"] is True
+        assert applied == [first, second]
+        assert nodes[0].state.match_lsn == second.lsn
+        assert nodes[0].state.match_term == 1
+        assert nodes[0].quorum_commit_lsn == second.lsn
+
+        # 同一个前缀不能重复追加；leader 应回退到更早的位置重发。
+        stale = nodes[0].append_entries(
+            1,
+            "leader",
+            0,
+            0,
+            [_record_to_json(first)],
+        )
+        assert stale["ok"] is False
+        assert stale["reason"] == "prefix_mismatch"
+    finally:
+        _stop(nodes)
+
+
+def test_append_entries_rejects_a_stale_leader_term(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[0].state.term = 5
+        nodes[0].state.save()
+        response = nodes[0].append_entries(4, "leader", 0, 0, [])
+        assert response["ok"] is False
+        assert response["reason"] == "stale_term"
+        assert response["term"] == 5
+    finally:
+        _stop(nodes)
+
+
+def test_append_entries_rpc_roundtrip(tmp_path):
+    nodes = _cluster(tmp_path)
+    try:
+        applied = []
+        nodes[1].set_log_applier(
+            lambda records: applied.extend(records) or len(records)
+        )
+        first = LogRecord(1, 7, LogType.BEGIN, b"")
+        response = QuorumClient.append_entries(
+            nodes[1].host,
+            nodes[1].port,
+            1,
+            "n0",
+            0,
+            0,
+            [_record_to_json(first)],
+            commit_lsn=first.lsn,
+        )
+        assert response["ok"] is True
+        assert applied == [first]
+        assert response["match_lsn"] == first.lsn
+        assert nodes[1].state.commit_lsn == first.lsn
+    finally:
+        _stop(nodes)
+
+
+def test_append_entries_moves_a_real_replica_forward(tmp_path):
+    """append_entries 不是只改元数据：entries 必须真正落到副本页上。"""
+    primary = _make_primary(tmp_path)
+    replica = Replica.bootstrap(primary, tmp_path / "replica")
+    node = QuorumNode("r", state_path=tmp_path / "r.vote.json").start()
+    try:
+        replica.attach_quorum(node)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        primary.execute_one("INSERT INTO t VALUES (1, 'one')")
+        records = list(primary.wal.iter_records(replica.applied_lsn + 1))
+        response = QuorumClient.append_entries(
+            node.host,
+            node.port,
+            1,
+            "primary",
+            replica.applied_lsn,
+            0,
+            [_record_to_json(record) for record in records],
+            commit_lsn=records[-1].lsn,
+        )
+        assert response["ok"] is True
+        assert response["match_lsn"] == records[-1].lsn
+        assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+    finally:
+        node.stop()
+        replica.db.close()
+        primary.close()

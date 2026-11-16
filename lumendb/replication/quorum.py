@@ -287,6 +287,57 @@ class QuorumClient:
                 pass
 
     @staticmethod
+    def append_entries(
+        host: str,
+        port: int,
+        term: int,
+        leader_id: str,
+        prev_lsn: int,
+        prev_term: int,
+        entries: list[dict[str, Any]],
+        *,
+        commit_lsn: int = 0,
+        timeout: float = 2.0,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """发送一批日志条目（每项是 ``wal_stream._record_to_json`` 的结果）。
+
+        这是 append_entries 的最小传输层：服务端先检查 ``prev_lsn/prev_term``
+        与本地已应用日志尾部是否一致，再通过绑定的 applier 重放 entries。
+        它不替代 WAL 流，也不做 Raft 的日志截断/回填；leader 侧仍可用
+        WAL 流把失联副本追上。
+        """
+        payload: dict[str, Any] = {
+            "type": "append_entries",
+            "term": int(term),
+            "leader_id": str(leader_id),
+            "prev_lsn": int(prev_lsn),
+            "prev_term": int(prev_term),
+            "entries": list(entries),
+            "commit_lsn": int(commit_lsn),
+        }
+        if token is not None:
+            payload["token"] = token
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.settimeout(timeout)
+            sock.sendall(_encode_line(payload))
+            line = sock.makefile("rb").readline()
+            if not line:
+                raise StorageError("仲裁节点没有返回日志追加响应")
+            data = _decode_line(line)
+            if data.get("type") == "error":
+                raise StorageError(str(data.get("message", "日志追加失败")))
+            if data.get("type") != "append_entries_response":
+                raise StorageError("仲裁节点返回了未知日志追加响应")
+            return data
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    @staticmethod
     def heartbeat(
         host: str,
         port: int,
@@ -393,6 +444,9 @@ class QuorumNode:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # append_entries 的重放是串行的；不能和 apply 并发。
+        self._append_lock = threading.Lock()
+        self._log_applier: Callable[[list[Any]], int] | None = None
         self.heartbeat_persist_interval = max(0.0, float(heartbeat_persist_interval))
         # 从持久化状态恢复：重启后的 status 不应该谎称"从没收到过心跳"。
         self._last_heartbeat_at = self.state.last_heartbeat_at or None
@@ -412,6 +466,10 @@ class QuorumNode:
         """记录已知的多数派提交水位（由心跳轮次或上层运维工具推进）。"""
         with self._lock:
             self.state.observe_commit(lsn)
+
+    def set_log_applier(self, applier: Callable[[list[Any]], int] | None) -> None:
+        """绑定 append_entries 的本地重放函数（通常是 ``Replica.apply``）。"""
+        self._log_applier = applier
 
     @property
     def quorum_commit_lsn(self) -> int:
@@ -568,6 +626,109 @@ class QuorumNode:
                 "match_lsn": self.state.match_lsn,
                 "match_term": self.state.match_term,
                 "commit_lsn": self.state.commit_lsn,
+            }
+
+    def append_entries(
+        self,
+        term: int,
+        leader_id: str,
+        prev_lsn: int,
+        prev_term: int,
+        entries: list[Any],
+        *,
+        commit_lsn: int = 0,
+    ) -> dict[str, Any]:
+        """处理一批 append_entries。
+
+        ``prev_lsn/prev_term`` 必须与本地已应用日志尾部完全一致；不匹配时
+        返回 ``ok=False``，让 leader 从更早的位置重发。entries 是
+        ``wal_stream._record_to_json`` 的字典，按顺序交给绑定的 applier
+        （通常是 ``Replica.apply``）。这里没有日志截断/回填，也没有把
+        entry 的任期逐个落盘；它只是把“前缀一致的追加”做成可校验的 RPC。
+        """
+        leader = _validate_node_id(leader_id)
+        requested = max(0, int(term))
+        previous = max(0, int(prev_lsn))
+        previous_term = max(0, int(prev_term))
+        if not isinstance(entries, list):
+            return self._append_rejection("entries 必须是数组")
+        if len(entries) > 1000:
+            return self._append_rejection("单次 append_entries 条目过多")
+
+        with self._append_lock:
+            with self._lock:
+                if requested < self.state.term:
+                    return {
+                        "type": "append_entries_response",
+                        "term": self.state.term,
+                        "ok": False,
+                        "reason": "stale_term",
+                        "match_lsn": self.state.match_lsn,
+                        "match_term": self.state.match_term,
+                    }
+                if requested > self.state.term:
+                    self.state.term = requested
+                    self.state.voted_for = None
+                    self.state.save()
+                if (
+                    previous != self.state.match_lsn
+                    or previous_term != self.state.match_term
+                ):
+                    return {
+                        "type": "append_entries_response",
+                        "term": self.state.term,
+                        "ok": False,
+                        "reason": "prefix_mismatch",
+                        "match_lsn": self.state.match_lsn,
+                        "match_term": self.state.match_term,
+                    }
+                applier = self._log_applier
+                if entries and applier is None:
+                    return self._append_rejection(
+                        "本节点没有绑定日志重放函数", term=self.state.term
+                    )
+
+            records: list[Any] = []
+            if entries:
+                from .wal_stream import _record_from_json
+
+                try:
+                    records = [_record_from_json(item) for item in entries]
+                except (KeyError, TypeError, ValueError, StorageError) as exc:
+                    return self._append_rejection(
+                        f"日志条目无法解码: {exc}", term=self.state.term
+                    )
+                try:
+                    applier(records)  # type: ignore[misc]
+                except StorageError as exc:
+                    return self._append_rejection(
+                        f"日志重放失败: {exc}", term=self.state.term
+                    )
+                last_lsn = int(records[-1].lsn)
+                with self._lock:
+                    self.state.observe_applied(last_lsn, term=requested)
+            with self._lock:
+                self.state.observe_commit(int(commit_lsn))
+                return {
+                    "type": "append_entries_response",
+                    "term": self.state.term,
+                    "ok": True,
+                    "match_lsn": self.state.match_lsn,
+                    "match_term": self.state.match_term,
+                    "commit_lsn": self.state.commit_lsn,
+                }
+
+    def _append_rejection(
+        self, reason: str, *, term: int | None = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "type": "append_entries_response",
+                "term": self.state.term if term is None else int(term),
+                "ok": False,
+                "reason": str(reason),
+                "match_lsn": self.state.match_lsn,
+                "match_term": self.state.match_term,
             }
 
     def heartbeat_round(
@@ -940,6 +1101,15 @@ class QuorumNode:
                     str(request.get("leader_id", "")),
                     int(request.get("last_lsn", 0)),
                     int(request.get("commit_lsn", 0)),
+                )
+            elif request_type == "append_entries":
+                response = self.append_entries(
+                    int(request.get("term", 0)),
+                    str(request.get("leader_id", "")),
+                    int(request.get("prev_lsn", 0)),
+                    int(request.get("prev_term", 0)),
+                    request.get("entries", []),
+                    commit_lsn=int(request.get("commit_lsn", 0)),
                 )
             else:
                 conn.sendall(
