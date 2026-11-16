@@ -110,6 +110,29 @@ class SegmentedWAL(WAL):
 
     # -- 段文件 -------------------------------------------------------------
 
+    def seed_next_lsn(self, next_lsn: int, *, last_lsn: int = 0) -> None:
+        """把空的分段 WAL 接到一个更高的逻辑 LSN。
+
+        只允许在还没有任何段文件、也没有待写记录时调用。用于只读副本提升
+        成主库：副本的数据页来自基准备份，但本地没有 WAL；如果新主库从
+        LSN 1 重新开始，已经复制到高位的副本会拒绝后续记录。
+        """
+        with self._lock:
+            if (
+                self._fh is not None
+                or self._pending
+                or self._last_lsn
+                or self._size
+                or self._discover()
+            ):
+                raise StorageError("WAL 非空，不能重设起始 LSN")
+            next_lsn = int(next_lsn)
+            last_lsn = int(last_lsn)
+            if next_lsn < 1 or last_lsn < 0 or last_lsn >= next_lsn:
+                raise ValueError("WAL 的 LSN 边界非法")
+            self._next_lsn = next_lsn
+            self._last_lsn = last_lsn
+
     def _discover(self) -> list[Path]:
         found: list[tuple[int, Path]] = []
         for entry in self.path.iterdir():

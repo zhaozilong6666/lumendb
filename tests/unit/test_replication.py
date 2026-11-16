@@ -656,6 +656,30 @@ class TestReplica:
             restarted.stop()
             primary.close()
 
+    def test_promoted_replica_continues_wal_at_the_replicated_end(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        primary.execute_one("INSERT INTO t VALUES (1, 'a')")
+        replica = Replica.bootstrap(primary, tmp_path / "replica")
+        primary.execute_one("INSERT INTO t VALUES (2, 'b')")
+        records = list(primary.wal.iter_records(replica.applied_lsn + 1))
+        assert records
+        last = records[-1]
+        expected_next = last.lsn + len(last.encode())
+        replica.apply(records)
+        assert replica._next_lsn == expected_next
+
+        promoted = replica.promote()
+        try:
+            assert promoted.wal.last_lsn == replica.applied_lsn
+            assert promoted.wal.next_lsn == expected_next
+            promoted.execute_one("INSERT INTO t VALUES (3, 'c')")
+            assert promoted.wal.last_lsn >= expected_next
+            assert promoted.execute_one("SELECT COUNT(*) FROM t").rows == [(3,)]
+        finally:
+            promoted.close()
+            primary.close()
+
     def test_promote_after_primary_close(self, tmp_path):
         primary = make_primary(tmp_path)
         primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")

@@ -49,10 +49,20 @@ class Replica:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         marker = self.path / "replica.lsn"
+        next_lsn = applied_lsn + 1
         if marker.exists():
             try:
-                applied_lsn = int(marker.read_text(encoding="utf-8").strip() or "0")
-            except (OSError, ValueError) as exc:
+                parts = marker.read_text(encoding="utf-8").split()
+                applied_lsn = int(parts[0] or "0")
+                if len(parts) > 1:
+                    next_lsn = int(parts[1])
+                else:
+                    # 旧 marker 只有已 apply 的记录 LSN，没有它的结束边界；
+                    # 从 applied_lsn + 1 开始至少保证提升后的 LSN 不倒退。
+                    next_lsn = applied_lsn + 1
+                if applied_lsn < 0 or next_lsn <= applied_lsn:
+                    raise ValueError("marker 边界非法")
+            except (OSError, ValueError, IndexError) as exc:
                 raise StorageError(
                     "副本复制进度文件损坏，拒绝从猜测的 LSN 继续",
                     detail=str(marker),
@@ -64,6 +74,9 @@ class Replica:
             wal_segment_bytes=wal_segment_bytes,
         )
         self._applied_lsn = applied_lsn
+        #: 提升成主库时下一条 WAL 记录应使用的 LSN。基准备份后是
+        #: checkpoint_lsn + 1；每 apply 一批后推进到“最后一条记录 + 其编码长度”。
+        self._next_lsn = max(applied_lsn + 1, int(next_lsn))
         # 上一批最后一条记录之后的字节边界；用于拒绝中间有洞的复制流。
         # 0 表示还没有在本进程内建立连续视图（首次 apply 允许从任意 LSN 开始，
         # 例如基准备份之后的第一条记录）。
@@ -252,6 +265,7 @@ class Replica:
                 # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
                 self._applied_lsn = record.lsn
                 self._expected_end_lsn = record.lsn + len(record.encode())
+                self._next_lsn = self._expected_end_lsn
                 count += 1
 
             if count:
@@ -306,7 +320,7 @@ class Replica:
         marker = self.path / "replica.lsn"
         tmp = self.path / "replica.lsn.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(str(self._applied_lsn))
+            fh.write(f"{self._applied_lsn}\n{self._next_lsn}\n")
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, marker)
@@ -357,6 +371,11 @@ class Replica:
         current = self._current_lsn()
         if current > int(getattr(self, "_applied_lsn", 0)):
             self._applied_lsn = current
+            wal = getattr(self.db, "wal", None)
+            if wal is not None:
+                self._next_lsn = max(
+                    int(self._next_lsn), int(getattr(wal, "next_lsn", 0))
+                )
             # 写路径的 WAL 进度不是复制 apply 的连续边界。
             self._expected_end_lsn = 0
             self._write_marker()
@@ -495,6 +514,7 @@ class Replica:
                     self.path, read_only=True, checkpoint_wal_bytes=0
                 )
                 self._applied_lsn = checkpoint_lsn
+                self._next_lsn = checkpoint_lsn + 1
                 # 基准备份换了数据文件，旧进程内维护的“下一条记录边界”
                 # 已经不再对应新的 WAL 位置。
                 self._expected_end_lsn = 0
@@ -718,8 +738,29 @@ class Replica:
                 checkpoint_wal_bytes=0,
                 write_fence=write_fence,
             )
+            self._seed_promoted_wal()
             self._adopt_local_lsn()
             return self.db
+
+    def _seed_promoted_wal(self) -> None:
+        """把新主库的空 WAL 接到副本已复制到的边界。
+
+        基准备份和复制 apply 都不在副本上写 WAL，所以提升后打开的数据库
+        默认从 LSN 1 开始追加；旧副本已经 apply 到更高的 LSN，会把新主库
+        的第一批记录当成“落后/重叠”。这里在 WAL 仍为空时，把 next_lsn
+        设到上一批记录结束处，保持整个集群的 LSN 单调。
+        """
+        wal = getattr(self.db, "wal", None)
+        if wal is None or int(getattr(wal, "last_lsn", 0)) != 0:
+            return
+        seed = getattr(wal, "seed_next_lsn", None)
+        if seed is None:
+            return
+        next_lsn = max(1, int(self._next_lsn))
+        if next_lsn <= 1:
+            return
+        seed(next_lsn, last_lsn=int(self._applied_lsn))
+        self._next_lsn = next_lsn
 
 
 __all__ = ["Replica"]
