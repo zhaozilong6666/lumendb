@@ -595,9 +595,13 @@ def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
         assert leader.db.wal.last_lsn > follower.applied_lsn
 
         nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+        batch = list(leader.db.wal.iter_records(follower.applied_lsn + 1))
+        assert batch
         pushed = leader.push_entries_to_peers(nodes[0])
         assert pushed.get("n1", 0) > 0
         assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        # 推送成功后多数派水位要立刻计入 peer 的 match_lsn，不等下一轮心跳。
+        assert nodes[0].quorum_commit_lsn == batch[-1].lsn
     finally:
         _stop(nodes)
         leader.db.close()

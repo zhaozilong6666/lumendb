@@ -496,6 +496,17 @@ class QuorumNode:
             self.state.observe_commit(watermark)
             return self.state.commit_lsn
 
+    def refresh_commit_lsn(self, self_lsn: int) -> int:
+        """立即用最近一轮心跳/推送记录到的 peer ``match_lsn`` 重算水位。
+
+        ``heartbeat_round`` 每轮都会算一次；append_entries 成功之后等下一轮
+        心跳才重算会让同步复制的屏障多等一个心跳周期。推送方在成功后调用
+        本方法，把已经真实 apply 的进度立刻计入多数派水位。
+        """
+        return self._advance_commit_lsn(
+            self_lsn, dict(getattr(self, "last_matches", {}))
+        )
+
     def request_vote(
         self,
         term: int,

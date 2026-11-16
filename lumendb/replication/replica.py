@@ -462,6 +462,12 @@ class Replica:
                 node.last_match_terms[peer_id] = int(
                     response.get("match_term", 0)
                 )
+        if pushed:
+            # peer 已经真实 apply：立刻把它的 match_lsn 计入多数派水位，
+            # 同步复制的屏障不用再等下一轮心跳。
+            refresh = getattr(node, "refresh_commit_lsn", None)
+            if refresh is not None:
+                refresh(self._current_lsn())
         return pushed
 
     # ------------------------------------------------------------------

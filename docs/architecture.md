@@ -464,9 +464,11 @@ read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` �
 静默丢掉主库已提交、但还没发出去的尾段。这里用一层最小协议补上这个判断：
 
 - 每个节点把**真正复制到**的 LSN 记在 `VoteState.match_lsn`，心跳响应会带上它；
-- leader 每轮心跳收集"自己 + 各 peer 的 `match_lsn`"，取第 `majority` 大的值作为
-  `quorum_commit_lsn`（三节点即"第二大的那个"），并持久化（只前进不后退）；
-  心跳请求同时携带 leader 的 `commit_lsn`，follower 也会保存，换主时新候选
+- leader 每轮心跳收集“自己 + 各 peer 的 `match_lsn`”，取第 `majority` 大的值作为
+  `quorum_commit_lsn`（三节点即“第二大的那个”），并持久化（只前进不后退）；
+  append_entries 推送成功后 `push_entries_to_peers` 会立即把 peer 的新
+  `match_lsn` 计入水位，同步复制的屏障不用多等一个心跳周期；心跳请求同时
+  携带 leader 的 `commit_lsn`，follower 也会保存，换主时新候选
   不必从 0 开始猜水位；
 - `campaign()` 在投票前先比一次：`candidate_lsn < quorum_commit_lsn` 直接拒绝提升，
   提示先追平 WAL（或做一次增量基准备份）再发起。
