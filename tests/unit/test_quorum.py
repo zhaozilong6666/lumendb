@@ -716,3 +716,48 @@ def test_heartbeat_push_catches_up_during_concurrent_writes(tmp_path):
         leader.db.close()
         follower.db.close()
         primary.close()
+
+
+def test_heartbeat_push_resumes_after_leader_restart(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    source = tmp_path / "leader"
+    leader.db.close()
+    shutil.copytree(source, tmp_path / "follower")
+    leader.db = Database(source, read_only=True, checkpoint_wal_bytes=0)
+    follower = Replica(tmp_path / "follower")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        follower.attach_quorum(nodes[1])
+        leader.promote_with_quorum(
+            nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)],
+            timeout=5.0,
+        ), "重启前没有追平"
+        # 模拟 leader 重启：Replica.close() 会把本地 WAL 进度写回 replica.lsn，
+        # 再以只读句柄重新打开、重新竞选提升（直接 leader.db.close() 会绕过
+        # _adopt_local_lsn，重启后会把落后进度拿去竞选）。
+        leader.close()
+        leader.db = Database(source, read_only=True, checkpoint_wal_bytes=0)
+        leader.promote_with_quorum(
+            nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        for i in range(2, 12):
+            leader.execute_one(f"INSERT INTO t VALUES ({i}, 'v{i}')")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(11,)],
+            timeout=10.0,
+        ), "leader 重启后心跳推送没有恢复"
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower.db.close()
+        primary.close()
