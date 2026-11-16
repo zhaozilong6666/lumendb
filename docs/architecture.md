@@ -340,6 +340,14 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 并恢复保留点。若起点已经落在已回收段之前，服务端返回明确错误，要求重新
 基准备份，避免静默丢段。
 
+复制流的每个 WAL 记录额外携带 `has_crc` / `crc`：CRC32 覆盖逻辑帧头和
+payload（不覆盖帧尾自身的 CRC 字段），接收端在反序列化时校验；不带 `crc`
+的旧服务端仍可通信。基准备份的单个响应、流式分块和增量页也带 `crc`，
+客户端在写页文件前校验。`Replica.apply` 还会用上一帧的
+`lsn + len(record.encode())` 计算下一条记录应有的字节边界，发现批次跳过
+记录时抛 `StorageError`，不把 `replica.lsn` 静默推过缺口；基准备份和
+提升会重置这个进程内边界。
+
 多副本用 `WALServer(slot_dir=...)`：每个请求携带 `replica_id`，确认 LSN 写到
 `<id>.confirmed`；服务端把保留点刷新为所有已知槽位的最小值，慢副本不会被
 快副本的 ack 提前截断。`Replica.bootstrap_from_server(replica_id=...)` 在拉完
