@@ -4,10 +4,11 @@
 验证方式见 `README.md` 的"怎么验证它真的能跑"。
 
 先说清边界：LumenDB 现在的复制是"物理 WAL 流 + 多数派水位 + 可选同步复制"，
-已有 prefix-checked `append_entries` MVP，但还**没有 Raft 级日志协商**：没有
-分歧尾巴截断、逐条 per-entry term，也没有由 leader 心跳自动驱动。它适合
-"单写者 + 一个共享目录（fence/租约文件）"的部署，不适合跨公网、跨不可靠
-文件系统的多写场景。
+已有 prefix-checked `append_entries` MVP 和 leader 侧显式
+`Replica.push_entries_to_peers()`（先跑一轮心跳拿 peer 前缀，再推下一批），但还
+**没有 Raft 级日志协商**：没有分歧尾巴截断、逐条 per-entry term，也没有由
+leader 心跳自动驱动。它适合“单写者 + 一个共享目录（fence/租约文件）”的部署，
+不适合跨公网、跨不可靠文件系统的多写场景。
 
 ---
 
@@ -61,9 +62,25 @@ replica.promote_with_quorum(
 ```
 
 提升前会依次检查：多数派投票 → 候选 `last_lsn >= quorum_commit_lsn`（水位闸门）
-→ 拿租约 → 写 fence → 切读写 → 起 keeper/心跳（可选装提交屏障）。
+→ 拿租约 → 写 fence → 切读写 → 起 keeper/心跳（可选装提交屏障）。提升后
+`Replica` 会把本地空 WAL 的 `next_lsn` 接到已复制边界，避免新主库从 LSN 1
+重新开始；旧版 `replica.lsn` 只有 applied LSN，提升前建议先做一次完整
+bootstrap 或记录精确边界。
 
-### 3.2 自动提升
+### 3.2 手动推送日志
+
+`append_entries` 不是自动后台循环。需要让某个 peer 走日志追加（而不是 WAL 流）时：
+
+```python
+quorum.heartbeat_round(primary.db.wal.last_lsn)  # 填 last_matches / last_match_terms
+pushed = replica.push_entries_to_peers(quorum, max_entries=1000)
+```
+
+每次只推一批，返回每个 peer 实际推了多少条；遇到 `prefix_mismatch` 只更新
+peer 的已知前缀，不会自动截断 leader 的尾巴。长期落后仍应用 WAL 流或
+`rebase_from_server` 追上。
+
+### 3.3 自动提升
 
 ```python
 ReplicationMonitor(
@@ -138,7 +155,7 @@ ReplicationMonitor(
 
 | 限制 | 影响 | 缓解 |
 |---|---|---|
-| 日志协商只有 MVP | `append_entries` 能做前缀检查并重放连续条目，但不截断分歧尾巴、不持久化逐条任期，也不由 leader 心跳自动驱动；长期失联的旧 leader 复辟后仍可能写入"多数派没有"的记录 | 共享 fence + 租约；不要让旧主库重新可写 |
+| 日志协商只有 MVP | `append_entries` 能做前缀检查并重放连续条目，`push_entries_to_peers` 可显式推一批；但不截断分歧尾巴、不持久化逐条任期，也不由 leader 心跳自动驱动；长期失联的旧 leader 复辟后仍可能写入"多数派没有"的记录 | 共享 fence + 租约；不要让旧主库重新可写 |
 | 写并发度为 1 | 写事务串行；读不受影响 | 需要更高写并发要接行级锁（见 `architecture.md` §2.5） |
 | 提升会丢掉主库未发送的尾段 | 未同步复制的写入可能丢失 | 开 `sync_replication`，或提升前确认 `lag_lsn == 0` |
 | 租约用墙钟 | 时钟漂移缩小安全窗口 | 强制 NTP，偏移 < `ttl/3` |

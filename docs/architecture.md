@@ -344,11 +344,16 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 payload（不覆盖帧尾自身的 CRC 字段），接收端在反序列化时校验；不带 `crc`
 的旧服务端仍可通信。更老的服务端连 `has_crc` 都不发送，接收端必须按
 `has_crc=False` 解码，否则本地重编码会多出 4 字节，破坏后续记录的 LSN
-连续性。基准备份的单个响应、流式分块和增量页也带 `crc`，
-客户端在写页文件前校验。`Replica.apply` 还会用上一帧的
-`lsn + len(record.encode())` 计算下一条记录应有的字节边界，发现批次跳过
-记录时抛 `StorageError`，不把 `replica.lsn` 静默推过缺口；基准备份和
-提升会重置这个进程内边界。
+连续性。`Replica.apply` 还会用上一帧的 `lsn + len(record.encode())` 计算
+下一条记录应有的字节边界，发现批次跳过记录时抛 `StorageError`，不把
+`replica.lsn` 静默推过缺口；基准备份和提升会重置这个进程内边界。
+
+提升时的另一个边界：基准备份只拷贝数据文件、不拷贝 WAL，副本提升后本地
+WAL 是空的。`Replica` 在 `replica.lsn` 里同时记录“最后 apply 的记录 LSN”
+和“下一条记录边界”；`promote()` 在 WAL 仍为空时把分段 WAL 的 `next_lsn`
+接到这个边界，避免新主库从 LSN 1 重新开始、让已经追到高位的副本拒绝后续记录。
+旧版单整数 marker 仍可读，但只按 `applied_lsn + 1` 估算边界，精确边界从新
+marker 开始生效。
 
 多副本用 `WALServer(slot_dir=...)`：每个请求携带 `replica_id`，确认 LSN 写到
 `<id>.confirmed`；服务端把保留点刷新为所有已知槽位的最小值，慢副本不会被
@@ -396,8 +401,9 @@ Raft 的 `(last_term, last_lsn)` 字典序拒绝落后候选（同 LSN 但最后
 一并记录日志任期；心跳只更新"听到过"的 `last_lsn`，**不会**把 leader 的当前
 任期写成日志任期，否则日志相同的节点会互相拒绝。`Replica.promote_with_quorum()`
 先拿票再切换读写。它已有 leader 心跳 RPC、独立 `HeartbeatLoop` 和 TTL 租约，
-但没有 `append_entries` 的逐条日志协商，也不能单独处理“主库还活着但网络
-分区”的脑裂；提升后仍依赖共享 fence 挡住旧主库。
+以及 prefix-checked `append_entries` MVP，但没有分歧尾巴截断、逐条任期和
+自动心跳驱动，也不能单独处理“主库还活着但网络分区”的脑裂；提升后仍依赖
+共享 fence 挡住旧主库。
 
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写进共享文件。主库每次写语句前调用 `lease.assert_writable`，超过 TTL
@@ -485,11 +491,13 @@ leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数
 
 它仍然**不是完整的 Raft 日志协商**：现在有 prefix-checked `append_entries`
 MVP（`QuorumClient` / `QuorumNode`，`prev_lsn/prev_term` 前缀检查，entries 走
-现有 CRC 解码并交给绑定的 `Replica.apply`），但还没有分歧尾巴截断/回填、
-逐条日志的 per-entry term，也没有由 leader 心跳自动驱动。长期失联的旧
-leader 复辟后仍可能写进一些"多数派没收到"的记录（共享 fence + 租约负责
-挡住这类写入）。当前的 `(last_term, last_lsn)` 投票只能防止"同 LSN 但更旧
-任期"的候选直接当选，`last_term` 来自 `observe_applied` 上报时携带的任期，
+现有 CRC 解码并交给绑定的 `Replica.apply`），并且 `Replica.push_entries_to_peers`
+可以在一次显式调用中把本地 WAL 的下一批记录推给 peers；它依赖调用方先跑
+`heartbeat_round` 填好 peer 前缀，只推一批，不是后台自动驱动。仍有分歧尾巴
+截断/回填、逐条日志的 per-entry term，也没有完整的 commit index 协商。长期失联的旧
+leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 fence + 租约负责
+挡住这类写入）。当前的 `(last_term, last_lsn)` 投票只能防止“同 LSN 但更旧
+任期”的候选直接当选，`last_term` 来自 `observe_applied` 上报时携带的任期，
 是近似值。要做到 Raft 级别的正确性，仍需要完整日志协商 + commit index。
 
 客户端重定向已做 MVP（`WALServer(redirect_to=...)` / `WALClient(follow_redirects=True)`），

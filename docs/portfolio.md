@@ -80,7 +80,7 @@
 >   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；另有 prefix-checked `append_entries` MVP，能把带 CRC 的连续 WAL 条目推给已绑定 `Replica.apply` 的节点，但对分歧尾巴截断、逐条任期和心跳自动驱动仍未实现；
 > - 处理降级/关闭与在途 SQL 的竞争：`close()` 先等待只读语句退出，再回滚线上未提交事务并关闭句柄；
 >   pgwire 的写/COMMIT/SAVEPOINT 路径与 `Database._write_lock` 对齐，避免 step_down 之后仍有写落到已关闭的 WAL。
-> - 1157 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 1159 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -182,7 +182,7 @@
 > - Close/step-down races are explicit: `close()` waits for active readers,
 >   aborts live wire transactions, and pgwire write/COMMIT/savepoint paths use
 >   the same write lock, so no statement can land on a closed WAL.
-> - 1157 automated tests including crash-injection and a 20-seed randomized
+> - 1159 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
