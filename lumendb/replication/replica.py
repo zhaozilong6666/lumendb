@@ -836,8 +836,21 @@ class Replica:
         )
         term_of = lambda: getattr(getattr(quorum, "state", None), "term", None)
         fence = LeaseFence(lease, term_of) if lease is not None else None
+        if lease is not None:
+            # 提升后的新主库要以持有者身份打开数据库（Database 打开时的
+            # 租约重启防护会校验持有者）；轻量 mock quorum 的 campaign 不会
+            # acquire，这里兜底保证租约一定落在自己名下。acquire 对自己
+            # 幂等（等价续租）。任期优先取 quorum 的当前任期；拿不到时
+            # （mock 没有 state）沿用租约文件里已有的任期，避免触发
+            # "任期回退"拒绝。
+            acquire_term = term_of()
+            if acquire_term is None:
+                existing = lease.read()
+                acquire_term = int(existing["term"]) if existing else 0
+            lease.acquire(int(acquire_term))
         db = self.promote(
             fence_path=fence_path,
+            lease_path=lease_path,
             write_fence=fence.assert_writable if fence is not None else None,
             node_id=candidate_node,
         )
@@ -956,6 +969,7 @@ class Replica:
         self,
         *,
         fence_path: str | Path | None = None,
+        lease_path: str | Path | None = None,
         node_id: str = "replica",
         write_fence: Callable[[], None] | None = None,
     ) -> Database:
@@ -987,6 +1001,7 @@ class Replica:
                 wal_segment_bytes=getattr(self, "_wal_segment_bytes", 1024 * 1024),
                 write_fence=write_fence,
                 fence_path=fence_path,
+                lease_path=lease_path,
                 node_id=node_id,
             )
             self._seed_promoted_wal()

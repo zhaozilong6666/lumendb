@@ -73,6 +73,7 @@ class Database:
         commit_barrier: Optional[Callable[[int], None]] = None,
         wal_retain_lsn: int = 0,
         fence_path: str | Path | None = None,
+        lease_path: str | Path | None = None,
         node_id: str = "primary",
     ) -> None:
         self.path = Path(path)
@@ -91,6 +92,17 @@ class Database:
                 fence.assert_writable()
                 if write_fence is None:
                     write_fence = fence.assert_writable
+        if lease_path is not None:
+            # TTL 写租约：与 fence 同源的重启防护。租约文件持有者不是自己
+            # 且未过期 → 旧主库重启后不能写；过期则放行（等待重新 acquire
+            # 的语义由调用方处理）。持续检查同样接进写路径。
+            from ..replication.lease import Lease, LeaseFence
+
+            lease = Lease(lease_path, node_id)
+            if not read_only:
+                lease.assert_writable()
+                if write_fence is None:
+                    write_fence = LeaseFence(lease).assert_writable
         self._write_fence = write_fence
         #: 同步复制的提交屏障（参数是 COMMIT 记录的 LSN）。
         self._commit_barrier = commit_barrier

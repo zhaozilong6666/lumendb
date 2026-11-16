@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lumendb.engine.database import Database
@@ -183,6 +185,82 @@ class TestFencePathOnOpen:
             db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
             db.execute_one("INSERT INTO t VALUES (1)")
             assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            db.close()
+
+
+class TestLeasePathOnOpen:
+    """租约版的重启防护：与 fence 同源，语义更严——无租约/他人持有/
+    已过期一律拒绝写模式，旧主库必须重新 acquire 才能恢复写。
+
+    旧主库重启后，租约持有者不是自己 → 拒绝写模式打开；自己仍是
+    持有者且未过期 → 可写（提升后的新主库重启场景）。
+    """
+
+    def test_open_rejects_when_lease_held_by_other(self, tmp_path):
+        from lumendb.replication.lease import Lease
+
+        data = tmp_path / "old-primary"
+        lease_path = tmp_path / "lease.json"
+        db = Database(data)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.close()
+
+        Lease(lease_path, "new-leader", ttl=10.0).acquire(term=2)
+        with pytest.raises(NotSupportedError, match="租约"):
+            Database(data, lease_path=lease_path, node_id="old-primary")
+
+    def test_open_after_expiry_still_rejected_until_reacquire(self, tmp_path):
+        from lumendb.replication.lease import Lease
+
+        data = tmp_path / "old-primary"
+        lease_path = tmp_path / "lease.json"
+        db = Database(data)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.close()
+
+        lease = Lease(lease_path, "new-leader", ttl=0.1)
+        lease.acquire(term=2)
+        time.sleep(0.2)
+        # 过期不等于放行：旧主库必须显式重新 acquire。
+        with pytest.raises(NotSupportedError, match="租约"):
+            Database(data, lease_path=lease_path, node_id="old-primary")
+        # 重新 acquire（自己成为持有者）后可以写。
+        Lease(lease_path, "old-primary", ttl=10.0).acquire(term=3)
+        reopened = Database(data, lease_path=lease_path, node_id="old-primary")
+        try:
+            reopened.execute_one("INSERT INTO t VALUES (1)")
+            assert reopened.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            reopened.close()
+
+    def test_open_when_lease_is_mine(self, tmp_path):
+        from lumendb.replication.lease import Lease
+
+        data = tmp_path / "new-leader"
+        lease_path = tmp_path / "lease.json"
+        Lease(lease_path, "new-leader", ttl=10.0).acquire(term=2)
+        db = Database(data, lease_path=lease_path, node_id="new-leader")
+        try:
+            db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+            db.execute_one("INSERT INTO t VALUES (1)")
+            assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        finally:
+            db.close()
+
+    def test_lease_expiry_after_open_blocks_the_next_write(self, tmp_path):
+        from lumendb.replication.lease import Lease
+
+        data = tmp_path / "old-primary"
+        lease_path = tmp_path / "lease.json"
+        Lease(lease_path, "old-primary", ttl=0.15).acquire(term=2)
+        db = Database(data, lease_path=lease_path, node_id="old-primary")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        try:
+            db.execute_one("INSERT INTO t VALUES (1)")
+            time.sleep(0.25)
+            with pytest.raises(NotSupportedError, match="租约"):
+                db.execute_one("INSERT INTO t VALUES (2)")
         finally:
             db.close()
 
