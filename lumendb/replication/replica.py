@@ -21,6 +21,7 @@ import os
 import shutil
 import ssl
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -111,6 +112,9 @@ class Replica:
         self.last_rebuild_error: str | None = None
         self._rebuild_lock = threading.Lock()
         self._rebuild_in_flight = False
+        #: 推送退避：``{peer_id: 可重试的 monotonic 时刻}``。持续拒绝
+        #: （无 applier / 重建反复失败）的 peer 在退避期内跳过推送。
+        self._push_backoff: dict[str, float] = {}
         #: ``step_down()`` 的观察者（``ReplicationMonitor`` 用它更新状态机）。
         self._step_down_listeners: list[Callable[[str], None]] = []
         if not marker_exists:
@@ -503,10 +507,17 @@ class Replica:
         from .wal_stream import _record_to_json
 
         pushed: dict[str, int] = {}
+        now = time.monotonic()
         for peer_id, (host, port) in dict(getattr(node, "peers", {})).items():
             if peer_id == node.node_id:
                 continue
             if peer_id not in node.last_matches:
+                continue
+            # 持续拒绝的 peer 退避：无 applier（配置错误）或重建反复失败的
+            # peer 每轮心跳空推 1000 条纯属浪费；退避期内跳过，成功推进后
+            # 立即恢复。
+            skip_until = self._push_backoff.get(peer_id, 0.0)
+            if now < skip_until:
                 continue
             prev_lsn = int(node.last_matches[peer_id])
             # 拼接点任期优先用 leader 自己的知识：peer 上报的 match_term
@@ -550,6 +561,7 @@ class Replica:
                 )
                 pushed[peer_id] = len(records)
                 self.last_push_rejections.pop(peer_id, None)
+                self._push_backoff.pop(peer_id, None)
             else:
                 reason = str(response.get("reason", "unknown"))
                 if self.last_push_rejections.get(peer_id) != reason:
@@ -567,8 +579,17 @@ class Replica:
                     node.last_match_terms[peer_id] = int(
                         response.get("match_term", 0)
                     )
-                # rebuild_required（日志分歧）时保持 last_matches 不动：
-                # 该 peer 需要重新基准备份，盲目重发只会反复被拒。
+                    self._push_backoff.pop(peer_id, None)
+                elif (
+                    response.get("rebuild_required")
+                    or reason == "本节点没有绑定日志重放函数"
+                ):
+                    # rebuild_required（日志分歧）时保持 last_matches 不动：
+                    # 该 peer 需要重新基准备份，盲目重发只会反复被拒；无
+                    # applier 的 peer 是配置错误。两者都退避几秒，别让每轮
+                    # 心跳空推 1000 条。重建成功/peer 修复后由成功路径清除。
+                    backoff = 2.0 if response.get("rebuild_required") else 5.0
+                    self._push_backoff[peer_id] = time.monotonic() + backoff
         if pushed:
             # peer 已经真实 apply：立刻把它的 match_lsn 计入多数派水位，
             # 同步复制的屏障不用再等下一轮心跳。
