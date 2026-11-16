@@ -204,6 +204,67 @@ def test_heartbeat_timeout_drives_follower_promotion(tmp_path):
         primary.close()
 
 
+def test_partitioned_leader_stops_writing_when_lease_renew_fails(tmp_path):
+    """网络分区双写防护：多数派不可达 → quorum 续租失败 → 旧主库自停写。
+
+    这是 fence 之外的第二层防护。旧主库在少数派分区里时，心跳只能
+    拿到自己一票，``lease_renew_with_quorum`` 的续租被拒；keeper 失败
+    触发 ``lease_loss_stepdown`` 切回只读，TTL 到期前就停写，不等租约
+    自然过期。
+    """
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    for i in range(5):
+        primary.execute_one(f"INSERT INTO t VALUES ({i})")
+    server = WALServer(primary).start()
+
+    nodes = [
+        QuorumNode(
+            f"n{i}",
+            state_path=tmp_path / f"n{i}.vote.json",
+            timeout=1.0,
+        ).start()
+        for i in range(3)
+    ]
+    peers = {n.node_id: (n.host, n.port) for n in nodes}
+    for node in nodes:
+        node.peers = {p: a for p, a in peers.items() if p != node.node_id}
+
+    replica = None
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "leader"
+        )
+        replica.promote_with_quorum(
+            nodes[0],
+            fence_path=tmp_path / "fence.json",
+            lease_path=tmp_path / "lease.json",
+            lease_ttl=0.6,
+            lease_keeper_interval=0.1,
+            lease_renew_with_quorum=True,
+            lease_loss_stepdown=True,
+            heartbeat_interval=0.05,
+        )
+        replica.execute_one("INSERT INTO t VALUES (5)")
+        assert replica.db._read_only is False
+
+        # 分区：多数派节点宕机，leader 只剩自己一票。
+        nodes[1].stop()
+        nodes[2].stop()
+        assert _wait_for(
+            lambda: replica.db._read_only is True, timeout=5.0
+        ), "多数派不可达后旧主库没有在租约到期前自停写"
+        with pytest.raises(NotSupportedError, match="只读"):
+            replica.execute_one("INSERT INTO t VALUES (6)")
+    finally:
+        if replica is not None:
+            replica.close()
+        for node in nodes:
+            node.stop()
+        server.stop()
+        primary.close()
+
+
 def test_two_candidates_pick_exactly_one_leader(tmp_path):
     """两个 follower 同时超时竞选：必须选出恰一个 leader，另一个退出。
 
