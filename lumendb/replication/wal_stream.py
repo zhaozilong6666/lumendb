@@ -297,6 +297,9 @@ class WALServer:
                         pass
                     continue
             conn.settimeout(10)
+            # 周期性 follower 会不断开新连接；只保留还活着的处理线程，
+            # 否则长期运行的服务会无限累积已结束的线程对象。
+            self._handlers[:] = [h for h in self._handlers if h.is_alive()]
             handler = threading.Thread(target=self._handle, args=(conn,), daemon=True)
             self._handlers.append(handler)
             handler.start()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import shutil
 import threading
+import time
 
 import pytest
 
@@ -386,6 +387,21 @@ class TestReplica:
         finally:
             if replica is not None:
                 replica.db.close()
+            server.stop()
+            primary.close()
+
+    def test_server_prunes_finished_handler_threads(self, tmp_path):
+        """短连接不断开新连，服务器不得无限累积已结束的处理线程。"""
+        primary = make_primary(tmp_path)
+        server = WALServer(primary).start()
+        try:
+            for _ in range(25):
+                assert "current_lsn" in WALClient(server.host, server.port, timeout=2.0).status()
+            time.sleep(0.3)
+            assert len(server._handlers) <= 2, (
+                f"处理线程没有被回收：{len(server._handlers)}"
+            )
+        finally:
             server.stop()
             primary.close()
 
