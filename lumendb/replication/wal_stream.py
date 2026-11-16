@@ -38,6 +38,7 @@ from typing import Iterable
 from ..errors import RedirectError, StorageError, TransactionError
 from ..storage.page import PAGE_SIZE
 from ..storage.wal import CRC_SIZE, LogRecord
+from ._atomic import atomic_replace
 
 
 def _crc32(data: bytes) -> int:
@@ -253,7 +254,7 @@ class WALServer:
             fh.write(str(lsn))
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, target)
+        atomic_replace(tmp, target)
         try:
             dir_fd = os.open(self.slot_dir, os.O_RDONLY)
             try:
@@ -557,7 +558,7 @@ class WALServer:
                 if self.slot_path is not None:
                     tmp = self.slot_path.with_name(self.slot_path.name + ".tmp")
                     tmp.write_text(str(lsn), encoding="utf-8")
-                    os.replace(tmp, self.slot_path)
+                    atomic_replace(tmp, self.slot_path)
             confirmed = self._confirmed_lsn
         else:
             confirmed = self._record_replica_ack(replica_id, lsn)
@@ -663,7 +664,7 @@ class WALClient:
                         break
             if checkpoint_lsn is None:
                 raise StorageError("基准备份流没有结束标记")
-            os.replace(tmp, target)
+            atomic_replace(tmp, target)
             return checkpoint_lsn
         except Exception:
             try:

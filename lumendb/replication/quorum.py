@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import NotSupportedError, StorageError
+from ._atomic import atomic_replace
 from .fence import PromotionFence
 from .lease import Lease
 
@@ -152,7 +153,7 @@ class VoteState:
                 )
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            atomic_replace(tmp, self.path)
 
     def observe_lsn(self, lsn: int) -> None:
         """记录"听到过"的最高 LSN（投票安全用，不代表持有数据）。
@@ -742,6 +743,8 @@ class QuorumNode:
                     "term": self.state.term,
                     "granted": bool(would_grant),
                     "pre_vote": True,
+                    "last_lsn": self.state.last_lsn,
+                    "last_term": self.state.last_term,
                 }
         with self._lock:
             if requested < self.state.term:
@@ -749,6 +752,8 @@ class QuorumNode:
                     "type": "vote_response",
                     "term": self.state.term,
                     "granted": False,
+                    "last_lsn": self.state.last_lsn,
+                    "last_term": self.state.last_term,
                 }
             if requested > self.state.term:
                 self.state.term = requested
@@ -759,12 +764,16 @@ class QuorumNode:
                     "type": "vote_response",
                     "term": self.state.term,
                     "granted": False,
+                    "last_lsn": self.state.last_lsn,
+                    "last_term": self.state.last_term,
                 }
             if not log_is_newer_or_equal():
                 return {
                     "type": "vote_response",
                     "term": self.state.term,
                     "granted": False,
+                    "last_lsn": self.state.last_lsn,
+                    "last_term": self.state.last_term,
                 }
             self.state.voted_for = candidate
             self.state.save()
@@ -772,6 +781,8 @@ class QuorumNode:
                 "type": "vote_response",
                 "term": self.state.term,
                 "granted": True,
+                "last_lsn": self.state.last_lsn,
+                "last_term": self.state.last_term,
             }
 
     def status(self) -> dict[str, Any]:
@@ -1362,6 +1373,14 @@ class QuorumNode:
                 highest_term = peer_term
             if response.get("granted"):
                 votes.add(peer_id)
+                # 把投票者报出的真实进度吸收进 last_matches：新 leader 当选后
+                # 第一轮 push 就能从正确拼接点推批，不必等下一轮心跳刷新。
+                peer_lsn = int(response.get("last_lsn", 0) or 0)
+                if peer_lsn > 0:
+                    self.last_matches[peer_id] = peer_lsn
+                    self.last_match_terms[peer_id] = int(
+                        response.get("last_term", 0) or 0
+                    )
 
         if highest_term > term:
             with self._lock:

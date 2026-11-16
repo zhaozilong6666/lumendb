@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..errors import NotSupportedError, StorageError
+from ._atomic import atomic_replace
 
 
 class Lease:
@@ -111,7 +112,7 @@ class Lease:
             json.dump(payload, fh, separators=(",", ":"), ensure_ascii=False)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        atomic_replace(tmp, self.path)
 
     def acquire(
         self,

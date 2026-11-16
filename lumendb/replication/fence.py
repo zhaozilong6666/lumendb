@@ -13,10 +13,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from ..errors import NotSupportedError
+from ._atomic import atomic_replace
 
 
 class PromotionFence:
@@ -74,7 +74,7 @@ class PromotionFence:
             json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
             encoding="utf-8",
         )
-        os.replace(tmp, self.path)
+        atomic_replace(tmp, self.path)
 
     def clear(self) -> None:
         self._cache_key = None

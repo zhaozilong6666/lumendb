@@ -33,6 +33,7 @@ from ..storage.txn import TxnState
 from ..storage.page import PageType
 from ..storage.pager import DiskManager
 from ..storage.wal import LogType, decode_page_image, decode_page_update
+from ._atomic import atomic_replace
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
 from .quorum import HeartbeatLoop, QuorumCommitBarrier
@@ -350,7 +351,7 @@ class Replica:
             fh.write(f"{self._applied_lsn}\n{self._next_lsn}\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, marker)
+        atomic_replace(tmp, marker)
         # 目录项本身也要落盘，否则崩溃后可能看到旧的 marker（会导致重放，
         # 但不会丢已 flush 的页）；在没有目录 fsync 的平台上跳过。
         try:
@@ -737,7 +738,7 @@ class Replica:
                     disk.sync()
                 finally:
                     disk.close()
-                os.replace(staged_path, data_path)
+                atomic_replace(staged_path, data_path)
                 self.db = Database(
                     self.path, read_only=True, checkpoint_wal_bytes=0
                 )

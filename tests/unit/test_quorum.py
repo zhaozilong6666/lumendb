@@ -1199,6 +1199,24 @@ def test_append_entries_moves_a_real_replica_forward(tmp_path):
         primary.close()
 
 
+def test_campaign_absorbs_voter_progress_into_last_matches(tmp_path):
+    """投票响应携带投票者进度：新 leader 首轮推批不必再等一轮心跳。"""
+    nodes = _cluster(tmp_path)
+    try:
+        # n1 有真实进度；n2 是空节点（last_lsn=0，不影响吸收）。
+        nodes[1].observe_applied(50, term=1)
+        nodes[0].observe_applied(100, term=1)
+        term = nodes[0].campaign(100)
+        assert term >= 1
+        # 三节点集群、候选自己 100 >= 所有投票者进度，全票通过。
+        assert nodes[0].last_matches.get("n1") == 50
+        assert nodes[0].last_match_terms.get("n1") == 1
+        # 空节点报 0：不写进 last_matches，避免把候选的拼接点拉回 0。
+        assert "n2" not in nodes[0].last_matches or nodes[0].last_matches["n2"] == 0
+    finally:
+        _stop(nodes)
+
+
 def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
