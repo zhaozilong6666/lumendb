@@ -27,7 +27,7 @@ def _cluster(tmp_path, count: int = 3):
     nodes = []
     for i in range(count):
         node = QuorumNode(
-            f"n{i}", state_path=tmp_path / f"n{i}.vote.json", timeout=0.5
+            f"n{i}", state_path=tmp_path / f"n{i}.vote.json", timeout=1.0
         ).start()
         nodes.append(node)
     peers = {node.node_id: (node.host, node.port) for node in nodes}

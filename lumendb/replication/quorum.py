@@ -1282,15 +1282,24 @@ class HeartbeatLoop:
             thread = self._thread
             self._thread = None
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(1.0, self.interval + 0.5))
+            # 线程可能正卡在一轮心跳的 socket 等待里；join 超时必须覆盖
+            # 剩余等待，否则解释器关闭时线程还在提交新请求。
+            thread.join(
+                timeout=max(
+                    1.0,
+                    self.interval + getattr(self.node, "timeout", 2.0) + 0.5,
+                )
+            )
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             term_before = self.node.state.term
             try:
                 acks, errors = self.node.heartbeat_round(self.last_lsn())
-            except (OSError, ValueError, StorageError) as exc:
+            except Exception as exc:  # noqa: BLE001 - 解释器关闭时 ThreadPool 也会抛
                 acks, errors = 0, [str(exc)]
+                if self._stop.is_set():
+                    break
             self.last_acks = acks
             self.last_errors = errors
             self.last_quorum_commit_lsn = self.node.quorum_commit_lsn

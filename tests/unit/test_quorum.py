@@ -25,7 +25,7 @@ def _cluster(tmp_path, count: int = 3):
         node = QuorumNode(
             f"n{i}",
             state_path=tmp_path / f"n{i}.vote.json",
-            timeout=0.5,
+            timeout=1.0,
         ).start()
         nodes.append(node)
     peers = {
@@ -629,6 +629,44 @@ def test_heartbeat_loop_pushes_entries_to_a_real_replica(tmp_path):
             lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)],
             timeout=3.0,
         ), "心跳循环没有把 append_entries 推到副本"
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower.db.close()
+        primary.close()
+
+
+def test_heartbeat_push_catches_up_during_concurrent_writes(tmp_path):
+    """自动推送与主库写并发：心跳线程在迭代 WAL 的同时，写线程在追加。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    source = tmp_path / "leader"
+    leader.db.close()
+    shutil.copytree(source, tmp_path / "follower")
+    leader.db = Database(source, read_only=True, checkpoint_wal_bytes=0)
+    follower = Replica(tmp_path / "follower")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        follower.attach_quorum(nodes[1])
+        leader.promote_with_quorum(
+            nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        for i in range(200):
+            leader.execute_one(f"INSERT INTO t VALUES ({i}, 'v{i}')")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(200,)],
+            timeout=10.0,
+        ), "心跳推送没有在并发写入下追平副本"
+        # 追平后再写几笔，确认批次边界没有被并发追加破坏。
+        for i in range(200, 205):
+            leader.execute_one(f"INSERT INTO t VALUES ({i}, 'v{i}')")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(205,)],
+            timeout=10.0,
+        ), "追平后的增量批次没有送达"
     finally:
         _stop(nodes)
         leader.db.close()

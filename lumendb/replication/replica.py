@@ -403,8 +403,8 @@ class Replica:
     ) -> dict[str, int]:
         """把本地 WAL 的下一批记录通过 append_entries 推给 peers。
 
-        这是 leader 侧的显式推送，不是自动心跳驱动：调用方先做一轮
-        ``heartbeat_round`` 填好每个 peer 的 ``last_matches``，再调用本方法。
+        leader 侧既可显式调用（先跑一轮 ``heartbeat_round`` 填好每个 peer 的
+        ``last_matches``），也会被提升后的 ``HeartbeatLoop`` 每轮自动调用。
         只处理下一批；失败/前缀不匹配时返回 0 并留下 peer 的已知位置，交由
         下一次调用或 WAL 流回填。没有分歧尾巴截断，也没有逐条任期。
         """
@@ -445,6 +445,10 @@ class Replica:
                 timeout=node.timeout,
                 token=node.token,
             )
+            if max(0, int(response.get("term", 0))) > int(node.state.term):
+                # 有 peer 已进入更高任期：本节点已经过期，不再把同一批
+                # 旧任期的条目推给其他 peer；任期推进交给下一轮心跳。
+                break
             if response.get("ok"):
                 node.last_matches[peer_id] = int(response.get("match_lsn", 0))
                 node.last_match_terms[peer_id] = int(
