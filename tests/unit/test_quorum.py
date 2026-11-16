@@ -609,6 +609,31 @@ def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
         primary.close()
 
 
+def test_push_stops_when_a_peer_reports_a_higher_term(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    follower = Replica.bootstrap(primary, tmp_path / "follower")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        follower.attach_quorum(nodes[1])
+        leader.promote()
+        leader.attach_quorum(nodes[0])
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+        match_before = dict(nodes[0].last_matches)
+        nodes[1].state.term = nodes[0].state.term + 1
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed == {}, "peer 已进入更高任期，本轮不该再推送任何批次"
+        assert nodes[0].last_matches == match_before
+        assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower.db.close()
+        primary.close()
+
+
 def test_heartbeat_loop_pushes_entries_to_a_real_replica(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
