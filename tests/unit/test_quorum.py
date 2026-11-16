@@ -563,6 +563,36 @@ def test_append_entries_rejects_an_oversized_batch(tmp_path):
         _stop(nodes)
 
 
+def test_append_entries_survives_a_raising_applier(tmp_path):
+    """applier 抛任意异常都回退成拒绝，且不打死节点的服务循环。"""
+    nodes = _cluster(tmp_path)
+    try:
+        def boom(records):
+            raise OSError("boom")
+
+        nodes[1].set_log_applier(boom)
+        first = LogRecord(1, 7, LogType.BEGIN, b"")
+        response = QuorumClient.append_entries(
+            "127.0.0.1",
+            nodes[1].port,
+            1,
+            "leader",
+            0,
+            0,
+            [_record_to_json(first)],
+            timeout=1.0,
+        )
+        assert response.get("ok") is False
+        assert "日志重放失败" in response.get("reason", "")
+        # 同一个节点还活着：心跳仍然应答。
+        ack = QuorumClient.heartbeat(
+            "127.0.0.1", nodes[1].port, 1, "leader", 1, timeout=1.0
+        )
+        assert ack.get("ok") is True
+    finally:
+        _stop(nodes)
+
+
 def test_append_entries_rejects_an_internal_gap(tmp_path):
     nodes = _cluster(tmp_path)
     try:

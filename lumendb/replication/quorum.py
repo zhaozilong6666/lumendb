@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
@@ -26,6 +27,8 @@ from typing import Any
 from ..errors import NotSupportedError, StorageError
 from .fence import PromotionFence
 from .lease import Lease
+
+_log = logging.getLogger(__name__)
 
 _NODE_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
@@ -759,7 +762,9 @@ class QuorumNode:
                         )
                 try:
                     applier(records)  # type: ignore[misc]
-                except StorageError as exc:
+                except Exception as exc:  # noqa: BLE001 - 重放异常一律回退为拒绝
+                    # 覆盖 StorageError 之外的意外异常（OSError/ValueError 等）：
+                    # 不能让单个畸形批次把请求线程或整个服务循环打死。
                     return self._append_rejection(
                         f"日志重放失败: {exc}", term=self.state.term
                     )
@@ -1129,6 +1134,8 @@ class QuorumNode:
                 break
             try:
                 self._handle(conn)
+            except Exception:  # noqa: BLE001 - 单个坏请求不能打死服务循环
+                _log.exception("仲裁请求处理失败，连接已关闭")
             finally:
                 try:
                     conn.close()
