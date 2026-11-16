@@ -23,7 +23,7 @@ from pathlib import Path
 
 from ..errors import NotSupportedError, RedirectError, StorageError
 from .replica import Replica
-from .wal_stream import WALClient
+from .wal_stream import WALClient, WALServer
 
 _log = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ class ReplicationMonitor:
         heartbeat_interval: float | None = None,
         sync_replication: bool = False,
         sync_timeout: float = 2.0,
+        serve_on: tuple[str, int] | None = None,
     ) -> None:
         self.replica = replica
         self.host = host
@@ -97,6 +98,11 @@ class ReplicationMonitor:
         self.heartbeat_interval = heartbeat_interval
         self.sync_replication = sync_replication
         self.sync_timeout = sync_timeout
+        #: 提升成功后自动起 WALServer 的地址（None = 不起）；其他 follower
+        #: 可以从这里追新主库，分叉 follower 也用它自动重建。
+        self.serve_on = serve_on
+        #: 提升成功后由 monitor 启动的复制服务（未提升/未配置 serve_on 时为 None）。
+        self.server: WALServer | None = None
         self.max_failures = max(1, int(max_failures))
         self.timeout = timeout
         self.max_records = max_records
@@ -227,6 +233,13 @@ class ReplicationMonitor:
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
+        server = self.server
+        self.server = None
+        if server is not None:
+            try:
+                server.stop()
+            except OSError:
+                pass
 
     def _promote(self) -> bool:
         self.state = MonitorState.PROMOTING
@@ -257,7 +270,31 @@ class ReplicationMonitor:
             return False
         self.promoted = True
         self.state = MonitorState.PROMOTED
+        self._start_serving()
         return True
+
+    def _start_serving(self) -> None:
+        """提升成功后对外服务复制流，并把自己登记为分叉重建端点。
+
+        其他 follower 的 monitor 会被旧主库的 redirect 导到这里；分叉的
+        follower 则通过 append_entries 里的 rebuild_host 直接重建。起服务
+        失败只记日志——提升本身已经成功，不能因此回退。
+        """
+        if self.serve_on is None:
+            return
+        try:
+            self.server = WALServer(
+                self.replica.db,
+                host=self.serve_on[0],
+                port=int(self.serve_on[1]),
+            ).start()
+            self.replica.rebuild_from = (self.server.host, self.server.port)
+            _log.info(
+                "提升完成，复制服务监听 %s:%s", self.server.host, self.server.port
+            )
+        except OSError as exc:
+            _log.warning("提升后起复制服务失败（follower 无法追流/重建）: %s", exc)
+            self.last_error = f"serve failed: {exc}"
 
     def _handle_step_down(self, reason: str) -> None:
         """Replica 被降级时把状态扣回 needs_attention，而不是继续报 promoted。"""

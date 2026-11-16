@@ -441,6 +441,52 @@ def test_diverged_follower_rebuilds_from_leader_hint(tmp_path):
         primary.close()
 
 
+def test_monitor_serves_replication_stream_after_promotion(tmp_path):
+    """提升后的 monitor 自动起复制服务，新 follower 能直接从这里 bootstrap。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    late_follower = None
+    monitor = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        server.stop()
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+            serve_on=("127.0.0.1", 0),
+        )
+        assert monitor.poll() == "promoted"
+        assert monitor.server is not None
+        assert replica.rebuild_from == (monitor.server.host, monitor.server.port)
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        late_follower = Replica.bootstrap_from_server(
+            monitor.server.host, monitor.server.port, tmp_path / "late"
+        )
+        assert late_follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+    finally:
+        if monitor is not None:
+            monitor.stop()
+        if late_follower is not None:
+            late_follower.close()
+        _stop(nodes)
+        if replica is not None:
+            replica.close()
+        server.stop()
+        primary.close()
+
+
 def test_monitor_loop_survives_unexpected_poll_errors(tmp_path, monkeypatch):
     """poll() 抛未预期异常时后台轮询线程必须继续跑，而不是静默退出。"""
     primary = _make_primary(tmp_path)
