@@ -193,6 +193,21 @@ follower 分叉时经 `QuorumNode.rebuild_callback` 后台重新基准备份并
 网络分区时多数派不可达会明确失败，双写防护靠共享 fence + TTL 租约
 两层兜底，不是完整的多数派写确认。
 
+**重启双写防护（fence/lease 打开即检）**：fence 与租约此前只接在运行中
+的写路径上，旧主库被 fence 后若进程崩溃重启，重开的裸 `Database` 不知道
+marker 的存在，恢复写入即成双主。现在 `Database(fence_path=..., node_id=...)`
+/ `Database(lease_path=...)` 在非只读打开时立即校验共享 marker（fence 指向
+别的节点拒绝打开；租约无主/他人持有/已过期一律拒绝，旧主库必须重新
+`acquire` 才能恢复写），并在调用方未提供更强围栏时把检查持续接进写路径
+（打开后别人才提升的场景在下一笔写上被拦）。只读打开放行——被废黜的旧
+主库仍可当只读观察者。`Replica.promote` 重开可写库时透传两个路径，
+提升后的新主库重启同样受自己写的 marker 保护。follower 落后到 leader
+WAL 起点之前时，leader 的 `push_entries_to_peers` 会主动下发
+`rebuild_hint`（提升后新 WAL 从 applied 边界开始，`base_lsn` 不可用，
+用 leader 的 applied 位置判断缺口），follower 收到后跳过 prefix 校验
+直接走基准备份自愈，落后副本不再停在原地干等（端到端验收
+`test_lagging_follower_gap_triggers_auto_rebuild`）。
+
 **写租约 MVP**：`Lease(path, node_id, ttl=...)` 把持有者、任期和到期时间
 原子写入共享文件。主库每笔写语句前通过 `Database(write_fence=lease.assert_writable)`
 检查租约，超过 TTL 没有 `renew` 就自行停写；候选节点必须等旧租约过期才能

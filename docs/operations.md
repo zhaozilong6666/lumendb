@@ -172,9 +172,11 @@ ReplicationMonitor(
 
 | 限制 | 影响 | 缓解 |
 |---|---|---|
-| 日志协商只有 MVP | `append_entries` 能做前缀检查并重放连续条目，`push_entries_to_peers` 可显式推一批，提升后的心跳循环也会自动推；但不截断分歧尾巴、不持久化逐条任期、没有完整 commit index；长期失联的旧 leader 复辟后仍可能写入"多数派没有"的记录 | 共享 fence + 租约；不要让旧主库重新可写 |
+| 日志协商只有 MVP | `append_entries` 能做前缀检查并重放连续条目，`push_entries_to_peers` 可显式推一批，提升后的心跳循环也会自动推；逐条任期已持久化（`VoteState.log_terms`）、拼接点任期分歧与 WAL 缺口都会触发自动重建；但不截断分歧尾巴、没有完整 commit index；长期失联的旧 leader 复辟后仍可能写入"多数派没有"的记录 | 共享 fence + 租约；不要让旧主库重新可写 |
 | 写并发度为 1 | 写事务串行；读不受影响 | 需要更高写并发要接行级锁（见 `architecture.md` §2.5） |
 | 提升会丢掉主库未发送的尾段 | 未同步复制的写入可能丢失 | 开 `sync_replication`，或提升前确认 `lag_lsn == 0` |
 | 租约用墙钟 | 时钟漂移缩小安全窗口 | 强制 NTP，偏移 < `ttl/3` |
 | 旧 WAL 记录没有 CRC | 升级前写入的历史记录仍可能把介质位翻转当成合法记录 | 新写入记录自带 CRC32；完整记录校验失败会拒绝恢复而不是静默截尾 |
 | 基准备份是全量拷贝 | 大库首次同步慢 | 页级增量备份（`rebase_from_server`） |
+| witness 节点没有数据水位 | 只投票不带数据的 witness 没听过 leader 心跳时，`last_lsn=0`，会把票投给第一个候选——如果那是落后候选，它会带着旧数据当选 | witness 加入前必须让 leader 心跳先广播一轮水位；候选提升闸门 `candidate_lsn >= quorum_commit_lsn` 依赖心跳推进过的水位，水位为 0 的全新集群不受此限制 |
+| 旧主库重启后双写 | 旧主库进程重启、裸 `Database(path)` 打开时不知道 fence/租约 marker 的存在，恢复写入即成双主 | 重启时必须带 `fence_path`/`lease_path`（打开即检；租约场景旧主库还要重新 `acquire` 才能恢复写） |
