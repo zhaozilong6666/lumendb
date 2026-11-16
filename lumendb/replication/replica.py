@@ -634,6 +634,7 @@ class Replica:
         lease_loss_callback: Callable[[LeaseKeeper], None] | None = None,
         lease_loss_stepdown: bool = False,
         heartbeat_interval: float | None = None,
+        push_max_batches_per_round: int = 10,
         on_higher_term: Callable[[int], None] | None = None,
         sync_replication: bool = False,
         sync_timeout: float = 2.0,
@@ -659,6 +660,8 @@ class Replica:
           维持 leader 活跃度并观察任期。观察到更高任期时调用
           ``on_higher_term(term)``；未提供时若 ``lease_loss_stepdown`` 为真就
           直接 ``step_down()``，否则只记录在 ``last_heartbeat_errors``。
+        * **追赶推送**：每轮心跳后自动把本地 WAL 推给 peers，一轮最多
+          ``push_max_batches_per_round`` 批（每批上限 1000 条），追平即停。
         """
         if sync_replication and heartbeat_interval is None:
             # 同步复制靠心跳轮次推进多数派水位；没有心跳就等于每笔写都要
@@ -726,6 +729,7 @@ class Replica:
                 interval=heartbeat_interval,
                 on_higher_term=callback,
                 push_entries=self.push_entries_to_peers,
+                max_batches_per_round=push_max_batches_per_round,
             ).start()
 
         if sync_replication:
