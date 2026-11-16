@@ -284,6 +284,51 @@ def test_monitor_uses_quorum_for_auto_promotion(tmp_path):
         primary.close()
 
 
+def test_monitor_promotion_starts_the_heartbeat_push(tmp_path):
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = WALServer(primary).start()
+    replica = None
+    follower = None
+    nodes = _cluster(tmp_path)
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica"
+        )
+        follower = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "follower"
+        )
+        server.stop()
+        follower.attach_quorum(nodes[1])
+        monitor = ReplicationMonitor(
+            replica,
+            server.host,
+            server.port,
+            fence_path=tmp_path / "fence.json",
+            max_failures=1,
+            timeout=0.2,
+            quorum=nodes[0],
+            heartbeat_interval=0.05,
+            lease_keeper_auto=False,
+        )
+        assert monitor.poll() == "promoted"
+        # monitor 提升走的 promote_with_quorum 应该已经把心跳循环挂上：
+        # 新写入会被 append_entries 推到另一个真实副本。
+        replica.execute_one("INSERT INTO t VALUES (1)")
+        assert _wait_for(
+            lambda: follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)],
+            timeout=5.0,
+        ), "monitor 提升后的心跳循环没有推送新写入"
+    finally:
+        _stop(nodes)
+        if replica is not None:
+            replica.db.close()
+        if follower is not None:
+            follower.db.close()
+        server.stop()
+        primary.close()
+
+
 def test_monitor_auto_promotion_uses_lease(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
