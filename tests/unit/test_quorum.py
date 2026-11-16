@@ -1366,3 +1366,49 @@ def test_heartbeat_push_resumes_after_leader_restart(tmp_path):
         leader.db.close()
         follower.db.close()
         primary.close()
+
+
+def test_push_backoff_skips_peer_without_applier_and_recovers(tmp_path):
+    """持续拒绝的 peer 退避；修复（装上 applier）后成功路径立即恢复。
+
+    无 applier 的 peer 是配置错误——每轮心跳空推 1000 条纯属浪费，
+    ``_push_backoff`` 在退避期内跳过它；拒绝原因也进入
+    ``last_push_rejections`` 供监控读取。
+    """
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    follower = Replica.bootstrap(primary, tmp_path / "follower")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        leader.promote()
+        leader.attach_quorum(nodes[0])
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        # follower 不 attach：peer n1 没有日志重放函数，推批会被拒绝。
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed == {}
+        assert "本节点没有绑定日志重放函数" in leader.last_push_rejections.get(
+            "n1", ""
+        )
+        # 退避期内再推：直接跳过，不重复空推。
+        assert "n1" in leader._push_backoff
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed == {}
+        # 修复：给 follower 装上 applier，并把退避时刻拨回过去。
+        # attach_quorum 会把 follower 本地 applied 立即报到自己的
+        # match_lsn，leader 需要再收一轮心跳刷新 last_matches。
+        follower.attach_quorum(nodes[1])
+        leader._push_backoff["n1"] = 0
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed.get("n1", 0) > 0
+        assert follower.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        assert "n1" not in leader._push_backoff
+        assert "n1" not in leader.last_push_rejections
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower.db.close()
+        primary.close()
