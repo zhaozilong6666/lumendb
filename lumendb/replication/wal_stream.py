@@ -249,8 +249,19 @@ class WALServer:
             return
         target = self.slot_dir / f"{replica_id}.confirmed"
         tmp = target.with_name(target.name + ".tmp")
-        tmp.write_text(str(lsn), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(str(lsn))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, target)
+        try:
+            dir_fd = os.open(self.slot_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     def _record_replica_ack(self, replica_id: str, lsn: int) -> int:
         lsn = max(0, int(lsn))
