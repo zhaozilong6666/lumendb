@@ -1,4 +1,4 @@
-"""复制路径的可复现基准：基准备份、WAL 追平、副本查询。
+﻿"""复制路径的可复现基准：基准备份、WAL 追平、副本查询。
 
 跑法：
     python -m bench.replication --rows 2000
@@ -35,12 +35,12 @@ def _insert_batch(db: Database, start: int, count: int, batch: int = 200) -> Non
         db.execute_one("INSERT INTO t VALUES " + ", ".join(rows))
 
 
-def run(root: Path, rows: int) -> dict:
+def run(root: Path, rows: int, batch: int = 200) -> dict:
     primary = Database(root / "primary", checkpoint_wal_bytes=0, pool_size=512)
     primary.execute_one(
         "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32), score INT)"
     )
-    _insert_batch(primary, 0, min(rows, 200))
+    _insert_batch(primary, 0, min(rows, batch), batch)
 
     server = WALServer(primary).start()
     replica = None
@@ -57,7 +57,7 @@ def run(root: Path, rows: int) -> dict:
 
         before_lag = replica.lag_from_server(server.host, server.port)
         start = time.perf_counter()
-        _insert_batch(primary, min(rows, 200), max(0, rows - min(rows, 200)))
+        _insert_batch(primary, min(rows, batch), max(0, rows - min(rows, batch)), batch)
         write_s = time.perf_counter() - start
         after_lag = replica.lag_from_server(server.host, server.port)
 
@@ -108,6 +108,12 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=2000)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=200,
+        help="每条 INSERT 语句的行数；1 表示逐行插入（验证逐行写入路径）",
+    )
     args = parser.parse_args()
     if args.rows < 1 or args.repeat < 1:
         parser.error("--rows/--repeat 必须 >= 1")
@@ -118,7 +124,7 @@ def main() -> int:
             root = Path(tmp) / f"run{i}"
             if root.exists():
                 shutil.rmtree(root)
-            samples.append(run(root, args.rows))
+            samples.append(run(root, args.rows, batch=max(1, args.batch)))
 
     best = min(samples, key=lambda s: s["apply_s"])
     med_apply = statistics.median(s["apply_s"] for s in samples)
