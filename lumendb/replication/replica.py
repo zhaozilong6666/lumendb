@@ -24,6 +24,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,10 @@ class Replica:
         self._apply_chunk_size = 512
         #: 正在等数据锁的只读查询数（无锁启发式计数，只用来决定要不要让出）。
         self._pending_reads = 0
+        #: 正在进行"一致快照读"的线程数（``snapshot_read`` 上下文）。>0 时
+        #: apply 不再在组边界交出锁：一次应用完剩余记录，读者就不会看到
+        #: 跨表半应用的中间态。它只能由快照读者在持锁状态下改。
+        self._snapshot_depth = 0
         self._lease_keeper: LeaseKeeper | None = None
         self._heartbeat: HeartbeatLoop | None = None
         #: 本副本对应的仲裁节点；用来把复制进度（match_lsn）报给 leader。
@@ -375,17 +380,25 @@ class Replica:
         todo = list(records)
         count = 0
         chunk = max(1, int(self._apply_chunk_size))
-        for start in range(0, len(todo), chunk):
+        start = 0
+        total = len(todo)
+        while start < total:
+            size = chunk
             with self._lock:
                 if self.db is not database or getattr(database, "_closed", False):
                     break
-                count += self._apply_records(todo[start : start + chunk], primary)
+                if self._snapshot_depth:
+                    # 有读者在要"跨语句一致视图"：把剩余记录一次应用完，
+                    # 不在这里把锁交出去，否则读者会看到跨表半应用的中间态。
+                    size = total - start
+                count += self._apply_records(todo[start : start + size], primary)
             # 有只读查询在等锁时给一个让出窗口；没有读者就不减速。
             # ``RLock`` 没有公平性：只 sleep(0) 的话应用线程常常立刻把锁
             # 抢回去，等待中的读者可能整批都轮不到；1ms 的窗口足够一次
             # SELECT 进入临界区，而只在"确实有人在等"时才付这个代价。
-            if self._pending_reads > 0 and start + chunk < len(todo):
+            if self._pending_reads > 0 and start + size < total:
                 time.sleep(0.001)
+            start += size
         if count:
             with self._lock:
                 if self.db is database:
@@ -769,6 +782,36 @@ class Replica:
         return pushed
 
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def snapshot_read(self):
+        """把一段多条语句的只读工作固定在同一个已应用前缀上。
+
+        ``apply`` 默认按 ``_apply_chunk_size`` 分组、组间释放数据锁（这样长
+        批不会把读者饿死）。单条语句因此是原子的，但"先查 A 表、再查 B 表"
+        会跨过组边界：如果中间刚好应用了"只写了 A 表"的记录，读者就会看到
+        A 已更新、B 还没更新的中间态。
+
+        用法::
+
+            with replica.snapshot_read():
+                a = replica.execute_one("SELECT COUNT(*) FROM a")
+                b = replica.execute_one("SELECT COUNT(*) FROM b")
+
+        上下文期间持有数据锁，``apply`` 会把剩余记录一次性应用完；两次查询
+        看到的是同一个一致的已应用前缀。**代价**是这段时间副本的 apply 停摆，
+        所以只用于确实需要跨语句一致性的短读，不要包住慢操作。
+        """
+        self._pending_reads += 1
+        with self._lock:
+            # 在持锁状态下登记，保证与 apply 的组边界互斥：一旦置位，
+            # 后续 apply 一定会看到它。
+            self._snapshot_depth += 1
+            try:
+                yield self
+            finally:
+                self._snapshot_depth -= 1
+                self._pending_reads -= 1
 
     def execute_one(self, sql: str, params=None):
         # 先用无锁计数登记"有读者在等"，apply 的组间让出据此决定是否

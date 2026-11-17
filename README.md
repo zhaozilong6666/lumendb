@@ -298,6 +298,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 同步复制（可选）：`sync_replication=True` 时 COMMIT 要等多数派水位追平，超时给 `40003`（结果未知、不回滚），只读事务不受影响
 - [x] 复制流二进制记录帧：WAL 记录走 `B` + 23 B 定长头 + 原始 payload，8,124 条记录的流体积 1,634,288 B → 863,144 B（1.89x，省 47.2%）；非记录消息仍是 JSON 行，按首字节分派，老客户端不受影响，默认关闭
 - [x] 副本跟随读等待：`Replica.wait_until(lsn, host, port, timeout)` 阻塞到副本应用目标 LSN，用于"写入后重定向到副本"时避免读到旧前缀
+- [x] 副本一致快照读：`Replica.snapshot_read()` 把多条只读语句固定在同一个已应用前缀上。**但默认读路径仍有已知缺口**——apply 分组在组边界释放锁时，读者可能看到"表页已应用、索引页未应用"的中间态，详见 [`docs/replication-correctness.md`](docs/replication-correctness.md)
 - [x] 复制流长连接复用：`WALClient(keepalive=True)` / `Replica.replicate_from_server(keepalive=True)` 在一条 TCP 连接上发多个请求，服务端按请求循环并支持压缩与二进制帧混用，空闲超时回收线程，断连自动重连
 - [x] 重建失败自愈：页级增量重建失败（本地页损坏 / 主库已回收旧页）时自动回退到全量基准备份，旧数据文件保留到 `broken-<时间戳>/` 供取证
 - [x] Raft 级日志协商（任期/前缀一致性检查）：`append_entries` 带逐条任期做前缀校验，任期分歧拒绝；缺 commit index（见上一条）
