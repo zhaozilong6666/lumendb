@@ -99,6 +99,14 @@ class Replica:
         #: 一批 ``apply`` 内每组应用的记录数。组的边界是"给等待中的只读
         #: 查询让出锁"的窗口：批次很大时读者不必等整批应用完。
         self._apply_chunk_size = 512
+        #: 跨批的"半个事务"暂存区（见 ``apply`` 的说明）。记录按 LSN 连续排列；
+        #: ``_pending_end_lsn`` 是暂存区最后一条记录的 LSN，也用来当拉取游标——
+        #: 否则下一批会从 applied_lsn 重新拉取同一段，永远推进不过去。
+        self._pending_records: list = []
+        self._pending_end_lsn = 0
+        #: 暂存上限：单个事务超过它就报错，宁可让复制停住等人处理，
+        #: 也不退化成"应用半个事务"。
+        self._max_pending_records = 100_000
         #: 正在等数据锁的只读查询数（无锁启发式计数，只用来决定要不要让出）。
         self._pending_reads = 0
         #: 正在进行"一致快照读"的线程数（``snapshot_read`` 上下文）。>0 时
@@ -275,6 +283,16 @@ class Replica:
         with self._lock:
             return self._applied_lsn
 
+    @property
+    def _fetch_cursor(self) -> int:
+        """下一批从哪里开始拉：**暂存区里的记录也算已经取到**。
+
+        用 ``applied_lsn`` 当游标的话，超长事务会卡死：第一批全在事务中间、
+        一条都没应用，applied_lsn 不动，下一次又从同一条开始拉，永远走不到
+        COMMIT。所以游标要取 applied 与 pending 的较大者。
+        """
+        return max(self._applied_lsn, self._pending_end_lsn)
+
     def lag_lsn(self, primary: Database) -> int:
         """尚未应用的 WAL 字节数；没有待应用记录时返回 0。"""
         with self._lock:
@@ -365,7 +383,7 @@ class Replica:
                     "副本落后于主库已回收的 WAL，需要重新基准备份",
                     detail=f"applied_lsn={self._applied_lsn} base_lsn={base_lsn}",
                 )
-            records = primary.wal.iter_records(self._applied_lsn + 1)
+            records = primary.wal.iter_records(self._fetch_cursor + 1)
             return self.apply(records, primary=primary)
 
     def replicate_from_server(
@@ -410,7 +428,7 @@ class Replica:
                     self._stream_client = client
                     self._stream_key = key
             try:
-                records = client.fetch(self._applied_lsn, max_records=max_records)
+                records = client.fetch(self._fetch_cursor, max_records=max_records)
             except Exception:
                 # 长连接出错就丢掉缓存，下一次从新连接开始；错误照常抛给
                 # 调用方（监控层负责计数与退避）。
@@ -423,20 +441,70 @@ class Replica:
             return applied
 
     def apply(self, records, *, primary: Database | None = None) -> int:
-        """应用一批 WAL 记录，返回本次应用的条数。
+        """应用一批 WAL 记录，返回本次**真正应用**的条数。
 
-        批次按 ``_apply_chunk_size`` 分组，组间释放数据锁：批次很大时
-        等待中的只读查询（``execute_one``）不必等整批应用完。一条记录应用
-        完成后的页状态是自洽的（PAGE_IMAGE 全页替换 / 单页 diff），所以
-        读者在组边界能看到"应用了前缀"的一致数据，不会看到半个记录。
+        ## 半事务暂存区
 
-        组间还会重新校验数据库句柄：``promote`` / ``step_down`` /
-        ``rebase_from_server`` 会在别的线程里关闭并替换 ``self.db``，
-        一旦发现句柄已换，本批立即中止（已应用的记录保持，marker 不推进，
-        重放由 pageLSN 保持幂等）。
+        ``max_records`` 是有界的，但一个事务可以比它更大：一次 2000 行批量
+        插入会产生几千条"表页一条 + 每个索引页各一条"的记录。早期实现遇到
+        "整批都没有 COMMIT/ABORT"时退回批尾切组，于是超长事务必然被切成两半，
+        读者在中间会看到顺序扫描与索引扫描对不上（严重时 BTreeInvariantError）。
+
+        现在的做法：**没有事务边界的记录一条都不应用**，先放进
+        ``_pending_records``；下一批到达后与暂存区拼接，找到边界再一起应用。
+        暂存区上限 ``_max_pending_records``，超过就报错——宁可让复制停住等人
+        处理，也不退化成撕裂应用。
+
+        拉取游标必须用 ``_fetch_cursor``（applied 与 pending 的较大者），
+        否则第一批全在事务中间、applied_lsn 不动，会永远重拉同一段。
+
+        ## 其余语义不变
+
+        批次按 ``_apply_chunk_size`` 分组，组间释放数据锁，让等待中的只读
+        查询不必等整批应用完；组边界一定落在事务边界上。组间重新校验数据库
+        句柄，``promote`` / ``step_down`` / ``rebase_from_server`` 换掉 ``self.db``
+        时本批中止，已应用记录保持、marker 不推进，重放由 pageLSN 幂等兜底。
         """
         database = self.db
-        todo = list(records)
+        with self._lock:
+            buffered = self._pending_records
+            self._pending_records = []
+            self._pending_end_lsn = 0
+        incoming = list(records)
+        if buffered:
+            # 调用方可能从 applied_lsn 重取（重试 / 换连接），把暂存区已覆盖的丢掉。
+            incoming = [r for r in incoming if r.lsn > buffered[-1].lsn]
+            todo = buffered + incoming
+        else:
+            todo = incoming
+        # 已经应用过的记录也过滤掉：重取批次里的 COMMIT 会被当成"新边界"，
+        # 把后面真正的半个事务误判成可以应用。
+        todo = [r for r in todo if r.lsn > self._applied_lsn]
+        total = len(todo)
+        if not total:
+            return 0
+
+        # 批里最后一个事务边界；它后面的记录属于下一个还没结束的事务。
+        boundary = 0
+        for index, record in enumerate(todo):
+            if record.rtype in (LogType.COMMIT, LogType.ABORT):
+                boundary = index + 1
+        carry = todo[boundary:]
+        if boundary == 0:
+            if len(todo) > self._max_pending_records:
+                raise StorageError(
+                    "单个事务超过副本暂存上限，无法原子应用",
+                    detail=(
+                        f"pending={len(todo)} cap={self._max_pending_records}；"
+                        "调大 Replica._max_pending_records，或把事务拆小"
+                    ),
+                )
+            with self._lock:
+                self._pending_records = todo
+                self._pending_end_lsn = todo[-1].lsn
+            return 0
+
+        todo = todo[:boundary]
         count = 0
         chunk = max(1, int(self._apply_chunk_size))
         start = 0
@@ -445,11 +513,16 @@ class Replica:
             # 切点必须落在事务结束（COMMIT/ABORT）之后：一条 DML 的 WAL
             # 是"表页记录 + 各索引页记录"，切在事务中间会让读者看到
             # "表页已应用、索引页未应用"（docs/replication-correctness.md）。
-            # 服务端 fetch 已经保证批以事务边界结尾，所以这里通常一次就切到。
             size = self._transaction_cut(todo, start, total, chunk)
             with self._lock:
                 if self.db is not database or getattr(database, "_closed", False):
-                    break
+                    # 句柄已换：已应用的保持，剩余记录（含 carry）放回暂存区，
+                    # 由新句柄按 pageLSN 幂等重放。
+                    keep = todo[start:] + carry
+                    if keep:
+                        self._pending_records = keep
+                        self._pending_end_lsn = keep[-1].lsn
+                    return count
                 if self._snapshot_depth:
                     # 有读者在要"跨语句一致视图"：把剩余记录一次应用完，
                     # 不在这里把锁交出去，否则读者会看到跨表半应用的中间态。
@@ -462,6 +535,10 @@ class Replica:
             if self._pending_reads > 0 and start + size < total:
                 time.sleep(0.001)
             start += size
+        if carry:
+            with self._lock:
+                self._pending_records = carry
+                self._pending_end_lsn = carry[-1].lsn
         if count:
             with self._lock:
                 if self.db is database:
@@ -480,9 +557,10 @@ class Replica:
         """返回从 ``start`` 开始的一段长度，使其结束在事务边界上。
 
         优先在 ``chunk`` 窗口内找最后一个 COMMIT/ABORT；窗口内没有，就向后
-        延伸到最近的边界（保证一个事务不会被切成两半）；整批都没有边界
-        （单事务超长或跨批）时退回批尾——此时原子性由"下一批继续"兜底，
-        代价是窗口仍然存在，但不能让 apply 无限延长。
+        延伸到最近的边界（保证一个事务不会被切成两半）。
+
+        ``apply`` 现在只会把**到最后一个边界为止**的记录交给它，所以这里的
+        "整段都没有边界就退回段尾"是防御性分支：正常路径不该走到。
         """
         limit = min(total, start + chunk)
         cut = None
