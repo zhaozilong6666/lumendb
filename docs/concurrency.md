@@ -171,6 +171,31 @@ WAL 体积降到 **1/16.4（−93.9%）**。注意：批量 INSERT（一条 SQL 
 顺带效果：全量测试套件 118.9 s → **75.0 s**（套件里大量 `SELECT` 走只读事务，
 不再每次 fsync）。
 
+### 第 1.9 步：结构性写与在途读者互斥（已完成，2026-11-17）
+
+第 1.8 步把读路径放开之后，`HeapFile.vacuum` 出现了一个 TOCTOU：
+
+1. `vacuum` 检查 `t.active_xids` 为空（没有并发事务）；
+2. 检查通过之后、重排页之前，**新的只读事务**可以开起来（它不再拿
+   `_write_lock`），扫到正在重排的页——槽位目录与记录位置都在变。
+
+`TRUNCATE` 与 shadow heap 重写（`ALTER TYPE` / `DROP COLUMN`）是同一类问题。
+于是引入 `Database.exclusive_guard()`：拿 `_write_lock` 之后等 `_readers`
+归零，并在此期间挡住新读者（`read_guard()` 先检查 `_no_readers` 标志）。
+`_readers_cv` 本来就绑在 `_write_lock` 上，条件变量与写者锁天然同序，
+不引入 ABBA。
+
+`Database._run_locked` 与 pgwire 的 `_run_statement` 两处入口按语句类型选
+guard：`Vacuum` / `Truncate` / `AlterTableAlterType` / `AlterTableDropColumn`
+走 `exclusive_guard()`，其余写语句仍只拿 `_write_lock`。
+
+顺带修掉一个可用性问题：此前 VACUUM 碰到并发读**直接报错**（"VACUUM 需要表上
+没有并发事务"），读密集型系统里永远跑不起来；现在它等读者退出（毫秒级）再
+独占执行。测试 `tests/unit/test_exclusive_guard.py`（4 例）：VACUUM 不再失败、
+独占期间新读者被挡、在途读者挡住结构性写、四类语句都被正确标记。
+
+注意：这是**结构性写与读者**的互斥，不是行级并发控制；第 2 步（行/键锁）
+仍没开工，写语句之间依旧靠 `_write_lock` 完全串行。
 ### 第 2 步的评估结论（2026-11-17）
 
 第 1 步（"DML 不再无条件 persist 目录"）**已落地**（见上面第 1.5 步），

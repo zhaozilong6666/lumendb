@@ -254,12 +254,17 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
     可以走标准库 TLS；服务端 `SSLContext.verify_mode = CERT_REQUIRED` + 客户端
     证书即双向认证，已有测试覆盖。证书分发和轮换仍需部署层补齐；主机名校验由客户端 `server_hostname`
   控制，已有“错误主机名必须握手失败”的测试。
-- 副本查询与 apply 的并发调度**已做 MVP**：`Replica.apply` 按
-  `_apply_chunk_size`（默认 512）分组应用，组间释放数据锁，等待中的只读
-  查询能在组边界插入（`_pending_reads` 启发式只决定"要不要让出"，不承担
-  正确性）；拉取循环的串行化拆到 `_fetch_lock` 上，不再与数据面共用一把锁。
-  语义边界：读者看到的是"已应用前缀"，不保证跨组一致快照；多条只读查询
-  之间仍受引擎语句锁（L1）串行化。
+- 副本查询与 apply 的并发调度**已做，原子单元是事务**：`Replica.apply`
+  仍按 `_apply_chunk_size`（默认 512）分组、组间释放数据锁，但**切点只落在
+  COMMIT/ABORT 之后**，服务端 `fetch` 也回退到批内最后一个事务边界——读者在
+  任何组边界看到的都是"完整事务前缀"，顺序扫描与索引扫描不会再对不上
+  （按记录数硬切时能看到"表页已应用、索引页未应用"：400 行 + 二级索引 +
+  `_apply_chunk_size=1` 的对照实验从 7 次错位降到 0，且修复前伴随
+  `BTreeInvariantError`）。`_pending_reads` 启发式只决定"要不要让出"，不承担
+  正确性；拉取循环的串行化拆到 `_fetch_lock` 上。跨语句一致视图用
+  `Replica.snapshot_read()`（上下文期间 apply 停摆，只用于短读）。单事务记录
+  数超过 `max_records` 时无法对齐，窗口仍在（降级路径，见
+  `docs/replication-correctness.md`）。
 - 多副本槽位已做 MVP：`WALServer(slot_dir=...)` 每个 `replica_id` 一个
   `<id>.confirmed`，主库保留点取所有槽位的最小确认 LSN；`Replica` 在
   bootstrap 后先 ack 基准备份 LSN，避免新副本把保留点钉在 0。槽位仍保存在
@@ -303,10 +308,15 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 - 自动提交的只读语句不再写 BEGIN/COMMIT 记录（此前每条 SELECT 都要
   fsync），单次 `SELECT COUNT(*)` 1.45–1.52 ms → **0.18 ms（1/8.3）**；
 - 服务端语句执行进线程池、只读语句走 `read_guard()`、目录访问加叶子
-  RLock，两条连接的慢 SELECT 真正并行（写语句仍由 `_write_lock` 串行）。
+  RLock，两条连接的慢 SELECT 真正并行（写语句仍由 `_write_lock` 串行）；
+- 结构性写（VACUUM / TRUNCATE / ALTER TYPE / DROP COLUMN）改走
+  `exclusive_guard()`：读并发放开后，VACUUM 的"查 `active_xids` → 重排页"
+  之间有 TOCTOU 窗口，现在等读者归零并挡住新读者再执行，顺带把 VACUUM
+  从"遇并发读直接报错"变成"等读者退出（毫秒级）后独占执行"。
 
-剩余差距：follower 侧独立推演 commit index（现在靠 leader 心跳下发）、
-跨组一致快照；写并发的第 2 步（行/键锁）仍未开工，三个真实阻塞写在
+剩余差距：follower 侧独立推演 commit index（现在靠 leader 心跳下发）；
+单事务超过一个复制批时 apply 的原子性（现为降级路径，彻底解决要索引项
+MVCC）；写并发的第 2 步（行/键锁）仍未开工，三个真实阻塞写在
 `docs/concurrency.md`（结构变化时仍写同一批目录字节、唯一索引项在
 DELETE 时被物理删除、物理 undo 不按事务区分字节）。因此第 4 层仍只能
 标“MVP 验收”，不能标“生产就绪”。

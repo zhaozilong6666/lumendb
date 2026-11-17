@@ -93,7 +93,31 @@
 >   叶子 RLock（23 个方法），避免 CPython 的
 >   "dictionary changed size during iteration"。两条连接各跑一条 sleep(0.12)
 >   的 SELECT 总耗时 < 0.228 s（串行应 ≥ 0.24 s），慢查询期间新连接握手不被阻塞。
-> - 1271 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
+> - 把结构性写与在途只读语句互斥：读并发放开后，VACUUM 的"查 active_xids
+>   → 重排页"之间存在窗口，新开的读事务照样能扫到正在重排的页（TRUNCATE 与
+>   shadow heap 重写同理）。新增 `exclusive_guard()`（拿写锁后等读者归零并
+>   挡住新读者，条件变量本来就绑在写者锁上，不引入 ABBA），
+>   VACUUM/TRUNCATE/ALTER TYPE/DROP COLUMN 四类语句走它；顺带把 VACUUM 从
+>   "遇并发读直接报错"变成"等读者退出（毫秒级）后独占执行"，
+>   3 读线程 + 1 VACUUM 的 8 秒压测从"每次都抛错"变成 **0 异常**。
+> - 把副本的原子应用单元从"每 512 条记录"改成"整个事务"：一条 DML 会拆成
+>   表页 + 各索引页多条 WAL 记录，按记录数切组会让读者在组边界看到"表页已
+>   应用、索引页未应用"——顺序扫描与索引扫描对不上，极端时抛出
+>   `BTreeInvariantError`。服务端 `fetch` 回退到批内最后一个 COMMIT/ABORT
+>   之后，副本按事务边界切组（窗口内没有边界就向后延伸到最近边界，绝不把
+>   一个事务切成两半），**两侧一起对齐才有效**（只对齐一侧时组起点由上一组
+>   决定、且一个事务可能跨两个批）。400 行 + 二级索引、
+>   `_apply_chunk_size=1` 的对照实验：不一致从 **7 次**（样本全部
+>   `(51, 50)`，索引落后表页，并伴随 `BTreeInvariantError`）降到 **0 次**；
+>   顺带澄清统计口径——两次独立查询之间 `a < b` 属前缀合法前进，判据是
+>   `a > b`。
+> - 复制流的传输层硬化：二进制记录帧（`struct` 23 B 定长头替代 JSON+base64，
+>   1000 行一轮 WAL 编码后 863 KB → **456 KB，1.89x / 省 47.2%**，老客户端
+>   不受影响）、长连接复用（服务端按请求循环，同一连接可混用压缩与二进制
+>   帧，10 s 空闲回收线程，握手约 0.1 ms 故收益只在跨网络）、请求行有界读取
+>   （堵住"一条巨型行把处理线程内存打爆"）、`Replica.wait_until(lag)` 跟随
+>   读等待与重建失败自愈、`Replica.snapshot_read()` 把多条只读语句固定在
+>   同一个已应用前缀上（代价是上下文期间 apply 停摆，只用于短读）。> - 1271 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
 >   Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
@@ -202,7 +226,21 @@
 >   satisfies the quorum barrier without waiting for a heartbeat;
 >   `commit_lsn` (leader-announced) and `verified_commit_lsn` (recomputed from
 >   majority `match_lsn`) are kept apart so an inflated watermark cannot
->   release the barrier early. Divergent-tail truncation and a fully
+>   Replication transport is also hardened: a binary record frame (23-byte fixed
+>   header, `struct`, 863 KB → 456 KB for a 1000-row WAL round, 1.89x / 47.2%
+>   smaller, backward compatible), connection reuse (one socket serves many
+>   requests, mixing zlib and binary framing, with a 10 s idle timeout),
+>   bounded request-line reads, `Replica.wait_until(lag)` follow-reads with
+>   rebuild self-healing, and `Replica.snapshot_read()` pinning several
+>   read-only statements to one applied prefix. Replication also has a
+>   transaction-level apply unit: one DML is several WAL records (heap page +
+>   one per index page), so record-count chunking exposed "heap applied,
+>   index not yet" at group boundaries (sequential vs index scans disagreed,
+>   occasionally `BTreeInvariantError`); the server now truncates each batch
+>   after the last COMMIT/ABORT and the replica cuts groups only on
+>   transaction boundaries (extending forward when the window has none), which
+>   took a 400-row/two-level-index stress probe from 7 mismatches (all with
+>   the index lagging the heap) to 0.>   release the barrier early. Divergent-tail truncation and a fully
 >   follower-derived commit index remain future work.
 > - Close/step-down races are explicit: `close()` waits for active readers,
 >   aborts live wire transactions, and pgwire write/COMMIT/savepoint paths use
