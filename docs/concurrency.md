@@ -58,6 +58,31 @@ B 的代价是"并发度 = 执行器个数"，而不是"任意并发"；`Databas
 风险：`Binder` 的 `outer_schemas` / 视图展开缓存、`_check_cache` 也要一起搬；
 `_profile` 是 `EXPLAIN ANALYZE` 用的，必须按调用隔离，否则两个分析互相污染。
 
+### 第 2 步的前置：页级 latch（实测证据，2026-11-17）
+
+`BufferPoolManager` 只有一把全局 RLock（`fetch_page` / `unpin` 在锁内取放），
+**页内容的读写不在任何锁之下**：`HeapPage` 改 slot 目录、`free_space` 和记录
+偏移时，安全性完全依赖 `Database._write_lock` 把所有写语句串行。
+
+把这个前提绕开验证一次（2 线程 × 300 行、同一张表、各自独立事务、直接调
+`HeapFile.insert`）：
+
+| 指标 | 结果 |
+|---|---|
+| 请求插入 | 600 行 |
+| 返回 RID | 600 个，去重后 **513** |
+| RID 重复（同一 slot 被分配两次） | **87** |
+| 表里实际扫到 | **513 行（丢 87 行，14.5%）** |
+| 页链页数 vs `last_page` | **6 vs 7（链断了）** |
+
+结论：放开写并发**不能从行锁/键锁开始**，第一件事必须是**页级 latch**——
+每页一个读写 latch，`HeapPage` / `BTreePage` 的每个结构修改都在 latch 内；
+B+ 树分裂/合并要同时持有父页与子页，必须按 `page_id` 升序加锁防死锁。
+没有它，行锁只能保证"不同行不冲突"，挡不住"同一页的两行并发插入把 slot
+目录写坏"——上面的 87 次重复分配就是这么来的。
+
+探针：`D:\projects\lumendb-review\_probe_page_race.py`（`PYTHONPATH` 指向仓库
+后运行）。
 ### 第 2 步：行锁 + 键锁 + 目录锁（替掉 L2）
 
 | 资源 | 何时加 | 模式 | 释放 |
