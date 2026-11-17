@@ -290,6 +290,11 @@ class WALServer:
         self.host, self.port = self._sock.getsockname()
         self._thread: threading.Thread | None = None
         self._handlers: list[threading.Thread] = []
+        #: 活跃连接。长连接（keepalive）复用之后，只关 listen socket 是不够的：
+        #: 已经建立的那条连接仍会在 ``_handle`` 的 readline 上等下一个请求，
+        #: 服务"停了"却还在应答，探活/故障判断会被骗。``stop()`` 要把它一起关掉。
+        self._conns: set[socket.socket] = set()
+        self._conns_lock = threading.Lock()
 
     def _replica_id(self, request: dict) -> str | None:
         raw = request.get("replica_id")
@@ -391,6 +396,8 @@ class WALServer:
                     continue
             conn.settimeout(float(getattr(self, "idle_timeout", 10.0)))
             self.connection_count = getattr(self, "connection_count", 0) + 1
+            with self._conns_lock:
+                self._conns.add(conn)
             # 周期性 follower 会不断开新连接；只保留还活着的处理线程，
             # 否则长期运行的服务会无限累积已结束的线程对象。
             self._handlers[:] = [h for h in self._handlers if h.is_alive()]
@@ -460,6 +467,15 @@ class WALServer:
                     self._handle_status(conn, request)
                 elif kind == "slots":
                     self._handle_slots(conn, request)
+                elif kind == "ping":
+                    # 应用层心跳：长连接下 TCP 半开（对端进程没了但连接还在
+                    # ESTABLISHED）不会立刻报错，只有一次真实往返才能把它变成
+                    # 可捕获的超时/断开。顺手带上当前 LSN，省一次 status。
+                    _send_line(
+                        conn,
+                        {"type": "pong", "lsn": int(self.primary.wal.next_lsn)},
+                        compress=compress,
+                    )
                 else:
                     _send_line(
                         conn,
@@ -478,6 +494,8 @@ class WALServer:
             except OSError:
                 pass
         finally:
+            with self._conns_lock:
+                self._conns.discard(conn)
             try:
                 conn.close()
             except OSError:
@@ -712,6 +730,20 @@ class WALServer:
             self._sock.close()
         except OSError:
             pass
+        # 关掉所有已建立的长连接：否则复用的那条连接会继续应答，
+        # "服务已停"与"还能连上"同时成立（探活会被骗）。
+        with self._conns_lock:
+            live = list(self._conns)
+            self._conns.clear()
+        for conn in live:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=2)
         for handler in list(self._handlers):
@@ -912,6 +944,18 @@ class WALClient:
             if data.get("type") == "ack":
                 return int(data["confirmed_lsn"])
         return 0
+
+    def ping(self) -> int:
+        """应用层心跳：发一条 ``ping``，返回主库当前 WAL LSN。
+
+        没有响应（对端超时/断开）时抛 ``StorageError``，而不是像
+        ``status()`` 那样返回全 0——探活要能区分"活着但没数据"与"根本没连上"。
+        keepalive 模式下复用同一条 TCP 连接。
+        """
+        for data in self._request({"type": "ping"}):
+            if data.get("type") == "pong":
+                return int(data.get("lsn", 0))
+        raise StorageError("主库没有回应 ping")
 
     def status(self) -> dict:
         """读取主库当前 LSN、WAL 基础 LSN 和槽位确认 LSN。"""
