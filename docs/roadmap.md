@@ -190,6 +190,9 @@ follower 分叉时经 `QuorumNode.rebuild_callback` 后台重新基准备份并
 时旧主库立即降级，不留双主窗口；`fence_path` 在无租约时也默认把
 `assert_writable` 接进写路径，新主库提升后旧主库下一笔写即被拒。
 仍没有分歧尾巴截断（重建是唯一修复手段）和完整 commit index 协商；
+重建路径已是**增量优先 + 全量回退**：`rebase_from_server` 页级增量失败
+（本地页损坏 / 主库已回收旧页）时自动 `rebuild_from_scratch` 全量重拉，
+旧数据文件改名到 `broken-<时间戳>/` 保留取证、不删除，重建后仍是只读副本。
 网络分区时多数派不可达会明确失败，双写防护靠共享 fence + TTL 租约
 两层兜底，不是完整的多数派写确认。
 

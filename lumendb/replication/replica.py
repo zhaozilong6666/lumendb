@@ -121,6 +121,8 @@ class Replica:
         #: ``last_rebuild_error``。
         self.last_rebuild: dict[str, Any] | None = None
         self.last_rebuild_error: str | None = None
+        #: 全量重建时旧数据文件的保存位置（空串表示没有发生全量重建）。
+        self.last_rebuild_preserved: str = ""
         self._rebuild_lock = threading.Lock()
         self._rebuild_in_flight = False
         #: 推送退避：``{peer_id: 可重试的 monotonic 时刻}``。持续拒绝
@@ -233,6 +235,56 @@ class Replica:
             ).status()
             lag = status["current_lsn"] - self._applied_lsn
             return max(0, lag)
+
+    def wait_until(
+        self,
+        target_lsn: int,
+        host: str,
+        port: int,
+        *,
+        timeout: float = 10.0,
+        poll: float = 0.001,
+        max_records: int = 1000,
+        token: str | None = None,
+        compress: bool = False,
+        binary_records: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        replica_id: str | None = None,
+    ) -> bool:
+        """阻塞到副本已应用 ``target_lsn``（或超时），返回是否到达。
+
+        用途是"读己之写"：客户端写入后重定向到副本，副本可能还没追平那个
+        LSN；先 ``wait_until(lsn)`` 再查，就不会读到旧前缀。
+
+        ``target_lsn`` 是主库返回给客户端的提交 LSN（例如 ``wal.last_lsn``
+        或事务的 ``last_lsn``）。返回 True 表示 ``applied_lsn >= target_lsn``。
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.applied_lsn >= target_lsn:
+                return True
+            applied = self.replicate_from_server(
+                host,
+                port,
+                max_records=max_records,
+                timeout=timeout,
+                token=token,
+                compress=compress,
+                binary_records=binary_records,
+                ssl_context=ssl_context,
+                server_hostname=server_hostname,
+                replica_id=replica_id,
+            )
+            if applied:
+                continue
+            if self.applied_lsn >= target_lsn:
+                return True
+            if _time.monotonic() >= deadline:
+                return False
+            _time.sleep(max(0.0, poll))
 
     def apply_from_primary(self, primary: Database) -> int:
         """读取主库 WAL 中尚未应用的部分，返回本次应用的记录数。"""
@@ -500,9 +552,19 @@ class Replica:
                     "检测到历史分叉（lsn=%s），从 %s:%s 重新基准备份",
                     prev_lsn, host, port,
                 )
-                self.rebase_from_server(
-                    host, int(port), token=self.rebuild_token
-                )
+                try:
+                    self.rebase_from_server(
+                        host, int(port), token=self.rebuild_token
+                    )
+                except Exception as exc:  # noqa: BLE001 - 增量重建失败才回退
+                    # 页级增量在"本地文件损坏 / 主库已回收旧页"时无法完成，
+                    # 此时只剩全量重建一条路。全量重建会保留旧文件取证明。
+                    _log.warning(
+                        "增量重建失败（%s），回退到全量重建", exc
+                    )
+                    self.rebuild_from_scratch(
+                        host, int(port), token=self.rebuild_token
+                    )
                 with self._lock:
                     applied = self._applied_lsn
                 node = getattr(self, "_quorum_node", None)
@@ -832,6 +894,67 @@ class Replica:
                     temp.rmdir()
                 except OSError:
                     pass
+
+    def rebuild_from_scratch(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float = 10.0,
+        token: str | None = None,
+        compress: bool = False,
+        binary_records: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        replica_id: str | None = None,
+    ) -> int:
+        """全量重新基准备份——``rebase_from_server`` 失败后的最后手段。
+
+        页级增量重建在两种情况下会失败：本地数据文件已损坏（页无法安全覆盖），
+        或主库已经回收了副本需要的旧页。这时唯一能自愈的做法是重新拉一份完整
+        基准备份。**旧数据文件不删除**，改名为 ``broken-<时间戳>/lumendb.data``
+        留作取证；调用方拿到返回值后应重置仲裁进度（``reset_progress``），
+        否则 leader 下一轮会按旧位置推送、永远拼接点不匹配。
+
+        返回新的基础 LSN。
+        """
+        with self._lock:
+            from .wal_stream import WALClient
+
+            self.db.close()
+            data_path = self.path / "lumendb.data"
+            preserved = ""
+            if data_path.exists():
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                broken = self.path / f"broken-{stamp}"
+                broken.mkdir(parents=True, exist_ok=True)
+                data_path.rename(broken / "lumendb.data")
+                preserved = str(broken)
+                _log.warning("旧数据文件已保留到 %s，开始全量重建", preserved)
+            client = WALClient(
+                host, port, timeout=timeout, token=token, compress=compress,
+                binary_records=binary_records,
+                ssl_context=ssl_context, server_hostname=server_hostname,
+                replica_id=replica_id,
+            )
+            base_lsn = client.backup_to(data_path)
+            try:
+                self.db = Database(
+                    self.path, read_only=True, checkpoint_wal_bytes=0
+                )
+            except Exception:
+                # 基准备份文件打不开（磁盘截断/校验失败）时退成可写句柄，
+                # 至少让副本仍能对外提供句柄；下一次重建会再次覆盖这份文件。
+                _log.warning("重建后的数据文件无法以只读方式打开，回退普通句柄")
+                self.db = Database(self.path, checkpoint_wal_bytes=0)
+            self._applied_lsn = base_lsn
+            self._next_lsn = base_lsn + 1
+            self._expected_end_lsn = 0
+            self._write_marker()
+            self.last_rebuild_preserved = preserved
+            if replica_id is not None:
+                client.ack(base_lsn)
+            return base_lsn
 
     def promote_with_quorum(
         self,
