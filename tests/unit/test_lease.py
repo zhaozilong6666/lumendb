@@ -153,9 +153,21 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
         else:
             raise AssertionError(
                 f"keeper 没有续租：expires_at={lease.read()['expires_at']} "
-                f"first={first} last_error={keeper.last_error!r}"
+                f"first={first} last_error={keeper.last_error!r} "
+                f"lock_exists={lease.lock_path.exists()}"
             )
-        assert keeper.last_error is None
+        assert keeper.last_error is None, keeper.last_error
+    except Exception as exc:  # noqa: BLE001 - 偶发在整库负载下，留足定位信息
+        raise AssertionError(
+            f"{type(exc).__name__}: {exc}
+"
+            f"lease={lease.read()!r}
+first={first}
+"
+            f"keeper.last_error={keeper.last_error!r}
+"
+            f"lock_exists={lease.lock_path.exists()}"
+        ) from exc
     finally:
         keeper.stop()
 
