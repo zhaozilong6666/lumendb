@@ -1217,6 +1217,41 @@ def test_campaign_absorbs_voter_progress_into_last_matches(tmp_path):
         _stop(nodes)
 
 
+def test_campaign_immediately_verifies_majority_commit_index(tmp_path):
+    """当选即算多数派水位：新 leader 的 verified_commit_lsn 立刻可用。
+
+    修复前 verified_commit_lsn 只由 heartbeat_round 推进，新 leader 的第一
+    笔同步复制写要空等一个心跳周期；当选时用本轮赞成票进度算一次，屏障就能
+    立刻有"多数派自证"的水位。
+    """
+    nodes = _cluster(tmp_path)
+    try:
+        for node in nodes:
+            node.observe_applied(100, term=1)
+        term = nodes[0].campaign(100)
+        assert term >= 1
+        # 三节点：自己 100 + 两票 100 → 立即自证到 100。
+        assert nodes[0].verified_commit_lsn == 100
+        assert nodes[0].quorum_commit_lsn == 100
+    finally:
+        _stop(nodes)
+
+
+def test_campaign_commit_index_takes_the_majority_median_not_the_max(tmp_path):
+    """投票者落后时，当选水位取第 majority 大值，不能把只有自己持有的当多数派。"""
+    nodes = _cluster(tmp_path)
+    try:
+        nodes[1].observe_applied(40, term=1)
+        nodes[2].observe_applied(40, term=1)
+        nodes[0].observe_applied(100, term=1)
+        term = nodes[0].campaign(100)
+        assert term >= 1
+        # lsns=[100,40,40] → 第 2 大 = 40。
+        assert nodes[0].verified_commit_lsn == 40
+    finally:
+        _stop(nodes)
+
+
 def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")

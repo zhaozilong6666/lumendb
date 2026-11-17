@@ -1377,6 +1377,10 @@ class QuorumNode:
         majority = total_nodes // 2 + 1
         highest_term = term
         errors: list[str] = []
+        #: 本轮投赞成票的 peer 报出的真实进度（含 0）。当选后用它算一次
+        #: "多数派持有"水位：只统计本轮响应，避免拿旧心跳里未参与投票的
+        #: peer 进度虚抬水位。
+        granted_lsns: dict[str, int] = {}
         for peer_id, address in self.peers.items():
             if peer_id == self.node_id:
                 continue
@@ -1399,9 +1403,10 @@ class QuorumNode:
                 highest_term = peer_term
             if response.get("granted"):
                 votes.add(peer_id)
+                peer_lsn = int(response.get("last_lsn", 0) or 0)
+                granted_lsns[peer_id] = peer_lsn
                 # 把投票者报出的真实进度吸收进 last_matches：新 leader 当选后
                 # 第一轮 push 就能从正确拼接点推批，不必等下一轮心跳刷新。
-                peer_lsn = int(response.get("last_lsn", 0) or 0)
                 if peer_lsn > 0:
                     self.last_matches[peer_id] = peer_lsn
                     self.last_match_terms[peer_id] = int(
@@ -1432,6 +1437,10 @@ class QuorumNode:
 
         # 候选现在确定持有到 candidate_lsn 的数据，记录下来供后续水位计算。
         self.observe_applied(candidate_lsn, term=candidate_term)
+        # 当选即算一次"多数派持有"水位：用本轮赞成票 peer 报出的真实进度。
+        # 新 leader 的 verified_commit_lsn 立刻反映多数派持有，而不是等下一
+        # 轮心跳——同步复制屏障的**第一笔写**不必空等一个心跳周期。
+        self._advance_commit_lsn(candidate_lsn, granted_lsns)
         if lease_path is not None:
             Lease(lease_path, self.node_id, ttl=lease_ttl).acquire(term)
         if fence_path is not None:
