@@ -1,0 +1,862 @@
+"""LumenDB 项目记忆：带证据、可校验、可检索的长期事实账本。
+
+为什么不是又一个 TODO markdown
+------------------------------
+长周期项目里最危险的不是"忘了做什么"，而是把"我记得的数字"当成事实。
+所以这里的每条记录都必须挂**机器可核对的证据**：
+
+* ``commit``  —— 这个提交还在不在（git rev-parse）
+* ``file``    —— 文件还在不在，关键锚点（函数名/常量的字面串）还在不在
+* ``test``    —— 覆盖它的测试文件还在不在；加 ``--run-tests`` 才真的跑
+* ``command`` —— 复现命令，默认只记录、标记为 manual（不擅自执行外部命令）
+
+``verify`` 会把每条证据重新核对一遍。这样"我记错了"和"记录本身过期了"
+被同一个机制抓住，而不是靠人再读一遍。
+
+用到的算法（都是标准库实现，确定性、可解释、离线可跑）
+------------------------------------------------------
+====================  ==========================================  ==========================
+问题                  算法                                        为什么是它
+====================  ==========================================  ==========================
+按问题找相关记录      Okapi BM25 (k1=1.2, b=0.75)                 语料里全是标识符（commit
+                                                                 哈希、文件路径、错误码），
+                                                                 精确 token 匹配正是 BM25
+                                                                 的强项；嵌入模型反而容易
+                                                                 把 ``dcab1b6`` 稀释掉
+旧事实不该压过新事实  指数半衰期（默认 120 天，0.5^(age/hl)）      "上个月测的"该排在"三月前
+                                                                 测的"前面，但不该被彻底
+                                                                 丢弃——原始 BM25 分仍然
+                                                                 一起输出
+写入时发现重复        SimHash(64bit) + Jaccard                    同一件事换个说法记两遍，
+                                                                 以后一定会被当成两条证据
+数字互相矛盾          单位归一 + 同主题数值比对（>25% 报警）        "0.13ms" 和 "0.47ms" 同时
+                                                                 躺在账本里，早晚会被误引；
+                                                                 宁可在写入时就吵起来
+中文分词              字符 + 二元组（bigram），ASCII 按标识符切     无词典依赖，能匹配
+                                                                 "解析缓存" / "缓存解析"
+====================  ==========================================  ==========================
+
+账本是 append-only 的：修正一条旧结论的正确做法是**追加一条新事实并写
+``supersedes``**，而不是改旧行——历史可以被推翻，但不该被抹掉。
+（``verify`` 只回写 ``verify`` 字段，不改 claim。）
+
+用法见 ``docs/memory/README.md``；命令行入口是 ``python -m tools.project_memory``。
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LEDGER = REPO_ROOT / "docs" / "memory" / "ledger.jsonl"
+
+FACT_KINDS = (
+    "decision",      # 做了什么取舍，为什么
+    "measurement",   # 测出来的数字，怎么测的
+    "bug",           # 修掉的真 bug，根因是什么
+    "pitfall",       # 走过的死路：别再试
+    "open_question", # 还没定的事，等谁拍板
+    "commit",        # 由 git 自动灌入的提交记录
+    "contract",      # 对使用者的承诺（语义/不变量）
+)
+
+CONFIDENCE = ("verified", "measured", "inferred", "unverified")
+
+# 单位归一表：先匹配长的，避免 "ms" 被 "s" 抢走。
+_UNIT_PATTERNS = (
+    ("行/秒", "rows/s"),
+    ("次/秒", "ops/s"),
+    ("毫秒", "ms"),
+    ("ms", "ms"),
+    ("µs", "us"),
+    ("us", "us"),
+    ("GB", "GB"),
+    ("MB", "MB"),
+    ("KB", "KB"),
+    ("倍", "x"),
+    ("%", "%"),
+    ("秒", "s"),
+)
+_NUM_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(" + "|".join(re.escape(p) for p, _ in _UNIT_PATTERNS) + r")"
+)
+_UNIT_ALIAS = dict(_UNIT_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# 分词：ASCII 标识符整体 + 按分隔符拆开，中文按 字 + 二元组
+# ---------------------------------------------------------------------------
+
+_ASCII_RE = re.compile(r"[A-Za-z0-9_./\\:@#$%^&*+=~-]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def tokenize(text: str) -> list[str]:
+    """把一段文本切成检索 token。
+
+    中文用「单字 + 二元组」是为了不依赖词典也能匹配语序变化（"解析缓存"
+    和"缓存解析"共享 ``解析``/``缓存`` 之外的 ``析缓`` 之类噪声，但二元组
+    的召回收益远大于噪声）。ASCII 标识符既保留整体（``btree._scan_range``）
+    也保留拆开的片段（``btree``/``scan``/``range``），因为人既会整串引用，
+    也会只写后半截。
+    """
+    tokens: list[str] = []
+    for match in _ASCII_RE.finditer(text):
+        raw = match.group(0)
+        low = raw.lower().strip("._-/:")
+        if not low:
+            continue
+        tokens.append(low)
+        if len(low) > 1:
+            for part in _SPLIT_RE.split(low):
+                if len(part) > 1:
+                    tokens.append(part)
+    for match in _CJK_RE.finditer(text):
+        run = match.group(0)
+        tokens.extend(run)
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+def _tokens(text: str) -> set[str]:
+    return set(tokenize(text))
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# ---------------------------------------------------------------------------
+# SimHash：用于"同一件事记了两遍"的近似重复检测
+# ---------------------------------------------------------------------------
+
+_HASH_BITS = 64
+
+
+def simhash(text: str) -> int:
+    """64 位 SimHash。按 token 频次加权投票每一位的符号。"""
+    vector = [0] * _HASH_BITS
+    for token in tokenize(text):
+        h = int(hashlib.blake2b(token.encode("utf-8"), digest_size=8).hexdigest(), 16)
+        for bit in range(_HASH_BITS):
+            vector[bit] += 1 if (h >> bit) & 1 else -1
+    out = 0
+    for bit in range(_HASH_BITS):
+        if vector[bit] > 0:
+            out |= 1 << bit
+    return out
+
+
+def hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+# ---------------------------------------------------------------------------
+# 数字抽取与单位归一（数字矛盾检测的基础）
+# ---------------------------------------------------------------------------
+
+
+def extract_metrics(text: str) -> list[tuple[float, str]]:
+    """抽出 ``(数值, 归一单位)``。只认带单位的数字，避免把行号/提交哈希当指标。"""
+    out: list[tuple[float, str]] = []
+    for raw_value, raw_unit in _NUM_RE.findall(text):
+        unit = _UNIT_ALIAS.get(raw_unit, raw_unit)
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        out.append((value, unit))
+    return out
+
+
+_UNIT_WORDS = {
+    "ms",
+    "us",
+    "s",
+    "x",
+    "%",
+    "gb",
+    "mb",
+    "kb",
+    "rows",
+    "ops",
+    "倍",
+    "秒",
+    "毫秒",
+    "行",
+    "次",
+}
+
+
+def _topic_tokens(text: str) -> set[str]:
+    """去掉数字与单位后的主题 token——判"是不是在说同一件事"。
+
+    关键在于**把数值剥离出去**：``0.13ms`` 和 ``0.47ms`` 的主题是"索引点查
+    延迟"，不是"0.13 与 0.47"。否则两个数字自己会把 Jaccard 拉低，冲突检测
+    永远不触发。
+    """
+    keep: set[str] = set()
+    for token in tokenize(text):
+        if token and token[0].isdigit():
+            continue
+        if token.lower() in _UNIT_WORDS:
+            continue
+        if len(token) == 1 and "\u4e00" <= token <= "\u9fff":
+            # 单字太泛（"的""是"全在里面），二元组已经携带了信息
+            continue
+        keep.add(token)
+    return keep
+
+
+# ---------------------------------------------------------------------------
+# Fact / Ledger
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Fact:
+    id: str
+    kind: str
+    claim: str
+    created: str
+    confidence: str = "measured"
+    tags: list[str] = field(default_factory=list)
+    evidence: list[dict] = field(default_factory=list)
+    supersedes: Optional[str] = None
+    verify: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Fact":
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def search_text(self) -> str:
+        parts = [self.claim, self.kind, " ".join(self.tags)]
+        parts.extend(str(e.get("value", "")) for e in self.evidence)
+        return " ".join(parts)
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def _parse_when(value: str) -> datetime:
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.now().astimezone()
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return stamp
+
+
+class Ledger:
+    def __init__(self, path: Path = DEFAULT_LEDGER, root: Path = REPO_ROOT) -> None:
+        self.path = Path(path)
+        self.root = Path(root)
+        self.facts: list[Fact] = []
+        self.load()
+
+    # -- IO ---------------------------------------------------------------
+    def load(self) -> None:
+        self.facts = []
+        if not self.path.exists():
+            return
+        for line_no, line in enumerate(
+            self.path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                self.facts.append(Fact.from_dict(json.loads(line)))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(f"{self.path}:{line_no} 不是合法的账本行：{exc}") from exc
+
+    def append(self, fact: Fact) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(fact.to_dict(), ensure_ascii=False) + "\n")
+        self.facts.append(fact)
+
+    def rewrite(self) -> None:
+        """回写整个账本（只用于更新 verify 字段；claim 本身不该改）。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            for fact in self.facts:
+                handle.write(json.dumps(fact.to_dict(), ensure_ascii=False) + "\n")
+        os.replace(tmp, self.path)
+
+    def get(self, fact_id: str) -> Optional[Fact]:
+        for fact in self.facts:
+            if fact.id == fact_id:
+                return fact
+        return None
+
+    def new_id(self, claim: str) -> str:
+        digest = hashlib.sha1(f"{claim}|{_now_iso()}".encode("utf-8")).hexdigest()[:6]
+        candidate = f"f-{datetime.now().strftime('%Y%m%d')}-{digest}"
+        existing = {f.id for f in self.facts}
+        suffix = 1
+        while candidate in existing:
+            candidate = f"f-{datetime.now().strftime('%Y%m%d')}-{digest}{suffix}"
+            suffix += 1
+        return candidate
+
+    # -- 写入期检查 -------------------------------------------------------
+    def near_duplicates(self, fact: Fact, threshold: float = 0.8) -> list[Fact]:
+        mine = _tokens(fact.search_text())
+        mine_hash = simhash(fact.search_text())
+        hits = []
+        for other in self.facts:
+            if other.id == fact.id:
+                continue
+            theirs = _tokens(other.search_text())
+            if jaccard(mine, theirs) >= threshold:
+                hits.append(other)
+            elif hamming(mine_hash, simhash(other.search_text())) <= 3:
+                hits.append(other)
+        return hits
+
+    def number_conflicts(self, fact: Fact, rel_tolerance: float = 0.25) -> list[tuple]:
+        """同一主题、同一单位、数值差 > 25% —— 很可能是旧测量没被取代。"""
+        mine = extract_metrics(fact.claim)
+        if not mine:
+            return []
+        my_topic = _topic_tokens(fact.claim)
+        findings = []
+        for other in self.facts:
+            theirs = extract_metrics(other.claim)
+            if not theirs:
+                continue
+            topic = _topic_tokens(other.claim)
+            if jaccard(my_topic, topic) < 0.5:
+                continue
+            for my_value, my_unit in mine:
+                for their_value, their_unit in theirs:
+                    if my_unit != their_unit:
+                        continue
+                    base = max(abs(my_value), abs(their_value), 1e-9)
+                    if abs(my_value - their_value) / base > rel_tolerance:
+                        findings.append((other, my_value, my_unit, their_value))
+        return findings
+
+
+# ---------------------------------------------------------------------------
+# BM25 检索 + 时间衰减
+# ---------------------------------------------------------------------------
+
+
+class BM25:
+    def __init__(
+        self, docs: Sequence[Sequence[str]], k1: float = 1.2, b: float = 0.75
+    ) -> None:
+        self.k1 = k1
+        self.b = b
+        self.docs = [list(d) for d in docs]
+        self.n = len(self.docs)
+        self.avgdl = (sum(len(d) for d in self.docs) / self.n) if self.n else 0.0
+        self.df: dict[str, int] = {}
+        for doc in self.docs:
+            for token in set(doc):
+                self.df[token] = self.df.get(token, 0) + 1
+
+    def idf(self, token: str) -> float:
+        freq = self.df.get(token, 0)
+        if self.n == 0:
+            return 0.0
+        return math.log(1 + (self.n - freq + 0.5) / (freq + 0.5))
+
+    def score(self, query: Sequence[str]) -> list[float]:
+        scores = [0.0] * self.n
+        if not self.n or self.avgdl <= 0:
+            return scores
+        for token in query:
+            idf = self.idf(token)
+            if idf <= 0:
+                continue
+            for index, doc in enumerate(self.docs):
+                tf = doc.count(token)
+                if not tf:
+                    continue
+                denom = tf + self.k1 * (1 - self.b + self.b * len(doc) / self.avgdl)
+                scores[index] += idf * tf * (self.k1 + 1) / denom
+        return scores
+
+
+def search(
+    facts: Sequence[Fact],
+    query: str,
+    *,
+    top_k: int = 5,
+    half_life_days: float = 120.0,
+    now: Optional[datetime] = None,
+    kind: Optional[str] = None,
+    tag: Optional[str] = None,
+) -> list[dict]:
+    """返回排好序的命中：BM25 × 时间衰减，但两个分数都原样给出。"""
+    now = now or datetime.now().astimezone()
+    selected = [
+        f
+        for f in facts
+        if (kind is None or f.kind == kind) and (tag is None or tag in f.tags)
+    ]
+    if not selected:
+        return []
+    engine = BM25([tokenize(f.search_text()) for f in selected])
+    raw = engine.score(tokenize(query))
+    results = []
+    for fact, base in zip(selected, raw):
+        age_days = max((now - _parse_when(fact.created)).total_seconds() / 86400.0, 0.0)
+        decay = 0.5 ** (age_days / half_life_days) if half_life_days > 0 else 1.0
+        results.append(
+            {
+                "fact": fact,
+                "bm25": base,
+                "decay": decay,
+                "score": base * decay,
+                "age_days": age_days,
+            }
+        )
+    results.sort(key=lambda item: (item["score"], item["fact"].created), reverse=True)
+    return [r for r in results if r["bm25"] > 0][:top_k]
+
+
+# ---------------------------------------------------------------------------
+# 证据校验
+# ---------------------------------------------------------------------------
+
+GIT_CANDIDATES = (
+    os.environ.get("LUMENDB_GIT_EXE", ""),
+    r"D:\git\Git\cmd\git.exe",
+    "/usr/bin/git",
+)
+
+
+def find_git() -> Optional[str]:
+    found = shutil.which("git")
+    if found:
+        return found
+    for candidate in GIT_CANDIDATES:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _git(args: Sequence[str], root: Path) -> subprocess.CompletedProcess:
+    exe = find_git()
+    if not exe:
+        raise RuntimeError("找不到 git 可执行文件")
+    return subprocess.run(
+        [exe, "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def verify_fact(
+    fact: Fact,
+    *,
+    root: Path = REPO_ROOT,
+    run_tests: bool = False,
+    run_commands: bool = False,
+    timeout: float = 300.0,
+) -> tuple[str, list[dict]]:
+    """逐条核对证据，返回 (聚合状态, 每条证据的核对结果)。
+
+    聚合规则：任何一条 ``failed`` → ``failed``；否则有 ``unchecked``/``manual``
+    → ``partial``；全部 ``ok`` → ``ok``。unknown 证据类型一律 ``failed``，
+    因为无法核对的证据不该被当成证据。
+    """
+    details: list[dict] = []
+    for item in fact.evidence:
+        kind = str(item.get("type", ""))
+        value = str(item.get("value", ""))
+        anchor = str(item.get("anchor", "") or "")
+        status, detail = "ok", ""
+        try:
+            if kind == "commit":
+                proc = _git(["rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"], root)
+                if proc.returncode == 0:
+                    detail = f"commit {proc.stdout.strip()[:12]} 存在"
+                else:
+                    status, detail = "failed", "commit 不存在（可能被 rebase/删分支）"
+            elif kind == "file":
+                path = root / value
+                if not path.exists():
+                    status, detail = "failed", f"文件不存在：{value}"
+                elif anchor:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    if anchor in text:
+                        detail = f"锚点命中：{anchor}"
+                    else:
+                        status, detail = "failed", f"文件在，但找不到锚点：{anchor}"
+                else:
+                    detail = "文件存在"
+            elif kind == "test":
+                path = root / value
+                if not path.exists():
+                    status, detail = "failed", f"测试文件不存在：{value}"
+                elif run_tests:
+                    proc = subprocess.run(
+                        [sys.executable, "-m", "pytest", value, "-q"],
+                        cwd=str(root),
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                    if proc.returncode == 0:
+                        tail = (proc.stdout or "").strip().splitlines()[-1:]
+                        detail = f"测试通过：{tail[0] if tail else 'ok'}"
+                    else:
+                        status, detail = "failed", "测试未通过"
+                else:
+                    status, detail = "unchecked", "未跑（加 --run-tests 才执行）"
+            elif kind == "command":
+                if run_commands:
+                    status, detail = "manual", "已记录；自动执行复现命令不默认开启"
+                else:
+                    status, detail = "manual", "复现命令，需人工执行"
+            else:
+                status, detail = "failed", f"未知证据类型：{kind}"
+        except subprocess.TimeoutExpired:
+            status, detail = "failed", "校验超时"
+        except (OSError, RuntimeError) as exc:
+            status, detail = "failed", f"校验失败：{exc}"
+        details.append({"type": kind, "value": value, "anchor": anchor, "status": status, "detail": detail})
+
+    statuses = {d["status"] for d in details}
+    if "failed" in statuses:
+        aggregate = "failed"
+    elif not details:
+        aggregate = "unverified"
+    elif statuses <= {"ok"}:
+        aggregate = "ok"
+    else:
+        aggregate = "partial"
+    return aggregate, details
+
+
+# ---------------------------------------------------------------------------
+# 从 git 灌入（机器生成的锚点，最不容易出错的那类记录）
+# ---------------------------------------------------------------------------
+
+_PREFIX_TAGS = {
+    "perf": ["perf"],
+    "fix": ["fix"],
+    "feat": ["feat"],
+    "docs": ["docs"],
+    "test": ["test"],
+    "refactor": ["refactor"],
+    "bench": ["bench"],
+}
+
+
+def facts_from_git(
+    root: Path = REPO_ROOT, rev_range: str = "-20", ledger: Optional[Ledger] = None
+) -> list[Fact]:
+    proc = _git(["log", rev_range, "--format=%H%x1f%ad%x1f%s", "--date=short"], root)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "git log 失败")
+    known = {e.get("value") for f in (ledger.facts if ledger else []) for e in f.evidence}
+    out: list[Fact] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3:
+            continue
+        commit_hash, day, subject = parts
+        if commit_hash in known:
+            continue
+        tags: list[str] = []
+        match = re.match(r"([a-z]+)(?:\((.*?)\))?", subject)
+        if match:
+            tags.extend(_PREFIX_TAGS.get(match.group(1), [match.group(1)]))
+            if match.group(2):
+                tags.extend(re.split(r"[,/ ]+", match.group(2)))
+        out.append(
+            Fact(
+                id=f"g-{commit_hash[:7]}",
+                kind="commit",
+                claim=subject,
+                created=f"{day}T00:00:00",
+                confidence="verified",
+                tags=[t for t in tags if t][:6],
+                evidence=[{"type": "commit", "value": commit_hash, "anchor": ""}],
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_evidence(raw: str) -> dict:
+    parts = raw.split(":", 2)
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError("证据格式是 TYPE:VALUE[:ANCHOR]")
+    return {"type": parts[0], "value": parts[1], "anchor": parts[2] if len(parts) > 2 else ""}
+
+
+def _print_fact(fact: Fact, prefix: str = "") -> None:
+    status = fact.verify.get("status", "-") if fact.verify else "-"
+    print(f"{prefix}{fact.id}  [{fact.kind}] {fact.claim}")
+    print(f"    conf={fact.confidence} verify={status} tags={','.join(fact.tags) or '-'}")
+    for item in fact.evidence:
+        anchor = f" :: {item['anchor']}" if item.get("anchor") else ""
+        print(f"    · {item['type']}:{item['value']}{anchor}")
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    fact = Fact(
+        id=ledger.new_id(args.claim),
+        kind=args.kind,
+        claim=args.claim,
+        created=_now_iso(),
+        confidence=args.confidence,
+        tags=[t.strip() for t in (args.tags or "").split(",") if t.strip()],
+        evidence=[_parse_evidence(e) for e in (args.evidence or [])],
+        supersedes=args.supersedes,
+    )
+    if fact.kind not in FACT_KINDS:
+        print(f"kind 必须是 {FACT_KINDS} 之一", file=sys.stderr)
+        return 2
+    if not fact.evidence:
+        print("警告：没有证据的记录以后无法校验（建议至少给一条 file/commit/test）", file=sys.stderr)
+
+    for other in ledger.number_conflicts(fact):
+        print(f"⚠ 数字冲突：{other[0].id} 说 {other[3]}{other[2]}，本条说 {other[1]}{other[2]}")
+
+    ledger.append(fact)
+    print(f"已记录 {fact.id}")
+    _print_fact(fact)
+    dups = ledger.near_duplicates(fact)
+    if dups:
+        print("⚠ 疑似重复（换个说法记了同一件事？）：")
+        for other in dups:
+            print(f"    {other.id}  {other.claim}")
+    return 0
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    hits = search(
+        ledger.facts,
+        args.text,
+        top_k=args.top_k,
+        half_life_days=args.half_life,
+        kind=args.kind,
+        tag=args.tag,
+    )
+    if not hits:
+        print("（没有命中）")
+        return 1
+    for item in hits:
+        fact = item["fact"]
+        age = item["age_days"]
+        print(
+            f"{item['score']:7.3f}  bm25={item['bm25']:6.3f} decay={item['decay']:.2f} "
+            f"age={age:5.1f}d  {fact.id} [{fact.kind}] {fact.claim}"
+        )
+        for evidence in fact.evidence:
+            print(f"            ↳ {evidence['type']}:{evidence['value']}")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    targets = ledger.facts if not args.ids else [ledger.get(i) for i in args.ids]
+    targets = [t for t in targets if t is not None]
+    if args.only_stale:
+        targets = [t for t in targets if t.verify.get("status") not in ("ok",)]
+    if not targets:
+        print("没有需要校验的记录")
+        return 0
+    failures = 0
+    for fact in targets:
+        status, details = verify_fact(
+            fact, root=Path(args.root), run_tests=args.run_tests, run_commands=args.run_commands
+        )
+        fact.verify = {"status": status, "checked_at": _now_iso(), "detail": details}
+        print(f"{status:8s} {fact.id}  {fact.claim[:60]}")
+        for detail in details:
+            if detail["status"] != "ok":
+                print(f"         - {detail['type']}:{detail['value']} → {detail['status']}（{detail['detail']}）")
+        if status == "failed":
+            failures += 1
+    ledger.rewrite()
+    print(f"\n校验完成：{len(targets)} 条，失败 {failures} 条")
+    return 1 if failures else 0
+
+
+def cmd_ingest_git(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    fresh = facts_from_git(Path(args.root), args.rev_range, ledger)
+    for fact in fresh:
+        ledger.append(fact)
+    print(f"从 git 灌入 {len(fresh)} 条提交记录（范围 {args.rev_range}）")
+    return 0
+
+
+def cmd_dups(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    found = 0
+    for i, fact in enumerate(ledger.facts):
+        mine = _tokens(fact.search_text())
+        for other in ledger.facts[i + 1 :]:
+            theirs = _tokens(other.search_text())
+            if jaccard(mine, theirs) >= 0.75:
+                print(f"{fact.id} ≈ {other.id}  jaccard={jaccard(mine, theirs):.2f}")
+                print(f"    A: {fact.claim}")
+                print(f"    B: {other.claim}")
+                found += 1
+    print(f"共 {found} 对疑似重复")
+    return 0 if found == 0 else 1
+
+
+def cmd_conflicts(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    found = 0
+    for fact in ledger.facts:
+        for other, mine, unit, theirs in ledger.number_conflicts(fact):
+            if other.id >= fact.id:
+                continue
+            print(f"{fact.id} ({mine}{unit}) vs {other.id} ({theirs}{unit})")
+            print(f"    A: {fact.claim}")
+            print(f"    B: {other.claim}")
+            found += 1
+    print(f"共 {found} 处数字冲突")
+    return 0 if found == 0 else 1
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    total = len(ledger.facts)
+    print(f"记录总数：{total}")
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for fact in ledger.facts:
+        by_kind[fact.kind] = by_kind.get(fact.kind, 0) + 1
+        status = fact.verify.get("status", "unverified")
+        by_status[status] = by_status.get(status, 0) + 1
+    for kind in FACT_KINDS:
+        if by_kind.get(kind):
+            print(f"  {kind:13s} {by_kind[kind]}")
+    print("校验状态：" + "，".join(f"{k}={v}" for k, v in sorted(by_status.items())))
+    if total:
+        coverage = (by_status.get("ok", 0) + by_status.get("partial", 0)) / total
+        print(f"有校验记录的比例：{coverage:.0%}")
+    stale = [
+        f
+        for f in ledger.facts
+        if f.verify.get("status") in ("failed",)
+    ]
+    if stale:
+        print(f"⚠ 校验失败的记录 {len(stale)} 条（下次写文档前先处理）：")
+        for fact in stale[:5]:
+            print(f"    {fact.id} {fact.claim[:60]}")
+    no_evidence = [f for f in ledger.facts if not f.evidence]
+    if no_evidence:
+        print(f"⚠ 无证据的记录 {len(no_evidence)} 条")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    fact = ledger.get(args.id)
+    if fact is None:
+        print(f"没有 {args.id}", file=sys.stderr)
+        return 1
+    _print_fact(fact)
+    if fact.verify:
+        print("    校验：", fact.verify.get("status"), fact.verify.get("checked_at"))
+        for detail in fact.verify.get("detail", []):
+            print(f"      {detail['status']:9s} {detail['type']}:{detail['value']} {detail['detail']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.project_memory",
+        description="LumenDB 项目记忆：带证据、可校验、可检索的长期事实账本",
+    )
+    parser.add_argument("--ledger", default=str(DEFAULT_LEDGER), help="账本路径")
+    parser.add_argument("--root", default=str(REPO_ROOT), help="证据的相对根目录")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="追加一条事实")
+    add.add_argument("--kind", required=True, choices=FACT_KINDS)
+    add.add_argument("--claim", required=True)
+    add.add_argument("--tags", default="")
+    add.add_argument("--confidence", default="measured", choices=CONFIDENCE)
+    add.add_argument("--evidence", action="append", type=_parse_evidence, default=[])
+    add.add_argument("--supersedes", default=None)
+    add.set_defaults(func=cmd_add)
+
+    query = sub.add_parser("query", help="按问题检索（BM25 + 时间衰减）")
+    query.add_argument("text")
+    query.add_argument("--top-k", type=int, default=5)
+    query.add_argument("--half-life", type=float, default=120.0)
+    query.add_argument("--kind", default=None, choices=FACT_KINDS)
+    query.add_argument("--tag", default=None)
+    query.set_defaults(func=cmd_query)
+
+    verify = sub.add_parser("verify", help="核对证据是否还成立")
+    verify.add_argument("--ids", nargs="*", default=[])
+    verify.add_argument("--only-stale", action="store_true")
+    verify.add_argument("--run-tests", action="store_true")
+    verify.add_argument("--run-commands", action="store_true")
+    verify.set_defaults(func=cmd_verify)
+
+    ingest = sub.add_parser("ingest-git", help="把 git 提交灌成 anchor 记录")
+    ingest.add_argument("--rev-range", default="-20")
+    ingest.set_defaults(func=cmd_ingest_git)
+
+    dups = sub.add_parser("dups", help="找出几乎重复的记录")
+    dups.set_defaults(func=cmd_dups)
+
+    conflicts = sub.add_parser("conflicts", help="找出互相矛盾的数字")
+    conflicts.set_defaults(func=cmd_conflicts)
+
+    stats = sub.add_parser("stats", help="总览")
+    stats.set_defaults(func=cmd_stats)
+
+    show = sub.add_parser("show", help="看一条记录")
+    show.add_argument("id")
+    show.set_defaults(func=cmd_show)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -65,6 +65,10 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 部署与排障（租约/fence/水位/故障剧本）见 [`docs/operations.md`](docs/operations.md)；
 并发模型（三层串行化、为什么写并发度是 1、放开它的三步）见 [`docs/concurrency.md`](docs/concurrency.md)。
 
+长周期开发的事实账本见 [`docs/memory/README.md`](docs/memory/README.md)：每条结论都挂
+commit / 文件锚点 / 测试作为证据，`python -m tools.project_memory verify` 可一键复查，
+并会自动检测"同一主题下互相矛盾的数字"——避免把过期的测量当成当前事实。
+
 ## 快速开始
 
 无需任何第三方依赖，只需要 Python 3.12+。
