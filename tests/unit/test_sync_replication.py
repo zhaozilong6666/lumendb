@@ -203,3 +203,55 @@ class TestReplicaSyncReplication:
             primary.close()
             for node in nodes:
                 node.stop()
+
+
+class TestWatermarkProvenance:
+    """提交水位有两个来源，屏障只能信"多数派自证"的那个。
+
+    follower 会把 leader 心跳/append_entries 里抄来的水位记进 `commit_lsn`，
+    这对竞选闸门是对的（"我还落后多少"）。但一个抄来高水位的节点如果被手动
+    提升成主库，`commit_lsn` 仍然很高；屏障若直接信它，就会把"根本没复制
+    出去"的写入当成已提交——同步复制静默退化成异步。
+    """
+
+    def test_hint_does_not_satisfy_the_barrier(self):
+        node = _FakeNode(0)
+        node.verified_commit_lsn = 0
+        node.quorum_commit_lsn = 10_000  # 从 leader 抄来的高水位
+        barrier = QuorumCommitBarrier(node, timeout=0.05, poll_interval=0.005)
+        with pytest.raises(CommitOutcomeUnknown):
+            barrier(600)
+
+    def test_verified_watermark_satisfies_the_barrier(self):
+        node = _FakeNode(0)
+        node.quorum_commit_lsn = 10_000
+        node.verified_commit_lsn = 800
+        barrier = QuorumCommitBarrier(node, timeout=0.05, poll_interval=0.005)
+        barrier(600)  # 多数派自证到 800，600 可以放行
+        assert barrier.timeouts == 0
+
+    def test_node_separates_hint_from_verified(self, tmp_path):
+        from lumendb.replication.quorum import QuorumNode
+
+        node = QuorumNode("n0", state_path=tmp_path / "n0.vote.json")
+        try:
+            node.observe_commit(1000)  # leader 口头告知
+            assert node.quorum_commit_lsn == 1000
+            assert node.verified_commit_lsn == 0
+            node.observe_commit(700, verified=True)  # 心跳按多数派算出
+            assert node.quorum_commit_lsn == 1000  # 不后退
+            assert node.verified_commit_lsn == 700
+        finally:
+            node.stop()
+
+    def test_append_entries_hint_is_not_verified(self, tmp_path):
+        from lumendb.replication.quorum import QuorumNode
+
+        node = QuorumNode("n0", state_path=tmp_path / "n0.vote.json")
+        try:
+            # 空批次 + 声称提交到 500：只能算"听说"，不能自证
+            node.append_entries(1, "leader", 0, 0, [], commit_lsn=500)
+            assert node.quorum_commit_lsn == 500
+            assert node.verified_commit_lsn == 0
+        finally:
+            node.stop()

@@ -78,8 +78,11 @@ class VoteState:
         self.match_lsn = 0
         #: ``match_lsn`` 处日志条目的任期。
         self.match_term = 0
-        #: 多数派确认过的提交水位（本节点目前知道的上界）。
+        #: 已知的提交水位上界（可能来自 leader 的心跳/append_entries 告知）。
         self.commit_lsn = 0
+        #: **多数派自证**的提交水位：只由 heartbeat_round 根据多数派 match_lsn
+        #: 算出。同步复制的屏障只信这个值。
+        self.verified_commit_lsn = 0
         #: 本节点**已应用**日志的任期分段：``[[start_lsn, term], ...]``，
         #: ``start_lsn`` 单调递增。append_entries 逐条带任期时精确记录，
         #: 用于拼接点校验：同一 LSN 但任期不同说明两条历史分叉了。
@@ -115,6 +118,9 @@ class VoteState:
         self.match_lsn = max(0, int(raw.get("match_lsn", 0)))
         self.match_term = max(0, int(raw.get("match_term", 0)))
         self.commit_lsn = max(0, int(raw.get("commit_lsn", 0)))
+        self.verified_commit_lsn = max(
+            0, int(raw.get("verified_commit_lsn", 0))
+        )
         self.log_terms = []
         for raw_pair in raw.get("log_terms", []) or []:
             try:
@@ -142,6 +148,7 @@ class VoteState:
                 "match_lsn": int(self.match_lsn),
                 "match_term": int(self.match_term),
                 "commit_lsn": int(self.commit_lsn),
+                "verified_commit_lsn": int(self.verified_commit_lsn),
                 "log_terms": [list(pair) for pair in self.log_terms],
                 "last_heartbeat_at": round(float(self.last_heartbeat_at), 6),
                 "last_heartbeat_from": self.last_heartbeat_from,
@@ -282,12 +289,26 @@ class VoteState:
                 self._persisted_heartbeat_at = self.last_heartbeat_at
                 self.save()
 
-    def observe_commit(self, lsn: int) -> None:
-        """推进多数派提交水位（只前进，不后退）。"""
+    def observe_commit(self, lsn: int, *, verified: bool = False) -> None:
+        """推进提交水位（只前进，不后退）。
+
+        ``verified=False``（默认）是"leader 口头告知"的高水位：follower 用它
+        决定"我还落后多少、能不能竞选"，本身不代表本地验证过多数派。
+        ``verified=True`` 只由 ``heartbeat_round`` 根据多数派 `match_lsn` 算出，
+        代表"多数派确实持有"。同步复制的提交屏障必须用后者——否则一个从
+        leader 那里抄来高水位的节点，在手动提升成主库后会让屏障一上来就
+        放行（把没复制出去的写入当成已提交）。
+        """
         with self._lock:
             value = max(0, int(lsn))
+            changed = False
             if value > self.commit_lsn:
                 self.commit_lsn = value
+                changed = True
+            if verified and value > self.verified_commit_lsn:
+                self.verified_commit_lsn = value
+                changed = True
+            if changed:
                 self.save()
 
 
@@ -587,10 +608,10 @@ class QuorumNode:
         with self._lock:
             self.state.observe_applied(lsn, term=term)
 
-    def observe_commit(self, lsn: int) -> None:
-        """记录已知的多数派提交水位（由心跳轮次或上层运维工具推进）。"""
+    def observe_commit(self, lsn: int, *, verified: bool = False) -> None:
+        """记录已知的提交水位；``verified=True`` 表示"多数派自证"。"""
         with self._lock:
-            self.state.observe_commit(lsn)
+            self.state.observe_commit(lsn, verified=verified)
 
     def set_log_applier(self, applier: Callable[[list[Any]], int] | None) -> None:
         """绑定 append_entries 的本地重放函数（通常是 ``Replica.apply``）。"""
@@ -660,6 +681,11 @@ class QuorumNode:
         """本节点目前知道的"多数派已持有"的 LSN 上界。"""
         return self.state.commit_lsn
 
+    @property
+    def verified_commit_lsn(self) -> int:
+        """多数派**自证**的提交水位（同步复制屏障只信这个）。"""
+        return self.state.verified_commit_lsn
+
     def _majority(self) -> int:
         total = len(self.peers) + (0 if self.node_id in self.peers else 1)
         return total // 2 + 1
@@ -673,7 +699,7 @@ class QuorumNode:
         lsns.sort(reverse=True)
         watermark = lsns[majority - 1]
         with self._lock:
-            self.state.observe_commit(watermark)
+            self.state.observe_commit(watermark, verified=True)
             return self.state.commit_lsn
 
     def refresh_commit_lsn(self, self_lsn: int) -> int:
@@ -1561,6 +1587,15 @@ class QuorumCommitBarrier:
 
     @property
     def quorum_commit_lsn(self) -> int:
+        """屏障看的水位：优先用"多数派自证"的值。
+
+        只信 ``quorum_commit_lsn`` 是不够的：follower 会把 leader 口头告知的
+        水位抄进同一个字段，手动提升后屏障会一上来就放行。``verified_commit_lsn``
+        只由心跳轮次按多数派 match_lsn 算出，才代表"多数派真的持有"。
+        """
+        verified = getattr(self.node, "verified_commit_lsn", None)
+        if verified is not None:
+            return int(verified)
         return int(getattr(self.node, "quorum_commit_lsn", 0))
 
     def __call__(self, lsn: int) -> None:
