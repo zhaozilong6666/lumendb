@@ -45,8 +45,19 @@ def _print_result(result, *, show_tag: bool = True) -> None:
         print(result.tag)
 
 
+def _open_database(args: argparse.Namespace) -> Database:
+    """按命令行参数打开数据库（三个子命令共用同一套 fence/只读语义）。"""
+    return Database(
+        args.path,
+        pool_size=args.pool_size,
+        read_only=bool(getattr(args, "read_only", False)),
+        fence_path=getattr(args, "fence_path", None),
+        node_id=getattr(args, "node_id", "primary"),
+    )
+
+
 def cmd_exec(args: argparse.Namespace) -> int:
-    db = Database(args.path, pool_size=args.pool_size)
+    db = _open_database(args)
     try:
         code = 0
         for statement_sql in _split_input(args.sql):
@@ -55,11 +66,7 @@ def cmd_exec(args: argparse.Namespace) -> int:
                 for result in results:
                     _print_result(result)
             except LumenError as exc:
-                print(f"错误：{exc.message}", file=sys.stderr)
-                if exc.detail:
-                    print(f"DETAIL: {exc.detail}", file=sys.stderr)
-                if exc.hint:
-                    print(f"HINT: {exc.hint}", file=sys.stderr)
+                _report(exc)
                 code = 1
         return code
     finally:
@@ -67,7 +74,7 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
-    db = Database(args.path, pool_size=args.pool_size)
+    db = _open_database(args)
     print("LumenDB 交互式 shell。输入 SQL 以分号结束；\\q 退出，\\dt 查看表。")
     buffer: list[str] = []
     try:
@@ -117,7 +124,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    db = Database(args.path, pool_size=args.pool_size)
+    db = _open_database(args)
     server = PGWireServer(db, host=args.host, port=args.port)
     try:
         asyncio.run(server.serve_forever())
@@ -163,6 +170,25 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--path", type=Path, default=Path("lumendb_data"), help="数据目录")
         p.add_argument("--pool-size", type=int, default=64, help="缓冲池页数")
+        # 共享 fencing marker：给了就必须能挡住"重启后的旧主库"。
+        # 之前这三个命令都不接受它，`Database(fence_path=...)` 的保护
+        # 只有写代码的人才能用到，用 CLI 拉起的旧主库重启后照样能双写。
+        p.add_argument(
+            "--fence-path",
+            type=Path,
+            default=None,
+            help="共享提升 marker（fence）路径；旧主库会据此拒绝写入",
+        )
+        p.add_argument(
+            "--node-id",
+            default="primary",
+            help="本节点在 fence 里的身份（默认 primary）",
+        )
+        p.add_argument(
+            "--read-only",
+            action="store_true",
+            help="以只读方式打开（副本/观察者）",
+        )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")
         if name == "serve":
@@ -172,10 +198,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report(exc: LumenError) -> None:
+    print(f"错误：{exc.message}", file=sys.stderr)
+    if exc.detail:
+        print(f"DETAIL: {exc.detail}", file=sys.stderr)
+    if exc.hint:
+        print(f"HINT: {exc.hint}", file=sys.stderr)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.handler(args)
+    try:
+        return args.handler(args)
+    except LumenError as exc:
+        # 打开数据库本身也可能被拒（被 fence 的旧主库、目录被另一个进程占用、
+        # 只读库的写语句……）。这些是预期内的用户错误，不应该甩 traceback。
+        _report(exc)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

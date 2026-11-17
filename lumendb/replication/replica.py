@@ -431,6 +431,17 @@ class Replica:
         由 ``QuorumNode.append_entries`` 的分叉分支回调；重建期间在途的
         apply 会因锁竞争而排队，leader 侧短暂超时后下一轮心跳会重试。
         """
+        # 已提升（可写）的节点绝不能被"重建"覆盖数据目录：重建会关闭并
+        # 重开句柄、用 leader 的基准备份替换数据文件，而本地可能已经有
+        # 对外确认过的写入。出现"新 leader 推分叉日志"时正确顺序是：
+        # 先降级（step_down）再以 follower 身份重建。
+        if not getattr(getattr(self, "db", None), "_read_only", True):
+            _log.warning(
+                "本节点当前可写（已提升），拒绝被重建（lsn=%s from %s:%s）",
+                prev_lsn, host, port,
+            )
+            self.last_rebuild_error = "promoted: refuse rebuild while writable"
+            return
         with self._rebuild_lock:
             if self._rebuild_in_flight:
                 return
