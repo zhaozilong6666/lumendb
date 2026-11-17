@@ -108,6 +108,17 @@ class Database:
         self._commit_barrier = commit_barrier
         # 写路径串行化：既保护单文件 DiskManager，也作为基准备份的写冻结门。
         self._write_lock = threading.RLock()
+        #: **引擎级语句锁**：Executor 把每条语句的状态（binder / 参数 / CTE
+        #: 作用域 / 递归工作表）存在实例字段上，所以同一个 Database 上不能
+        #: 有两条语句同时在跑。读语句不走 ``_write_lock``（备份期间要能继续
+        #: 读），于是"两个线程同时 SELECT"会互相覆盖 binder，拿到对方的参数
+        #: 或丢失 CTE 作用域。
+        #:
+        #: 这把锁只包住"引擎执行"这一段：它是 RLock、不参与 quiesce，
+        #: close()/snapshot() 仍然只拿 ``_write_lock``，所以"备份时读可以继续"
+        #: 的语义不变。要真正支持并发语句，必须把 Executor 的语句状态改成
+        #: 按调用传递的上下文（见 docs/concurrency.md 的路线）。
+        self._statement_lock = threading.RLock()
         self.disk = DiskManager(self.path / "lumendb.data")
         # 兼容旧库：如果已有单文件 WAL，继续用它；新库默认使用分段 WAL，
         # 这样 checkpoint 后可以回收旧段。
@@ -249,6 +260,10 @@ class Database:
                 "只读副本拒绝写入",
                 hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
             )
+        with self._statement_lock:
+            return self._run_locked(statement, params)
+
+    def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             with self._write_lock:
                 # [Review-Fix] 关闭/围栏检查必须在拿到 _write_lock **之后**：

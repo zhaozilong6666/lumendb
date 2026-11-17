@@ -62,7 +62,8 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 ```
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)、[`docs/storage-format.md`](docs/storage-format.md)；
-部署与排障（租约/fence/水位/故障剧本）见 [`docs/operations.md`](docs/operations.md)。
+部署与排障（租约/fence/水位/故障剧本）见 [`docs/operations.md`](docs/operations.md)；
+并发模型（三层串行化、为什么写并发度是 1、放开它的三步）见 [`docs/concurrency.md`](docs/concurrency.md)。
 
 ## 快速开始
 
@@ -221,7 +222,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1210 个自动化测试**（`python -m pytest tests -q`，约 20–120 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1213 个自动化测试**（`python -m pytest tests -q`，约 20–120 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
