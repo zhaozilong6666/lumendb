@@ -83,6 +83,26 @@ B+ 树分裂/合并要同时持有父页与子页，必须按 `page_id` 升序�
 
 探针：`D:\projects\lumendb-review\_probe_page_race.py`（`PYTHONPATH` 指向仓库
 后运行）。
+
+**已落地（2026-11-17，基础设施，尚未放开 `_write_lock`）**：
+
+- `Page.latch`（`threading.RLock`，进 `__slots__`）：`BufferPool` 对每个
+  `page_id` 只缓存一个 `Page` 对象，所以对象上的这把锁就是那一页的锁；
+  `Page.view()` 共享同一块 `buf`，也共享同一把 latch；
+- `HeapFile._apply_and_log` 与 `_insert_raw` **自锁**：读旧值 → 写日志 →
+  写页三步在 `page.latch` 内完成，交错时不会出现"后者的 before image 已经
+  含了前者的改动"；`_insert_raw` 在 latch 内**重新核算空间**，不够就返回
+  `None` 让调用方重选页（`insert` 最多重试 4 次）；
+- `BufferPoolManager.shape_lock(table_name)`：跨 `HeapFile` 实例共享的表级
+  "形状锁"，覆盖"读 `last_page` → 判空间 → 必要时追加新页 → 更新链尾指针"。
+  这一把必须挂在 BufferPool 上而不是 `HeapFile` 上——`HeapFile` 是每次执行
+  新建的短命对象，挂它身上两个写者各拿一把锁等于没锁；
+- 实测（同一探针）：RID 重复 **87 → 0**，表里扫到的行数 **513 → 600**。
+
+**仍未覆盖**：`bp.new_page()` 拿到 page_id 与把新页链上链尾之间的窗口、
+目录 `last_page`/`root_page` 的持久化与 catalog 重载之间的一致性。这两段要
+等"行/键锁 + 目录锁"一起做；在此之前 `Database._write_lock` 仍然串行所有写
+语句，页 latch 只是为放开设好的基础设施（本切片不改变对外并发语义）。
 ### 第 2 步：行锁 + 键锁 + 目录锁（替掉 L2）
 
 | 资源 | 何时加 | 模式 | 释放 |

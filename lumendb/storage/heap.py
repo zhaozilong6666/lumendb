@@ -57,6 +57,9 @@ class HeapFile:
         self._bp = buffer_pool
         self.table = table
         self._txns = txn_mgr
+        # 页链形状（链尾指针、last_page、新页分配）的保护：页 latch 只护住
+        # 单页内容，链的推进要靠这把跨 HeapFile 实例共享的表级锁。
+        self._shape_lock = buffer_pool.shape_lock(table.name)
 
     # ------------------------------------------------------------------
     # 页管理
@@ -100,17 +103,20 @@ class HeapFile:
 
     def _find_page_with_space(self, txn: Transaction, size: int) -> HeapPage:
         """从链尾向前找一段有空间的页；都满了就新开一页。"""
-        page_id = self.table.last_page
-        steps = 0
-        while page_id != INVALID_PAGE_ID and steps <= _MAX_BACKWARD_SCAN:
-            page = self._fetch(page_id)
-            if page.can_fit(size):
-                return page
-            prev_id = page.prev_page
-            self._release(page)
-            page_id = prev_id
-            steps += 1
-        return self._append_page(txn)
+        # "读 last_page → 判空间 → 必要时追加新页"必须原子，否则两个写者
+        # 会各追加一页，链尾指针互相覆盖（探针里表现为页链断开 + 丢行）。
+        with self._shape_lock:
+            page_id = self.table.last_page
+            steps = 0
+            while page_id != INVALID_PAGE_ID and steps <= _MAX_BACKWARD_SCAN:
+                page = self._fetch(page_id)
+                if page.can_fit(size):
+                    return page
+                prev_id = page.prev_page
+                self._release(page)
+                page_id = prev_id
+                steps += 1
+            return self._append_page(txn)
 
     # ------------------------------------------------------------------
     # 物理写入原语（都带 WAL）
@@ -124,37 +130,43 @@ class HeapFile:
         new: bytes,
         old: Optional[bytes] = None,
     ) -> None:
-        if old is None:
-            old = bytes(page.buf[offset : offset + len(new)])
-        self._bp.log_page_update(txn.xid, page, offset, old, new)
-        page.buf[offset : offset + len(new)] = new
-        self._bp.mark_dirty(page)
+        # 读旧值 → 写日志 → 写页三步必须原子：否则两个写者交错时，
+        # 后者的 before image 已经含了前者的改动，WAL 重放会算错。
+        with page.latch:
+            if old is None:
+                old = bytes(page.buf[offset : offset + len(new)])
+            self._bp.log_page_update(txn.xid, page, offset, old, new)
+            page.buf[offset : offset + len(new)] = new
+            self._bp.mark_dirty(page)
 
     def _insert_raw(self, txn: Transaction, page: HeapPage, payload: bytes) -> Optional[int]:
         """把一条已编码的记录放进页里，返回槽位号。"""
         size = len(payload)
-        if not page.can_fit(size):
-            return None
+        # 选页时看到的空间在并发写者插进来之后可能已经不够了，所以这里
+        # 在页 latch 里**重新核算**一次；核算失败返回 None，由调用方重选页。
+        with page.latch:
+            if not page.can_fit(size):
+                return None
 
-        slot = page.nslots
-        entry_off = 32 + 4 * slot
-        new_end = page.free_end - size
+            slot = page.nslots
+            entry_off = 32 + 4 * slot
+            new_end = page.free_end - size
 
-        # ① 页头：nslots / free_start / free_end
-        old_hdr = bytes(page.buf[2:8])
-        new_hdr = struct.pack("<HHH", slot + 1, entry_off + 4, new_end)
-        self._apply_and_log(txn, page, 2, new_hdr, old_hdr)
+            # ① 页头：nslots / free_start / free_end
+            old_hdr = bytes(page.buf[2:8])
+            new_hdr = struct.pack("<HHH", slot + 1, entry_off + 4, new_end)
+            self._apply_and_log(txn, page, 2, new_hdr, old_hdr)
 
-        # ② 槽目录项
-        old_slot = bytes(page.buf[entry_off : entry_off + 4])
-        new_slot = struct.pack("<HH", new_end, size)
-        self._apply_and_log(txn, page, entry_off, new_slot, old_slot)
+            # ② 槽目录项
+            old_slot = bytes(page.buf[entry_off : entry_off + 4])
+            new_slot = struct.pack("<HH", new_end, size)
+            self._apply_and_log(txn, page, entry_off, new_slot, old_slot)
 
-        # ③ 记录体
-        old_body = bytes(page.buf[new_end : new_end + size])
-        self._apply_and_log(txn, page, new_end, payload, old_body)
+            # ③ 记录体
+            old_body = bytes(page.buf[new_end : new_end + size])
+            self._apply_and_log(txn, page, new_end, payload, old_body)
 
-        return slot
+            return slot
 
     def _set_xmax(self, txn: Transaction, page: HeapPage, slot: int, xmax: int) -> None:
         """给某个版本打上"被谁删除/更新"的标记（行内 +8 处的 8 字节）。"""
@@ -304,20 +316,24 @@ class HeapFile:
                 detail=f"列：{', '.join(self.table.column_names)}",
             )
 
-        page = self._find_page_with_space(txn, len(payload))
-        try:
-            if page.nslots >= _MAX_SLOTS:
-                raise StorageError("页的槽位目录已满")
-            slot = self._insert_raw(txn, page, payload)
-            if slot is None:
-                raise StorageError(
-                    "页空间核算与实际写入不一致",
-                    detail=f"payload={len(payload)} free_space={page.free_space}",
-                )
-            self.table.row_count_hint += 1
-            return (page.page_id, slot)
-        finally:
-            self._release(page, dirty=True)
+        # 页 latch 只覆盖"页内结构 + 日志"；选页（页链/目录）仍是短锁覆盖
+        # 不到的窗口，所以并发写者把页写满后这里要**重选页**，不能直接报错。
+        for _attempt in range(4):
+            page = self._find_page_with_space(txn, len(payload))
+            try:
+                if page.nslots >= _MAX_SLOTS:
+                    raise StorageError("页的槽位目录已满")
+                slot = self._insert_raw(txn, page, payload)
+                if slot is None:
+                    continue
+                self.table.row_count_hint += 1
+                return (page.page_id, slot)
+            finally:
+                self._release(page, dirty=True)
+        raise StorageError(
+            "连续多页都装不下这条记录，放弃插入",
+            detail=f"payload={len(payload)} attempts=4",
+        )
 
     def _latest_version_rid(self, root_rid: RID) -> RID:
         """不判可见性，直接拿链上最新的物理版本。

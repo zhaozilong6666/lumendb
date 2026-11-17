@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import struct
 from enum import IntEnum
 from typing import Iterator, Optional, Tuple
@@ -56,13 +58,18 @@ class Page:
     子类（``HeapPage`` / B+ 树的叶页与内部页）在这层之上解释自己的布局。
     """
 
-    __slots__ = ("page_id", "buf")
+    __slots__ = ("page_id", "buf", "latch")
 
     def __init__(
         self,
         page_id: int = INVALID_PAGE_ID,
         data: Optional[bytes | bytearray] = None,
     ) -> None:
+        #: 页级 latch（短期锁）。页内容的读-改-日志-写必须在这一段里完成，
+        #: 否则两个写者会同时拿到同一个 slot（见 docs/concurrency.md 的
+        #: "第 2 步的前置"实测）。BufferPool 对每个 page_id 只缓存一个 Page
+        #: 对象，所以对象上的这把锁就是那一页的锁；``view()`` 共享同一把。
+        self.latch = threading.RLock()
         if data is None:
             self.buf = bytearray(PAGE_SIZE)
             self.page_id = page_id
@@ -143,6 +150,8 @@ class Page:
         obj = object.__new__(cls)
         obj.page_id = self.page_id
         obj.buf = self.buf
+        # 视图共享同一块字节，也必须共享同一把 latch（否则两把锁各锁各的）。
+        obj.latch = self.latch
         return obj
 
     def __repr__(self) -> str:  # pragma: no cover

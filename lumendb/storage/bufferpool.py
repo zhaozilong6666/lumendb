@@ -67,6 +67,10 @@ class BufferPoolManager:
         self._wal = wal
         self.pool_size = pool_size
         self._lock = threading.RLock()
+        #: 每张表一把"形状锁"（页链分配新页 / 目录字节），按表名共享。
+        #: ``HeapFile`` 是每次执行新建的短命对象，锁不能挂在它身上，否则两个
+        #: 写者各拿一把锁等于没锁（见 docs/concurrency.md 第 2 步的前置）。
+        self._shape_locks: dict[str, threading.RLock] = {}
         # page_id -> Page，按 LRU 顺序：最左是最近最少使用
         self._frames: "OrderedDict[int, Page]" = OrderedDict()
         self._pins: dict[int, int] = {}
@@ -78,6 +82,15 @@ class BufferPoolManager:
         self.stats = BufferPoolStats()
 
     # -- 查询状态 -----------------------------------------------------------
+
+    def shape_lock(self, table_name: str) -> threading.RLock:
+        """返回某张表的形状锁（页链追加 / 新页分配用），同库同名共享一把。"""
+        with self._lock:
+            lock = self._shape_locks.get(table_name)
+            if lock is None:
+                lock = threading.RLock()
+                self._shape_locks[table_name] = lock
+            return lock
 
     @property
     def size(self) -> int:
