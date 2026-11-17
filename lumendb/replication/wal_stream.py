@@ -37,8 +37,10 @@ from pathlib import Path
 from typing import Iterable
 
 from ..errors import RedirectError, StorageError, TransactionError
+from itertools import islice
+
 from ..storage.page import PAGE_SIZE
-from ..storage.wal import CRC_SIZE, LogRecord
+from ..storage.wal import CRC_SIZE, LogRecord, LogType
 from ._atomic import atomic_replace
 
 
@@ -628,17 +630,30 @@ class WALServer:
             self.primary.wal.retain_lsn = start_lsn
         self._refresh_retain()
 
-        count = 0
-        for record in self.primary.wal.iter_records(start_lsn + 1):
+        # 批必须切在**事务边界**。一条 DML 会拆成多条 WAL 记录（表页一条、
+        # 每个索引页各一条），按记录数硬切会让副本在组边界看到"表页已应用、
+        # 索引页未应用"——顺序扫描与索引扫描对不上，严重时 BTreeInvariantError
+        # （见 docs/replication-correctness.md）。
+        #
+        # 做法：先取 max_records 条，再回退到批内**最后一个** COMMIT/ABORT 之后。
+        # 批内一个事务都没结束时（单事务超过 max_records）只能整批发出去，
+        # 退化到"下一批继续"，此时窗口仍在但不会卡死。
+        limit = max_records if max_records else None
+        stream = self.primary.wal.iter_records(start_lsn + 1)
+        records = list(islice(stream, limit)) if limit else list(stream)
+        cut = len(records)
+        for index, record in enumerate(records):
+            if record.rtype in (LogType.COMMIT, LogType.ABORT):
+                cut = index + 1
+        if cut < len(records):
+            records = records[:cut]
+        for record in records:
             _send_line(
                 conn,
                 _record_to_json(record),
                 compress=compress,
                 binary_records=binary_records,
             )
-            count += 1
-            if max_records and count >= max_records:
-                break
         _send_line(
             conn,
             {"type": "end", "next_lsn": self.primary.wal.next_lsn},

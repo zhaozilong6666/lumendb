@@ -383,7 +383,11 @@ class Replica:
         start = 0
         total = len(todo)
         while start < total:
-            size = chunk
+            # 切点必须落在事务结束（COMMIT/ABORT）之后：一条 DML 的 WAL
+            # 是"表页记录 + 各索引页记录"，切在事务中间会让读者看到
+            # "表页已应用、索引页未应用"（docs/replication-correctness.md）。
+            # 服务端 fetch 已经保证批以事务边界结尾，所以这里通常一次就切到。
+            size = self._transaction_cut(todo, start, total, chunk)
             with self._lock:
                 if self.db is not database or getattr(database, "_closed", False):
                     break
@@ -412,6 +416,26 @@ class Replica:
                         if retain is not None:
                             primary.wal.retain_lsn = self._applied_lsn
         return count
+
+    def _transaction_cut(self, todo, start: int, total: int, chunk: int) -> int:
+        """返回从 ``start`` 开始的一段长度，使其结束在事务边界上。
+
+        优先在 ``chunk`` 窗口内找最后一个 COMMIT/ABORT；窗口内没有，就向后
+        延伸到最近的边界（保证一个事务不会被切成两半）；整批都没有边界
+        （单事务超长或跨批）时退回批尾——此时原子性由"下一批继续"兜底，
+        代价是窗口仍然存在，但不能让 apply 无限延长。
+        """
+        limit = min(total, start + chunk)
+        cut = None
+        for index in range(start, limit):
+            if todo[index].rtype in (LogType.COMMIT, LogType.ABORT):
+                cut = index + 1
+        if cut is not None:
+            return cut - start
+        for index in range(limit, total):
+            if todo[index].rtype in (LogType.COMMIT, LogType.ABORT):
+                return index + 1 - start
+        return total - start
 
     def _apply_records(self, records, primary: Database | None) -> int:
         """在已持有数据锁的前提下应用一段记录（连续性与幂等检查在内）。"""

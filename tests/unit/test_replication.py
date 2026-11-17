@@ -798,11 +798,14 @@ class TestReplica:
             assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(10,)]
             for i in range(10, 40):
                 primary.execute_one(f"INSERT INTO t VALUES ({i})")
-            # 第一批只拉 10 条——然后"网络中断"（服务端直接停止）。
+            # 第一批最多拉 10 条——然后"网络中断"（服务端直接停止）。
+            # 注意 ``max_records`` 是**上限**：服务端会把批截断到最后一个
+            # COMMIT/ABORT（事务边界），所以实际条数可能更少（一条 DML 会
+            # 产生表页 + 索引页多条记录）。见 docs/replication-correctness.md。
             applied = replica.replicate_from_server(
                 server.host, server.port, max_records=10, replica_id="r1"
             )
-            assert applied == 10
+            assert 0 < applied <= 10
             server.stop()
 
             # 中断期间主库继续写入；重启一个服务同一主库、同一槽位目录。
