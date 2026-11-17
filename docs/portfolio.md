@@ -81,7 +81,13 @@
 > - 处理降级/关闭与在途 SQL 的竞争：`close()` 先等待只读语句退出，再回滚线上未提交事务并关闭句柄；
 >   pgwire 的写/COMMIT/SAVEPOINT 路径与 `Database._write_lock` 对齐，避免 step_down 之后仍有写落到已关闭的 WAL。
 > - 把"每条 DML 都全量重写系统目录"改成"结构指纹变化才写"：目录持久化是整链重建 + 全页 before/after WAL，此前逐行 INSERT 会写 13 KB/行；现在按（表 root_page / last_page / 各索引 root_page）的整目录指纹判定，只在新页分配或索引重建时落盘，`row_count_hint` 降级为可丢的内存提示。逐行插入 WAL 从13,006 B/行降到 794 B/行（**1/16.4，−93.9%**），并补了"分配首页必须落盘""跨页插入后重开页链完整""单页内插入不重写目录"三条回归用例。
-> - 1223 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 让只读语句不再写 WAL：自动提交的 SELECT/EXPLAIN/SHOW 此前也写
+>   BEGIN/COMMIT 记录，组提交的 leader 必然 fsync ——**每条 SELECT 都要落盘一次**。
+>   只读事务改为不写记录、只登记快照起点（仍阻止 checkpoint 回收旧版本页），
+>   pgwire 的读路径改走 `read_guard()` 不拿写者锁。同机 100 次
+>   `SELECT COUNT(*)` 实测：WAL 4,200 B → **0 B**，单次延迟 1.45–1.52 ms →
+>   **0.18 ms（1/8.3，−88%）**。
+> - 1231 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -203,7 +209,15 @@
 >   13,006 B/row to 794 B/row (**16.4x less, -93.9%**) with three regression
 >   tests (first-page allocation must persist, page chain survives reopen,
 >   single-page inserts do not rewrite the catalog).
-> - 1223 automated tests including crash-injection and a 20-seed randomized
+> - Read-only statements no longer write WAL: auto-commit SELECT/EXPLAIN/SHOW
+>   used to append BEGIN/COMMIT records, and the group-commit leader always
+>   calls fsync, so every single SELECT paid a durable write. Read-only
+>   transactions now skip the records and only register their snapshot start
+>   (still blocking checkpoint from recycling versions they may read), and the
+>   wire-protocol read path uses `read_guard()` without the writer lock.
+>   Measured over 100 `SELECT COUNT(*)`: WAL 4,200 B -> **0 B**, per-statement
+>   latency 1.45-1.52 ms -> **0.18 ms (8.3x faster, -88%)**.
+> - 1231 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）

@@ -364,7 +364,9 @@ class Database:
         if self._txn is not None:
             return self.executor.run(statement, self._txn, params)
 
-        txn = self.txns.begin()
+        txn = self.txns.begin(
+            read_only=type(statement).__name__ in _PURE_READ_STATEMENTS
+        )
         try:
             result = self.executor.run(statement, txn, params)
             # [Review-Fix] 延迟约束只可能被写语句弄坏；对 SELECT / EXPLAIN /

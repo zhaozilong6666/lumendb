@@ -89,6 +89,10 @@ class Transaction:
     #: 自动提交的 SELECT 也会 begin/commit 一对，不能因为旧主被 fence 掉
     #: 就连读都不让做。
     wrote: bool = False
+    #: 入口就确定"这条语句只会读"的事务（自动提交的 SELECT/EXPLAIN/SHOW）。
+    #: 它们不写 BEGIN/COMMIT/ABORT 记录，所以既不争 WAL 锁，也不在提交时
+    #: 触发 fsync；MVCC 只需要内存里的结局表。
+    read_only: bool = False
 
     def require_active(self) -> None:
         if self.state is not TxnState.ACTIVE:
@@ -161,15 +165,31 @@ class TransactionManager:
 
     # -- 生命周期 -----------------------------------------------------------
 
-    def begin(self) -> Transaction:
+    def begin(self, read_only: bool = False) -> Transaction:
+        """开启事务。
+
+        ``read_only=True`` 给"入口就确定只读"的语句用（自动提交的
+        SELECT / EXPLAIN / SHOW）：不写 BEGIN 记录，因此不抢 WAL 写锁、
+        不在提交时触发 fsync。只读事务不产生任何页写，崩溃恢复不需要
+        认识它；但它的快照起点仍登记进 ``_active_starts``，否则长读事务
+        要读的旧版本页会被 checkpoint 提前回收。
+        """
         with self._lock:
             xid = self._allocate_xid()
             active_at_start = frozenset(self._active)
-            txn = Transaction(xid=xid, snapshot_xid=xid, active_at_start=active_at_start)
+            txn = Transaction(
+                xid=xid,
+                snapshot_xid=xid,
+                active_at_start=active_at_start,
+                read_only=read_only,
+            )
             self._states[xid] = TxnState.ACTIVE
             self._active.add(xid)
             self._txns[xid] = txn
-            txn.first_lsn = self._wal.begin(xid)
+            if read_only:
+                txn.first_lsn = self._wal.next_lsn
+            else:
+                txn.first_lsn = self._wal.begin(xid)
             txn.last_lsn = txn.first_lsn
             self._active_starts[xid] = txn.first_lsn
             self._current = txn
@@ -179,6 +199,12 @@ class TransactionManager:
         follower = False
         with self._lock:
             txn.require_active()
+            if txn.read_only and not txn.wrote:
+                # 只读事务没有要持久化的东西：不写 COMMIT 记录、不进组提交
+                # 队列、不触发 fsync。这是"每次 SELECT 都 fsync 一次"的
+                # 根因——组提交的 leader 必然调 wal.flush()。
+                self._mark_committed(txn)
+                return
             # [Review-Fix] 提交点复检写围栏：租约/任期可能在语句执行期间
             # 已经过期或被更高的任期取代。此处抛错 → COMMIT 记录不会被
             # 追加，调用方 abort，没有“已持久化的已提交事务”产生。
@@ -305,6 +331,18 @@ class TransactionManager:
     def abort(self, txn: Transaction) -> None:
         with self._lock:
             if txn.state is not TxnState.ACTIVE:
+                return
+            if txn.read_only and not txn.wrote:
+                # 同理：没有页写要撤销，也不该往 WAL 追加 ABORT 再 flush。
+                txn.state = TxnState.ABORTED
+                self._states[txn.xid] = TxnState.ABORTED
+                self._active.discard(txn.xid)
+                self._active_starts.pop(txn.xid, None)
+                self._txns.pop(txn.xid, None)
+                if self._current is txn:
+                    self._current = None
+                self._release_locks(txn.xid)
+                self._prune_states()
                 return
             # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
             # 这样 CatalogStore 的 root 回滚看到的是旧根页号，不会误判。

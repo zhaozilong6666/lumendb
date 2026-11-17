@@ -353,6 +353,21 @@ class PGWireServer:
             with database.read_guard():
                 return session.engine().run(statement, session.txn, params)
 
+        if type(statement).__name__ in _PURE_READ_STATEMENTS:
+            # 自动提交的只读语句：不拿写者锁、不写 WAL（不会 fsync），
+            # 只靠 read_guard 与 close()/降级互斥。
+            with database.read_guard():
+                txn = database.txns.begin(read_only=True)
+                try:
+                    result = session.engine().run(statement, txn, params)
+                except BaseException:
+                    database.txns.abort(txn)
+                    session.portals.clear()
+                    raise
+                database.txns.commit(txn)
+                session.portals.clear()
+                return result
+
         with database._write_lock:
             if database._closed:
                 raise StorageError("数据库已关闭")

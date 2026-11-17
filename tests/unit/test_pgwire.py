@@ -890,3 +890,44 @@ class TestExtendedQuery:
 
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         db.close()
+
+class TestWireReadOnlyStatements:
+    """线协议上自动提交的 SELECT 走只读事务：不写 WAL、不触发 fsync。"""
+
+    def test_select_over_wire_does_not_write_wal(self, tmp_path):
+        db = Database(tmp_path / "db", checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        server = PGWireServer(db)
+        base = db.wal.next_lsn
+
+        async def body(port):
+            reader, writer = await _connect(port)
+            for _ in range(20):
+                msgs = await _query(reader, writer, "SELECT COUNT(*) FROM t")
+                rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
+                assert rows == [["1"]]
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        assert db.wal.next_lsn == base, "线协议只读语句不应写 WAL"
+        assert db.txns.active_xids == []
+        db.close()
+
+    def test_insert_over_wire_still_writes_wal(self, tmp_path):
+        db = Database(tmp_path / "db", checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        server = PGWireServer(db)
+        base = db.wal.next_lsn
+
+        async def body(port):
+            reader, writer = await _connect(port)
+            await _query(reader, writer, "INSERT INTO t VALUES (7)")
+            writer.close()
+            await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        assert db.wal.next_lsn > base, "写语句必须继续写 WAL"
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        db.close()

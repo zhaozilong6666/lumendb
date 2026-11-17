@@ -116,11 +116,34 @@ WAL 体积降到 **1/16.4（−93.9%）**。注意：批量 INSERT（一条 SQL 
 本来就只有一次 persist，所以 `bench.replication` 的批量场景看不出差异；
 受益的是逐行写入的真实路径（CLI 单条执行、pgwire 单条 INSERT）。
 
-### 第 1.6 步：服务端并发（还没做）
+### 第 1.7 步：只读语句不再写 WAL（已完成，2026-11-17）
+
+自动提交的 `SELECT` / `EXPLAIN` / `SHOW` 此前也走 `txns.begin()` + `txns.commit()`，
+会在 WAL 里写一对 BEGIN/COMMIT 记录，而组提交的 leader 必然调 `wal.flush()`
+——**每一次 SELECT 都要 fsync 一次**。实测（同机，100 次 `SELECT COUNT(*)`）：
+
+| 版本 | WAL 增量 | 每次 SELECT |
+|---|---:|---:|
+| begin/commit 照写 | 4,200 B | 1.45–1.52 ms |
+| 只读事务不写记录 | **0 B** | **0.18 ms** |
+
+延迟降到 **1/8.3（−88%）**。做法：
+
+- `TransactionManager.begin(read_only=True)` 跳过 `wal.begin()`，只把当前
+  `next_lsn` 记成快照起点（仍登记进 `_active_starts`，长读事务要阻止
+  checkpoint 回收它还要读的旧版本页）；
+- `commit()` / `abort()` 对只读事务直接改内存结局表，不写记录、不触发
+  fsync（只读事务没有页写，崩溃恢复不需要认识它）；
+- `Database._run` 与 pgwire 的自动提交路径都按语句类型选 `read_only`；
+  pgwire 里只读语句走 `read_guard()`，不拿写者锁。
+- 显式 `BEGIN ... SELECT ... COMMIT` 仍是普通事务（入口无法预知后续语句）。
+
+### 第 1.8 步：服务端并发（还没做）
 
 `PGWireServer` 目前用一把 asyncio 锁把**所有连接的所有语句**串起来，所以即使每个
 会话已经有独立执行器，两个连接的长查询仍然排队——这与文档里"读并发"的说法有落差。
-放开它需要同时确认三件事：
+只读语句已经不写 WAL 了（第 1.7 步），所以放进线程池并发执行的最大共享点
+（`WAL` 锁与 fsync）已经消失。放开它需要同时确认三件事：
 
 1. 读语句不写共享可变状态（`Catalog` 只读、`BufferPool` 自带锁、`_check_cache` 已按
    执行器隔离）；
