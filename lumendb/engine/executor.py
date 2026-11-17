@@ -1,4 +1,4 @@
-"""执行引擎：把绑定后的计划跑成结果，以及 DDL / DML 的实际落地。
+﻿"""执行引擎：把绑定后的计划跑成结果，以及 DDL / DML 的实际落地。
 
 火山模型（Volcano / iterator model）：每个计划节点是一个生成器，一次产出
 一行，上游 `next()` 驱动下游。优点是实现简单、内存占用与数据量无关；缺点
@@ -2786,12 +2786,16 @@ class Executor:
         )
         return Result(tag="DROP INDEX", notice=notice)
 
-    def _snapshot_table_state(self, table, txn: Transaction) -> None:
-        """登记 DML 对表/索引根页号的逆操作。
+    def _snapshot_table_state(self, table, txn: Transaction):
+        """登记 DML 对表/索引根页号的逆操作，并返回 DML 前的结构状态。
 
         堆表插入可能分配新页并修改 ``root_page``/``last_page``，索引插入可能
         更换 B+ 树根页；这些字段在 Catalog 对象上原地变化，如果事务回滚只
         撤销页内容而不撤销这些指针，内存目录就会指向已经恢复成空页的页。
+
+        返回值 ``(root_page, last_page, row_count_hint, {索引: 根页})``
+        供 :meth:`_persist_if_structure_changed` 判断本次 DML 是否真的改了
+        结构，从而决定要不要把目录落盘。
         """
         state = (
             table.root_page,
@@ -2810,6 +2814,45 @@ class Executor:
                     idx.root_page = root_page
 
         txn.undo_log.append(undo)
+        return state
+
+    def _catalog_structure_fingerprint(self) -> tuple:
+        """整个目录的**结构性字段**指纹（不含 row_count_hint 等统计 hint）。
+
+        用整目录而不是单表：级联操作（``ON UPDATE CASCADE`` / ``SET NULL``）
+        会改子表，子表也可能分配新页。目录的 ``persist`` 本来就是全量保存，
+        指纹对上"全量"才是同一个粒度。
+        """
+        return tuple(
+            (
+                name,
+                table.root_page,
+                table.last_page,
+                tuple(
+                    (iname, idx.root_page)
+                    for iname, idx in table.indexes.items()
+                ),
+            )
+            for name, table in sorted(self._catalog.tables.items())
+        )
+
+    def _persist_if_structure_changed(self, before, txn: Transaction) -> None:
+        """DML 只在**结构**变化时持久化目录（写并发第 1 步的落地）。
+
+        目录里的 ``row_count_hint`` 是统计 hint：DML 更新它在内存里供
+        planner 用，但不逐笔落盘——重启后回退到上次结构性写入时的值，
+        查询结果不变，代价只是优化器的行数估计暂时偏保守。
+
+        ``root_page`` / ``last_page`` / 索引 ``root_page`` 是结构性的：
+        ``HeapFile._append_page`` 用 ``last_page`` 把新页链到链尾，崩
+        溃恢复后如果 ``last_page`` 是旧值，下一次分配会把新页链到旧的
+        链尾上，覆盖它已有的 ``next`` 指针。所以这些字段一变就必须
+        ``persist``。目录的整链保存（一条新页链 + 每页全页 WAL 镜像）
+        因此从"每行一次"降到"每分配一页一次"。
+        """
+        if self._catalog_structure_fingerprint() != before:
+            self._catalog.mark_dirty()
+            self._catalog.persist(txn)
 
     def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
         """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
@@ -3028,9 +3071,10 @@ class Executor:
     def _insert(self, stmt: Insert, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         self._snapshot_table_state(table, txn)
+        before = self._catalog_structure_fingerprint()
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.query is not None:
-            return self._insert_select(stmt, table, heap, txn)
+            return self._insert_select(stmt, table, heap, txn, before)
         if stmt.ctes:
             # 即使 VALUES 不读表，CTE 里的 SQL 也必须被解析/绑定，不能静默跳过
             self.binder.bind_ctes(stmt.ctes)
@@ -3102,8 +3146,7 @@ class Executor:
                 if returning_row is not None:
                     returned.append(returning_row)
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_if_structure_changed(before, txn)
         self._active_ctes = {}
         return Result(
             columns=ret_cols,
@@ -3397,7 +3440,9 @@ class Executor:
                             ]
         return list(pending.values())
 
-    def _insert_select(self, stmt: Insert, table, heap, txn: Transaction) -> Result:
+    def _insert_select(
+        self, stmt: Insert, table, heap, txn: Transaction, before
+    ) -> Result:
         if stmt.ctes:
             plan, out_cols = self.binder.bind_query(
                 Query(select=stmt.query, ctes=stmt.ctes)
@@ -3454,8 +3499,7 @@ class Executor:
             if returning_row is not None:
                 returned.append(returning_row)
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_if_structure_changed(before, txn)
         self._active_ctes = {}
         return Result(
             columns=ret_cols,
@@ -3549,6 +3593,7 @@ class Executor:
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         self._snapshot_table_state(table, txn)
+        before = self._catalog_structure_fingerprint()
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.ctes:
             self.binder.bind_ctes(stmt.ctes)
@@ -3627,8 +3672,7 @@ class Executor:
                 )
             updated += 1
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_if_structure_changed(before, txn)
         self._active_ctes = {}
         return Result(
             columns=ret_cols,
@@ -3640,6 +3684,7 @@ class Executor:
     def _delete(self, stmt: Delete, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         self._snapshot_table_state(table, txn)
+        before = self._catalog_structure_fingerprint()
         heap = HeapFile(self._bp, table, self._txns)
         if stmt.ctes:
             self.binder.bind_ctes(stmt.ctes)
@@ -3734,8 +3779,7 @@ class Executor:
                 child_new,
             )
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_if_structure_changed(before, txn)
         self._active_ctes = {}
         return Result(
             columns=ret_cols,
