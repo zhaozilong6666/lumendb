@@ -104,6 +104,15 @@ class Session:
     txn: Optional[Any] = None
     #: 事务里出过错之后，PostgreSQL 语义是"只能 ROLLBACK"
     failed: bool = False
+    #: 本连接自己的执行器：Executor 的语句状态（binder/参数/CTE 作用域）在
+    #: 实例上，多个连接共用一个执行器时只能靠外层锁串行。每个会话一个执行器
+    #: 是放开语句并发的前置条件（见 docs/concurrency.md）。
+    executor: Optional[Any] = None
+
+    def engine(self):
+        if self.executor is None:
+            self.executor = self.database.make_executor()
+        return self.executor
 
 
 class PGWireServer:
@@ -280,8 +289,8 @@ class PGWireServer:
                     # 校验，否则 DEFERRABLE INITIALLY DEFERRED 的外键/唯一约束在
                     # psql/pgwire 连接上完全失效：提交时静默写入悬空引用。
                     try:
-                        database.executor.validate_deferred_foreign_keys(txn)
-                        database.executor.validate_deferred_unique_constraints(txn)
+                        session.engine().validate_deferred_foreign_keys(txn)
+                        session.engine().validate_deferred_unique_constraints(txn)
                     except BaseException:
                         database.txns.abort(txn)
                         raise
@@ -340,9 +349,9 @@ class PGWireServer:
                 # 之后仍可能有一条 INSERT 把页写到已关闭的句柄上。
                 with database._write_lock:
                     database.assert_writable()
-                    return database.executor.run(statement, session.txn, params)
+                    return session.engine().run(statement, session.txn, params)
             with database.read_guard():
-                return database.executor.run(statement, session.txn, params)
+                return session.engine().run(statement, session.txn, params)
 
         with database._write_lock:
             if database._closed:
@@ -351,13 +360,13 @@ class PGWireServer:
             try:
                 if type(statement).__name__ not in _PURE_READ_STATEMENTS:
                     database.assert_writable()
-                result = database.executor.run(statement, txn, params)
+                result = session.engine().run(statement, txn, params)
                 # [Review-Fix] 隐式事务的提交点同样要补检延迟约束。否则单条
                 # ``INSERT INTO child ...`` 就能写入一条没有父行的引用：
                 # 校验被"延迟"了，而这条路径上根本没有人来补检。
                 if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-                    database.executor.validate_deferred_foreign_keys(txn)
-                    database.executor.validate_deferred_unique_constraints(txn)
+                    session.engine().validate_deferred_foreign_keys(txn)
+                    session.engine().validate_deferred_unique_constraints(txn)
             except BaseException:
                 database.txns.abort(txn)
                 # 隐式事务失败后同样没有仍然有效的门户。
@@ -563,7 +572,7 @@ class PGWireServer:
             placeholders = [None] * len(stmt.param_oids)
             try:
                 async with self._lock:
-                    columns = session.database.executor.describe(
+                    columns = session.engine().describe(
                         stmt.parsed, placeholders
                     )
             except UndefinedParameterError:
@@ -584,7 +593,7 @@ class PGWireServer:
         # 拿列信息，导致同一条 INSERT 在 Describe + Execute 中执行两次。
         async with self._lock:
             try:
-                columns = session.database.executor.describe(
+                columns = session.engine().describe(
                     portal.statement.parsed, portal.params
                 )
             except LumenError as exc:

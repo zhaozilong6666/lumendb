@@ -184,6 +184,27 @@ class Database:
         self._commit_barrier = barrier
         self.txns.set_commit_barrier(barrier)
 
+    def make_executor(self) -> Executor:
+        """为**一个会话**创建独立的执行器（共享缓冲池/目录/事务/锁）。
+
+        `Executor` 把每条语句的状态（binder、`$n` 参数、CTE 作用域、递归工作表）
+        存在实例字段上，所以"同一个执行器"天生只能串行使用。要并发跑语句，
+        最小的一步不是重写执行器，而是让每个会话拿一个自己的执行器：
+        它们共享 `bp/catalog/txns/wal/locks`，只有语句状态是私有的。
+
+        真正的写并发还需要行/键锁（见 docs/concurrency.md 第 2 步）；
+        在那之前，独立执行器只保证"互不踩状态"，不保证同时写同一份数据安全。
+        """
+        return Executor(
+            self.bp,
+            self.catalog,
+            self.txns,
+            self.wal,
+            self.disk,
+            self.locks,
+            read_only=self._read_only,
+        )
+
     def assert_writable(self) -> None:
         """写围栏的**唯一入口**。
 

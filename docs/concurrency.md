@@ -38,14 +38,22 @@
 
 ## 2. 放开写并发的三步
 
-### 第 1 步：语句状态外置（不改语义）
+### 第 1 步：执行器按会话隔离（已完成，`9922875` / 本轮）
 
-- 新增 `StatementContext`（binder、params、active_ctes、recursive_rows、profile、
-  txn），`Executor.run` 接收它而不是写 `self._*`；
-- `Database` 为**每个会话**准备一个 `Executor`（`PGWireServer.Session` 一个），
-  CLI 路径仍用一个；
-- 验收：`tests/unit/test_concurrent_statements.py` 在**去掉 L1** 的情况下依然全绿
-  （现在是靠 L1 才绿）；这是"状态真的外置了"的判据。
+两条路可以做到"语句状态不被共享"，选的是成本低的那条：
+
+| 方案 | 内容 | 成本 |
+|---|---|---|
+| A | 把状态放进 `StatementContext`，`Executor.run` 逐层传递 | 要改 4400 行执行器里所有 `self.binder/self._params/self._active_ctes/self._txn` 的读写点 |
+| **B（已采用）** | `Executor` 保持"实例即语句状态"，但**每个会话一个执行器**：`Database.make_executor()`，`PGWireServer.Session.engine()` 懒创建，共享 `bp/catalog/txns/wal/locks` | 新增 12 行 + 一处 `session.engine()` 替换 |
+
+B 的代价是"并发度 = 执行器个数"，而不是"任意并发"；`Database.execute` 仍然只有
+一个执行器，所以 L1 保留。B 的收益是不动执行器内部就拿到了隔离，且为第 2 步
+（行锁）准备好"多会话并行"的骨架。
+
+**验收（已满足）**：`tests/unit/test_concurrent_statements.py::TestPerSessionExecutor`
+直接绕过 `Database._run` 调两个执行器并发跑 CTE 查询与参数化查询，结果互不影响——
+等价于"L1 不存在时仍然正确"。
 
 风险：`Binder` 的 `outer_schemas` / 视图展开缓存、`_check_cache` 也要一起搬；
 `_profile` 是 `EXPLAIN ANALYZE` 用的，必须按调用隔离，否则两个分析互相污染。
@@ -79,6 +87,18 @@
   改**同一行**必须 40001、父子表交叉更新必须靠等待图检出死锁（40P01）。
 
 ---
+
+### 第 1.5 步：服务端并发（还没做）
+
+`PGWireServer` 目前用一把 asyncio 锁把**所有连接的所有语句**串起来，所以即使每个
+会话已经有独立执行器，两个连接的长查询仍然排队——这与文档里"读并发"的说法有落差。
+放开它需要同时确认三件事：
+
+1. 读语句不写共享可变状态（`Catalog` 只读、`BufferPool` 自带锁、`_check_cache` 已按
+   执行器隔离）；
+2. 写语句仍然由行/键锁互斥（第 2 步没做完之前，写必须继续串行）；
+3. 备份/降级（`snapshot()`/`close()`）持有 `_write_lock` 时就等于"写静止点"，
+   读可以继续，但不能让新事务在备份过程中开始写。
 
 ## 3. 已知的取舍（写在这里，避免下一轮再讨论一遍）
 

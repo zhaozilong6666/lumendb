@@ -93,3 +93,69 @@ def test_writes_and_reads_from_threads_are_serialized_not_corrupted(db):
     _run_threads(work, 9)
     total = db.execute_one("SELECT COUNT(*) FROM t").rows[0][0]
     assert total == 3 + 3  # 9 个任务里 index 0/3/6 各插一行
+
+
+class TestPerSessionExecutor:
+    """每个会话一个执行器：语句状态私有，底层（页/目录/事务）共享。"""
+
+    def test_sessions_get_independent_executors(self, db):
+        from lumendb.server.pgwire import PGWireServer, Session
+
+        server = PGWireServer(db)
+        first, second = Session(database=db), Session(database=db)
+        assert first.engine() is not second.engine()
+        assert first.engine() is not db.executor
+        # 共享的底层对象必须是同一份（否则事务/页缓存不共享）
+        assert first.engine()._bp is db.bp
+        assert first.engine()._catalog is db.catalog
+        assert first.engine()._txns is db.txns
+        _ = server
+
+    def test_two_executors_can_run_cte_and_param_queries_concurrently(self, db):
+        """两个执行器同时跑：各自的 CTE 作用域 / 参数互不影响。
+
+        这条用例不经过 Database._statement_lock（直接调 executor），
+        等价于"L1 已经不存在"时并发是否安全。
+        """
+        engines = [db.make_executor(), db.make_executor()]
+        txn = db.txns.begin()
+        results: dict[int, list] = {}
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2, timeout=5)
+
+        def work(index: int) -> None:
+            engine = engines[index]
+            try:
+                barrier.wait()
+                if index == 0:
+                    rows = list(
+                        engine.run(
+                            __import__("lumendb.sql.parser", fromlist=["parse_sql"]).parse_sql(
+                                "WITH c AS (SELECT a FROM t WHERE a > 1) SELECT a FROM c ORDER BY a")
+                            [0],
+                            txn,
+                        ).rows
+                    )
+                else:
+                    rows = list(
+                        engine.run(
+                            __import__("lumendb.sql.parser", fromlist=["parse_sql"]).parse_sql(
+                                "SELECT a FROM t WHERE a = $1")
+                            [0],
+                            txn,
+                            [3],
+                        ).rows
+                    )
+                results[index] = rows
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        db.txns.commit(txn)
+        assert not errors, errors
+        assert results[0] == [(2,), (3,)]
+        assert results[1] == [(3,)]
