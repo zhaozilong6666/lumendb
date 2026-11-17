@@ -87,7 +87,14 @@
 >   pgwire 的读路径改走 `read_guard()` 不拿写者锁。同机 100 次
 >   `SELECT COUNT(*)` 实测：WAL 4,200 B → **0 B**，单次延迟 1.45–1.52 ms →
 >   **0.18 ms（1/8.3，−88%）**。
-> - 1231 个自动化测试（含崩溃注入），CI 覆盖 Ubuntu/Windows × Python 3.12/3.13。
+> - 服务端并发：语句执行移入线程池（`min(32, cpu+4)` 个工作线程），
+>   每个 wire 会话一个独立执行器，只读语句走 `read_guard()` 不拿写者锁；
+>   写语句仍由 `_write_lock` 完全串行（行/键锁未做前的刻意选择）。目录访问加
+>   叶子 RLock（23 个方法），避免 CPython 的
+>   "dictionary changed size during iteration"。两条连接各跑一条 sleep(0.12)
+>   的 SELECT 总耗时 < 0.228 s（串行应 ≥ 0.24 s），慢查询期间新连接握手不被阻塞。
+> - 1233 个自动化测试（含崩溃注入），全量套件跑完 75 s，CI 覆盖
+>   Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
 
@@ -217,8 +224,17 @@
 >   wire-protocol read path uses `read_guard()` without the writer lock.
 >   Measured over 100 `SELECT COUNT(*)`: WAL 4,200 B -> **0 B**, per-statement
 >   latency 1.45-1.52 ms -> **0.18 ms (8.3x faster, -88%)**.
-> - 1231 automated tests including crash-injection and a 20-seed randomized
->   crash-consistency suite; CI matrix covers Ubuntu/Windows × Python 3.12/3.13.
+> - Server-side concurrency: statement execution runs on a worker pool
+>   (`min(32, cpu+4)` threads) with one executor per wire session; read-only
+>   statements take `read_guard()` instead of the writer lock, while writes
+>   stay fully serialized on `_write_lock` (deliberate until row/key locks
+>   land). Catalog access is guarded by a leaf RLock (23 methods) so a DDL
+>   thread cannot mutate a dict mid-iteration. Two connections each running
+>   a sleep(0.12) SELECT finish in under 0.228 s (serial would be >= 0.24 s),
+>   and a new connection's handshake is not blocked during a slow query.
+> - 1233 automated tests including crash-injection and a 20-seed randomized
+>   crash-consistency suite (full run 75 s); CI matrix covers
+>   Ubuntu/Windows × Python 3.12/3.13.
 
 ## 七个可深挖的点（面试主力）
 

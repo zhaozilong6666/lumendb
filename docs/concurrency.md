@@ -138,18 +138,38 @@ WAL 体积降到 **1/16.4（−93.9%）**。注意：批量 INSERT（一条 SQL 
   pgwire 里只读语句走 `read_guard()`，不拿写者锁。
 - 显式 `BEGIN ... SELECT ... COMMIT` 仍是普通事务（入口无法预知后续语句）。
 
-### 第 1.8 步：服务端并发（还没做）
+### 第 1.8 步：服务端并发（已完成，2026-11-17）
 
-`PGWireServer` 目前用一把 asyncio 锁把**所有连接的所有语句**串起来，所以即使每个
-会话已经有独立执行器，两个连接的长查询仍然排队——这与文档里"读并发"的说法有落差。
-只读语句已经不写 WAL 了（第 1.7 步），所以放进线程池并发执行的最大共享点
-（`WAL` 锁与 fsync）已经消失。放开它需要同时确认三件事：
+`PGWireServer` 此前用一把 asyncio 锁把**所有连接的所有语句**串起来，而且语句是
+同步阻塞调用，留在事件循环线程里会把所有连接的网络 IO 一起卡住。现在：
 
-1. 读语句不写共享可变状态（`Catalog` 只读、`BufferPool` 自带锁、`_check_cache` 已按
-   执行器隔离）；
-2. 写语句仍然由行/键锁互斥（第 2 步没做完之前，写必须继续串行）；
-3. 备份/降级（`snapshot()`/`close()`）持有 `_write_lock` 时就等于"写静止点"，
-   读可以继续，但不能让新事务在备份过程中开始写。
+- 语句执行（`_run_statements` / `_run_statement` / `Describe`）放进
+  `ThreadPoolExecutor`（`min(32, cpu+4)` 个工作线程），用
+  `loop.run_in_executor` 等待；网络读写与协议编解码仍在事件循环线程；
+- 原来那把全局 asyncio 锁**删掉**了：写语句的互斥由 `Database._write_lock`
+  （threading RLock）继续保证，只读语句走 `read_guard()`，两者都不依赖事件循环；
+- 每个会话一个执行器（第 1 步）保证 `Executor` 的 binder / `$n` 参数 / CTE 作用域
+  不跨连接串味；
+- `Catalog` 加了一把 RLock（`@_locked`，23 个读/写方法）：CPython 保证单次 dict
+  操作原子，但**迭代**期间被 DDL 改会抛 `RuntimeError: dictionary changed size
+  during iteration`。目录锁是叶子锁（持有 `_write_lock` 的写路径可以继续拿它，
+  反向不存在），所以不引入 ABBA；
+- `serve_forever` 退出时 `shutdown(wait=True)` 关池。
+
+正确性边界（写在这里，避免下一轮误读）：
+
+1. **写语句仍然完全串行**（`_write_lock`），这是第 2 步没做完之前的刻意选择；
+2. 读语句与写语句可以真正并行：MVCC 快照保证读不到未提交的行，读到的页链即使
+   被并发追加新页也只会"多看到一页而已"，可见性由 xid 过滤；
+3. 备份/降级（`snapshot()` / `close()`）持有 `_write_lock` 时仍是写静止点，
+   读可以继续，但新事务不能开始写。
+
+测试（`tests/unit/test_pgwire.py::TestWireConcurrency`）：两个连接各跑一条
+`sleep(0.12)` 的 SELECT，总耗时 < 0.228 s（串行应 ≥ 0.24 s）；另一条用例证明
+慢查询进行中，新连接的握手不被阻塞。
+
+顺带效果：全量测试套件 118.9 s → **75.0 s**（套件里大量 `SELECT` 走只读事务，
+不再每次 fsync）。
 
 ### 第 2 步的评估结论（2026-11-17）
 

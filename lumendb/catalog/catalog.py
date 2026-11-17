@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import threading
 from dataclasses import replace
 from typing import Optional
 
@@ -66,9 +68,30 @@ def _rewrite_check_tokens(
     return rewritten
 
 
+def _locked(method):
+    """目录的读/写方法互斥。
+
+    线协议的服务端并发（docs/concurrency.md 第 1.8 步）会让多个连接的
+    SELECT 在各自线程里同时读目录；而 DDL 线程会 ``insert``/``del``
+    ``self.tables``。CPython 保证单次 dict 操作原子，但**迭代**期间被改会抛
+    ``RuntimeError: dictionary changed size during iteration``——所以凡是
+    遍历 dict 的方法（以及所有会改 dict 的方法）都进同一把 RLock。
+    锁是叶子锁：持有 ``Database._write_lock`` 的写路径可以继续拿它，
+    反向（目录锁内去拿写锁）不存在。
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Catalog:
     def __init__(self, store: CatalogStore) -> None:
         self._store = store
+        self._lock = threading.RLock()
         self.tables: dict[str, TableDef] = {}
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
         self.views: dict[str, list[tuple[str, str]]] = {}
@@ -82,6 +105,7 @@ class Catalog:
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
 
+    @_locked
     def mark_dirty(self) -> None:
         self.dirty = True
 
@@ -89,6 +113,7 @@ class Catalog:
     # 加载 / 持久化
     # ------------------------------------------------------------------
 
+    @_locked
     def load(self) -> None:
         raw = self._store.load()
         self.tables.clear()
@@ -127,6 +152,7 @@ class Catalog:
                 }
         self._loaded = True
 
+    @_locked
     def persist(self, txn: Transaction) -> None:
         txn.wrote = True
         payload = json.dumps(
@@ -158,6 +184,7 @@ class Catalog:
     # 查询
     # ------------------------------------------------------------------
 
+    @_locked
     def get_table(self, name: str) -> TableDef:
         table = self.tables.get(name.lower())
         if table is None:
@@ -167,21 +194,27 @@ class Catalog:
             )
         return table
 
+    @_locked
     def has_table(self, name: str) -> bool:
         return name.lower() in self.tables
 
+    @_locked
     def list_tables(self) -> list[TableDef]:
         return [self.tables[k] for k in sorted(self.tables)]
 
+    @_locked
     def table_names(self) -> list[str]:
         return sorted(self.tables)
 
+    @_locked
     def view_names(self) -> list[str]:
         return sorted(self.views)
 
+    @_locked
     def has_view(self, name: str) -> bool:
         return name.lower() in self.views
 
+    @_locked
     def get_view(self, name: str) -> list[tuple[str, str]]:
         key = name.lower()
         tokens = self.views.get(key)
@@ -192,6 +225,7 @@ class Catalog:
             )
         return tokens
 
+    @_locked
     def get_view_columns(self, name: str) -> list[str]:
         return list(self.view_columns.get(name.lower(), []))
 
@@ -199,6 +233,7 @@ class Catalog:
     # DDL
     # ------------------------------------------------------------------
 
+    @_locked
     def create_table(
         self,
         txn: Transaction,
@@ -231,6 +266,7 @@ class Catalog:
         self.persist(txn)
         return table
 
+    @_locked
     def create_view(
         self,
         txn: Transaction,
@@ -260,6 +296,7 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    @_locked
     def replace_view(
         self,
         txn: Transaction,
@@ -290,6 +327,7 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    @_locked
     def update_view_dependencies(
         self,
         txn: Transaction,
@@ -320,6 +358,7 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    @_locked
     def drop_view(
         self, txn: Transaction, name: str, cascade: bool = False
     ) -> None:
@@ -350,6 +389,7 @@ class Catalog:
         txn.undo_log.append(undo)
         self.persist(txn)
 
+    @_locked
     def _view_dependents(self, key: str) -> list[str]:
         return sorted(
             name
@@ -357,6 +397,7 @@ class Catalog:
             if key in deps
         )
 
+    @_locked
     def _view_column_dependents(self, table: str, column: str) -> list[str]:
         return sorted(
             name
@@ -364,6 +405,7 @@ class Catalog:
             if (table, column) in deps
         )
 
+    @_locked
     def drop_table(
         self, txn: Transaction, name: str, cascade: bool = False
     ) -> tuple[int, int]:
@@ -424,6 +466,7 @@ class Catalog:
         self.persist(txn)
         return len(dependents), len(fk_dependents)
 
+    @_locked
     def rename_table(self, txn: Transaction, old_name: str, new_name: str) -> TableDef:
         old_key = old_name.lower()
         new_key = new_name.lower()
@@ -485,6 +528,7 @@ class Catalog:
         self.persist(txn)
         return table
 
+    @_locked
     def rename_column(
         self, txn: Transaction, table_name: str, old_name: str, new_name: str
     ) -> TableDef:
@@ -583,6 +627,7 @@ class Catalog:
         self.persist(txn)
         return table
 
+    @_locked
     def create_index(
         self,
         txn: Transaction,
@@ -605,6 +650,7 @@ class Catalog:
         self.persist(txn)
         return index
 
+    @_locked
     def drop_index(self, txn: Transaction, index_name: str) -> str:
         for table in self.tables.values():
             if index_name in table.indexes:

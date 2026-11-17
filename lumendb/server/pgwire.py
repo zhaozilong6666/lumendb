@@ -1,4 +1,4 @@
-"""PostgreSQL v3 线协议服务端。
+﻿"""PostgreSQL v3 线协议服务端。
 
 为什么值得做：数据库自研项目最容易停留在"跑测试的库"，接不上任何真实工具。
 实现了 wire protocol 之后，``psql`` / DBeaver / Navicat / 任何 JDBC 驱动都能
@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
+from concurrent.futures import ThreadPoolExecutor
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -115,12 +118,40 @@ class Session:
         return self.executor
 
 
+def _describe_statement(session, statement, params):
+    """在线程池里跑 ``Executor.describe``（首次调用会懒建会话执行器）。"""
+    return session.engine().describe(statement, params)
+
+
 class PGWireServer:
     def __init__(self, database: Database, host: str = "127.0.0.1", port: int = 5432) -> None:
         self.database = database
         self.host = host
         self.port = port
-        self._lock = asyncio.Lock()
+        #: 语句执行放线程池：语句本身是同步阻塞调用（扫页、锁 BufferPool、
+        #: 拷贝行），留在事件循环线程里会把所有连接的网络 IO 一起卡住。
+        #: 每个会话一个执行器（Cherry 的 326c0c6）是前提；只读语句不写 WAL
+        #: （0bd8d2f）后，并发读的共享写点只剩 WAL 的 next_lsn 读取。
+        self._pool: Optional[ThreadPoolExecutor] = None
+
+    def _statement_pool(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=min(32, (os.cpu_count() or 4) + 4),
+                thread_name_prefix="lumen-pg",
+            )
+        return self._pool
+
+    async def _in_pool(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._statement_pool(), functools.partial(fn, *args)
+        )
+
+    def shutdown(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
     # ------------------------------------------------------------------
 
@@ -129,8 +160,11 @@ class PGWireServer:
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
         print(f"LumenDB 正在监听 {addrs}")
         print(f"用 psql 连接：psql -h {self.host} -p {self.port} -U lumendb -d lumendb")
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            self.shutdown()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         session = Session(database=self.database)
@@ -422,23 +456,22 @@ class PGWireServer:
             self._send_ready(session, writer)
             await writer.drain()
             return
-        async with self._lock:
-            try:
-                results = self._run_statements(session, sql)
-            except LumenError as exc:
-                if session.txn is not None:
-                    session.failed = True
-                self._send_error(writer, exc)
-                self._send_ready(session, writer)
-                await writer.drain()
-                return
-            except Exception as exc:  # pragma: no cover
-                if session.txn is not None:
-                    session.failed = True
-                self._send_error(writer, LumenError(str(exc)))
-                self._send_ready(session, writer)
-                await writer.drain()
-                return
+        try:
+            results = await self._in_pool(self._run_statements, session, sql)
+        except LumenError as exc:
+            if session.txn is not None:
+                session.failed = True
+            self._send_error(writer, exc)
+            self._send_ready(session, writer)
+            await writer.drain()
+            return
+        except Exception as exc:  # pragma: no cover
+            if session.txn is not None:
+                session.failed = True
+            self._send_error(writer, LumenError(str(exc)))
+            self._send_ready(session, writer)
+            await writer.drain()
+            return
 
         for result in results:
             if result.columns:
@@ -586,10 +619,9 @@ class PGWireServer:
             # 数据，所以 NULL 占位足够，既不会执行 DML，也能返回列元数据。
             placeholders = [None] * len(stmt.param_oids)
             try:
-                async with self._lock:
-                    columns = session.engine().describe(
-                        stmt.parsed, placeholders
-                    )
+                columns = await self._in_pool(
+                    _describe_statement, session, stmt.parsed, placeholders
+                )
             except UndefinedParameterError:
                 columns = []
             except LumenError as exc:
@@ -606,14 +638,13 @@ class PGWireServer:
             return
         # 只绑定、不执行：Describe 不能产生 DML 副作用。以前这里执行一次
         # 拿列信息，导致同一条 INSERT 在 Describe + Execute 中执行两次。
-        async with self._lock:
-            try:
-                columns = session.engine().describe(
-                    portal.statement.parsed, portal.params
-                )
-            except LumenError as exc:
-                self._send_error(writer, exc)
-                return
+        try:
+            columns = await self._in_pool(
+                _describe_statement, session, portal.statement.parsed, portal.params
+            )
+        except LumenError as exc:
+            self._send_error(writer, exc)
+            return
         if columns:
             self._send_row_description(writer, columns, include_header=True)
         else:
@@ -648,14 +679,13 @@ class PGWireServer:
         if portal is None:
             self._send_error(writer, ProtocolError(f"未找到门户 {portal_name!r}"))
             return
-        async with self._lock:
-            try:
-                result = self._run_statement(
-                    session, portal.statement.parsed, portal.params
-                )
-            except LumenError as exc:
-                self._send_error(writer, exc)
-                return
+        try:
+            result = await self._in_pool(
+                self._run_statement, session, portal.statement.parsed, portal.params
+            )
+        except LumenError as exc:
+            self._send_error(writer, exc)
+            return
         if result.columns:
             for row in result.rows:
                 self._send_data_row(writer, row)

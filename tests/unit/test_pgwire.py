@@ -2,10 +2,12 @@
 
 import asyncio
 import struct
+import time
 
 import pytest
 
 from lumendb.engine.database import Database
+from lumendb.engine.executor import Executor
 from lumendb.server.pgwire import PGWireServer
 
 
@@ -930,4 +932,81 @@ class TestWireReadOnlyStatements:
         asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
         assert db.wal.next_lsn > base, "写语句必须继续写 WAL"
         assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+        db.close()
+
+class TestWireConcurrency:
+    """语句执行在线程池里：两个连接的慢查询必须并行，而不是排队。"""
+
+    def test_two_connections_run_selects_concurrently(self, tmp_path, monkeypatch):
+        db = Database(tmp_path / "db", checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        db.execute_one("INSERT INTO t VALUES (1)")
+        server = PGWireServer(db)
+
+        slow = 0.12
+        real_run = Executor.run
+
+        def slow_run(executor_self, statement, txn, params=None):
+            if type(statement).__name__ == "Select":
+                time.sleep(slow)
+            return real_run(executor_self, statement, txn, params)
+
+        monkeypatch.setattr(Executor, "run", slow_run)
+
+        async def body(port):
+            c1 = await _connect(port)
+            c2 = await _connect(port)
+            started = time.perf_counter()
+            await asyncio.gather(
+                _query(c1[0], c1[1], "SELECT COUNT(*) FROM t"),
+                _query(c2[0], c2[1], "SELECT COUNT(*) FROM t"),
+            )
+            elapsed = time.perf_counter() - started
+            assert elapsed < slow * 1.9, (
+                f"两条 SELECT 应并发执行，实际 {elapsed:.3f}s（串行应 >= {slow * 2:.3f}s）"
+            )
+            for reader, writer in (c1, c2):
+                writer.close()
+                await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        server.shutdown()
+        db.close()
+
+    def test_reads_do_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """慢查询在 worker 线程里跑：同一条连接上的另一条连接的握手不受影响。"""
+        db = Database(tmp_path / "db", checkpoint_wal_bytes=0)
+        db.execute_one("CREATE TABLE t (id INT)")
+        server = PGWireServer(db)
+
+        slow = 0.15
+        real_run = Executor.run
+
+        def slow_run(executor_self, statement, txn, params=None):
+            if type(statement).__name__ == "Select":
+                time.sleep(slow)
+            return real_run(executor_self, statement, txn, params)
+
+        monkeypatch.setattr(Executor, "run", slow_run)
+
+        async def body(port):
+            slow_conn = await _connect(port)
+            slow_task = asyncio.create_task(
+                _query(slow_conn[0], slow_conn[1], "SELECT COUNT(*) FROM t")
+            )
+            await asyncio.sleep(0.02)
+            started = time.perf_counter()
+            other = await _connect(port)
+            handshake_s = time.perf_counter() - started
+            await _query(other[0], other[1], "SELECT 1")
+            await slow_task
+            assert handshake_s < slow * 0.8, (
+                f"慢查询不应阻塞事件循环，握手用了 {handshake_s:.3f}s"
+            )
+            for reader, writer in (slow_conn, other):
+                writer.close()
+                await writer.wait_closed()
+
+        asyncio.run(_run_session(db, [], {"handler": server._handle, "body": body}))
+        server.shutdown()
         db.close()
