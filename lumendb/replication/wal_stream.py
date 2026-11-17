@@ -114,6 +114,8 @@ def _send_line(
 
 
 #: 二进制记录帧的固定头长度：lsn(8) + xid(8) + rtype(2) + has_crc(1) + crc(4)
+#: 单条复制请求行的字节上限：超过就拒绝并关闭连接（有界读取，防内存打爆）。
+_MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _BIN_RECORD_HEADER = 23
 
 
@@ -407,8 +409,18 @@ class WALServer:
         try:
             file = conn.makefile("rb")
             while True:
-                line = file.readline()
+                # 有界读取：``readline()`` 不带上限，对端发一条几百 MB 的"行"
+                # 就能把这个线程的内存打爆。请求本身（含 base64 参数）最多几
+                # KB，8 MB 已经是极宽松的上限。
+                line = file.readline(_MAX_REQUEST_BYTES + 1)
                 if not line:
+                    return
+                if len(line) > _MAX_REQUEST_BYTES:
+                    _send_line(
+                        conn,
+                        {"type": "error", "message": "复制请求行过长"},
+                        compress=False,
+                    )
                     return
                 request = _decode_line(line)
                 compress = bool(request.get("compress"))
