@@ -159,3 +159,48 @@ class TestPerSessionExecutor:
         assert not errors, errors
         assert results[0] == [(2,), (3,)]
         assert results[1] == [(3,)]
+
+
+def test_two_executors_keep_independent_snapshots(db):
+    """两个执行器 + 两个事务并发读：各自看到自己快照里的版本（不会串）。
+
+    这是"读并发"的语义基础：执行器状态隔离（上一组用例）之外，快照也必须
+    按事务隔离——否则并发读会看到别人未提交的写入。
+    """
+    import time as _time
+
+    first = db.make_executor()
+    second = db.make_executor()
+    writer_txn = db.txns.begin()
+    reader_txn = db.txns.begin()
+
+    try:
+        # writer 插入一行（未提交）
+        from lumendb.sql.parser import parse_sql
+
+        first.run(parse_sql("INSERT INTO t VALUES (99)")[0], writer_txn)
+
+        results: dict[str, int] = {}
+        barrier = threading.Barrier(2, timeout=5)
+
+        def count_rows(name: str, engine, txn) -> None:
+            barrier.wait()
+            _time.sleep(0.01)
+            results[name] = engine.run(
+                parse_sql("SELECT COUNT(*) FROM t")[0], txn
+            ).rows[0][0]
+
+        threads = [
+            threading.Thread(target=count_rows, args=("writer", first, writer_txn)),
+            threading.Thread(target=count_rows, args=("reader", second, reader_txn)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert results["writer"] == 4, results   # 自己的未提交写入可见
+        assert results["reader"] == 3, results   # 别人的未提交写入不可见
+    finally:
+        db.txns.abort(writer_txn)
+        db.txns.commit(reader_txn)
