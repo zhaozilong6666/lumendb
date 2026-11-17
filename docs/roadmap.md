@@ -236,6 +236,11 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
   （`QuorumNode.campaign()` / `Replica.promote_with_quorum()` / `Lease`），但
   完整 leader 选举、日志复制协商和网络分区下的双写防护仍未完成。
 - 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
+  - **二进制记录帧已做**（`binary_records=True`）：WAL 记录走 `B` + 定长头 +
+    原始 payload，8,124 条记录的流体积 1,634,288 B → 863,144 B（1.89x，省
+    47.2%）；非记录消息仍是 JSON 行，按首字节分派，老客户端不受影响。
+    端到端 apply 时间在本机差异落在噪声内（apply 由页操作主导），收益体现在
+    流字节与省掉的 base64 解码。
   - **认证/压缩/TLS 已做 MVP**：`WALServer(token=...)` / `WALClient(token=...)`
     在每条请求上校验共享 token；`WALClient(compress=True)` 让响应行使用
     zlib 压缩；`WALServer(ssl_context=...)` / `WALClient(ssl_context=...)`

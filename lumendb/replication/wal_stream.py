@@ -29,6 +29,7 @@ import os
 import re
 import socket
 import ssl
+import struct
 import tempfile
 import threading
 import zlib
@@ -94,9 +95,88 @@ def _decode_line(line: bytes) -> dict:
 
 
 def _send_line(
-    sock: socket.socket, payload: dict, *, compress: bool = False
+    sock: socket.socket,
+    payload: dict,
+    *,
+    compress: bool = False,
+    binary_records: bool = False,
 ) -> None:
+    """发送一条消息。
+
+    ``binary_records`` 只对 WAL 记录生效：记录走无 base64 的二进制定长帧，
+    其余消息（hello/status/backup/error/end）保持 JSON 行——客户端按首字节
+    分派，所以两种格式可以在同一条流里混用。
+    """
+    if binary_records and payload.get("type") == "record":
+        sock.sendall(_encode_binary_record(payload))
+        return
     sock.sendall(_encode_line(payload, compress=compress))
+
+
+#: 二进制记录帧的固定头长度：lsn(8) + xid(8) + rtype(2) + has_crc(1) + crc(4)
+_BIN_RECORD_HEADER = 23
+
+
+def _encode_binary_record(payload: dict) -> bytes:
+    """WAL 记录 -> ``B`` + 长度 + 定长头 + 原始 payload。
+
+    为什么值得：JSON 行每条记录要写约 85 B 的字段名与标点，而页 diff 的
+    payload 常常只有几十字节——800 KB 的流里记录数 8k+ 时，JSON 头占了大半。
+    原始字节直接发，不走 base64，也不带字段名。
+    """
+    body = (
+        struct.pack(
+            "!QQHBI",
+            int(payload["lsn"]),
+            int(payload["xid"]),
+            int(payload["rtype"]),
+            1 if payload.get("has_crc") else 0,
+            int(payload.get("crc", 0)),
+        )
+        + base64.b64decode(payload["payload"])
+    )
+    return b"B" + struct.pack("!I", len(body)) + body
+
+
+def _decode_binary_record(body: bytes) -> dict:
+    lsn, xid, rtype, has_crc, crc = struct.unpack(
+        "!QQHBI", body[:_BIN_RECORD_HEADER]
+    )
+    return {
+        "type": "record",
+        "lsn": lsn,
+        "xid": xid,
+        "rtype": rtype,
+        # 直接给原始字节：再 base64 一遍是无谓的往返（编码 + 解码各一次）。
+        "payload": body[_BIN_RECORD_HEADER:],
+        "has_crc": bool(has_crc),
+        "crc": crc,
+    }
+
+
+def _iter_messages(file):
+    """按首字节分派的消息迭代器（JSON 行与二进制记录帧可混用）。"""
+    while True:
+        first = file.read(1)
+        if not first:
+            return
+        if first == b"B":
+            header = file.read(4)
+            if len(header) < 4:
+                raise ValueError("复制流被截断：二进制帧头不完整")
+            total = struct.unpack("!I", header)[0]
+            body = b""
+            while len(body) < total:
+                chunk = file.read(total - len(body))
+                if not chunk:
+                    raise ValueError("复制流被截断：二进制帧主体不完整")
+                body += chunk
+            yield _decode_binary_record(body)
+            continue
+        line = first + file.readline()
+        if not line.strip():
+            continue
+        yield _decode_line(line)
 
 
 def _record_to_json(record: LogRecord) -> dict:
@@ -132,11 +212,14 @@ def _record_from_json(data: dict) -> LogRecord:
         has_crc = bool(data["has_crc"])
     else:
         has_crc = "crc" in data
+    raw_payload = data["payload"]
+    if isinstance(raw_payload, str):
+        raw_payload = base64.b64decode(raw_payload)
     record = LogRecord(
         lsn=int(data["lsn"]),
         xid=int(data["xid"]),
         rtype=int(data["rtype"]),
-        payload=base64.b64decode(data["payload"]),
+        payload=raw_payload,
         has_crc=has_crc,
     )
     if "crc" in data:
@@ -313,6 +396,7 @@ class WALServer:
                 return
             request = _decode_line(line)
             compress = bool(request.get("compress"))
+            binary_records = request.get("format") == "bin"
             if self.token is not None and request.get("token") != self.token:
                 _send_line(
                     conn,
@@ -339,7 +423,7 @@ class WALServer:
             elif kind == "incremental":
                 self._handle_incremental(conn, request)
             elif kind == "replicate":
-                self._handle_replicate(conn, request)
+                self._handle_replicate(conn, request, binary_records)
             elif kind == "ack":
                 self._handle_ack(conn, request)
             elif kind == "status":
@@ -490,7 +574,9 @@ class WALServer:
             except OSError:
                 pass
 
-    def _handle_replicate(self, conn: socket.socket, request: dict) -> None:
+    def _handle_replicate(
+        self, conn: socket.socket, request: dict, binary_records: bool = False
+    ) -> None:
         compress = bool(request.get("compress"))
         start_lsn = int(request.get("start_lsn", 0))
         max_records = max(0, int(request.get("max_records", 1000)))
@@ -512,7 +598,12 @@ class WALServer:
 
         count = 0
         for record in self.primary.wal.iter_records(start_lsn + 1):
-            _send_line(conn, _record_to_json(record), compress=compress)
+            _send_line(
+                conn,
+                _record_to_json(record),
+                compress=compress,
+                binary_records=binary_records,
+            )
             count += 1
             if max_records and count >= max_records:
                 break
@@ -593,6 +684,7 @@ class WALClient:
         server_hostname: str | None = None,
         replica_id: str | None = None,
         follow_redirects: bool = False,
+        binary_records: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -604,6 +696,9 @@ class WALClient:
         self._explicit_hostname = server_hostname is not None
         self.replica_id = replica_id
         self.follow_redirects = follow_redirects
+        #: 记录走 ``B`` 前缀的二进制帧（无 base64 / 无 JSON 字段名）。
+        #: 非记录消息仍是 JSON 行，接收端按首字节分派。
+        self.binary_records = binary_records
         self.redirects = 0
 
     def _request(self, payload: dict, _depth: int = 0) -> Iterable[dict]:
@@ -612,6 +707,8 @@ class WALClient:
             payload["token"] = self.token
         if self.compress:
             payload["compress"] = True
+        if self.binary_records:
+            payload["format"] = "bin"
         if self.replica_id is not None:
             payload["replica_id"] = self.replica_id
         sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -623,8 +720,7 @@ class WALClient:
             sock.settimeout(self.timeout)
             _send_line(sock, payload)
             file = sock.makefile("rb")
-            for line in file:
-                data = _decode_line(line)
+            for data in _iter_messages(file):
                 if data.get("type") == "error":
                     raise StorageError(data.get("message", "复制请求失败"))
                 if data.get("type") == "redirect":

@@ -1,4 +1,4 @@
-"""只读副本的物理 WAL 应用。
+﻿"""只读副本的物理 WAL 应用。
 
 主库 checkpoint 后复制数据文件作为基准备份，副本从 ``checkpoint_lsn + 1``
 开始读取主库 WAL，把页更新重放到自己的 Buffer Pool，并用主库事务状态控制
@@ -170,6 +170,7 @@ class Replica:
         timeout: float = 10.0,
         token: str | None = None,
         compress: bool = False,
+        binary_records: bool = False,
         ssl_context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
         replica_id: str | None = None,
@@ -188,7 +189,7 @@ class Replica:
         client = WALClient(
             host, port, timeout=timeout, token=token, compress=compress,
             ssl_context=ssl_context, server_hostname=server_hostname,
-            replica_id=replica_id,
+            replica_id=replica_id, binary_records=binary_records,
         )
         base_lsn = client.backup_to(data_path)
         if replica_id is not None:
@@ -254,18 +255,23 @@ class Replica:
         timeout: float = 10.0,
         token: str | None = None,
         compress: bool = False,
+        binary_records: bool = False,
         ssl_context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
         replica_id: str | None = None,
     ) -> int:
-        """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
+        """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。
+
+        ``binary_records=True`` 让主库把每条 WAL 记录编成 ``B`` 前缀的二进制定长
+        帧（无 base64、无 JSON 字段名），非记录消息仍是 JSON 行。
+        """
         with self._fetch_lock:
             from .wal_stream import WALClient
 
             client = WALClient(
                 host, port, timeout=timeout, token=token, compress=compress,
                 ssl_context=ssl_context, server_hostname=server_hostname,
-                replica_id=replica_id,
+                replica_id=replica_id, binary_records=binary_records,
             )
             records = client.fetch(self._applied_lsn, max_records=max_records)
             applied = self.apply(records, primary=None)

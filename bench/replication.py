@@ -35,7 +35,7 @@ def _insert_batch(db: Database, start: int, count: int, batch: int = 200) -> Non
         db.execute_one("INSERT INTO t VALUES " + ", ".join(rows))
 
 
-def run(root: Path, rows: int, batch: int = 200) -> dict:
+def run(root: Path, rows: int, batch: int = 200, binary: bool = False) -> dict:
     primary = Database(root / "primary", checkpoint_wal_bytes=0, pool_size=512)
     primary.execute_one(
         "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32), score INT)"
@@ -47,7 +47,7 @@ def run(root: Path, rows: int, batch: int = 200) -> dict:
     try:
         start = time.perf_counter()
         replica = Replica.bootstrap_from_server(
-            server.host, server.port, root / "replica"
+            server.host, server.port, root / "replica", binary_records=binary
         )
         bootstrap_s = time.perf_counter() - start
 
@@ -65,7 +65,7 @@ def run(root: Path, rows: int, batch: int = 200) -> dict:
         applied = 0
         while True:
             n = replica.replicate_from_server(
-                server.host, server.port, max_records=1000
+                server.host, server.port, max_records=1000, binary_records=binary
             )
             if n == 0:
                 break
@@ -114,6 +114,11 @@ def main() -> int:
         default=200,
         help="每条 INSERT 语句的行数；1 表示逐行插入（验证逐行写入路径）",
     )
+    parser.add_argument(
+        "--binary",
+        action="store_true",
+        help="WAL 记录走二进制帧（B + 定长头 + 原始 payload），而不是 JSON 行",
+    )
     args = parser.parse_args()
     if args.rows < 1 or args.repeat < 1:
         parser.error("--rows/--repeat 必须 >= 1")
@@ -124,7 +129,9 @@ def main() -> int:
             root = Path(tmp) / f"run{i}"
             if root.exists():
                 shutil.rmtree(root)
-            samples.append(run(root, args.rows, batch=max(1, args.batch)))
+            samples.append(
+            run(root, args.rows, batch=max(1, args.batch), binary=args.binary)
+        )
 
     best = min(samples, key=lambda s: s["apply_s"])
     med_apply = statistics.median(s["apply_s"] for s in samples)
