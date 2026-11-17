@@ -200,3 +200,44 @@ def test_search_respects_kind_and_tag_filters():
     assert [h["fact"].id for h in hits] == ["b"]
     hits = search(facts, "索引", top_k=5, tag="bench", half_life_days=10**6)
     assert [h["fact"].id for h in hits] == ["a"]
+
+
+def test_status_command_summarizes_project(tmp_path, capsys):
+    git = find_git()
+    if not git:
+        pytest.skip("本机没有 git")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run([git, "-C", str(repo), "init", "-q"], check=True)
+    (repo / "a.txt").write_text("x", encoding="utf-8")
+    subprocess.run([git, "-C", str(repo), "add", "a.txt"], check=True)
+    subprocess.run(
+        [git, "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "feat(replica): 事务边界"],
+        check=True,
+    )
+    head = subprocess.run(
+        [git, "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=repo)
+    ledger.append(_fact("q1", "本地提交是否 push 到远端，等待确认", kind="open_question", tags=["git"]))
+    ledger.append(
+        _fact(
+            "t1", "全量测试 1302 passed（182.9s）",
+            kind="measurement", tags=["tests"],
+            evidence=[{"type": "commit", "value": head}],
+        )
+    )
+
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(repo), "status"]) == 0
+    out = capsys.readouterr().out
+    assert "项目状态" in out
+    assert head in out
+    assert "未决问题（1）" in out
+    assert "1302" in out
+    assert "校验" in out
+

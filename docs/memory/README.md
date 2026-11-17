@@ -36,6 +36,8 @@
 
 ## 三条使用规则
 
+0. **每轮先 `status`。** 它把"现在在哪、还剩什么"压成十几行：HEAD、ahead、
+   账本覆盖、最近一次测试、未决问题、校验失败的记录。避免开场就凭记忆开工。
 1. **写文档/总结前先 `query`。** 任何要写进 README、portfolio、提交说明的数字，
    都必须能从这里查到一条 `measurement` 记录；查不到就先测再写。
 2. **修正旧结论用 `--supersedes` 追加新记录，不要改旧行。** 历史可以被推翻，
@@ -46,6 +48,9 @@
 ## 命令
 
 ```powershell
+# 一页看清现在在哪：HEAD / 分支 / 领先多少提交 / 账本覆盖 / 最近测试 / 未决问题
+python -m tools.project_memory status
+
 # 追加一条带证据的事实
 python -m tools.project_memory add --kind measurement `
   --claim "索引点查 0.47ms/次，全表 48ms/次（约 100 倍）" `

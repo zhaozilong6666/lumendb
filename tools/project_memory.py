@@ -755,6 +755,90 @@ def cmd_conflicts(args: argparse.Namespace) -> int:
     return 0 if found == 0 else 1
 
 
+_TEST_RUN_RE = re.compile(r"(\d+)\s*passed")
+
+
+def _git_brief(root: Path) -> dict:
+    """尽量取出 git 状态；没有 git 就返回占位符，不影响 status 其余部分。"""
+    info = {"head": "-", "subject": "-", "branch": "-", "ahead": "未知"}
+    if find_git() is None:
+        return info
+    try:
+        head = _git(["rev-parse", "--short", "HEAD"], root)
+        if head.returncode != 0:
+            return info
+        info["head"] = head.stdout.strip()
+        info["subject"] = _git(["log", "-1", "--format=%s"], root).stdout.strip()
+        info["branch"] = _git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip()
+        upstream = _git(["rev-list", "--count", "@{upstream}..HEAD"], root)
+        if upstream.returncode == 0:
+            info["ahead"] = f"领先 upstream {upstream.stdout.strip()} 个提交"
+        else:
+            info["ahead"] = "未配置 upstream（提交只在本地）"
+    except RuntimeError:
+        pass
+    return info
+
+
+def _latest_test_run(facts: Sequence[Fact]) -> Optional[Fact]:
+    """找最近一条带 ``N passed`` 的测试记录（tags 含 tests/ci）。"""
+    best: Optional[Fact] = None
+    for fact in facts:
+        if "tests" not in fact.tags and "ci" not in fact.tags:
+            continue
+        if not _TEST_RUN_RE.search(fact.claim):
+            continue
+        if best is None or fact.created > best.created:
+            best = fact
+    return best
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    info = _git_brief(Path(args.root))
+    print("LumenDB 项目状态")
+    print(f"  HEAD    {info['head']}  {info['subject']}")
+    print(f"  分支    {info['branch']}  {info['ahead']}")
+
+    total = len(ledger.facts)
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for fact in ledger.facts:
+        by_kind[fact.kind] = by_kind.get(fact.kind, 0) + 1
+        status = fact.verify.get("status", "unverified")
+        by_status[status] = by_status.get(status, 0) + 1
+    kinds = "，".join(f"{k} {by_kind[k]}" for k in FACT_KINDS if by_kind.get(k))
+    print(f"  账本    {total} 条" + (f"：{kinds}" if kinds else ""))
+    checks = "，".join(f"{k}={v}" for k, v in sorted(by_status.items()))
+    print(f"  校验    {checks or '未校验'}")
+
+    test_fact = _latest_test_run(ledger.facts)
+    if test_fact:
+        commits = [
+            str(e.get("value", ""))[:7]
+            for e in test_fact.evidence
+            if e.get("type") == "commit"
+        ]
+        at = f"  @ {commits[0]}" if commits else ""
+        print(f"  最近测试 {test_fact.claim}{at}  （{test_fact.created[:10]}）")
+
+    questions = [f for f in ledger.facts if f.kind == "open_question"]
+    if questions:
+        print(f"  未决问题（{len(questions)}）")
+        for fact in questions[:6]:
+            print(f"    - {fact.claim}")
+
+    failed = [f for f in ledger.facts if f.verify.get("status") == "failed"]
+    if failed:
+        print(f"  待处理：{len(failed)} 条校验失败")
+        for fact in failed[:5]:
+            print(f"    ! {fact.id}  {fact.claim[:56]}")
+    no_evidence = [f for f in ledger.facts if not f.evidence]
+    if no_evidence:
+        print(f"  待处理：{len(no_evidence)} 条没有证据")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
     total = len(ledger.facts)
@@ -846,6 +930,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="总览")
     stats.set_defaults(func=cmd_stats)
+
+    status = sub.add_parser("status", help="一页看清：git / 账本 / 最近测试 / 未决问题")
+    status.set_defaults(func=cmd_status)
 
     show = sub.add_parser("show", help="看一条记录")
     show.add_argument("id")
