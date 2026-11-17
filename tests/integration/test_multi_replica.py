@@ -67,3 +67,49 @@ def test_two_replicas_one_stalls_then_catches_up(tmp_path):
 # 注：副本落后到 WAL 已被回收时的行为（服务端回 error → 副本走
 # `rebuild_from_scratch` 重新基准备份）已由 tests/unit/test_replica_rebuild_fallback.py
 # 覆盖，这里不重复造一个需要伪造段回收的脆弱场景。
+
+def test_replica_disk_full_does_not_skip_or_duplicate(tmp_path, monkeypatch):
+    """副本侧磁盘满：apply 失败不能"跳过"记录，恢复后也不能重复应用。
+
+    机制上副本是逐条推进 ``_applied_lsn`` + pageLSN 幂等，所以理论上安全；
+    但这条是第 4 层"副本不会静默丢数据"的核心不变量，必须有证据：
+
+    1. flush 失败时抛出 OSError（调用方/监控能看到，而不是假装成功）；
+    2. 恢复后追平，行数正好等于主库（不跳过、不重复）。
+    """
+    import errno
+
+    import pytest
+
+    primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    for i in range(10):
+        primary.execute_one(f"INSERT INTO t VALUES ({i})")
+    server = WALServer(primary).start()
+    replica = Replica.bootstrap_from_server(
+        server.host, server.port, tmp_path / "r"
+    )
+    try:
+        _catch_up(replica, server, None)
+        assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(10,)]
+
+        real_flush = replica.db.bp.flush_all
+
+        def boom() -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(replica.db.bp, "flush_all", boom)
+        for i in range(10, 15):
+            primary.execute_one(f"INSERT INTO t VALUES ({i})")
+        with pytest.raises(OSError):
+            replica.replicate_from_server(server.host, server.port)
+
+        monkeypatch.setattr(replica.db.bp, "flush_all", real_flush)
+        _catch_up(replica, server, None)
+        assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(15,)]
+        last = replica.execute_one("SELECT MAX(id) FROM t")
+        assert last.rows == [(14,)]
+    finally:
+        replica.close()
+        server.stop()
+        primary.close()
