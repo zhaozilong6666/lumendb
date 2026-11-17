@@ -104,6 +104,13 @@ class Catalog:
         self._loaded = False
         #: DML 可能改动表/索引的根页，由执行器置位，提交前统一落盘
         self.dirty = False
+        #: schema 形状版本：DDL 与副本重载目录时递增，供绑定计划缓存失效。
+        self.schema_version = 0
+
+    @_locked
+    def bump_schema(self) -> None:
+        """标记 schema 形状已变化；所有按旧版本缓存的计划立即失效。"""
+        self.schema_version += 1
 
     @_locked
     def mark_dirty(self) -> None:
@@ -151,6 +158,8 @@ class Catalog:
                     for table, column in vdata.get("column_dependencies", [])
                 }
         self._loaded = True
+        # 副本收到主库的目录页后会重载：旧计划引用的表/列对象已经过期。
+        self.schema_version += 1
 
     @_locked
     def persist(self, txn: Transaction) -> None:

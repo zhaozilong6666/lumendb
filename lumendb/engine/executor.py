@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import re
 import time
+import weakref
 from collections import Counter
 from typing import Any, Iterable, Iterator, Optional
 
@@ -119,6 +120,34 @@ from ..plan.nodes import (
 )
 
 
+#: 会改变 schema 形状（列、索引、视图、约束）的语句。执行前统一抬高
+#: ``Catalog.schema_version``，让所有已绑定计划失效。宁可让失败的 DDL 也
+#: 多清一次缓存，也不能让旧计划活到新 schema 上。
+_SCHEMA_CHANGING_STATEMENTS = {
+    CreateTable,
+    CreateTableAs,
+    CreateView,
+    DropView,
+    DropTable,
+    CreateIndex,
+    DropIndex,
+    Reindex,
+    Truncate,
+    AlterTableAddColumn,
+    AlterTableDropColumn,
+    AlterTableAlterType,
+    AlterTableAlterNullability,
+    AlterTableAlterDefault,
+    AlterTableAddConstraint,
+    AlterTableDropConstraint,
+    AlterTableAlterConstraint,
+    AlterTableValidateConstraint,
+    AlterTableRenameTable,
+    AlterTableRenameColumn,
+    AlterTableRenameConstraint,
+}
+
+
 @dataclass
 class ColumnMeta:
     name: str
@@ -165,6 +194,12 @@ class Executor:
         self._recursive_rows: dict[str, list[tuple]] = {}
         #: CHECK 约束 token -> 编译后谓词；DDL 改约束时键会变化，无需主动失效
         self._check_cache: dict[tuple, Any] = {}
+        #: 已绑定计划缓存：``(id(stmt), schema_version)`` -> (弱引用, 计划, 列, CTE)。
+        #: 只缓存无参数语句：``$n`` 在绑定阶段被折成字面量，键里必须含参数，
+        #: 而参数每次都变，缓存没有意义。弱引用保证 AST 被解析缓存淘汰后不会
+        #: 把新对象的 ``id`` 误当成旧计划。
+        self._plan_cache: dict[tuple[int, int], tuple] = {}
+        self._plan_cache_limit = 256
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
@@ -187,6 +222,9 @@ class Executor:
                 hint="SELECT / EXPLAIN / SHOW 可以执行，写操作需要在主库完成",
             )
         self._acquire_writer_lock(stmt, txn)
+        if type(stmt) in _SCHEMA_CHANGING_STATEMENTS:
+            # DDL 可能替换表/索引对象、改列形状；绑定计划缓存按版本号失效。
+            self._catalog.bump_schema()
         self._params = list(params) if params else []
         self._recursive_rows = {}
         # Binder 保存 CTE 作用域和参数；每条语句必须从干净的作用域开始，
@@ -370,9 +408,16 @@ class Executor:
             self._txn = None
 
     def _select(self, stmt: Query, txn: Transaction) -> Result:
-        plan, out_cols = self.binder.bind_query(stmt)
+        cached = self._plan_from_cache(stmt)
+        if cached is None:
+            plan, out_cols = self.binder.bind_query(stmt)
+            ctes = dict(self.binder.ctes)
+            if not self._params:
+                self._remember_plan(stmt, plan, out_cols, ctes)
+        else:
+            plan, out_cols, ctes = cached
         width = len(out_cols)
-        self._active_ctes = dict(self.binder.ctes)
+        self._active_ctes = dict(ctes)
         try:
             materialized = [tuple(r)[:width] for r in self._execute(plan, txn)]
         finally:
@@ -381,6 +426,31 @@ class Executor:
             columns=[ColumnMeta(c.name, c.type) for c in out_cols],
             rows=materialized,
             tag=f"SELECT {len(materialized)}",
+        )
+
+    def _plan_from_cache(self, stmt: Query):
+        key = (id(stmt), self._catalog.schema_version)
+        entry = self._plan_cache.get(key)
+        if entry is None:
+            return None
+        ref, plan, cols, ctes = entry
+        if ref() is not stmt:
+            # AST 被解析缓存淘汰后又释放，id 可能被新对象复用：绝不认错。
+            self._plan_cache.pop(key, None)
+            return None
+        return plan, cols, ctes
+
+    def _remember_plan(self, stmt: Query, plan, cols, ctes) -> None:
+        try:
+            ref = weakref.ref(stmt)
+        except TypeError:  # pragma: no cover - AST 目前都支持弱引用
+            return
+        if len(self._plan_cache) >= self._plan_cache_limit:
+            # 按插入顺序淘汰一条，而不是 clear() 全清：常量各不相同的点查
+            # 会轮询几百条 SQL，全清会让每一轮都重新绑定所有语句。
+            self._plan_cache.pop(next(iter(self._plan_cache)))
+        self._plan_cache[(id(stmt), self._catalog.schema_version)] = (
+            ref, plan, cols, ctes,
         )
 
     def _new_binder(self) -> Binder:
