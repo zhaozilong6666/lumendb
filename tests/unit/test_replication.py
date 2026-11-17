@@ -658,7 +658,18 @@ class TestReplica:
             )
             primary.execute_one("INSERT INTO t VALUES (1)")
             replica.replicate_from_server(server.host, server.port)
-            assert int(slot.read_text()) == replica.applied_lsn
+            # 槽位文件由服务端在 ack 时原子写；机器繁忙时文件可见性可能晚于
+            # 客户端拿到 ack 响应，这里按 deadline 等，而不是立刻断言。
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if int(slot.read_text()) == replica.applied_lsn:
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError(
+                    f"槽位没有追上已应用进度：slot={slot.read_text()} "
+                    f"applied={replica.applied_lsn}"
+                )
         finally:
             server.stop()
 
@@ -667,7 +678,16 @@ class TestReplica:
         try:
             primary.execute_one("INSERT INTO t VALUES (2)")
             replica.replicate_from_server(restarted.host, restarted.port)
-            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if replica.execute_one("SELECT COUNT(*) FROM t").rows == [(2,)]:
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError(
+                    "重启后副本没有追平："
+                    f"{replica.execute_one('SELECT COUNT(*) FROM t').rows}"
+                )
         finally:
             replica.db.close()
             restarted.stop()

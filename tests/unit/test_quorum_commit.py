@@ -43,6 +43,26 @@ def _stop(nodes):
         node.stop()
 
 
+def _advance_watermark(node, last_lsn: int, *, expect: int, timeout: float = 8.0) -> None:
+    """在 deadline 内反复跑心跳轮次，直到水位到达 expect。
+
+    单次 ``heartbeat_round`` 需要多数派 peer 在 ``node.timeout`` 内应答；整库
+    跑测试时机器可能很忙，命中一次超时就拿不到多数派（水位不推进），于是
+    断言假失败。测试不该假定"一次就成功"，但**被测语义**仍然是"多数派够了
+    才推进"，所以这里只重试轮次，不放宽断言。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        node.heartbeat_round(last_lsn)
+        if node.quorum_commit_lsn == expect:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"水位没有推进到 {expect}：当前 {node.quorum_commit_lsn}"
+        f"（last_lsn={last_lsn}, acks 可能一直不足）"
+    )
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -55,7 +75,7 @@ class TestQuorumCommitWatermark:
         try:
             nodes[1].observe_applied(100)
             nodes[2].observe_applied(120)
-            nodes[0].heartbeat_round(150)
+            _advance_watermark(nodes[0], 150, expect=120)
             # 三个节点的 match_lsn = [150, 100, 120]，多数派 = 2 → 第 2 大 = 120
             assert nodes[0].quorum_commit_lsn == 120
             assert nodes[0].state.commit_lsn == 120
@@ -67,7 +87,7 @@ class TestQuorumCommitWatermark:
         try:
             nodes[1].observe_applied(100)
             nodes[2].observe_applied(120)
-            nodes[0].heartbeat_round(150)
+            _advance_watermark(nodes[0], 150, expect=120)
             reloaded = VoteState(tmp_path / "n0.vote.json")
             assert reloaded.commit_lsn == 120
             assert reloaded.match_lsn == 150
