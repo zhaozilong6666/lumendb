@@ -372,7 +372,17 @@ class Database:
             except BaseException:
                 self.txns.abort(txn)
                 raise
-            self.txns.commit(txn)
+            try:
+                self.txns.commit(txn)
+            except BaseException:
+                # WAL 写 COMMIT 记录失败（磁盘满 / IO 错误）：事务既没持久化，
+                # 就不该留下改过的页和写者锁——单写者模型下那把锁一泄漏，
+                # 之后每个写事务都会拿到 40001，数据库等于永久只读。
+                # 反过来，COMMIT 记录已经落盘的情况（例如同步复制屏障超时）
+                # 不能 undo：事务事实上已提交，调用方拿到的是"结果未知"。
+                if not getattr(txn, "commit_record_written", False):
+                    self.txns.abort(txn)
+                raise
             self._maybe_checkpoint()
             return Result(tag="COMMIT")
 
@@ -425,7 +435,14 @@ class Database:
         except BaseException:
             self.txns.abort(txn)
             raise
-        self.txns.commit(txn)
+        try:
+            self.txns.commit(txn)
+        except BaseException:
+            # 同上：自动提交路径的 COMMIT 记录写失败时，也要把事务回滚掉，
+            # 否则页上已改的数据和写者锁都会留在原地。
+            if not getattr(txn, "commit_record_written", False):
+                self.txns.abort(txn)
+            raise
         self._maybe_checkpoint()
         return result
 

@@ -117,7 +117,7 @@
 >   帧，10 s 空闲回收线程，握手约 0.1 ms 故收益只在跨网络）、请求行有界读取
 >   （堵住"一条巨型行把处理线程内存打爆"）、`Replica.wait_until(lag)` 跟随
 >   读等待与重建失败自愈、`Replica.snapshot_read()` 把多条只读语句固定在
->   同一个已应用前缀上（代价是上下文期间 apply 停摆，只用于短读）。> - 1281 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
+>   同一个已应用前缀上（代价是上下文期间 apply 停摆，只用于短读）。> - 1284 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
 >   Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
@@ -270,7 +270,7 @@
 >   thread cannot mutate a dict mid-iteration. Two connections each running
 >   a sleep(0.12) SELECT finish in under 0.228 s (serial would be >= 0.24 s),
 >   and a new connection's handshake is not blocked during a slow query.
-> - 1281 automated tests including crash-injection and a 20-seed randomized
+> - 1284 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite (full run 75 s); CI matrix covers
 >   Ubuntu/Windows × Python 3.12/3.13.
 

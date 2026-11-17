@@ -282,6 +282,33 @@ guard：`Vacuum` / `Truncate` / `AlterTableAlterType` / `AlterTableDropColumn`
 2. 再做行/键锁（含"等锁后重新校验版本"，见上文）；
 3. 最后收掉事务写者锁。
 
+### 磁盘满（ENOSPC）时的事务收尾（2026-11-17）
+
+写 WAL 的 COMMIT 记录可能因为磁盘满而失败，这条路径此前有三个洞，现在
+都补了，并各有测试（`tests/unit/test_wal_failure.py` 3 例）：
+
+1. **COMMIT 记录写失败后事务没有回滚**。`Database._run_unlocked` 的两处
+   `txns.commit(txn)` 抛错时直接向上冒，事务留在 ACTIVE、页已改、写者锁
+   未释放 —— 单写者模型下后续每个写事务都拿 40001，整台库变成永久只读。
+   现在抛错时按 `txn.commit_record_written` 判断：没写过就 abort（页 undo
+   + 交锁），写过了（例如同步复制屏障超时）就不 undo —— 那时事务事实上
+   已提交，调用方拿到的是"结果未知"，回滚反而是错的。
+2. **不能用 `last_lsn` 当"是否已提交"的判据**。事务在 `begin()` 里就把
+   `last_lsn` 置成 `first_lsn`（非 0），WAL 写失败时它不会变回 0。所以
+   新增了显式标记 `Transaction.commit_record_written`。
+3. **abort 自己也会失败**。磁盘满时连 ABORT 记录都写不进去，`abort` 中途
+   抛错 → 锁照样泄漏。`TxnManager.abort` 现在用 `try/finally` 收尾：
+   无论 undo / WAL 能否写成功，事务状态一定落 ABORTED、簿记清干净、锁一定
+   交回去（页可能没完全撤销，但锁和状态机不会卡死）。
+
+**已知边界（不修，写清楚）**：abort 的 `undo_xid` 逐个页 flush，中途 ENOSPC
+会让一部分页已撤销落盘、后面的页只撤销在内存里。此时**本进程内**继续读那
+张表可能抛 `struct.error`（页内 slot 目录与记录不一致）。这是"进程内页已
+半损坏"，不是持久化数据坏了 —— 失败页仍是脏页、从未落盘，**重启后从磁盘读
+到的是事务开始前的版本**（测试里断言了这一点）。正确处置是重启，或直接从
+副本 / 基准备份重建。这正是第 4 层副本存在的意义：单机磁盘坏掉时，读一致
+性由副本兜底。
+
 ## 3. 已知的取舍（写在这里，避免下一轮再讨论一遍）
 
 - **`VACUUM` 仍是停机维护**：它重排 RID、重建索引，需要"没有其它活跃事务"。

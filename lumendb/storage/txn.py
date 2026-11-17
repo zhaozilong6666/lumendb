@@ -68,6 +68,11 @@ class Transaction:
     state: TxnState = TxnState.ACTIVE
     first_lsn: int = 0
     last_lsn: int = 0
+    #: COMMIT 记录是否已经写进 WAL。**不能用 last_lsn 判断**：事务开始时
+    #: last_lsn 就被置成 first_lsn（非 0），WAL 写失败时它不会变回 0。
+    #: 提交失败后要靠这个标记区分"没持久化（必须回滚）"与"记录已落盘、
+    #: 只是后续步骤失败（事实上已提交，不能 undo）"。
+    commit_record_written: bool = False
     #: DDL 的内存逆操作；abort 时逆序执行，页级 undo 由 WAL 负责。
     undo_log: list = field(default_factory=list)
     #: SAVEPOINT 栈；ROLLBACK TO 只撤销保存点之后的页/对象变更。
@@ -211,6 +216,7 @@ class TransactionManager:
             if self._write_fence is not None and txn.wrote:
                 self._write_fence()
             txn.last_lsn = self._wal.commit(txn.xid)
+            txn.commit_record_written = True
             self._commit_queue.append((txn, txn.last_lsn))
             follower = self._commit_leader
             if not follower:
@@ -344,36 +350,49 @@ class TransactionManager:
                 self._release_locks(txn.xid)
                 self._prune_states()
                 return
-            # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
-            # 这样 CatalogStore 的 root 回滚看到的是旧根页号，不会误判。
-            if self._bp is not None:
-                self._bp.undo_xid(txn.xid)
-            # DDL 修改的是内存里的 Catalog 对象；WAL 只能恢复页，不能替
-            # 调用方恢复已变异的 Python 对象，所以这里再逆序执行内存 undo。
-            while txn.undo_log:
-                undo = txn.undo_log.pop()
-                try:
-                    undo()
-                except Exception:  # pragma: no cover - 撤销本身不应改变事务结局
-                    # 吞掉但要留痕：静默失败会让目录停在半回滚状态，
-                    # 事后只能靠恢复日志猜当时发生了什么。
-                    _log.exception(
-                        "事务 %s 的目录 undo 回调抛错，目录可能已偏离回滚前的状态",
-                        txn.xid,
-                    )
-            txn.savepoints.clear()
-            txn.touched_tables.clear()
-            txn.last_lsn = self._wal.abort(txn.xid)
-            self._wal.flush()
-            txn.state = TxnState.ABORTED
-            self._states[txn.xid] = TxnState.ABORTED
-            self._active.discard(txn.xid)
-            self._active_starts.pop(txn.xid, None)
-            self._txns.pop(txn.xid, None)
-            if self._current is txn:
-                self._current = None
-            self._release_locks(txn.xid)
-            self._prune_states()
+            try:
+                # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
+                # 这样 CatalogStore 的 root 回滚看到的是旧根页号，不会误判。
+                if self._bp is not None:
+                    self._bp.undo_xid(txn.xid)
+                # DDL 修改的是内存里的 Catalog 对象；WAL 只能恢复页，不能替
+                # 调用方恢复已变异的 Python 对象，所以这里再逆序执行内存 undo。
+                while txn.undo_log:
+                    undo = txn.undo_log.pop()
+                    try:
+                        undo()
+                    except Exception:  # pragma: no cover
+                        # 吞掉但要留痕：静默失败会让目录停在半回滚状态，
+                        # 事后只能靠恢复日志猜当时发生了什么。
+                        _log.exception(
+                            "事务 %s 的目录 undo 回调抛错，目录可能已偏离回滚前的状态",
+                            txn.xid,
+                        )
+                txn.savepoints.clear()
+                txn.touched_tables.clear()
+                txn.last_lsn = self._wal.abort(txn.xid)
+                self._wal.flush()
+            except BaseException:
+                # [Review-Fix] WAL 写失败（磁盘满 / IO 错误）时 abort 自己也会
+                # 抛错。若就此退出，事务仍登记为 ACTIVE、写者锁仍被持有——
+                # 单写者模型下这台库从此永久只能读（后续写事务一律 40001），
+                # 比"页没撤销干净"的后果严重得多。所以无论如何都要收尾：
+                # 状态落 ABORTED、簿记清干净、锁一定交回去。
+                _log.exception(
+                    "事务 %s 的 ABORT 记录写入失败，仍按已回滚收尾（页可能未完全撤销）",
+                    txn.xid,
+                )
+                raise
+            finally:
+                txn.state = TxnState.ABORTED
+                self._states[txn.xid] = TxnState.ABORTED
+                self._active.discard(txn.xid)
+                self._active_starts.pop(txn.xid, None)
+                self._txns.pop(txn.xid, None)
+                if self._current is txn:
+                    self._current = None
+                self._release_locks(txn.xid)
+                self._prune_states()
 
     def abort_all(self) -> int:
         """回滚所有仍处于 ACTIVE 的事务；返回回滚数量。
