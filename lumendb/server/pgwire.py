@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..datatypes import DataType
-from ..engine.database import Database
+from ..engine.database import Database, _STRUCTURAL_STATEMENTS
 from ..engine.executor import ColumnMeta, Result
 from ..errors import (
     ClientDisconnected,
@@ -381,7 +381,14 @@ class PGWireServer:
             if type(statement).__name__ not in _PURE_READ_STATEMENTS:
                 # 写语句要与 Database.close()/降级互斥；否则 close 在 flush
                 # 之后仍可能有一条 INSERT 把页写到已关闭的句柄上。
-                with database._write_lock:
+                # 结构性语句（VACUUM/TRUNCATE/shadow heap 重写）还要与在途
+                # 只读语句互斥：它们不拿写者锁，会扫到重排中的页。
+                guard = (
+                    database.exclusive_guard()
+                    if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                    else database._write_lock
+                )
+                with guard:
                     database.assert_writable()
                     return session.engine().run(statement, session.txn, params)
             with database.read_guard():
@@ -402,7 +409,12 @@ class PGWireServer:
                 session.portals.clear()
                 return result
 
-        with database._write_lock:
+        guard = (
+            database.exclusive_guard()
+            if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+            else database._write_lock
+        )
+        with guard:
             if database._closed:
                 raise StorageError("数据库已关闭")
             txn = database.txns.begin()

@@ -58,6 +58,17 @@ def _is_read_only_statement(statement: object) -> bool:
 
 _PURE_READ_STATEMENTS = {"Query", "Select", "Explain", "ShowTables", "ShowViews"}
 
+#: 会重排/重写堆页的语句：VACUUM 重排 RID 并重建索引，TRUNCATE 清空页链，
+#: ALTER TYPE / DROP COLUMN 走 shadow heap（写新页再切根）。这些操作期间，
+#: 一个正在扫页的 SELECT 会读到"槽位表已改、记录已搬走"的中间态——所以它们
+#: 必须与所有在途只读语句互斥，而不只是与写语句互斥。
+_STRUCTURAL_STATEMENTS = {
+    "Vacuum",
+    "Truncate",
+    "AlterTableAlterType",
+    "AlterTableDropColumn",
+}
+
 
 class Database:
     def __init__(
@@ -139,6 +150,12 @@ class Database:
         self._closed = False
         #: 正在执行的只读语句数；close() 要等它们退出再关磁盘句柄。
         self._readers = 0
+        #: 结构性写（VACUUM / TRUNCATE / shadow heap 重写）正在独占期间为 True：
+        #: 新的只读语句必须等它结束，否则会读到重排中的页。
+        self._no_readers = False
+        #: 注意这个 Condition 绑在 ``_write_lock`` 上：``with self._readers_cv``
+        #: 等于拿写者锁。读语句只在此处进出各一次（计数 +1/-1），粒度极短，
+        #: 所以并发读仍然成立。
         self._readers_cv = threading.Condition(self._write_lock)
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
@@ -231,6 +248,8 @@ class Database:
         锁做 reader 计数：close 置位 ``_closed`` 后等所有在途读者退出。
         """
         with self._readers_cv:
+            while self._no_readers:
+                self._readers_cv.wait()
             if self._closed:
                 raise StorageError(
                     "数据库已关闭",
@@ -270,6 +289,29 @@ class Database:
 
     # ------------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def exclusive_guard(self):
+        """结构性写独占门：等所有在途只读语句退出，并在期间阻止新读者进入。
+
+        为什么必须有：``HeapFile.vacuum`` 虽然会检查 ``active_xids``，但那是
+        "检查 → 重写"之间的 TOCTOU——检查通过后新开的读事务照样能扫到正在重排
+        的页（slot 目录与记录位置在变）。只读语句不拿 ``_write_lock``，所以
+        写者锁挡不住它们，必须靠这个门。
+
+        语义上也更好：此前 VACUUM 遇到并发读会直接报
+        "VACUUM 需要表上没有并发事务"，读密集型系统里永远跑不起来；现在它
+        先等读者退出（毫秒级）再独占执行，然后放行。
+        """
+        with self._readers_cv:  # 等价于拿 _write_lock（本方法本来就是写路径）
+            self._no_readers = True
+            while self._readers:
+                self._readers_cv.wait()
+            try:
+                yield
+            finally:
+                self._no_readers = False
+                self._readers_cv.notify_all()
+
     def _run(self, statement, params: Optional[list[Any]] = None) -> Result:
         if self._closed:
             raise StorageError(
@@ -286,7 +328,12 @@ class Database:
 
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-            with self._write_lock:
+            guard = (
+                self.exclusive_guard()
+                if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                else self._write_lock
+            )
+            with guard:
                 # [Review-Fix] 关闭/围栏检查必须在拿到 _write_lock **之后**：
                 # 入口检查通过后可能在等锁期间被 close 关掉，此时再写就会
                 # 落到已经关闭的 WAL/磁盘句柄上。两个检查都放进锁内，
