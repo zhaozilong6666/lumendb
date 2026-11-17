@@ -52,7 +52,7 @@ def fresh_db(root: Path, name: str) -> Database:
 def bench_insert(root: Path, rows: int) -> dict:
     def run() -> None:
         db = fresh_db(root, "insert")
-        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32), score INT)")
+        db.execute_one("CREATE TABLE t (id INT, name VARCHAR(32), score INT)")
         batch = []
         for i in range(rows):
             batch.append(f"({i}, 'user{i}', {i % 100})")
@@ -102,7 +102,7 @@ def _prepare_scan_db(root: Path, rows: int, name: str = "scan") -> Path:
     if path.exists():
         shutil.rmtree(path)
     db = Database(path, pool_size=1024)
-    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32), score INT)")
+    db.execute_one("CREATE TABLE t (id INT, name VARCHAR(32), score INT)")
     batch = []
     for i in range(rows):
         batch.append(f"({i}, 'user{i}', {i % 100})")
@@ -116,20 +116,28 @@ def _prepare_scan_db(root: Path, rows: int, name: str = "scan") -> Path:
 
 
 def bench_scan(root: Path, rows: int) -> dict:
+    # 打开一次，只给查询计时。此前每个 run() 都重开数据库，~0.3 s 的冷启动
+    # 被摊进单次 COUNT 的耗时里，报出来的"吞吐"描述的是打开速度（见
+    # bench_open 单独量的那一项）。
     path = _prepare_scan_db(root, rows)
+    db = Database(path, pool_size=1024)
+    ops = 20
 
     def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("SELECT COUNT(*) FROM t")
-        db.close()
+        for _ in range(ops):
+            db.execute_one("SELECT COUNT(*) FROM t")
 
-    best, median = timed(run)
+    try:
+        best, median = timed(run)
+    finally:
+        db.close()
+    per_op = best / ops
     return {
-        "name": "全表扫描 COUNT(*)",
+        "name": "全表扫描 COUNT(*)（每次，热缓存）",
         "rows": rows,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": rows / best,
+        "seconds": per_op,
+        "median_seconds": median / ops,
+        "per_sec": rows / per_op,
     }
 
 
@@ -140,48 +148,50 @@ def bench_point_lookup_index(root: Path, rows: int) -> dict:
     builder.execute_one("CREATE INDEX idx_id ON t (id)")
     builder.close()
     probes = min(500, max(50, rows // 10))
+    db = Database(path, pool_size=1024)
+    random.seed(7)
+    keys = [random.randrange(rows) for _ in range(probes)]
 
     def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("BEGIN")
-        random.seed(7)
-        keys = [random.randrange(rows) for _ in range(probes)]
         for key in keys:
             db.execute_one(f"SELECT name FROM t WHERE id = {key}")
-        db.execute_one("COMMIT")
-        db.close()
 
-    best, median = timed(run, repeat=REPEAT)
+    try:
+        best, median = timed(run, repeat=REPEAT)
+    finally:
+        db.close()
+    per_op = best / probes
     return {
-        "name": f"索引点查（{probes} 次）",
+        "name": f"索引点查（{probes} 次，每次）",
         "rows": probes,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": probes / best,
+        "seconds": per_op,
+        "median_seconds": median / probes,
+        "per_sec": 1 / per_op,
     }
 
 
 def bench_point_lookup_scan(root: Path, rows: int) -> dict:
     path = _prepare_scan_db(root, rows)
     probes = min(50, max(10, rows // 100))
+    db = Database(path, pool_size=1024)
+    random.seed(7)
+    keys = [random.randrange(rows) for _ in range(probes)]
 
     def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("BEGIN")
-        random.seed(7)
-        keys = [random.randrange(rows) for _ in range(probes)]
         for key in keys:
             db.execute_one(f"SELECT name FROM t WHERE id = {key}")
-        db.execute_one("COMMIT")
-        db.close()
 
-    best, median = timed(run, repeat=REPEAT)
+    try:
+        best, median = timed(run, repeat=REPEAT)
+    finally:
+        db.close()
+    per_op = best / probes
     return {
-        "name": f"无索引点查（{probes} 次，全表扫描）",
+        "name": f"无索引点查（{probes} 次，全表扫描，每次）",
         "rows": probes,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": probes / best,
+        "seconds": per_op,
+        "median_seconds": median / probes,
+        "per_sec": 1 / per_op,
     }
 
 
@@ -207,18 +217,24 @@ def bench_update(root: Path, rows: int) -> dict:
 def bench_group_by(root: Path, rows: int) -> dict:
     path = _prepare_scan_db(root, rows)
 
-    def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("SELECT score, COUNT(*), AVG(score) FROM t GROUP BY score")
-        db.close()
+    db = Database(path, pool_size=1024)
+    ops = 10
 
-    best, median = timed(run)
+    def run() -> None:
+        for _ in range(ops):
+            db.execute_one("SELECT score, COUNT(*), AVG(score) FROM t GROUP BY score")
+
+    try:
+        best, median = timed(run)
+    finally:
+        db.close()
+    per_op = best / ops
     return {
-        "name": "GROUP BY（100 个分组）",
+        "name": "GROUP BY（100 个分组，每次）",
         "rows": rows,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": rows / best,
+        "seconds": per_op,
+        "median_seconds": median / ops,
+        "per_sec": rows / per_op,
     }
 
 
@@ -274,21 +290,23 @@ def bench_range_index(root: Path, rows: int) -> dict:
     builder.close()
     probes = min(100, max(20, rows // 40))
 
+    db = Database(path, pool_size=1024)
+
     def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("BEGIN")
         for _ in range(probes):
             db.execute_one("SELECT COUNT(*) FROM t WHERE score >= 99")
-        db.execute_one("COMMIT")
-        db.close()
 
-    best, median = timed(run, repeat=REPEAT)
+    try:
+        best, median = timed(run, repeat=REPEAT)
+    finally:
+        db.close()
+    per_op = best / probes
     return {
-        "name": f"索引范围查询（score >= 99，{probes} 次）",
+        "name": f"索引范围查询（score >= 99，{probes} 次，每次）",
         "rows": probes,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": probes / best,
+        "seconds": per_op,
+        "median_seconds": median / probes,
+        "per_sec": 1 / per_op,
     }
 
 
@@ -296,21 +314,23 @@ def bench_range_scan(root: Path, rows: int) -> dict:
     path = _prepare_scan_db(root, rows, name="range_scan")
     probes = min(30, max(10, rows // 100))
 
+    db = Database(path, pool_size=1024)
+
     def run() -> None:
-        db = Database(path, pool_size=1024)
-        db.execute_one("BEGIN")
         for _ in range(probes):
             db.execute_one("SELECT COUNT(*) FROM t WHERE score >= 99")
-        db.execute_one("COMMIT")
-        db.close()
 
-    best, median = timed(run, repeat=REPEAT)
+    try:
+        best, median = timed(run, repeat=REPEAT)
+    finally:
+        db.close()
+    per_op = best / probes
     return {
-        "name": f"无索引范围查询（score >= 99，{probes} 次，全表扫描）",
+        "name": f"无索引范围查询（score >= 99，{probes} 次，全表扫描，每次）",
         "rows": probes,
-        "seconds": best,
-        "median_seconds": median,
-        "per_sec": probes / best,
+        "seconds": per_op,
+        "median_seconds": median / probes,
+        "per_sec": 1 / per_op,
     }
 
 
@@ -380,22 +400,51 @@ def bench_join(root: Path, rows: int) -> dict:
         db.execute_one("INSERT INTO orders VALUES " + ", ".join(batch))
     db.close()
 
-    def run() -> None:
-        conn = Database(path, pool_size=1024)
-        conn.execute_one("BEGIN")
-        conn.execute_one(
-            "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id"
-        )
-        conn.execute_one("COMMIT")
-        conn.close()
+    conn = Database(path, pool_size=1024)
+    ops = 5
 
-    best, median = timed(run, repeat=REPEAT)
+    def run() -> None:
+        for _ in range(ops):
+            conn.execute_one(
+                "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id"
+            )
+
+    try:
+        best, median = timed(run, repeat=REPEAT)
+    finally:
+        conn.close()
+    per_op = best / ops
     return {
-        "name": f"等值连接（{rows} 订单 × {customers} 客户，哈希）",
+        "name": f"等值连接（{rows} 订单 × {customers} 客户，哈希，每次）",
         "rows": rows,
+        "seconds": per_op,
+        "median_seconds": median / ops,
+        "per_sec": rows / per_op,
+    }
+
+
+def bench_open(root: Path, rows: int) -> dict:
+    """冷启动：打开一个已有数据的库并做一次 COUNT。
+
+    单独量这一项，是因为其余场景此前都把 ``Database(path)`` 放进了计时的
+    ``run()`` 里——打开一次约 0.3 s，比单次点查贵两个数量级，于是"索引点查
+    294 行/秒"这类数字描述的其实是冷启动，不是查询能力。现在读场景都改成
+    "打开一次、重复查询"，冷启动成本在这里显式给出。
+    """
+    path = _prepare_scan_db(root, rows, name="open")
+
+    def run() -> None:
+        db = Database(path, pool_size=1024)
+        db.execute_one("SELECT COUNT(*) FROM t")
+        db.close()
+
+    best, median = timed(run)
+    return {
+        "name": f"冷启动（打开 {rows} 行库 + 1 次 COUNT）",
+        "rows": 1,
         "seconds": best,
         "median_seconds": median,
-        "per_sec": rows / best,
+        "per_sec": 1 / best,
     }
 
 
@@ -412,6 +461,7 @@ BENCHMARKS = [
     bench_range_index,
     bench_range_scan,
     bench_join,
+    bench_open,
     bench_fk_insert,
 ]
 
