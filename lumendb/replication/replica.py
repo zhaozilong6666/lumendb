@@ -209,6 +209,65 @@ class Replica:
             client.ack(base_lsn)
         return cls(target, applied_lsn=base_lsn)
 
+    @classmethod
+    def rejoin_from_server(
+        cls,
+        host: str,
+        port: int,
+        path: str | Path,
+        *,
+        archive_dir: str | Path | None = None,
+        timeout: float = 10.0,
+        token: str | None = None,
+        compress: bool = False,
+        binary_records: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        replica_id: str | None = None,
+    ) -> tuple["Replica", Path | None]:
+        """把曾当过主库/旧副本的本地目录归档，全量基准备份后作为只读副本返回。
+
+        为什么不能走页级增量重建（``rebase_from_server``）：增量重建只覆盖
+        "新主库 pageLSN 更新过的页"。旧主库如果留下**分叉尾巴**（崩溃前已提交、
+        但从未复制出去的事务），它写过的页在新主库侧根本没被改过，增量重建
+        不会覆盖它们 —— 副本就会带着新主库不认的行继续服务，读出来的数据比
+        集群的真实前缀多。所以重新加入必须**全量**。
+
+        归档而不是删除：旧目录整体改名为 ``<name>.stale-<YYYYMMDD-HHMMSS>``
+        （给了 ``archive_dir`` 就移进去），现场保留供事后审计、人工捞数据。
+        调用方必须先确保本地句柄已经关闭（``step_down()`` 或 ``close()``）。
+
+        返回值是 ``(新副本, 归档目录或 None)``。
+        """
+        import shutil
+
+        target = Path(path)
+        archived: Path | None = None
+        if target.exists() and any(target.iterdir()):
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            base = Path(archive_dir) if archive_dir is not None else target.parent
+            base.mkdir(parents=True, exist_ok=True)
+            dest = base / f"{target.name}.stale-{stamp}"
+            index = 1
+            while dest.exists():
+                index += 1
+                dest = base / f"{target.name}.stale-{stamp}-{index}"
+            shutil.move(str(target), str(dest))
+            archived = dest
+        replica = cls.bootstrap_from_server(
+            host,
+            port,
+            target,
+            timeout=timeout,
+            token=token,
+            compress=compress,
+            binary_records=binary_records,
+            ssl_context=ssl_context,
+            server_hostname=server_hostname,
+            replica_id=replica_id,
+        )
+        return replica, archived
+
     # ------------------------------------------------------------------
 
     @property
