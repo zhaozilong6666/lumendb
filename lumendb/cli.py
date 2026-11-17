@@ -15,6 +15,7 @@ from typing import Optional
 
 from .engine.database import Database
 from .errors import LumenError
+from .replication.replica import Replica
 from .server.pgwire import PGWireServer
 
 
@@ -158,6 +159,38 @@ def _split_input(sql: str) -> list[str]:
     return statements
 
 
+def cmd_rejoin(args: argparse.Namespace) -> int:
+    """把本地目录（曾是主库/旧副本）归档，再从新主库全量重建为只读副本。
+
+    为什么必须全量：旧主库可能留下"分叉尾巴"（崩溃前已提交、从未复制出去
+    的事务），页级增量重建只覆盖新主库 pageLSN 更新过的页，分叉页不会被覆盖。
+    旧目录整体归档（默认同级 ``<name>.stale-<时间戳>``），不删除。
+    """
+    replica, archived = Replica.rejoin_from_server(
+        args.host,
+        args.port,
+        args.path,
+        archive_dir=args.archive_dir,
+        token=args.token,
+        compress=args.compress,
+        binary_records=args.binary,
+        replica_id=args.replica_id,
+        timeout=args.timeout,
+    )
+    try:
+        if archived is not None:
+            print(f"旧目录已归档到：{archived}")
+        else:
+            print("目标目录原本为空，无需归档")
+        print(
+            f"已从 {args.host}:{args.port} 全量重建为只读副本，"
+            f"applied_lsn={replica.applied_lsn}"
+        )
+    finally:
+        replica.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lumendb", description="LumenDB 命令行工具")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -195,6 +228,29 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--host", default="127.0.0.1")
             p.add_argument("--port", type=int, default=5432)
         p.set_defaults(handler=handler)
+
+    # 重新加入集群：不与上面三个共用 --fence-path / --node-id / --read-only
+    # （重建之后本来就是一个只读副本，fence 由新主库持有）。
+    p = sub.add_parser(
+        "rejoin", help="归档本地目录并从新主库全量重建为只读副本"
+    )
+    p.add_argument(
+        "--path", type=Path, default=Path("lumendb_data"), help="本地数据目录（会被归档）"
+    )
+    p.add_argument("--host", required=True, help="新主库地址")
+    p.add_argument("--port", type=int, required=True, help="新主库复制流端口")
+    p.add_argument(
+        "--archive-dir",
+        type=Path,
+        default=None,
+        help="旧目录归档位置（默认同级 <name>.stale-<时间戳>）",
+    )
+    p.add_argument("--token", default=None, help="复制流共享 token")
+    p.add_argument("--replica-id", default=None, help="槽位 id")
+    p.add_argument("--compress", action="store_true", help="复制流走 zlib")
+    p.add_argument("--binary", action="store_true", help="记录走二进制帧")
+    p.add_argument("--timeout", type=float, default=10.0)
+    p.set_defaults(handler=cmd_rejoin)
     return parser
 
 

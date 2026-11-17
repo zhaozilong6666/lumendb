@@ -126,3 +126,56 @@ class TestPromotedReplicaRefusesRebuild:
                 replica.close()
         finally:
             primary.close()
+
+
+class TestCliRejoin:
+    """``lumendb rejoin``：把旧目录归档后从新主库全量重建为只读副本。"""
+
+    def test_rejoin_command_archives_and_rebuilds(self, tmp_path, capsys):
+        from lumendb.replication.wal_stream import WALServer
+
+        # 旧主库：写下 5 行并复制给副本。
+        old = Database(tmp_path / "old", checkpoint_wal_bytes=0)
+        old.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        for i in range(5):
+            old.execute_one(f"INSERT INTO t VALUES ({i})")
+        server = WALServer(old).start()
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "new"
+        )
+        assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(5,)]
+        # 副本提升为新主库，旧主库下线。
+        newdb = replica.promote()
+        server.stop()
+        old.close()
+
+        new_server = WALServer(newdb).start()
+        try:
+            rc = main(
+                [
+                    "rejoin",
+                    "--path",
+                    str(tmp_path / "old"),
+                    "--host",
+                    new_server.host,
+                    "--port",
+                    str(new_server.port),
+                ]
+            )
+            assert rc == 0
+            out = capsys.readouterr().out
+            assert "归档" in out
+            assert "只读副本" in out
+            # 旧目录按 <name>.stale-<时间戳> 归档，现场保留。
+            archives = list(tmp_path.glob("old.stale-*"))
+            assert archives, "必须保留归档目录，不能直接删"
+            assert (archives[0] / "lumendb.data").exists()
+            # 重建出来的目录能读到集群真实前缀，且只读。
+            fresh = Database(tmp_path / "old", read_only=True, checkpoint_wal_bytes=0)
+            try:
+                assert fresh.execute_one("SELECT COUNT(*) FROM t").rows == [(5,)]
+            finally:
+                fresh.close()
+        finally:
+            new_server.stop()
+            newdb.close()

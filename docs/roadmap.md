@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1273 passed。
+- 全量测试：1280 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -242,7 +242,12 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
   - **长连接复用已做**：`WALClient(keepalive=True)` /
     `Replica.replicate_from_server(keepalive=True)`；服务端 `_handle` 按请求
     循环，同一连接可混用压缩与二进制帧，空闲超时回收，断连由客户端丢弃重连。
-    本机回环收益可忽略，跨网络追平时省掉每批一个 RTT。仍未做应用层心跳探测。
+    本机回环收益可忽略，跨网络追平时省掉每批一个 RTT。**应用层心跳已做**：
+    `WALClient.ping()` 发一条真实往返（`ping`/`pong`，pong 带当前 LSN），
+    对端没响应抛 `StorageError` 而不是像 `status()` 那样返回全 0。写这条测试
+    时撞出并修掉一个真实缺口：`WALServer.stop()` 此前只关 listen socket 和
+    join 处理线程，**已建立的长连接仍在应答**——"服务停了但还能连上"，探活
+    会被骗；现在服务端记录活跃连接并在 `stop()` 里逐个 shutdown+close。
   - **二进制记录帧已做**（`binary_records=True`）：WAL 记录走 `B` + 定长头 +
     原始 payload，8,124 条记录的流体积 1,634,288 B → 863,144 B（1.89x，省
     47.2%）；非记录消息仍是 JSON 行，按首字节分派，老客户端不受影响。
@@ -289,7 +294,10 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
 保留现场供审计），再走全量基准备份；返回值带归档路径。
 `tests/unit/test_rejoin_as_replica.py` 用"旧主库多提交 5 行、副本提升为新主库"的
 场景验证：重新加入后只看到集群真实前缀的 10 行（分叉 5 行按预期丢弃），
-节点只读、且能追平提升后的新写入。
+节点只读、且能追平提升后的新写入。命令行同样可达：
+`lumendb rejoin --path <旧目录> --host <新主库> --port <复制端口>`（可选
+`--archive-dir` / `--token` / `--replica-id` / `--compress` / `--binary`），
+打印归档位置与重建后的 `applied_lsn`。
 完成标准（整体第 4 层）：主库写入、副本追平、主库崩溃后副本可提升；有延迟
 与丢失窗口的量化报告；上述未完成项至少补齐复制槽、写冻结基准备份和提升
 fencing。
