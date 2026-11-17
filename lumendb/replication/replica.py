@@ -123,6 +123,12 @@ class Replica:
         self.last_rebuild_error: str | None = None
         #: 全量重建时旧数据文件的保存位置（空串表示没有发生全量重建）。
         self.last_rebuild_preserved: str = ""
+        #: 长连接复用：``replicate_from_server(keepalive=True)`` 时缓存一个
+        #: ``WALClient``；参数（host/port/token/compress/binary）变化就换新的。
+        #: 每批一次 TCP 握手在跨网络追平时是实打实的 RTT 开销，本机回环则
+        #: 可以忽略，所以默认关闭。
+        self._stream_client: Any | None = None
+        self._stream_key: tuple[Any, ...] | None = None
         self._rebuild_lock = threading.Lock()
         self._rebuild_in_flight = False
         #: 推送退避：``{peer_id: 可重试的 monotonic 时刻}``。持续拒绝
@@ -308,6 +314,7 @@ class Replica:
         token: str | None = None,
         compress: bool = False,
         binary_records: bool = False,
+        keepalive: bool = False,
         ssl_context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
         replica_id: str | None = None,
@@ -320,12 +327,32 @@ class Replica:
         with self._fetch_lock:
             from .wal_stream import WALClient
 
-            client = WALClient(
-                host, port, timeout=timeout, token=token, compress=compress,
-                ssl_context=ssl_context, server_hostname=server_hostname,
-                replica_id=replica_id, binary_records=binary_records,
+            key = (
+                host, int(port), timeout, token, compress, binary_records,
+                id(ssl_context), server_hostname, replica_id,
             )
-            records = client.fetch(self._applied_lsn, max_records=max_records)
+            if keepalive and self._stream_client is not None:
+                if self._stream_key != key:
+                    self._release_stream_client()
+                client = self._stream_client
+            if not keepalive or self._stream_client is None:
+                client = WALClient(
+                    host, port, timeout=timeout, token=token, compress=compress,
+                    ssl_context=ssl_context, server_hostname=server_hostname,
+                    replica_id=replica_id, binary_records=binary_records,
+                    keepalive=keepalive,
+                )
+                if keepalive:
+                    self._stream_client = client
+                    self._stream_key = key
+            try:
+                records = client.fetch(self._applied_lsn, max_records=max_records)
+            except Exception:
+                # 长连接出错就丢掉缓存，下一次从新连接开始；错误照常抛给
+                # 调用方（监控层负责计数与退避）。
+                if keepalive:
+                    self._release_stream_client()
+                raise
             applied = self.apply(records, primary=None)
             if applied:
                 client.ack(self._applied_lsn)
@@ -756,8 +783,20 @@ class Replica:
     def close(self) -> None:
         """停止后台线程并关闭数据库句柄。"""
         self._stop_background()
+        self._release_stream_client()
         self._adopt_local_lsn()
         self.db.close()
+
+    def _release_stream_client(self) -> None:
+        client = self._stream_client
+        self._stream_client = None
+        self._stream_key = None
+        close = getattr(client, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - 关闭长连接不能影响收工
+                pass
 
     def add_step_down_listener(self, callback: Callable[[str], None]) -> None:
         """注册降级观察者（``ReplicationMonitor`` 用它把状态改成 needs_attention）。"""

@@ -93,7 +93,7 @@
 >   叶子 RLock（23 个方法），避免 CPython 的
 >   "dictionary changed size during iteration"。两条连接各跑一条 sleep(0.12)
 >   的 SELECT 总耗时 < 0.228 s（串行应 ≥ 0.24 s），慢查询期间新连接握手不被阻塞。
-> - 1245 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
+> - 1252 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
 >   Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
@@ -232,7 +232,7 @@
 >   thread cannot mutate a dict mid-iteration. Two connections each running
 >   a sleep(0.12) SELECT finish in under 0.228 s (serial would be >= 0.24 s),
 >   and a new connection's handshake is not blocked during a slow query.
-> - 1245 automated tests including crash-injection and a 20-seed randomized
+> - 1252 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite (full run 75 s); CI matrix covers
 >   Ubuntu/Windows × Python 3.12/3.13.
 

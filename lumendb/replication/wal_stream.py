@@ -250,10 +250,15 @@ class WALServer:
         token: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         redirect_to: tuple[str, int] | None = None,
+        idle_timeout: float = 10.0,
     ) -> None:
         if slot_path is not None and slot_dir is not None:
             raise ValueError("slot_path 与 slot_dir 只能配置一个")
         self.primary = primary
+        #: 长连接的空闲超时：超时后回收处理线程，不当成错误。
+        self.idle_timeout = float(idle_timeout)
+        #: 已接受的 TCP 连接总数（诊断用：验证 keepalive 真的复用了连接）。
+        self.connection_count = 0
         self.token = token
         self.ssl_context = ssl_context
         self.redirect_to = redirect_to
@@ -380,7 +385,8 @@ class WALServer:
                     except OSError:
                         pass
                     continue
-            conn.settimeout(10)
+            conn.settimeout(float(getattr(self, "idle_timeout", 10.0)))
+            self.connection_count = getattr(self, "connection_count", 0) + 1
             # 周期性 follower 会不断开新连接；只保留还活着的处理线程，
             # 否则长期运行的服务会无限累积已结束的线程对象。
             self._handlers[:] = [h for h in self._handlers if h.is_alive()]
@@ -389,53 +395,67 @@ class WALServer:
             handler.start()
 
     def _handle(self, conn: socket.socket) -> None:
+        """处理一条 TCP 连接上的请求。
+
+        连接**可以复用**：处理完一个请求后继续等下一个（``WALClient(keepalive=
+        True)`` 用它省掉反复握手）。每个请求自己带 ``compress`` / ``format``，
+        所以同一连接上可以混用压缩与二进制帧。空闲超过 ``idle_timeout`` 或对方
+        关闭时静默退出；任何一个请求处理出错都写 error 并结束这条连接——出错后
+        流可能已经半截，继续复用会把残包当成下一个请求。
+        """
         compress = False
         try:
-            line = conn.makefile("rb").readline()
-            if not line:
-                return
-            request = _decode_line(line)
-            compress = bool(request.get("compress"))
-            binary_records = request.get("format") == "bin"
-            if self.token is not None and request.get("token") != self.token:
-                _send_line(
-                    conn,
-                    {"type": "error", "message": "复制流认证失败"},
-                    compress=compress,
-                )
-                return
-            if self.redirect_to is not None:
-                _send_line(
-                    conn,
-                    {
-                        "type": "redirect",
-                        "host": self.redirect_to[0],
-                        "port": int(self.redirect_to[1]),
-                    },
-                    compress=compress,
-                )
-                return
-            kind = request.get("type")
-            if kind == "backup":
-                self._handle_backup(conn, request)
-            elif kind == "backup_stream":
-                self._handle_backup_stream(conn, request)
-            elif kind == "incremental":
-                self._handle_incremental(conn, request)
-            elif kind == "replicate":
-                self._handle_replicate(conn, request, binary_records)
-            elif kind == "ack":
-                self._handle_ack(conn, request)
-            elif kind == "status":
-                self._handle_status(conn, request)
-            elif kind == "slots":
-                self._handle_slots(conn, request)
-            else:
-                _send_line(
-                    conn,
-                    {"type": "error", "message": "未知复制请求"},
-                    compress=compress,
-                )
+            file = conn.makefile("rb")
+            while True:
+                line = file.readline()
+                if not line:
+                    return
+                request = _decode_line(line)
+                compress = bool(request.get("compress"))
+                binary_records = request.get("format") == "bin"
+                if self.token is not None and request.get("token") != self.token:
+                    _send_line(
+                        conn,
+                        {"type": "error", "message": "复制流认证失败"},
+                        compress=compress,
+                    )
+                    return
+                if self.redirect_to is not None:
+                    _send_line(
+                        conn,
+                        {
+                            "type": "redirect",
+                            "host": self.redirect_to[0],
+                            "port": int(self.redirect_to[1]),
+                        },
+                        compress=compress,
+                    )
+                    return
+                kind = request.get("type")
+                if kind == "backup":
+                    self._handle_backup(conn, request)
+                elif kind == "backup_stream":
+                    self._handle_backup_stream(conn, request)
+                elif kind == "incremental":
+                    self._handle_incremental(conn, request)
+                elif kind == "replicate":
+                    self._handle_replicate(conn, request, binary_records)
+                elif kind == "ack":
+                    self._handle_ack(conn, request)
+                elif kind == "status":
+                    self._handle_status(conn, request)
+                elif kind == "slots":
+                    self._handle_slots(conn, request)
+                else:
+                    _send_line(
+                        conn,
+                        {"type": "error", "message": "未知复制请求"},
+                        compress=compress,
+                    )
+                    return
+        except socket.timeout:
+            # 长连接空闲超时：安静地回收线程，不当作错误。
+            return
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             try:
                 _send_line(
@@ -685,6 +705,7 @@ class WALClient:
         replica_id: str | None = None,
         follow_redirects: bool = False,
         binary_records: bool = False,
+        keepalive: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -699,7 +720,53 @@ class WALClient:
         #: 记录走 ``B`` 前缀的二进制帧（无 base64 / 无 JSON 字段名）。
         #: 非记录消息仍是 JSON 行，接收端按首字节分派。
         self.binary_records = binary_records
+        #: 复用同一条 TCP 连接发多个请求（服务端 ``_handle`` 按请求循环）。
+        #: 一个 ``WALClient`` 实例同一时刻只允许一个在途请求，所以内部用锁
+        #: 串行化；连接坏了就关掉，下一次请求自动重连。
+        self.keepalive = keepalive
+        self._sock: socket.socket | None = None
+        self._io_lock = threading.RLock()
         self.redirects = 0
+
+    def close(self) -> None:
+        """关闭 keepalive 连接（普通模式没有长连接，调用无副作用）。"""
+        with self._io_lock:
+            sock = self._sock
+            self._sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _connect(self) -> socket.socket:
+        sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        if self.ssl_context is not None:
+            sock = self.ssl_context.wrap_socket(
+                sock, server_hostname=self.server_hostname
+            )
+        sock.settimeout(self.timeout)
+        return sock
+
+    def _exchange(self, sock: socket.socket, payload: dict, _depth: int) -> Iterable[dict]:
+        _send_line(sock, payload)
+        file = sock.makefile("rb")
+        for data in _iter_messages(file):
+            if data.get("type") == "error":
+                raise StorageError(data.get("message", "复制请求失败"))
+            if data.get("type") == "redirect":
+                target_host = str(data.get("host", ""))
+                target_port = int(data.get("port", 0))
+                if self.follow_redirects and _depth < 3:
+                    self.host = target_host
+                    self.port = target_port
+                    if not self._explicit_hostname:
+                        self.server_hostname = target_host
+                    self.redirects += 1
+                    yield from self._request(payload, _depth + 1)
+                    return
+                raise RedirectError(target_host, target_port)
+            yield data
 
     def _request(self, payload: dict, _depth: int = 0) -> Iterable[dict]:
         payload = dict(payload)
@@ -711,36 +778,27 @@ class WALClient:
             payload["format"] = "bin"
         if self.replica_id is not None:
             payload["replica_id"] = self.replica_id
-        sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        try:
-            if self.ssl_context is not None:
-                sock = self.ssl_context.wrap_socket(
-                    sock, server_hostname=self.server_hostname
-                )
-            sock.settimeout(self.timeout)
-            _send_line(sock, payload)
-            file = sock.makefile("rb")
-            for data in _iter_messages(file):
-                if data.get("type") == "error":
-                    raise StorageError(data.get("message", "复制请求失败"))
-                if data.get("type") == "redirect":
-                    target_host = str(data.get("host", ""))
-                    target_port = int(data.get("port", 0))
-                    if self.follow_redirects and _depth < 3:
-                        self.host = target_host
-                        self.port = target_port
-                        if not self._explicit_hostname:
-                            self.server_hostname = target_host
-                        self.redirects += 1
-                        yield from self._request(payload, _depth + 1)
-                        return
-                    raise RedirectError(target_host, target_port)
-                yield data
-        finally:
+        if not self.keepalive:
+            sock = self._connect()
             try:
-                sock.close()
-            except OSError:
-                pass
+                yield from self._exchange(sock, payload, _depth)
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            return
+        with self._io_lock:
+            if self._sock is None:
+                self._sock = self._connect()
+            sock = self._sock
+            try:
+                yield from self._exchange(sock, payload, _depth)
+            except (OSError, StorageError):
+                # 连接坏了（对端重启/半包/超时）：丢掉它，下一次请求重连。
+                # 错误照常抛给调用方——"明确失败"比静默重试安全。
+                self.close()
+                raise
 
     def backup_to(self, target: str | Path, *, chunk_size: int = 256 * 1024) -> int:
         """分块接收基准备份并落盘，返回基础 checkpoint LSN。"""

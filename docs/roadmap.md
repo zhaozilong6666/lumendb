@@ -238,7 +238,11 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
   `ReplicationMonitor` 会跟随最多 3 次），多数派投票和 TTL 写租约 MVP 已做
   （`QuorumNode.campaign()` / `Replica.promote_with_quorum()` / `Lease`），但
   完整 leader 选举、日志复制协商和网络分区下的双写防护仍未完成。
-- 复制流认证/TLS、压缩、二进制帧、断点续传与真实网络故障注入。
+- 复制流认证/TLS、压缩、二进制帧、长连接、断点续传与真实网络故障注入。
+  - **长连接复用已做**：`WALClient(keepalive=True)` /
+    `Replica.replicate_from_server(keepalive=True)`；服务端 `_handle` 按请求
+    循环，同一连接可混用压缩与二进制帧，空闲超时回收，断连由客户端丢弃重连。
+    本机回环收益可忽略，跨网络追平时省掉每批一个 RTT。仍未做应用层心跳探测。
   - **二进制记录帧已做**（`binary_records=True`）：WAL 记录走 `B` + 定长头 +
     原始 payload，8,124 条记录的流体积 1,634,288 B → 863,144 B（1.89x，省
     47.2%）；非记录消息仍是 JSON 行，按首字节分派，老客户端不受影响。
