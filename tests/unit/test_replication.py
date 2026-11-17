@@ -1,4 +1,4 @@
-"""只读副本的物理 WAL 应用测试。"""
+﻿"""只读副本的物理 WAL 应用测试。"""
 
 from __future__ import annotations
 
@@ -833,4 +833,71 @@ class TestReplica:
         finally:
             if replica is not None:
                 replica.db.close()
+            primary.close()
+
+
+class TestReplicaApplyInterleavingWithReads:
+    """副本的只读查询与"大批次 apply"共用数据锁，但组间必须给读者让路。"""
+
+    def test_large_batch_apply_yields_to_waiting_readers(self, tmp_path):
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        replica = Replica.bootstrap(primary, tmp_path / "replica")
+        # 缩小分组，让"组边界"足够多——生产默认 512，行为相同。
+        replica._apply_chunk_size = 8
+        try:
+            for i in range(200):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+
+            apply_done = threading.Event()
+            reads_while_applying = 0
+            guard = threading.Lock()
+
+            def reader() -> None:
+                nonlocal reads_while_applying
+                hits = 0
+                while not apply_done.is_set():
+                    count = replica.execute_one(
+                        "SELECT COUNT(*) FROM t"
+                    ).rows[0][0]
+                    # 组边界上读到的是"已应用前缀"：行数必须在合理区间内。
+                    assert 0 <= count <= 200
+                    if not apply_done.is_set():
+                        hits += 1
+                with guard:
+                    reads_while_applying = hits
+
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            # 让读者先进入 execute_one、登记到 _pending_reads 上。
+            time.sleep(0.02)
+            applied = replica.apply_from_primary(primary)
+            apply_done.set()
+            thread.join(timeout=10)
+            assert applied > 0
+            assert replica.execute_one("SELECT COUNT(*) FROM t").rows == [(200,)]
+            # 核心断言：应用整批期间读者成功进入过临界区（不是等整批结束）。
+            assert reads_while_applying >= 1, (
+                "读者没有在 apply 期间穿插进来："
+                f"applied={applied} chunk={replica._apply_chunk_size}"
+            )
+        finally:
+            replica.db.close()
+            primary.close()
+
+    def test_apply_aborts_when_database_handle_was_closed(self, tmp_path):
+        """提升/降级在别的线程关了句柄后，在途的 apply 不能继续写页。"""
+        primary = make_primary(tmp_path)
+        primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        replica = Replica.bootstrap(primary, tmp_path / "replica")
+        replica._apply_chunk_size = 4
+        try:
+            for i in range(40):
+                primary.execute_one(f"INSERT INTO t VALUES ({i})")
+            records = list(primary.wal.iter_records(replica.applied_lsn + 1))
+            assert records
+            replica.db.close()  # 模拟 step_down/promote 已完成句柄替换
+            applied = replica.apply(records, primary=primary)
+            assert applied == 0
+        finally:
             primary.close()

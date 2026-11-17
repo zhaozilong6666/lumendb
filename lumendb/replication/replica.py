@@ -89,7 +89,17 @@ class Replica:
         # 默认 1MB 与用户配置。
         self._wal_segment_bytes = wal_segment_bytes
         # apply 与只读查询不能同时碰到 Buffer Pool / catalog。
+        # 这把锁只保护"数据面"（一组 WAL 记录的应用 / 一次只读查询）；
+        # 拉取循环的串行化在 ``_fetch_lock`` 上，避免两件事互相拖住。
         self._lock = threading.RLock()
+        #: 串行化"拉取循环"（fetch + apply + ack）：同一时刻只允许一个线程
+        #: 推进副本进度，否则两个拉取者会交错确认同一个 LSN。
+        self._fetch_lock = threading.Lock()
+        #: 一批 ``apply`` 内每组应用的记录数。组的边界是"给等待中的只读
+        #: 查询让出锁"的窗口：批次很大时读者不必等整批应用完。
+        self._apply_chunk_size = 512
+        #: 正在等数据锁的只读查询数（无锁启发式计数，只用来决定要不要让出）。
+        self._pending_reads = 0
         self._lease_keeper: LeaseKeeper | None = None
         self._heartbeat: HeartbeatLoop | None = None
         #: 本副本对应的仲裁节点；用来把复制进度（match_lsn）报给 leader。
@@ -225,7 +235,7 @@ class Replica:
 
     def apply_from_primary(self, primary: Database) -> int:
         """读取主库 WAL 中尚未应用的部分，返回本次应用的记录数。"""
-        with self._lock:
+        with self._fetch_lock:
             base_lsn = getattr(primary.wal, "base_lsn", 0)
             if base_lsn and self._applied_lsn + 1 < base_lsn:
                 raise StorageError(
@@ -249,7 +259,7 @@ class Replica:
         replica_id: str | None = None,
     ) -> int:
         """通过 TCP 拉取一批 WAL 记录并应用，返回本次应用条数。"""
-        with self._lock:
+        with self._fetch_lock:
             from .wal_stream import WALClient
 
             client = WALClient(
@@ -264,49 +274,80 @@ class Replica:
             return applied
 
     def apply(self, records, *, primary: Database | None = None) -> int:
-        with self._lock:
-            count = 0
-            for record in records:
-                if record.lsn <= self._applied_lsn:
-                    continue
-                if (
-                    self._expected_end_lsn
-                    and record.lsn != self._expected_end_lsn
-                ):
-                    raise StorageError(
-                        "复制记录不连续，拒绝跳过缺失的 WAL",
-                        detail=(
-                            f"expected_lsn={self._expected_end_lsn} "
-                            f"got_lsn={record.lsn}"
-                        ),
-                    )
-                if record.rtype == LogType.PAGE_IMAGE:
-                    self._apply_page_image(record)
-                elif record.rtype in (LogType.UPDATE, LogType.CLR):
-                    self._apply_page_update(record, primary)
-                elif record.rtype == LogType.BEGIN:
-                    self.db.txns.note_replica_state(record.xid, TxnState.ACTIVE)
-                elif record.rtype == LogType.COMMIT:
-                    self.db.txns.note_replica_state(record.xid, TxnState.COMMITTED)
-                elif record.rtype == LogType.ABORT:
-                    self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
-                # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
-                self._applied_lsn = record.lsn
-                self._expected_end_lsn = record.lsn + len(record.encode())
-                self._next_lsn = self._expected_end_lsn
-                count += 1
+        """应用一批 WAL 记录，返回本次应用的条数。
 
-            if count:
-                # 先把页写下去，再推进副本 LSN；崩溃后最多重放一段记录，
-                # pageLSN 会让重复应用变成幂等操作。
-                self.db.bp.flush_all()
-                self.db.catalog.load()
-                self._write_marker()
-                if primary is not None:
-                    retain = getattr(primary.wal, "retain_lsn", None)
-                    if retain is not None:
-                        primary.wal.retain_lsn = self._applied_lsn
-            return count
+        批次按 ``_apply_chunk_size`` 分组，组间释放数据锁：批次很大时
+        等待中的只读查询（``execute_one``）不必等整批应用完。一条记录应用
+        完成后的页状态是自洽的（PAGE_IMAGE 全页替换 / 单页 diff），所以
+        读者在组边界能看到"应用了前缀"的一致数据，不会看到半个记录。
+
+        组间还会重新校验数据库句柄：``promote`` / ``step_down`` /
+        ``rebase_from_server`` 会在别的线程里关闭并替换 ``self.db``，
+        一旦发现句柄已换，本批立即中止（已应用的记录保持，marker 不推进，
+        重放由 pageLSN 保持幂等）。
+        """
+        database = self.db
+        todo = list(records)
+        count = 0
+        chunk = max(1, int(self._apply_chunk_size))
+        for start in range(0, len(todo), chunk):
+            with self._lock:
+                if self.db is not database or getattr(database, "_closed", False):
+                    break
+                count += self._apply_records(todo[start : start + chunk], primary)
+            # 有只读查询在等锁时给一个让出窗口；没有读者就不减速。
+            # ``RLock`` 没有公平性：只 sleep(0) 的话应用线程常常立刻把锁
+            # 抢回去，等待中的读者可能整批都轮不到；1ms 的窗口足够一次
+            # SELECT 进入临界区，而只在"确实有人在等"时才付这个代价。
+            if self._pending_reads > 0 and start + chunk < len(todo):
+                time.sleep(0.001)
+        if count:
+            with self._lock:
+                if self.db is database:
+                    # 先把页写下去，再推进副本 LSN；崩溃后最多重放一段记录，
+                    # pageLSN 会让重复应用变成幂等操作。
+                    self.db.bp.flush_all()
+                    self.db.catalog.load()
+                    self._write_marker()
+                    if primary is not None:
+                        retain = getattr(primary.wal, "retain_lsn", None)
+                        if retain is not None:
+                            primary.wal.retain_lsn = self._applied_lsn
+        return count
+
+    def _apply_records(self, records, primary: Database | None) -> int:
+        """在已持有数据锁的前提下应用一段记录（连续性与幂等检查在内）。"""
+        count = 0
+        for record in records:
+            if record.lsn <= self._applied_lsn:
+                continue
+            if (
+                self._expected_end_lsn
+                and record.lsn != self._expected_end_lsn
+            ):
+                raise StorageError(
+                    "复制记录不连续，拒绝跳过缺失的 WAL",
+                    detail=(
+                        f"expected_lsn={self._expected_end_lsn} "
+                        f"got_lsn={record.lsn}"
+                    ),
+                )
+            if record.rtype == LogType.PAGE_IMAGE:
+                self._apply_page_image(record)
+            elif record.rtype in (LogType.UPDATE, LogType.CLR):
+                self._apply_page_update(record, primary)
+            elif record.rtype == LogType.BEGIN:
+                self.db.txns.note_replica_state(record.xid, TxnState.ACTIVE)
+            elif record.rtype == LogType.COMMIT:
+                self.db.txns.note_replica_state(record.xid, TxnState.COMMITTED)
+            elif record.rtype == LogType.ABORT:
+                self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
+            # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
+            self._applied_lsn = record.lsn
+            self._expected_end_lsn = record.lsn + len(record.encode())
+            self._next_lsn = self._expected_end_lsn
+            count += 1
+        return count
 
     def _apply_page_image(self, record) -> None:
         page_id, image = decode_page_image(record.payload)
@@ -635,8 +676,14 @@ class Replica:
     # ------------------------------------------------------------------
 
     def execute_one(self, sql: str, params=None):
-        with self._lock:
-            return self.db.execute_one(sql, params)
+        # 先用无锁计数登记"有读者在等"，apply 的组间让出据此决定是否
+        # 减速；计数只影响调度启发式，不承担任何正确性职责。
+        self._pending_reads += 1
+        try:
+            with self._lock:
+                return self.db.execute_one(sql, params)
+        finally:
+            self._pending_reads -= 1
 
     def close(self) -> None:
         """停止后台线程并关闭数据库句柄。"""

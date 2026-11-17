@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1216 passed。
+- 全量测试：1218 passed。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -242,7 +242,12 @@ keeper 续租失败通知；`lease_loss_stepdown=True` 时 keeper 失败会直�
     可以走标准库 TLS；服务端 `SSLContext.verify_mode = CERT_REQUIRED` + 客户端
     证书即双向认证，已有测试覆盖。证书分发和轮换仍需部署层补齐；主机名校验由客户端 `server_hostname`
   控制，已有“错误主机名必须握手失败”的测试。
-- 副本查询与 apply 的并发调度；当前是单线程应用。
+- 副本查询与 apply 的并发调度**已做 MVP**：`Replica.apply` 按
+  `_apply_chunk_size`（默认 512）分组应用，组间释放数据锁，等待中的只读
+  查询能在组边界插入（`_pending_reads` 启发式只决定"要不要让出"，不承担
+  正确性）；拉取循环的串行化拆到 `_fetch_lock` 上，不再与数据面共用一把锁。
+  语义边界：读者看到的是"已应用前缀"，不保证跨组一致快照；多条只读查询
+  之间仍受引擎语句锁（L1）串行化。
 - 多副本槽位已做 MVP：`WALServer(slot_dir=...)` 每个 `replica_id` 一个
   `<id>.confirmed`，主库保留点取所有槽位的最小确认 LSN；`Replica` 在
   bootstrap 后先 ack 基准备份 LSN，避免新副本把保留点钉在 0。槽位仍保存在
@@ -273,7 +278,8 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 `append_entries` + 逐条任期 + 分叉/缺口自动重建（重建替代尾巴截断）；
 心跳超时自动竞选与双候选收敛已做；双写防护为共享 fence + TTL 租约 +
 重启打开即检（`fence_path`/`lease_path`）三层兜底，不是完整的多数派写
-确认。剩余差距：完整 commit index、副本查询与 apply 的并发调度，因此
+确认。副本查询与 apply 的并发调度已做 MVP（批内分组让出）；剩余差距：
+完整 commit index、跨组一致快照，因此
 第 4 层只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
