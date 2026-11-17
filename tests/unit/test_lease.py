@@ -137,14 +137,24 @@ def test_lease_lock_times_out_when_lock_file_exists(tmp_path):
 
 
 def test_lease_keeper_renews_until_stopped(tmp_path):
-    lease = Lease(tmp_path / "lease.json", "n0", ttl=0.4)
+    # ttl 用大一点：机器繁忙时 0.4s 的租约可能在 keeper 第一次续租前就过期，
+    # 于是 last_error 被设上、断言假失败。被测语义是"keeper 会持续续租"，
+    # 不是"它一定在 150ms 内续上"，所以改成 deadline 轮询。
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=10.0)
     lease.acquire(term=1)
     first = lease.read()["expires_at"]
     keeper = LeaseKeeper(lease, interval=0.05).start()
     try:
-        time.sleep(0.15)
-        renewed = lease.read()["expires_at"]
-        assert renewed > first
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if lease.read()["expires_at"] > first:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(
+                f"keeper 没有续租：expires_at={lease.read()['expires_at']} "
+                f"first={first} last_error={keeper.last_error!r}"
+            )
         assert keeper.last_error is None
     finally:
         keeper.stop()
