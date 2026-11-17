@@ -346,6 +346,9 @@ class Ledger:
         my_topic = _topic_tokens(fact.claim)
         findings = []
         for other in self.facts:
+            if fact.supersedes and other.id == fact.supersedes:
+                # 本条就是来取代它的，旧值不该再报冲突。
+                continue
             theirs = extract_metrics(other.claim)
             if not theirs:
                 continue
@@ -825,7 +828,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         at = f"  @ {commits[0]}" if commits else ""
         print(f"  最近测试 {test_fact.claim}{at}  （{test_fact.created[:10]}）")
 
-    questions = [f for f in ledger.facts if f.kind == "open_question"]
+    questions = [
+        f
+        for f in ledger.facts
+        if f.kind == "open_question"
+        and f.id not in {x.supersedes for x in ledger.facts if x.supersedes}
+    ]
     if questions:
         print(f"  未决问题（{len(questions)}）")
         for fact in questions[:6]:

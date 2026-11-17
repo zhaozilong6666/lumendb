@@ -26,7 +26,16 @@ from tools.project_memory import (
 )
 
 
-def _fact(fact_id: str, claim: str, *, created: str | None = None, tags=(), evidence=(), kind="measurement"):
+def _fact(
+    fact_id: str,
+    claim: str,
+    *,
+    created: str | None = None,
+    tags=(),
+    evidence=(),
+    kind="measurement",
+    supersedes=None,
+):
     return Fact(
         id=fact_id,
         kind=kind,
@@ -34,6 +43,7 @@ def _fact(fact_id: str, claim: str, *, created: str | None = None, tags=(), evid
         created=created or datetime.now().astimezone().replace(microsecond=0).isoformat(),
         tags=list(tags),
         evidence=list(evidence),
+        supersedes=supersedes,
     )
 
 
@@ -226,6 +236,34 @@ def test_cli_add_with_evidence_round_trips(tmp_path, capsys):
     assert [e["type"] for e in fact.evidence] == ["commit", "file"]
     assert fact.evidence[0]["value"] == "abc1234"
     assert fact.evidence[1]["anchor"] == "量级参考"
+
+
+def test_number_conflicts_ignores_fact_being_superseded(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    old = _fact("old", "外键子表插入 374 行/秒", tags=["bench"])
+    ledger.append(old)
+    new = _fact("new", "外键子表插入 1199 行/秒", tags=["bench"], supersedes="old")
+    assert ledger.number_conflicts(new) == []
+    # 没有 supersedes 时仍应报警：374 vs 1199 差超过 25%
+    unrelated = _fact("other", "外键子表插入 1199 行/秒", tags=["bench"])
+    assert ledger.number_conflicts(unrelated)
+
+
+def test_status_hides_open_question_answered_by_supersedes(tmp_path, capsys):
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("q1", "绑定计划缓存是否值得做", kind="open_question", tags=["perf"]))
+    ledger.append(
+        _fact(
+            "a1", "计划缓存已落地，同一 SQL 点查 −38.5%",
+            kind="measurement", tags=["perf"], supersedes="q1",
+        )
+    )
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "status"]) == 0
+    out = capsys.readouterr().out
+    assert "未决问题" not in out
+    assert "绑定计划缓存是否值得做" not in out
 
 
 def test_status_command_summarizes_project(tmp_path, capsys):
