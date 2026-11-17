@@ -202,6 +202,32 @@ def test_search_respects_kind_and_tag_filters():
     assert [h["fact"].id for h in hits] == ["a"]
 
 
+def test_cli_add_with_evidence_round_trips(tmp_path, capsys):
+    """argparse 的 type 已把 --evidence 变成 dict，cmd_add 不能再解析一次。"""
+    from tools.project_memory import main
+
+    ledger = tmp_path / "ledger.jsonl"
+    code = main(
+        [
+            "--ledger", str(ledger),
+            "--root", str(tmp_path),
+            "add",
+            "--kind", "measurement",
+            "--claim", "点查 0.47ms",
+            "--tags", "bench",
+            "--evidence", "commit:abc1234",
+            "--evidence", "file:README.md:量级参考",
+        ]
+    )
+    assert code == 0
+    loaded = Ledger(ledger, root=tmp_path)
+    assert len(loaded.facts) == 1
+    fact = loaded.facts[0]
+    assert [e["type"] for e in fact.evidence] == ["commit", "file"]
+    assert fact.evidence[0]["value"] == "abc1234"
+    assert fact.evidence[1]["anchor"] == "量级参考"
+
+
 def test_status_command_summarizes_project(tmp_path, capsys):
     git = find_git()
     if not git:

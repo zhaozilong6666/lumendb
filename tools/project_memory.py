@@ -641,7 +641,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         created=_now_iso(),
         confidence=args.confidence,
         tags=[t.strip() for t in (args.tags or "").split(",") if t.strip()],
-        evidence=[_parse_evidence(e) for e in (args.evidence or [])],
+        evidence=[
+            _parse_evidence(e) if isinstance(e, str) else e
+            for e in (args.evidence or [])
+        ],
         supersedes=args.supersedes,
     )
     if fact.kind not in FACT_KINDS:
