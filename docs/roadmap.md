@@ -332,12 +332,13 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
   之间有 TOCTOU 窗口，现在等读者归零并挡住新读者再执行，顺带把 VACUUM
   从"遇并发读直接报错"变成"等读者退出（毫秒级）后独占执行"。
 
-剩余差距：follower 侧独立推演 commit index（现在靠 leader 心跳下发）；
-单事务超过一个复制批时 apply 的原子性（现为降级路径，彻底解决要索引项
-MVCC）；写并发的第 2 步（行/键锁）仍未开工，三个真实阻塞写在
-`docs/concurrency.md`（结构变化时仍写同一批目录字节、唯一索引项在
-DELETE 时被物理删除、物理 undo 不按事务区分字节）。因此第 4 层仍只能
-标“MVP 验收”，不能标“生产就绪”。
+剩余差距：follower 的 commit_lsn 仍是 leader 口头告知（标准 Raft 行为，
+见 `docs/replication-commit-index.md`，同步屏障/提升闸门已用
+`verified_commit_lsn` 独立验证，不做 match 表广播）；单事务超过一个复制批
+时 apply 的原子性（现为降级路径，彻底解决要索引项 MVCC）；写并发的第 2 步
+（行/键锁）仍未开工，三个真实阻塞写在 `docs/concurrency.md`（结构变化时仍
+写同一批目录字节、唯一索引项在 DELETE 时被物理删除、物理 undo 不按事务
+区分字节）。因此第 4 层仍只能标“MVP 验收”，不能标“生产就绪”。
 
 ## 明确不做
 
