@@ -10,7 +10,7 @@
 | 层 | 位置 | 保护什么 | 去掉会怎样 |
 |---|---|---|---|
 | **L1 语句锁** | `Database._statement_lock`（`engine/database.py`） | `Executor` 的**每条语句状态**：`binder`、`$n` 参数、CTE 作用域、递归工作表 | 两个线程同时 SELECT 会互相覆盖 binder：带 CTE 的查询丢作用域、参数化查询拿到别人的参数。实测：去掉后 `tests/unit/test_concurrent_statements.py` 的并发 CTE 用例 **30/30 轮失败** |
-| **L2 事务写者锁** | `Executor._acquire_writer_lock` + `storage/lock.py:WRITER_RESOURCE` | 让"写事务"之间互斥：目录页、唯一索引项的物理删除、版本链 | 两个写事务同时改同一行 → 一个逻辑行 `SELECT` 出两行；回滚复活被删的唯一键；并发 DDL 互相踩目录页（都是实测过的真实故障） |
+| **L2 行/键/DDL 锁** | `Executor._lock_row` / `_lock_key` / `_acquire_writer_lock`（DDL 分支）+ `storage/lock.py` | 写写冲突：同一行、同一唯一键、DDL 互斥、目录保存 | 两个写事务同时改同一行 → 一个逻辑行 `SELECT` 出两行；回滚复活被删的唯一键；并发 DDL 互相踩目录页（都是实测过的真实故障） |
 | **L3 quiesce 锁** | `Database._write_lock` | `close()` / `snapshot()` / `checkpoint()` 与写语句互斥 | 备份/降级期间数据页被改，基准备份拿到混合状态；`step_down()` 把页写到已关闭的句柄上 |
 
 外加 `PGWireServer` 的 asyncio 锁（`server/pgwire.py`）：它把"单条语句"串行化，
@@ -125,7 +125,7 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 仍无锁，并发写探针里表现为"页链 7 页 vs last_page=8"。这两处属于目录级
 （而非页级）竞争，修法是把目录页也纳入同一套 latch，同样安排在第 2 步。
 
-### 第 2 步：行锁 + 键锁 + 目录锁（替掉 L2）
+### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 
 | 资源 | 何时加 | 模式 | 释放 |
 |---|---|---|---|
@@ -143,7 +143,7 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 目录仍然是瓶颈：第 2 步要让 DML **不再无条件 `persist`**（只有真正改了目录对象
 才写），否则"目录锁"会把所有写者重新串起来，等于白做。
 
-### 第 3 步：收掉 L2，重跑不变量
+### 第 3 步：重跑不变量（2026-11-18 已随第 2 步验收）
 
 - 删 `_acquire_writer_lock`，`WRITER_RESOURCE` 只留给"需要全库互斥的维护操作"
   （VACUUM 已经要求无活跃事务，可以直接用）；

@@ -50,27 +50,63 @@ def env(tmp_path):
 
 
 class TestWriteWriteConflict:
-    def test_second_writer_fails_fast(self, env):
-        """两个写事务不能同时持有写者锁；第二个拿到 40001 而不是静默写入。"""
+    """写并发：不同行/不同键可以同时写，只有真正冲突才 40001。
+
+    这一组用例在"单写者"时期断言的是"第二个写事务一律 40001"。行/键锁落地后，
+    冲突的粒度从"整个数据库"缩到"这一行 / 这一个唯一键"——所以这里既要有
+    "不同行可以并行"的正向用例，也要保留"同一行必须失败"的防线。
+    """
+
+    def test_two_writers_on_different_rows_both_commit(self, env):
         db, server = env
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
-        s1, s2 = Session(database=db), Session(database=db)
+        db.execute_one("INSERT INTO t VALUES (1, 0)")
+        db.execute_one("INSERT INTO t VALUES (2, 0)")
+        first, second = Session(database=db), Session(database=db)
 
-        _run(server, s1, "BEGIN")
-        _run(server, s2, "BEGIN")  # BEGIN 本身不冲突
-        _run(server, s1, "INSERT INTO t VALUES (1, 10)")
+        _run(server, first, "BEGIN")
+        _run(server, second, "BEGIN")
+        _run(server, first, "UPDATE t SET v = 111 WHERE id = 1")
+        _run(server, second, "UPDATE t SET v = 222 WHERE id = 2")  # 不冲突
+        _run(server, first, "COMMIT")
+        _run(server, second, "COMMIT")
+        assert _run(server, first, "SELECT id, v FROM t ORDER BY id")[0].rows == [
+            (1, 111),
+            (2, 222),
+        ]
 
+    def test_two_writers_on_the_same_row_conflict(self, env):
+        db, server = env
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 0)")
+        first, second = Session(database=db), Session(database=db)
+
+        _run(server, first, "BEGIN")
+        _run(server, second, "BEGIN")
+        _run(server, first, "UPDATE t SET v = 111 WHERE id = 1")
         with pytest.raises(SerializationError) as exc:
-            _run(server, s2, "INSERT INTO t VALUES (2, 20)")
+            _run(server, second, "UPDATE t SET v = 222 WHERE id = 1")
         assert exc.value.sqlstate == "40001"
+        _run(server, first, "COMMIT")
+        _run(server, second, "ROLLBACK")
+        assert _run(server, first, "SELECT COUNT(*) FROM t")[0].rows == [(1,)]
 
-        # 回滚掉失败的事务之后，写者锁归还，重试即可成功。
-        _run(server, s2, "ROLLBACK")
-        _run(server, s1, "COMMIT")
-        _run(server, s2, "BEGIN")
-        _run(server, s2, "INSERT INTO t VALUES (2, 20)")
-        _run(server, s2, "COMMIT")
-        assert _rows(server, s2, "SELECT COUNT(*) FROM t") == [(2,)]
+    def test_two_writers_on_the_same_unique_key_conflict(self, env):
+        db, server = env
+        db.execute_one("CREATE TABLE u (id INT PRIMARY KEY, code INT)")
+        db.execute_one("CREATE UNIQUE INDEX uq_code ON u (code)")
+        first, second = Session(database=db), Session(database=db)
+
+        _run(server, first, "BEGIN")
+        _run(server, second, "BEGIN")
+        _run(server, first, "INSERT INTO u VALUES (1, 7)")
+        with pytest.raises(SerializationError):
+            _run(server, second, "INSERT INTO u VALUES (2, 7)")
+        _run(server, first, "COMMIT")
+        _run(server, second, "ROLLBACK")
+        with pytest.raises(DuplicateKeyError) as exc:
+            _run(server, second, "INSERT INTO u VALUES (2, 7)")  # 提交后是真冲突
+        assert exc.value.sqlstate == "23505"
 
     def test_stale_snapshot_update_is_rejected(self, env):
         """对方的快照早于我的提交时，我的 UPDATE 必须 40001，不能覆盖版本链。
@@ -143,16 +179,19 @@ class TestWriteWriteConflict:
         names = sorted(r[0] for r in _rows(server, second, "SHOW TABLES"))
         assert names == ["a", "b"]
 
-    def test_autocommit_statement_also_takes_the_writer_lock(self, env):
+    def test_autocommit_statement_waits_behind_a_row_lock(self, env):
+        """自动提交语句也要受行锁约束：它撞的是"那一行"，不是整个库。"""
         db, server = env
-        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 0)")
         holder = Session(database=db)
         _run(server, holder, "BEGIN")
-        _run(server, holder, "INSERT INTO t VALUES (100)")  # 写语句才拿写者锁
+        _run(server, holder, "UPDATE t SET v = 1 WHERE id = 1")
         with pytest.raises(SerializationError):
-            db.execute_one("INSERT INTO t VALUES (1)")
+            db.execute_one("UPDATE t SET v = 2 WHERE id = 1")
+        # 不同行不受影响
+        db.execute_one("INSERT INTO t VALUES (2, 2)")
         _run(server, holder, "ROLLBACK")
-        db.execute_one("INSERT INTO t VALUES (1)")
 
 
 # ---------------------------------------------------------------------------

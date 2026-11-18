@@ -196,11 +196,34 @@ def writer_resource() -> tuple:
     return WRITER_RESOURCE
 
 
+def key_resource(table: str, index: str, key: tuple) -> tuple:
+    """唯一索引的**键级**锁。
+
+    为什么需要它：唯一性判断读的是"物理索引项"，而 `DELETE` 会立刻把索引项
+    摘掉。并发 INSERT 同一键时看不到未提交的删除，等删除方回滚、索引项被恢复，
+    主键就重复了。键锁让"改这个键"的事务互斥，回滚/提交之后再判断唯一性。
+    """
+    return ("ukey", table, index, tuple(key))
+
+
+def catalog_resource() -> tuple:
+    """目录保存的互斥锁：目录是"单根指针 + 页链"，整份保存必须独占。"""
+    return ("catalog", "*")
+
+
+def ddl_resource() -> tuple:
+    """DDL 的事务级互斥：schema 形状改变不能与另一个 DDL 并发。"""
+    return ("ddl", "*")
+
+
 __all__ = [
     "LockManager",
     "LockMode",
     "LockTimeoutError",
     "row_resource",
     "WRITER_RESOURCE",
+    "catalog_resource",
+    "ddl_resource",
+    "key_resource",
     "writer_resource",
 ]

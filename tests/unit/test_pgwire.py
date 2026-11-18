@@ -206,12 +206,10 @@ class TestSessionIsolation:
         db.close()
 
     def test_two_connections_can_open_transactions_simultaneously(self, tmp_path):
-        """两个连接可以同时处于事务中；但写事务之间是单写者，冲突快速失败。
+        """两个连接各自 BEGIN 并写**不同的行**：现在两个都成功。
 
-        [Review-Fix] 早期版本允许两个事务同时写同一张表并双双提交——实测那
-        会让目录页、唯一索引项和版本链互相踩，恢复时还会把已提交的数据
-        undo 掉。现在的语义是：BEGIN 可以并发；第二个写语句得到 40001，
-        由应用层重试。读（含快照读）不受影响。
+        行/键锁落地后，写冲突的粒度从"整个数据库"缩到"这一行 / 这一个唯一键"。
+        这一组用例改成验证新语义：不同行并行提交；同一行才 40001。
         """
         db = Database(tmp_path / "db")
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
@@ -223,22 +221,22 @@ class TestSessionIsolation:
             await _query(c1[0], c1[1], "BEGIN")
             assert _ready_status(await _query(c2[0], c2[1], "BEGIN")) == b"T"
             await _query(c1[0], c1[1], "INSERT INTO t VALUES (1, 'a')")
-
-            conflict = await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
-            err = next((p for k, p in conflict if k == b"E"), None)
-            assert err is not None, "第二个写事务必须被拒绝，而不是静默写入"
-            assert b"40001" in err  # serialization_failure
-
-            # 失败的事务回滚后，写者锁归还，重试即可成功。
-            await _query(c2[0], c2[1], "ROLLBACK")
+            await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")  # 不同行
             await _query(c1[0], c1[1], "COMMIT")
-            await _query(c2[0], c2[1], "BEGIN")
-            await _query(c2[0], c2[1], "INSERT INTO t VALUES (2, 'b')")
             await _query(c2[0], c2[1], "COMMIT")
-
             msgs = await _query(c2[0], c2[1], "SELECT COUNT(*) FROM t")
             rows = [_parse_data_row(p) for k, p in msgs if k == b"D"]
             assert rows == [["2"]]
+
+            # 同一行才冲突
+            await _query(c1[0], c1[1], "BEGIN")
+            await _query(c2[0], c2[1], "BEGIN")
+            await _query(c1[0], c1[1], "UPDATE t SET name = 'x' WHERE id = 1")
+            conflict = await _query(c2[0], c2[1], "UPDATE t SET name = 'y' WHERE id = 1")
+            err = next((p for k, p in conflict if k == b"E"), None)
+            assert err is not None and b"40001" in err
+            await _query(c1[0], c1[1], "COMMIT")
+            await _query(c2[0], c2[1], "ROLLBACK")
             for reader, writer in (c1, c2):
                 writer.close()
                 await writer.wait_closed()

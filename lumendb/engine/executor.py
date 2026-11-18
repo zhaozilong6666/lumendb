@@ -79,7 +79,15 @@ from ..storage.heap import HeapFile
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.record import RID
 from ..storage.recovery import RecoveryManager
-from ..storage.lock import LockManager, LockMode, writer_resource
+from ..storage.lock import (
+    LockManager,
+    LockMode,
+    catalog_resource,
+    ddl_resource,
+    key_resource,
+    row_resource,
+    writer_resource,
+)
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
 
@@ -326,32 +334,106 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _acquire_writer_lock(self, stmt: Statement, txn: Transaction) -> None:
-        """[Review-Fix] 单写者事务模型：写语句必须持有事务级写者锁。
+        """写并发的入口：DML 只由行/键锁保护，其它写语句拿 DDL 锁。
 
-        为什么是"快速失败"而不是排队等待：线协议在单条语句之外还持有一把
-        asyncio 锁，如果这里阻塞等锁，等待者会连带把持锁事务的 COMMIT
-        一起卡死。所以并发写直接给 40001，让应用层重试。
+        分配与顺序：
 
-        这把锁挡住了行锁挡不住的那一类冲突：目录页（任何写语句提交前都会
-        persist 一次）、唯一索引项的物理删除、以及没有 xmin 的多写者可见性。
+        * **DML**（INSERT/UPDATE/DELETE）：**不再**拿全库写者锁。它们要保护的
+          冲突（同一行、同一唯一键、父子行的引用）由 `row_resource` /
+          `key_resource` 在真正写之前逐条申请；
+        * **DDL 与维护语句**（建删表/索引/视图、ALTER、VACUUM、TRUNCATE、
+          REINDEX）：拿 `ddl_resource()` 的 X 锁，持到事务结束——schema 形状
+          变化不能与另一个 DDL 并发，也不能与"正在跑的 DML"并发；
+        * 目录保存另有 `catalog_resource()` 的短锁（见 `_persist_catalog`）。
+
+        全部走 ``try_acquire`` 快速失败（40001）：语句级串行化还在，阻塞等锁
+        会造出"持语句锁等行锁、持行锁等语句锁"的环，而等待图看不见这种环。
         """
         if type(stmt).__name__ in _NON_WRITING_STATEMENTS:
             return
-        if not self._locks.try_acquire(txn.xid, writer_resource(), LockMode.EXCLUSIVE):
-            holder = next(
-                (x for x in self._locks.holders(writer_resource()) if x != txn.xid),
-                None,
-            )
-            from ..errors import SerializationError
+        if isinstance(stmt, (Insert, Update, Delete)):
+            return
+        self._acquire_or_fail(
+            txn,
+            ddl_resource(),
+            LockMode.EXCLUSIVE,
+            "另一个事务正在执行 DDL / 维护语句",
+            "等它 COMMIT / ROLLBACK 后重试；schema 变更不能并发",
+        )
 
-            raise SerializationError(
-                "另一个事务正在写这个数据库",
-                detail=(
-                    f"LumenDB 当前是单写者模型：写事务之间用 40001 快速失败，"
-                    f"而不是排队等待（持锁事务 xid={holder}，本事务 {txn.xid}）"
-                ),
-                hint="等另一个事务 COMMIT / ROLLBACK 后重试本事务",
-            )
+    def _acquire_or_fail(
+        self,
+        txn: Transaction,
+        resource: tuple,
+        mode: LockMode,
+        message: str,
+        hint: str,
+    ) -> None:
+        """申请一把锁；拿不到就 40001（不等待）。"""
+        if self._locks.try_acquire(txn.xid, resource, mode):
+            return
+        holder = next(
+            (x for x in self._locks.holders(resource) if x != txn.xid), None
+        )
+        from ..errors import SerializationError
+
+        raise SerializationError(
+            message,
+            detail=(
+                f"resource={resource[0]} holder_xid={holder} "
+                f"waiter_xid={txn.xid}"
+            ),
+            hint=hint,
+        )
+
+    def _lock_row(self, table: TableDef, rid: RID, txn: Transaction) -> None:
+        """给一行拿 X 锁（改/删之前）。"""
+        self._acquire_or_fail(
+            txn,
+            row_resource(table.name, rid),
+            LockMode.EXCLUSIVE,
+            f"行 {table.name}{tuple(rid)} 正被另一个事务修改",
+            "重试事务；并发改同一行在快照隔离下必须失败",
+        )
+
+    def _lock_parent_row(self, table: TableDef, rid: RID, txn: Transaction) -> None:
+        """外键校验命中父行后拿 S 锁（等价 PostgreSQL 的 FOR KEY SHARE）。
+
+        没有它：T1 删父行、T2 插子行可以"都成功"，提交后就是悬空引用。
+        """
+        self._acquire_or_fail(
+            txn,
+            row_resource(table.name, rid),
+            LockMode.SHARED,
+            f"被引用行 {table.name}{tuple(rid)} 正被另一个事务修改",
+            "重试事务；外键校验期间父行不能改/删",
+        )
+
+    def _lock_key(
+        self, table: TableDef, idx: IndexDef, key: list[Any], txn: Transaction
+    ) -> None:
+        """给唯一索引的一个键拿 X 锁（插/删索引项之前）。"""
+        if not idx.unique or key is None:
+            return
+        self._acquire_or_fail(
+            txn,
+            key_resource(table.name, idx.name, tuple(key)),
+            LockMode.EXCLUSIVE,
+            f"唯一键 {table.name}.{idx.name}{tuple(key)} 正被另一个事务修改",
+            "重试事务；唯一性判断必须等对方提交/回滚",
+        )
+
+    def _persist_catalog(self, txn: Transaction) -> None:
+        """目录保存：短锁 + 整份落盘（目录是单根指针 + 页链）。"""
+        self._acquire_or_fail(
+            txn,
+            catalog_resource(),
+            LockMode.EXCLUSIVE,
+            "另一个事务正在保存目录",
+            "重试事务；目录保存是整链重写，必须独占",
+        )
+        self._catalog.mark_dirty()
+        self._catalog.persist(txn)
 
     def describe(self, stmt: Statement, params: Optional[list[Any]] = None) -> list[ColumnMeta]:
         """只绑定、不执行，返回语句的结果列。
@@ -1472,8 +1554,7 @@ class Executor:
         for row in source_rows:
             heap.insert(txn, list(row))
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(
             affected=len(source_rows),
             tag=f"CREATE TABLE AS SELECT ({len(source_rows)} rows)",
@@ -1537,8 +1618,7 @@ class Executor:
             table.checks = old_checks
 
         txn.undo_log.append(undo)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         notice = (
             f"已添加列 {name}；旧记录在读取时按默认值补齐，"
             "不重写堆页"
@@ -1598,8 +1678,7 @@ class Executor:
             table.columns[index] = old
 
         txn.undo_log.append(undo)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         action = "设置" if stmt.default is not None else "删除"
         return Result(
             tag="ALTER TABLE",
@@ -1642,8 +1721,7 @@ class Executor:
             table.columns[index] = old
 
         txn.undo_log.append(undo)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         action = "删除" if stmt.nullable else "设置"
         notice = f"已{action}列 {column.name} 的 NOT NULL 约束"
         if not stmt.nullable:
@@ -1814,8 +1892,7 @@ class Executor:
         rebuilt = 0
         if old_indexes:
             rebuilt, _entries = self._rebuild_indexes(table, txn)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         old_modes = {
             name: txn.constraint_modes[name]
             for name in removed_constraints
@@ -2031,8 +2108,7 @@ class Executor:
         rebuilt = 0
         if old_indexes:
             rebuilt, _entries = self._rebuild_indexes(table, txn)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         old_modes = {
             name: txn.constraint_modes[name]
             for name in removed_constraints
@@ -2156,8 +2232,7 @@ class Executor:
 
             txn.undo_log.append(undo)
 
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(
             tag="ALTER TABLE",
             notice=f"约束 {old_key} 已重命名为 {new_key}",
@@ -2211,8 +2286,7 @@ class Executor:
                 table.checks = old_checks
 
             txn.undo_log.append(undo_check)
-            self._catalog.mark_dirty()
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
             return Result(
                 tag="ALTER TABLE",
                 notice=(
@@ -2314,8 +2388,7 @@ class Executor:
                 table.foreign_keys = old_fks
 
             txn.undo_log.append(undo_fk)
-            self._catalog.mark_dirty()
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
             return Result(
                 tag="ALTER TABLE",
                 notice=f"已添加外键约束 {fk_name}",
@@ -2395,7 +2468,7 @@ class Executor:
                 table.columns = old_columns
 
             txn.undo_log.append(undo_columns)
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
             return Result(
                 tag="ALTER TABLE",
                 notice=f"已添加主键 {index_name}",
@@ -2471,8 +2544,7 @@ class Executor:
                 txn.constraint_modes[name] = old_mode
 
         txn.undo_log.append(undo)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         mode = (
             "INITIALLY DEFERRED"
             if deferrable and initially_deferred
@@ -2529,8 +2601,7 @@ class Executor:
                 table.checks[name] = old_check
 
             txn.undo_log.append(undo_check_validated)
-            self._catalog.mark_dirty()
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
             return Result(
                 tag="ALTER TABLE",
                 notice=f"已校验 CHECK 约束 {name}",
@@ -2555,8 +2626,7 @@ class Executor:
             table.foreign_keys[name] = old_fk
 
         txn.undo_log.append(undo_validated)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(
             tag="ALTER TABLE",
             notice=f"已校验外键约束 {name}",
@@ -2578,8 +2648,7 @@ class Executor:
                     txn.constraint_modes[name] = old_mode
 
             txn.undo_log.append(undo_fk)
-            self._catalog.mark_dirty()
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
             return Result(
                 tag="ALTER TABLE",
                 notice=f"已删除外键约束 {name}",
@@ -2655,7 +2724,7 @@ class Executor:
 
                     txn.undo_log.append(undo_columns)
                     self._catalog.mark_dirty()
-                    self._catalog.persist(txn)
+                    self._persist_catalog(txn)
                     return Result(
                         tag="ALTER TABLE",
                         notice=f"已删除主键约束 {name}{cascade_note}",
@@ -2688,8 +2757,7 @@ class Executor:
                 txn.constraint_modes[name] = old_mode
 
         txn.undo_log.append(undo_check)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(
             tag="ALTER TABLE",
             notice=f"已删除 CHECK 约束 {name}",
@@ -2782,7 +2850,7 @@ class Executor:
                 )
             tree.insert(txn, key, rid)
         idx.root_page = tree.root_page
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(tag="CREATE INDEX")
 
     def _drop_index(self, stmt: DropIndex, txn: Transaction) -> Result:
@@ -2925,16 +2993,14 @@ class Executor:
         因此从"每行一次"降到"每分配一页一次"。
         """
         if self._catalog_structure_fingerprint() != before:
-            self._catalog.mark_dirty()
-            self._catalog.persist(txn)
+            self._persist_catalog(txn)
 
     def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
         """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
         table = self._catalog.get_table(stmt.table)
         self._snapshot_table_state(table, txn)
         rebuilt, entries_total = self._rebuild_indexes(table, txn)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         if rebuilt == 0:
             return Result(tag="REINDEX 0 indexes", notice="该表没有索引")
         return Result(
@@ -2977,8 +3043,7 @@ class Executor:
             dead += d
             pages += p
             self._rebuild_indexes(table, txn)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return Result(
             affected=dead,
             tag=(
@@ -3067,8 +3132,7 @@ class Executor:
         heap = HeapFile(self._bp, table, self._txns)
         removed = heap.truncate(txn)
         self._rebuild_indexes(table, txn)
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        self._persist_catalog(txn)
         return removed
 
     def _show_tables(self) -> Result:
@@ -3404,6 +3468,12 @@ class Executor:
             if self._key_for(table, idx, old_tuple)
             != self._key_for(table, idx, prepared)
         ]
+        # 行锁：改这一行之前独占；随后 `heap.update` 里的版本检查才可靠。
+        self._lock_row(table, rid, txn)
+        # 键锁：改唯一键时，新旧两个键都要独占（别人可能正插/删同一个键）。
+        for idx in changed_indexes:
+            self._lock_key(table, idx, self._key_for(table, idx, old_tuple), txn)
+            self._lock_key(table, idx, self._key_for(table, idx, prepared), txn)
         for idx in changed_indexes:
             self._check_update_unique(table, idx, old_tuple, prepared, txn, rid)
         for idx in changed_indexes:
@@ -3650,6 +3720,8 @@ class Executor:
             key = self._key_for(table, idx, prepared)
             if key is None:
                 continue
+            # 键锁：唯一性判断依赖"物理索引项"，而并发的 DELETE 会立刻摘掉它。
+            self._lock_key(table, idx, key, txn)
             tree.insert(txn, key, rid)
             idx.root_page = tree.root_page
         self._track_deferred_fk_row(table, rid, txn)
@@ -3827,6 +3899,7 @@ class Executor:
             self._cascade_delete_children(
                 table, values, txn, deleted_rids, processing, deferred
             )
+            self._lock_row(table, rid, txn)
             self._delete_index_entries(table, values, txn, rid)
             txn.touched_tables.add(table.name)
             if ret_fns:
@@ -4268,6 +4341,9 @@ class Executor:
                         ref_values[pos] == value
                         for pos, value in zip(ref_positions, local_key)
                     ):
+                        # FOR KEY SHARE：校验期间父行不能被改/删，否则会出现
+                        # "子行插入成功、父行同时被删"的悬空引用。
+                        self._lock_parent_row(ref_table, rid, txn)
                         found = True
                         break
             if not found:
@@ -4294,6 +4370,9 @@ class Executor:
         for idx in table.indexes.values():
             key = self._key_for(table, idx, values)
             if key is not None:
+                # 删索引项前锁键：否则并发 INSERT 看不到这次未提交的删除，
+                # 删除方一回滚，索引里就出现两个相同的键。
+                self._lock_key(table, idx, key, txn)
                 self._tree_for(table, idx).delete(txn, key, rid)
 
     def _fk_child_rows(
@@ -4427,6 +4506,7 @@ class Executor:
                     self._cascade_delete_children(
                         child, child_values, txn, deleted, processing, deferred
                     )
+                    self._lock_row(child, child_rid, txn)
                     self._delete_index_entries(child, child_values, txn, child_rid)
                     txn.touched_tables.add(child.name)
                     child_heap.delete(txn, child_rid)
@@ -4447,6 +4527,13 @@ class Executor:
             # ON CONFLICT DO NOTHING：唯一冲突由调用方判断并跳过，
             # 但 NOT NULL / CHECK 之类的约束仍然必须报错。
             return
+        # 唯一性判断之前先锁键：唯一性读的是"物理索引项"，而并发事务可能正在
+        # 插/删同一个键（未提交）。不加锁时会把"别人还没提交的键"当成真冲突
+        # 报 23505——对方一旦回滚，这个 23505 就是错的。加了键锁，未提交冲突
+        # 变成 40001（重试），已提交冲突才是 23505。
+        for idx in table.indexes.values():
+            if idx.unique:
+                self._lock_key(table, idx, self._key_for(table, idx, values), txn)
         conflict = self._find_unique_conflict(table, values, txn)
         if conflict is not None:
             raise self._duplicate_key_error(conflict[0])
