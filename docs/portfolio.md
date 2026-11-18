@@ -76,8 +76,8 @@
 >   marker 阻止旧主继续写；`ReplicationMonitor` 在连续网络失败后自动提升；
 >   `QuorumNode` 的多数派投票必须在拿到多数节点同意后才允许提升，投票状态
 >   持久化任期并按 Raft 的 `(last_term, last_lsn)` 字典序拒绝落后或同 LSN
->   但任期更旧的候选，失败时副本保持只读；选举当选时用本轮投票返回的 `last_lsn` 建立"已验证 commit index"（只算本轮响应，不吃陈旧水位），新 leader 第一笔写不必等心跳即满足多数派屏障；`commit_lsn` 与 `verified_commit_lsn` 分开，避免"leader 口头告知"把水位虚抬到多数派未持有的位置；`Lease` 用 TTL 约束旧主库
->   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；`Database(fence_path=/lease_path=)` 打开时立即校验共享 marker 并持续接进写路径，堵住"旧主库崩溃重启后双写"的洞；另有 prefix-checked `append_entries`，能把带 CRC 的连续 WAL 条目按逐条任期推给已绑定 `Replica.apply` 的节点，拼接点任期分歧或 WAL 缺口自动触发基准备份重建（leader 侧还会主动下发 `rebuild_hint`），心跳超时自动触发竞选、双候选竞争收敛到唯一主库，仅分歧尾巴截断（重建替代）与 follower 侧独立推演的完整 commit index 尚未实现；
+>   但任期更旧的候选，失败时副本保持只读；选举当选时用本轮投票返回的 `match_lsn`（真正持有，不是"听到过"的 `last_lsn`）建立"已验证 commit index"（只算本轮响应，不吃陈旧水位），新 leader 第一笔写不必等心跳即满足多数派屏障；`commit_lsn` 与 `verified_commit_lsn` 分开，避免"leader 口头告知"把水位虚抬到多数派未持有的位置，且 witness（只投票不带数据）的 `match_lsn` 恒为 0，听再多心跳也虚抬不了自证水位；`Lease` 用 TTL 约束旧主库
+>   续租，超时未续租即自行停写，候选节点等旧租约过期后才获取新租约，租约操作用锁文件串行化并由后台 keeper 续租，`QuorumNode.heartbeat_round()` / `renew_lease()` 在多数派心跳确认后才续租，提升后的新主库把租约与当前任期组合成 `LeaseFence` 写围栏，自动故障切换也把租约与写围栏串到提升路径，独立 `HeartbeatLoop` 在后台持续发心跳并在任期变化时回调；`Database(fence_path=/lease_path=)` 打开时立即校验共享 marker 并持续接进写路径，堵住"旧主库崩溃重启后双写"的洞；另有 prefix-checked `append_entries`，能把带 CRC 的连续 WAL 条目按逐条任期推给已绑定 `Replica.apply` 的节点，拼接点任期分歧或 WAL 缺口自动触发基准备份重建（leader 侧还会主动下发 `rebuild_hint`），心跳超时自动触发竞选、双候选竞争收敛到唯一主库；分歧尾巴用重建替代（不做截断），follower 侧 commit index 沿用标准 Raft 的 leader 口头告知 + `verified_commit_lsn` 多数派自证（不做 match 表广播）；
 > - 处理降级/关闭与在途 SQL 的竞争：`close()` 先等待只读语句退出，再回滚线上未提交事务并关闭句柄；
 >   pgwire 的写/COMMIT/SAVEPOINT 路径与 `Database._write_lock` 对齐，避免 step_down 之后仍有写落到已关闭的 WAL。
 > - 把"每条 DML 都全量重写系统目录"改成"结构指纹变化才写"：目录持久化是整链重建 + 全页 before/after WAL，此前逐行 INSERT 会写 13 KB/行；现在按（表 root_page / last_page / 各索引 root_page）的整目录指纹判定，只在新页分配或索引重建时落盘，`row_count_hint` 降级为可丢的内存提示。逐行插入 WAL 从13,006 B/行降到 794 B/行（**1/16.4，−93.9%**），并补了"分配首页必须落盘""跨页插入后重开页链完整""单页内插入不重写目录"三条回归用例。
@@ -117,7 +117,7 @@
 >   帧，10 s 空闲回收线程，握手约 0.1 ms 故收益只在跨网络）、请求行有界读取
 >   （堵住"一条巨型行把处理线程内存打爆"）、`Replica.wait_until(lag)` 跟随
 >   读等待与重建失败自愈、`Replica.snapshot_read()` 把多条只读语句固定在
->   同一个已应用前缀上（代价是上下文期间 apply 停摆，只用于短读）。> - 1285 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
+>   同一个已应用前缀上（代价是上下文期间 apply 停摆，只用于短读）。> - 1326 个自动化测试（含崩溃注入），全量套件跑完 75-135 s，CI 覆盖
 >   Ubuntu/Windows × Python 3.12/3.13。
 
 ## 简历写法（English）
@@ -221,11 +221,16 @@
 >   divergence or a WAL gap triggers an automatic base-backup rebuild (the
 >   leader also proactively sends a `rebuild_hint`), heartbeat timeout drives
 >   automatic election and competing candidates converge on a single leader;
->   the election winner seeds a verified commit index from the LSNs returned
->   by its own vote round (stale watermarks are ignored), so its first write
+>   the election winner seeds a verified commit index from the `match_lsn`
+>   values returned by its own vote round (held progress, not heard
+>   `last_lsn`; stale watermarks are ignored), so its first write
 >   satisfies the quorum barrier without waiting for a heartbeat;
 >   `commit_lsn` (leader-announced) and `verified_commit_lsn` (recomputed from
 >   majority `match_lsn`) are kept apart so an inflated watermark cannot
+>   release the barrier early. Divergent-tail truncation is replaced by a full
+>   rebuild, and the follower commit index follows standard Raft
+>   (leader-announced `commit_lsn` + majority-derived `verified_commit_lsn`),
+>   so no match-table broadcast is implemented.
 >   Replication transport is also hardened: a binary record frame (23-byte fixed
 >   header, `struct`, 863 KB → 456 KB for a 1000-row WAL round, 1.89x / 47.2%
 >   smaller, backward compatible), connection reuse (one socket serves many
@@ -240,8 +245,7 @@
 >   after the last COMMIT/ABORT and the replica cuts groups only on
 >   transaction boundaries (extending forward when the window has none), which
 >   took a 400-row/two-level-index stress probe from 7 mismatches (all with
->   the index lagging the heap) to 0.>   release the barrier early. Divergent-tail truncation and a fully
->   follower-derived commit index remain future work.
+>   the index lagging the heap) to 0.
 > - Close/step-down races are explicit: `close()` waits for active readers,
 >   aborts live wire transactions, and pgwire write/COMMIT/savepoint paths use
 >   the same write lock, so no statement can land on a closed WAL.
@@ -270,7 +274,7 @@
 >   thread cannot mutate a dict mid-iteration. Two connections each running
 >   a sleep(0.12) SELECT finish in under 0.228 s (serial would be >= 0.24 s),
 >   and a new connection's handshake is not blocked during a slow query.
-> - 1285 automated tests including crash-injection and a 20-seed randomized
+> - 1326 automated tests including crash-injection and a 20-seed randomized
 >   crash-consistency suite (full run 75 s); CI matrix covers
 >   Ubuntu/Windows × Python 3.12/3.13.
 
