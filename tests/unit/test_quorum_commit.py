@@ -188,6 +188,28 @@ class TestPromotionGate:
         finally:
             _stop(nodes)
 
+    def test_campaign_uses_held_not_heard_progress_for_watermark(self, tmp_path):
+        """witness 听到 150 但持有 0：当选后 verified_commit_lsn 不能虚抬。
+
+        投票响应的 ``last_lsn`` 是"听到过"的进度，只用于投票安全性比较；
+        "多数派真正持有"的水位必须用 ``match_lsn``（真正 apply 到）。否则
+        witness 用它听到的高水位虚抬 ``verified_commit_lsn``，同步复制屏障
+        会误判"多数派已持有"、把没复制出去的写入当成已提交。
+        """
+        nodes = _cluster(tmp_path)
+        try:
+            nodes[0].observe_applied(150)          # 候选真正持有 150
+            nodes[1].observe_applied(80)           # 数据副本真正持有 80
+            nodes[2].heartbeat(1, "leader", 150)   # witness 只听到 150，持有 0
+            assert nodes[2].state.match_lsn == 0
+            assert nodes[2].state.last_lsn == 150
+            term = nodes[0].campaign(150)
+            assert term >= 1
+            # 持有的 [150, 80, 0]，多数派 = 2 → 第 2 大 = 80，不是听到的 150
+            assert nodes[0].verified_commit_lsn == 80
+        finally:
+            _stop(nodes)
+
     def test_campaign_is_not_blocked_without_a_watermark(self, tmp_path):
         """全新集群（水位还是 0）不能被闸门挡住。"""
         nodes = _cluster(tmp_path)

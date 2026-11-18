@@ -313,8 +313,10 @@ guard：`Vacuum` / `Truncate` / `AlterTableAlterType` / `AlterTableDropColumn`
 
 - **`VACUUM` 仍是停机维护**：它重排 RID、重建索引，需要"没有其它活跃事务"。
   行锁放开后这个前提不再天然成立，执行器已经在检查 `active_xids`。
-- **witness 节点不参与 durability**：不存数据的投票节点算进多数派会让
-  "多数派持有"比数据副本宽松；`docs/operations.md` 有提示，语义上应排除。
+- **witness 节点不参与 durability**：不存数据的投票节点**不计入**"多数派真正持有"
+  的提交水位。水位由 `match_lsn`（真正 apply 到）算出，`last_lsn`（听到过）只
+  用于投票安全性比较；心跳与投票响应都带两个字段、`campaign()` 与 `heartbeat_round`
+  都用 `match_lsn`，所以 witness（`match_lsn=0`）听再多心跳也抬不高水位。
 - **单写者不是 bug，是声明过的边界**：`README.md`、`docs/architecture.md` §2.5
   都写明"读并发、写单写者"。这份文档给出的是**放开它的正确顺序**，不是
   "现在就是坏的"。

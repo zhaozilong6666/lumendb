@@ -771,6 +771,8 @@ class QuorumNode:
                     "pre_vote": True,
                     "last_lsn": self.state.last_lsn,
                     "last_term": self.state.last_term,
+                    "match_lsn": self.state.match_lsn,
+                    "match_term": self.state.match_term,
                 }
         with self._lock:
             if requested < self.state.term:
@@ -780,6 +782,8 @@ class QuorumNode:
                     "granted": False,
                     "last_lsn": self.state.last_lsn,
                     "last_term": self.state.last_term,
+                    "match_lsn": self.state.match_lsn,
+                    "match_term": self.state.match_term,
                 }
             if requested > self.state.term:
                 self.state.term = requested
@@ -792,6 +796,8 @@ class QuorumNode:
                     "granted": False,
                     "last_lsn": self.state.last_lsn,
                     "last_term": self.state.last_term,
+                    "match_lsn": self.state.match_lsn,
+                    "match_term": self.state.match_term,
                 }
             if not log_is_newer_or_equal():
                 return {
@@ -800,6 +806,8 @@ class QuorumNode:
                     "granted": False,
                     "last_lsn": self.state.last_lsn,
                     "last_term": self.state.last_term,
+                    "match_lsn": self.state.match_lsn,
+                    "match_term": self.state.match_term,
                 }
             self.state.voted_for = candidate
             self.state.save()
@@ -809,6 +817,8 @@ class QuorumNode:
                 "granted": True,
                 "last_lsn": self.state.last_lsn,
                 "last_term": self.state.last_term,
+                "match_lsn": self.state.match_lsn,
+                "match_term": self.state.match_term,
             }
 
     def status(self) -> dict[str, Any]:
@@ -1377,9 +1387,9 @@ class QuorumNode:
         majority = total_nodes // 2 + 1
         highest_term = term
         errors: list[str] = []
-        #: 本轮投赞成票的 peer 报出的真实进度（含 0）。当选后用它算一次
-        #: "多数派持有"水位：只统计本轮响应，避免拿旧心跳里未参与投票的
-        #: peer 进度虚抬水位。
+        #: 本轮投赞成票的 peer **真正持有**的进度（`match_lsn`，含 0）。当选后
+        #: 用它算一次"多数派持有"水位：只统计本轮响应，避免拿旧心跳里未参与
+        #: 投票的 peer 进度虚抬水位；也不用 `last_lsn`——那只是"听到过"。
         granted_lsns: dict[str, int] = {}
         for peer_id, address in self.peers.items():
             if peer_id == self.node_id:
@@ -1403,14 +1413,18 @@ class QuorumNode:
                 highest_term = peer_term
             if response.get("granted"):
                 votes.add(peer_id)
-                peer_lsn = int(response.get("last_lsn", 0) or 0)
-                granted_lsns[peer_id] = peer_lsn
-                # 把投票者报出的真实进度吸收进 last_matches：新 leader 当选后
+                # 投票响应的 `last_lsn` 是"听到过"的进度，只用于投票安全性
+                # 比较；"多数派真正持有"的水位必须用 `match_lsn`（真正 apply
+                # 到）。否则不带数据的 witness 会用它听到的高水位虚抬
+                # `verified_commit_lsn`，让同步复制屏障误判"多数派已持有"。
+                held_lsn = int(response.get("match_lsn", 0) or 0)
+                granted_lsns[peer_id] = held_lsn
+                # 把投票者真正持有的进度吸收进 last_matches：新 leader 当选后
                 # 第一轮 push 就能从正确拼接点推批，不必等下一轮心跳刷新。
-                if peer_lsn > 0:
-                    self.last_matches[peer_id] = peer_lsn
+                if held_lsn > 0:
+                    self.last_matches[peer_id] = held_lsn
                     self.last_match_terms[peer_id] = int(
-                        response.get("last_term", 0) or 0
+                        response.get("match_term", 0) or 0
                     )
 
         if highest_term > term:

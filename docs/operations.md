@@ -178,5 +178,5 @@ ReplicationMonitor(
 | 租约用墙钟 | 时钟漂移缩小安全窗口 | 强制 NTP，偏移 < `ttl/3` |
 | 旧 WAL 记录没有 CRC | 升级前写入的历史记录仍可能把介质位翻转当成合法记录 | 新写入记录自带 CRC32；完整记录校验失败会拒绝恢复而不是静默截尾 |
 | 基准备份是全量拷贝 | 大库首次同步慢 | 页级增量备份（`rebase_from_server`） |
-| witness 节点没有数据水位 | 只投票不带数据的 witness 没听过 leader 心跳时，`last_lsn=0`，会把票投给第一个候选——如果那是落后候选，它会带着旧数据当选 | witness 加入前必须让 leader 心跳先广播一轮水位；候选提升闸门 `candidate_lsn >= quorum_commit_lsn` 依赖心跳推进过的水位，水位为 0 的全新集群不受此限制 |
+| witness 节点没有数据水位 | 只投票不带数据的 witness 没听过 leader 心跳时，`last_lsn=0`，会把票投给第一个候选——如果那是落后候选，它会带着旧数据当选；witness 的 `match_lsn` 恒为 0，**不计入**"多数派真正持有"的提交水位（`verified_commit_lsn` 只用 `match_lsn` 算，心跳与投票都如此） | witness 加入前必须让 leader 心跳先广播一轮水位；候选提升闸门 `candidate_lsn >= quorum_commit_lsn` 依赖心跳推进过的水位，水位为 0 的全新集群不受此限制 |
 | 旧主库重启后双写 | 旧主库进程重启、裸 `Database(path)` 打开时不知道 fence/租约 marker 的存在，恢复写入即成双主 | 重启时必须带 `fence_path`/`lease_path`（打开即检；租约场景旧主库还要重新 `acquire` 才能恢复写） |

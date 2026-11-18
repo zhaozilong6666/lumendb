@@ -488,7 +488,8 @@ read_only / needs_attention`）：租约丢失触发的 `Replica.step_down()` �
 的最高 LSN"，一个只投票不带数据的 witness 节点收到 leader 心跳后也会把它抬到
 leader 的位置——如果拿它算水位，两个 witness 就能伪造"多数派已持有"，闸门形同虚设。
 `heartbeat()` 里的 `observe_lsn(leader_lsn)` 只用于投票安全（拒绝落后候选），
-不参与水位计算。
+不参与水位计算；投票响应里 `last_lsn` 与 `match_lsn` 都带，`campaign()` 当选后
+算水位也只用 `match_lsn`，避免 witness 用"听到过"的进度虚抬 `verified_commit_lsn`。
 
 水位默认只解决"**提升谁**"的问题：写入仍然只要求本地 WAL fsync。
 `Replica.promote_with_quorum(sync_replication=True, heartbeat_interval=...)` 可以把它
