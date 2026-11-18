@@ -61,6 +61,9 @@ python -m tools.project_memory roadmap
 # 行动清单：按优先级 P0 拍板 → P1 修账本 → P2 决策矛盾 → P3 推进实现（按失修天数）
 python -m tools.project_memory plan
 
+# 文档漂移对账：文档里的"N passed"测试数 vs 账本最新测试数（跳过 *milestone* 冻结快照）
+python -m tools.project_memory drift
+
 # 追加一条带证据的事实
 python -m tools.project_memory add --kind measurement `
   --claim "索引点查 0.47ms/次，全表 48ms/次（约 100 倍）" `

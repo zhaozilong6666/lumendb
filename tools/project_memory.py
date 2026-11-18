@@ -1001,6 +1001,42 @@ def cmd_roadmap(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_drift(args: argparse.Namespace) -> int:
+    """文档漂移对账：把活文档里写的 ``N passed`` 测试数拿去和账本最新一次
+    测试结果对比，揪出"更新了账本却忘了改文档"的旧数字。
+
+    只扫 README 和 ``docs/`` 下的活文档；文件名含 ``milestone`` 的是冻结的
+    历史快照（如外键里程碑里写的 959 passed），本来就不该跟着最新数字走，
+    跳过。改完文档后重跑本命令应归零——这是防幻觉最实用的一道程序闸。
+    """
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    root = Path(args.root)
+    latest = _latest_test_run(ledger.facts)
+    if latest is None:
+        print("账本里没有带 N passed 的测试记录，无法对账")
+        return 0
+    want = int(_TEST_RUN_RE.search(latest.claim).group(1))
+
+    docs = [root / "README.md"] + sorted((root / "docs").glob("*.md"))
+    drift: list[tuple[str, int, int]] = []
+    for p in docs:
+        if not p.exists() or "milestone" in p.name:
+            continue
+        for lineno, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            for mm in _TEST_RUN_RE.finditer(line):
+                got = int(mm.group(1))
+                if got != want:
+                    drift.append((str(p.relative_to(root)), lineno, got))
+
+    if not drift:
+        print(f"文档测试数一致：全部 {want} passed")
+        return 0
+    print(f"文档测试数漂移（账本最新 {want} passed，改完重跑本命令应归零）：")
+    for doc, lineno, got in drift:
+        print(f"  {doc}:{lineno}  写 {got} passed")
+    return 0
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """开场先看这个：按优先级排出"现在该先做哪件"。
 
@@ -1184,6 +1220,11 @@ def build_parser() -> argparse.ArgumentParser:
         "roadmap", help="README「路线图」清单 × 账本证据：还剩什么、每条上次讨论"
     )
     roadmap.set_defaults(func=cmd_roadmap)
+
+    drift = sub.add_parser(
+        "drift", help="文档漂移对账：文档里的测试数 vs 账本最新测试数（跳过 milestone）"
+    )
+    drift.set_defaults(func=cmd_drift)
 
     plan = sub.add_parser(
         "plan", help="按优先级排序的行动清单：先拍板→先修→先决策→先推进"

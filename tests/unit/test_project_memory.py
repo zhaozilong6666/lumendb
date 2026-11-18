@@ -386,6 +386,28 @@ def test_roadmap_command_links_open_item_to_ledger(tmp_path, capsys):
     assert "是否 push 到远端" in out, "阻塞项（open_question）应被列出"
 
 
+def test_drift_command_flags_stale_and_skips_milestone(tmp_path, capsys):
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "roadmap.md").write_text(
+        "## 当前基线\n- 全量测试：1285 passed。\n", encoding="utf-8"
+    )
+    (tmp_path / "docs" / "foreign-key-milestone.md").write_text(
+        "- 全量测试：**959 passed**\n", encoding="utf-8"
+    )
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(
+        _fact("t1", "全量测试 1318 passed", tags=["tests"],
+              created="2026-11-18T10:00:00+08:00")
+    )
+
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "drift"]) == 0
+    out = capsys.readouterr().out
+    assert "roadmap.md:2" in out and "1285" in out, "活文档里的旧测试数应被揪出"
+    assert "959" not in out, "milestone 冻结快照不该被当漂移"
+
+
 def test_plan_command_orders_p0_to_p3(tmp_path, capsys):
     (tmp_path / "README.md").write_text(
         "## 路线图\n- [ ] 分歧尾巴截断\n", encoding="utf-8"
