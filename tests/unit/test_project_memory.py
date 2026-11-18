@@ -305,3 +305,34 @@ def test_status_command_summarizes_project(tmp_path, capsys):
     assert "1302" in out
     assert "校验" in out
 
+
+def test_number_conflicts_does_not_self_flag_before_after(tmp_path):
+    """一条 claim 里"从 A 到 B"的前后两个数字不是自相矛盾。"""
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    fact = _fact("a", "内部页缓存点查 303.9us -> 215.8us，+29.0%", tags=["perf", "btree"])
+    ledger.append(fact)
+    assert ledger.number_conflicts(fact) == []
+
+
+def test_digest_command_aggregates_and_hides_superseded(tmp_path, capsys):
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("q1", "是否 push 到远端", kind="open_question", tags=["git"]))
+    ledger.append(
+        _fact("m1", "点查 0.096ms", tags=["perf"],
+              created="2026-11-17T10:00:00+08:00")
+    )
+    ledger.append(
+        _fact("m2", "点查 0.047ms", tags=["perf"],
+              created="2026-11-18T10:00:00+08:00", supersedes="m1")
+    )
+
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "digest"]) == 0
+    out = capsys.readouterr().out
+    assert "未决问题" in out
+    assert "是否 push 到远端" in out
+    assert "0.047ms" in out
+    assert "0.096ms" not in out, "被 supersedes 的旧结论不该出现在最新结论里"
+
+

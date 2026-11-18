@@ -346,8 +346,15 @@ class Ledger:
         my_topic = _topic_tokens(fact.claim)
         findings = []
         for other in self.facts:
+            if other.id == fact.id:
+                # 一条 claim 里常有"从 A 降到 B"的前后两个数字，它们不是
+                # 自相矛盾，只是同一测量 before/after；跳过与自身的比较。
+                continue
             if fact.supersedes and other.id == fact.supersedes:
                 # 本条就是来取代它的，旧值不该再报冲突。
+                continue
+            if other.supersedes and other.supersedes == fact.id:
+                # 反方向：本条已被对方取代，也不该拿旧值去吵新值。
                 continue
             theirs = extract_metrics(other.claim)
             if not theirs:
@@ -850,6 +857,74 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _iter_number_conflicts(ledger: "Ledger") -> list[tuple]:
+    """跨全账本找出"同主题、同单位、数值差 >25%"的冲突对（去重、去被替代）。"""
+    found: list[tuple] = []
+    seen: set[frozenset] = set()
+    for fact in ledger.facts:
+        for other, mine, unit, theirs in ledger.number_conflicts(fact):
+            pair = frozenset((fact.id, other.id))
+            if pair in seen:
+                continue
+            seen.add(pair)
+            found.append((fact.id, other.id, mine, theirs, unit))
+    return found
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """续作交接视图：未决问题 + 需要处理 + 数字冲突 + 各主题最新结论。
+
+    和 ``status`` 的区别：status 回答"现在在哪、还剩什么"；digest 回答
+    "接手的人该先信哪几条、先处理哪几条"。它把四个最容易被忽视的信号
+    （未决问题、校验失败/无证据、数字互相矛盾、每个 kind 最新的几条）
+    压在一页里，是 agent 之间或隔段时间回来时的快速对齐入口。
+    """
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    info = _git_brief(Path(args.root))
+    facts = ledger.facts
+    superseded = {f.supersedes for f in facts if f.supersedes}
+    active = [f for f in facts if f.id not in superseded]
+
+    print("LumenDB 续作交接")
+    print(f"  HEAD    {info['head']}  {info['subject']}")
+    print(f"  账本    {len(facts)} 条（{len(active)} 条仍有效）")
+
+    questions = [f for f in active if f.kind == "open_question"]
+    if questions:
+        print("\n【未决问题】")
+        for f in questions:
+            print(f"  ? {f.claim}  ({f.id})")
+
+    failed = [f for f in active if f.verify.get("status") == "failed"]
+    no_evidence = [f for f in active if not f.evidence]
+    if failed or no_evidence:
+        print("\n【需要处理】")
+        for f in failed:
+            print(f"  ! 校验失败  {f.id}  {f.claim[:64]}")
+        for f in no_evidence:
+            print(f"  ! 无证据    {f.id}  {f.claim[:64]}")
+
+    conflicts = _iter_number_conflicts(ledger)
+    if conflicts:
+        print(f"\n【数字冲突（同主题同单位差>25%）】共 {len(conflicts)} 处")
+        for fact_id, other_id, mine, theirs, unit in conflicts[:8]:
+            print(f"  ~ {fact_id} ({mine}{unit})  vs  {other_id} ({theirs}{unit})")
+
+    print("\n【最新结论（每类取最近 3 条，被替代的已隐藏）】")
+    for kind in ("measurement", "decision", "bug", "contract"):
+        items = sorted(
+            (f for f in active if f.kind == kind),
+            key=lambda f: f.created,
+            reverse=True,
+        )[:3]
+        if not items:
+            continue
+        print(f"  [{kind}]")
+        for f in items:
+            print(f"    {f.created[:10]}  {f.claim[:80]}  ({f.id})")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
     total = len(ledger.facts)
@@ -944,6 +1019,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="一页看清：git / 账本 / 最近测试 / 未决问题")
     status.set_defaults(func=cmd_status)
+
+    digest = sub.add_parser(
+        "digest", help="续作交接：未决问题 + 需处理 + 数字冲突 + 最新结论"
+    )
+    digest.set_defaults(func=cmd_digest)
 
     show = sub.add_parser("show", help="看一条记录")
     show.add_argument("id")
