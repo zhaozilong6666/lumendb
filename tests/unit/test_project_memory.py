@@ -386,4 +386,23 @@ def test_roadmap_command_links_open_item_to_ledger(tmp_path, capsys):
     assert "是否 push 到远端" in out, "阻塞项（open_question）应被列出"
 
 
+def test_plan_command_orders_p0_to_p3(tmp_path, capsys):
+    (tmp_path / "README.md").write_text(
+        "## 路线图\n- [ ] 分歧尾巴截断\n", encoding="utf-8"
+    )
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("q1", "是否 push 到远端", kind="open_question", tags=["git"]))
+    ledger.append(
+        _fact("r1", "分歧尾巴截断暂不做，重建兜底", kind="decision", tags=["replication"])
+    )
+
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "plan"]) == 0
+    out = capsys.readouterr().out
+    assert "[P0]" in out and "是否 push 到远端" in out
+    assert "[P1]" in out and "[P2]" in out
+    assert "[P3]" in out and "分歧尾巴截断" in out
+
+
 

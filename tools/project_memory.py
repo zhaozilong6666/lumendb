@@ -1001,6 +1001,85 @@ def cmd_roadmap(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    """开场先看这个：按优先级排出"现在该先做哪件"。
+
+    四个优先级：
+      P0 需要你拍板（open_question，没解决就推进不下去）；
+      P1 需要修（账本自身出错：校验失败 / 没有证据）；
+      P2 需要决策（同主题同单位的数字互相矛盾，先定哪个是当前值）；
+      P3 可推进的实现工作（README 未完成项，按"失修天数"降序——最久
+         没人碰的排最前，避免被新热闹淹没）。
+
+    它和 digest/roadmap 的分工：digest 给"最近发生了什么"，roadmap 给
+    "还剩什么"，plan 给"按优先级先做什么"。三个合起来就是每轮开场不看
+    笔记、不凭印象的完整对齐。
+    """
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    root = Path(args.root)
+    now = datetime.now().astimezone()
+
+    facts = ledger.facts
+    superseded = {f.supersedes for f in facts if f.supersedes}
+    active = [f for f in facts if f.id not in superseded]
+    discussable = [f for f in active if f.kind != "commit"]
+
+    print("LumenDB 行动清单（按优先级）")
+
+    # P0：需要用户拍板
+    questions = [f for f in active if f.kind == "open_question"]
+    if questions:
+        print("\n[P0] 需要你拍板")
+        for f in sorted(questions, key=lambda f: f.created):
+            days = (now - _parse_when(f.created)).days
+            print(f"  ? {f.claim}  （{days} 天前）")
+    else:
+        print("\n[P0] 需要你拍板：无")
+
+    # P1：账本自身出错
+    failed = [f for f in active if f.verify.get("status") == "failed"]
+    no_evidence = [f for f in active if not f.evidence]
+    problems = failed + no_evidence
+    if problems:
+        print("\n[P1] 需要修（账本记录不再可信）")
+        for f in problems:
+            why = "校验失败" if f.verify.get("status") == "failed" else "无证据"
+            print(f"  ! {why}  {f.id}  {f.claim[:64]}")
+    else:
+        print("\n[P1] 需要修：无")
+
+    # P2：数字冲突
+    conflicts = _iter_number_conflicts(ledger)
+    if conflicts:
+        print(f"\n[P2] 需要决策（数字矛盾，共 {len(conflicts)} 处）")
+        for fact_id, other_id, mine, theirs, unit in conflicts[:6]:
+            print(f"  ~ {fact_id} ({mine}{unit})  vs  {other_id} ({theirs}{unit})")
+    else:
+        print("\n[P2] 需要决策：无")
+
+    # P3：可推进的实现工作，按失修天数降序
+    done, open_ = _readme_checklist(root)
+    if open_:
+        print(f"\n[P3] 可推进的实现工作（{len(open_)} 项，按失修程度排序）")
+        scored = []
+        for item in open_:
+            hits = search(discussable, item, top_k=1, half_life_days=10**6)
+            if hits:
+                latest = hits[0]["fact"]
+                days = max(0, (now - _parse_when(latest.created)).days)
+                scored.append((days, item, latest))
+            else:
+                scored.append((999999, item, None))
+        for days, item, latest in sorted(scored, key=lambda t: t[0], reverse=True):
+            tail = f"  失修 {days} 天" if days < 999999 else "  从未有过记录"
+            if latest is not None:
+                tail += f"（最近 {latest.id} {latest.claim[:48]}）"
+            print(f"  - {item}{tail}")
+    else:
+        print("\n[P3] 可推进的实现工作：无")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
     total = len(ledger.facts)
@@ -1105,6 +1184,11 @@ def build_parser() -> argparse.ArgumentParser:
         "roadmap", help="README「路线图」清单 × 账本证据：还剩什么、每条上次讨论"
     )
     roadmap.set_defaults(func=cmd_roadmap)
+
+    plan = sub.add_parser(
+        "plan", help="按优先级排序的行动清单：先拍板→先修→先决策→先推进"
+    )
+    plan.set_defaults(func=cmd_plan)
 
     show = sub.add_parser("show", help="看一条记录")
     show.add_argument("id")

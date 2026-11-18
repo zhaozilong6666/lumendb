@@ -58,6 +58,9 @@ python -m tools.project_memory digest
 # 路线图对账：README「路线图」清单 × 账本证据——还剩什么、每条上次讨论
 python -m tools.project_memory roadmap
 
+# 行动清单：按优先级 P0 拍板 → P1 修账本 → P2 决策矛盾 → P3 推进实现（按失修天数）
+python -m tools.project_memory plan
+
 # 追加一条带证据的事实
 python -m tools.project_memory add --kind measurement `
   --claim "索引点查 0.47ms/次，全表 48ms/次（约 100 倍）" `
