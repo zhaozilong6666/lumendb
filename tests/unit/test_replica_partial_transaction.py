@@ -65,6 +65,15 @@ def test_oversized_transaction_never_visible_half_applied(tmp_path):
         primary.close()
 
 
+def test_max_pending_records_is_constructor_tunable(tmp_path):
+    """暂存上限要能在构造时调，而不是只能事后改私有字段。"""
+    replica = Replica(tmp_path / "r", max_pending_records=25)
+    try:
+        assert replica._max_pending_records == 25
+    finally:
+        replica.close()
+
+
 def test_pending_cap_fails_loudly_instead_of_tearing(tmp_path):
     primary = Database(tmp_path / "primary", checkpoint_wal_bytes=0)
     primary.execute_one("CREATE TABLE t (id INT)")

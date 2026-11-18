@@ -49,6 +49,7 @@ class Replica:
         *,
         applied_lsn: int = 0,
         wal_segment_bytes: int = 1024 * 1024,
+        max_pending_records: int = 100_000,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
@@ -105,8 +106,8 @@ class Replica:
         self._pending_records: list = []
         self._pending_end_lsn = 0
         #: 暂存上限：单个事务超过它就报错，宁可让复制停住等人处理，
-        #: 也不退化成"应用半个事务"。
-        self._max_pending_records = 100_000
+        #: 也不退化成"应用半个事务"。构造时可调（见 `__init__` 参数）。
+        self._max_pending_records = max(1, int(max_pending_records))
         #: 正在等数据锁的只读查询数（无锁启发式计数，只用来决定要不要让出）。
         self._pending_reads = 0
         #: 正在进行"一致快照读"的线程数（``snapshot_read`` 上下文）。>0 时
@@ -496,7 +497,7 @@ class Replica:
                     "单个事务超过副本暂存上限，无法原子应用",
                     detail=(
                         f"pending={len(todo)} cap={self._max_pending_records}；"
-                        "调大 Replica._max_pending_records，或把事务拆小"
+                        "调大 Replica(max_pending_records=...)，或把事务拆小"
                     ),
                 )
             with self._lock:
