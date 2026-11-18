@@ -55,6 +55,9 @@ python -m tools.project_memory status
 # （和 status 的区别：status 说"现在在哪"，digest 说"接手先信哪几条、先处理哪几条"）
 python -m tools.project_memory digest
 
+# 路线图对账：README「路线图」清单 × 账本证据——还剩什么、每条上次讨论
+python -m tools.project_memory roadmap
+
 # 追加一条带证据的事实
 python -m tools.project_memory add --kind measurement `
   --claim "索引点查 0.47ms/次，全表 48ms/次（约 100 倍）" `

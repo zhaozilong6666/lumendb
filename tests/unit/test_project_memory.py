@@ -14,6 +14,7 @@ from tools.project_memory import (
     Fact,
     Ledger,
     _parse_when,
+    _readme_checklist,
     extract_metrics,
     facts_from_git,
     find_git,
@@ -334,5 +335,55 @@ def test_digest_command_aggregates_and_hides_superseded(tmp_path, capsys):
     assert "是否 push 到远端" in out
     assert "0.047ms" in out
     assert "0.096ms" not in out, "被 supersedes 的旧结论不该出现在最新结论里"
+
+
+def test_readme_checklist_only_counts_roadmap_section(tmp_path):
+    (tmp_path / "README.md").write_text(
+        "\n".join(
+            [
+                "# LumenDB",
+                "",
+                "## 路线图",
+                "- [x] 页式存储",
+                "- [ ] 完整 commit index 协商",
+                "- [x] B+ 树索引",
+                "",
+                "## 其他",
+                "- [ ] 这个不算路线图项",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    done, open_ = _readme_checklist(tmp_path)
+    assert done == ["页式存储", "B+ 树索引"]
+    assert open_ == ["完整 commit index 协商"]
+
+
+def test_roadmap_command_links_open_item_to_ledger(tmp_path, capsys):
+    (tmp_path / "README.md").write_text(
+        "\n".join(
+            [
+                "## 路线图",
+                "- [x] 已完成项",
+                "- [ ] 分歧尾巴截断",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(
+        _fact("r1", "分歧尾巴截断暂不做，重建兜底", kind="decision", tags=["replication"])
+    )
+    ledger.append(_fact("q1", "是否 push 到远端", kind="open_question", tags=["git"]))
+
+    from tools.project_memory import main
+
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "roadmap"]) == 0
+    out = capsys.readouterr().out
+    assert "完成 1，未完成 1" in out
+    assert "分歧尾巴截断" in out
+    assert "r1" in out, "未完成项应关联到账本里最近的讨论记录"
+    assert "是否 push 到远端" in out, "阻塞项（open_question）应被列出"
+
 
 

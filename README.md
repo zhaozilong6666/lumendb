@@ -307,7 +307,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 左深动态规划连接顺序：3–8 个源按子集枚举选择 `rows + cpu` 最小的顺序；逗号连接和纯 INNER 显式 `JOIN` 链都会重排，外连接/混合 `JOIN`/超过 8 源保持原序；输出列顺序由投影还原；`EXPLAIN` 标记 `[order=dp] [candidates=N]`
 - [x] 唯一/主键约束 `DEFERRABLE`：事务内暂存重复键，`COMMIT` 或 `SET CONSTRAINTS ... IMMEDIATE` 时统一校验
 - [x] 外键：`MATCH SIMPLE/FULL`、`RESTRICT/CASCADE/SET NULL/SET DEFAULT/NO ACTION`、`DEFERRABLE INITIALLY DEFERRED` 提交时检查、`SET CONSTRAINTS` 事务内切换、`ALTER CONSTRAINT` 修改延迟属性、`ALTER TABLE` 外键 DDL、`SET NULL/SET DEFAULT (col...)` 列级动作、`ADD CONSTRAINT ... NOT VALID`（外键/CHECK）与 `VALIDATE CONSTRAINT`
-- [ ] 外键 `MATCH PARTIAL`
+- 外键 `MATCH PARTIAL`：不做（PostgreSQL 本身不支持，见 `docs/roadmap.md`「明确不做」）
 - [x] 基于代价的连接顺序枚举（左深 DP，`rows + cpu`）
 - [x] 单源谓词下推：多源查询中只引用一个数据源的 `WHERE` 合取项下推到扫描之上，最终 `WHERE` 仍保留兜底 `Filter`
 - [x] 相关子查询

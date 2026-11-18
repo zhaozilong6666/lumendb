@@ -925,6 +925,82 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _readme_checklist(root: Path) -> tuple[list[str], list[str]]:
+    """解析 README「## 路线图」节的 ``- [x]`` / ``- [ ]`` 清单。
+
+    返回 ``(done, open)``。只认那个小节里的勾选行，避免把正文里的其他
+    ``- [ ]`` 语法（如果将来出现）也算进去。
+    """
+    readme = root / "README.md"
+    if not readme.exists():
+        return [], []
+    done: list[str] = []
+    open_: list[str] = []
+    in_section = False
+    for line in readme.read_text(encoding="utf-8").splitlines():
+        if line.strip() == "## 路线图":
+            in_section = True
+            continue
+        if in_section and line.startswith("## ") and line.strip() != "## 路线图":
+            break
+        if not in_section:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- [x]") or stripped.startswith("- [X]"):
+            done.append(stripped[5:].strip())
+        elif stripped.startswith("- [ ]"):
+            open_.append(stripped[5:].strip())
+    return done, open_
+
+
+def cmd_roadmap(args: argparse.Namespace) -> int:
+    """把 README「路线图」清单和账本证据拼成一张"还剩什么"的表。
+
+    路线图本身写在 markdown 里，是唯一的完成状态来源；这个命令把它变成
+    程序可查询、可对账的东西：每一条未完成项都试着在账本里找最近的
+    相关记录，标出"上次讨论是什么时候、有没有证据"，避免接手的人
+    只看到一句待办、不知道它已经走到哪一步。
+    """
+    ledger = Ledger(Path(args.ledger), Path(args.root))
+    root = Path(args.root)
+    done, open_ = _readme_checklist(root)
+
+    print("LumenDB 路线图（README「路线图」× 账本）")
+    print(f"  完成 {len(done)}，未完成 {len(open_)}")
+
+    if not open_:
+        print("  （没有未完成项）")
+    else:
+        print("\n【未完成项】")
+        discussable = [f for f in ledger.facts if f.kind != "commit"]
+        superseded = {f.supersedes for f in ledger.facts if f.supersedes}
+        for item in open_:
+            hits = search(
+                [f for f in discussable if f.id not in superseded],
+                item,
+                top_k=1,
+                half_life_days=10**6,
+            )
+            print(f"  - {item}")
+            if hits:
+                f = hits[0]["fact"]
+                print(f"      最近相关 {f.id}  {f.created[:10]}  {f.claim[:64]}")
+            else:
+                print("      账本里没有相关记录")
+
+    questions = [
+        f
+        for f in ledger.facts
+        if f.kind == "open_question"
+        and f.id not in {x.supersedes for x in ledger.facts if x.supersedes}
+    ]
+    if questions:
+        print("\n【阻塞项（open_question）】")
+        for f in questions:
+            print(f"  ? {f.claim}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
     total = len(ledger.facts)
@@ -1024,6 +1100,11 @@ def build_parser() -> argparse.ArgumentParser:
         "digest", help="续作交接：未决问题 + 需处理 + 数字冲突 + 最新结论"
     )
     digest.set_defaults(func=cmd_digest)
+
+    roadmap = sub.add_parser(
+        "roadmap", help="README「路线图」清单 × 账本证据：还剩什么、每条上次讨论"
+    )
+    roadmap.set_defaults(func=cmd_roadmap)
 
     show = sub.add_parser("show", help="看一条记录")
     show.add_argument("id")
