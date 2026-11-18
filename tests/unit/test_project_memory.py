@@ -315,6 +315,18 @@ def test_number_conflicts_does_not_self_flag_before_after(tmp_path):
     assert ledger.number_conflicts(fact) == []
 
 
+def test_conflicts_skip_fact_superseded_by_third_party(tmp_path):
+    """被第三条记录取代的旧值，不该再和有效记录报数字冲突。"""
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("a", "外键子表插入 1199 行/秒", tags=["bench"]))
+    ledger.append(_fact("b", "外键子表插入 374 行/秒", tags=["bench"]))
+    ledger.append(_fact("c", "外键子表插入 1199 行/秒", tags=["bench"], supersedes="b"))
+
+    from tools.project_memory import _iter_number_conflicts
+
+    assert _iter_number_conflicts(ledger) == []
+
+
 def test_digest_command_aggregates_and_hides_superseded(tmp_path, capsys):
     ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
     ledger.append(_fact("q1", "是否 push 到远端", kind="open_question", tags=["git"]))

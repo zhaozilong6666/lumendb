@@ -755,9 +755,13 @@ def cmd_dups(args: argparse.Namespace) -> int:
 
 def cmd_conflicts(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
+    superseded = _superseded_ids(ledger.facts)
+    active = [f for f in ledger.facts if f.id not in superseded]
     found = 0
-    for fact in ledger.facts:
+    for fact in active:
         for other, mine, unit, theirs in ledger.number_conflicts(fact):
+            if other.id in superseded:
+                continue
             if other.id >= fact.id:
                 continue
             print(f"{fact.id} ({mine}{unit}) vs {other.id} ({theirs}{unit})")
@@ -857,12 +861,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _superseded_ids(facts: Sequence["Fact"]) -> set[str]:
+    """所有已被其它记录取代的 id（出现在任一条 ``supersedes`` 字段里的 id）。"""
+    return {f.supersedes for f in facts if f.supersedes}
+
+
 def _iter_number_conflicts(ledger: "Ledger") -> list[tuple]:
-    """跨全账本找出"同主题、同单位、数值差 >25%"的冲突对（去重、去被替代）。"""
+    """跨全账本找出"同主题、同单位、数值差 >25%"的冲突对（去重、去被替代）。
+
+    只拿仍有效的记录两两比较：已经被第三条记录取代的旧值，不该再和谁吵。
+    """
+    superseded = _superseded_ids(ledger.facts)
+    active = [f for f in ledger.facts if f.id not in superseded]
     found: list[tuple] = []
     seen: set[frozenset] = set()
-    for fact in ledger.facts:
+    for fact in active:
         for other, mine, unit, theirs in ledger.number_conflicts(fact):
+            if other.id in superseded:
+                continue
             pair = frozenset((fact.id, other.id))
             if pair in seen:
                 continue
