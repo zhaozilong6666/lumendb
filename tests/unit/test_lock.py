@@ -142,3 +142,43 @@ class TestRowResource:
 
     def test_row_resource_distinguishes_slots(self):
         assert row_resource("t", (1, 1)) != row_resource("t", (1, 2))
+
+
+class TestReleaseAllScalesWithHeldLocks:
+    """`release_all` 只看自己持有的资源，不扫全系统锁表。
+
+    批量插入会给每行拿唯一键锁；如果每次提交都扫全表，多会话下这一步
+    就是 O(总锁数)。这里用"别人持有的锁不受影响 + 自己的锁全部释放"
+    钉住语义，再用数量断言钉住实现没有退化成全表扫描。
+    """
+
+    def test_release_all_only_touches_its_own_locks(self):
+        locks = LockManager(default_timeout=1.0)
+        for i in range(100):
+            locks.try_acquire(1, ("ukey", "t", "idx", i), LockMode.EXCLUSIVE)
+        locks.try_acquire(2, ("ukey", "t", "idx", 999), LockMode.EXCLUSIVE)
+
+        locks.release_all(1)
+        assert locks.held_count(1) == 0
+        assert locks.held_count(2) == 1
+        assert locks.holders(("ukey", "t", "idx", 999)) == {2: LockMode.EXCLUSIVE}
+        assert locks.holders(("ukey", "t", "idx", 0)) == {}
+
+    def test_held_count_tracks_growth_and_release(self):
+        locks = LockManager(default_timeout=1.0)
+        for i in range(50):
+            assert locks.try_acquire(7, ("row", "t", i, 0), LockMode.EXCLUSIVE)
+        assert locks.held_count(7) == 50
+        assert locks.held_count() == 50
+        locks.release(7, ("row", "t", 0, 0))
+        assert locks.held_count(7) == 49
+        locks.release_all(7)
+        assert locks.held_count() == 0
+
+    def test_upgrade_does_not_double_count(self):
+        locks = LockManager(default_timeout=1.0)
+        resource = ("row", "t", 1, 0)
+        assert locks.try_acquire(3, resource, LockMode.SHARED)
+        assert locks.try_acquire(3, resource, LockMode.EXCLUSIVE)
+        assert locks.held_count(3) == 1
+        assert locks.holders(resource) == {3: LockMode.EXCLUSIVE}

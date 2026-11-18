@@ -38,6 +38,10 @@ class LockManager:
     def __init__(self, default_timeout: float = 10.0) -> None:
         self._cond = threading.Condition()
         self._granted: dict[Hashable, dict[int, LockMode]] = {}
+        #: 每个事务持有的资源集合。`release_all` 必须只看自己持有的，
+        #: 否则每次提交都要扫全系统的锁表——批量插入会持有几千个键锁，
+        #: 多会话下这一步会变成 O(总锁数)。
+        self._held: dict[int, set[Hashable]] = {}
         self._waits_for: dict[int, set[int]] = {}
         self._timeout = default_timeout
 
@@ -109,6 +113,7 @@ class LockManager:
                     self._granted.setdefault(resource, {})[xid] = max(
                         self._granted[resource].get(xid, 0), mode
                     )
+                    self._held.setdefault(xid, set()).add(resource)
                     self._clear_waits(xid)
                     return
 
@@ -136,6 +141,7 @@ class LockManager:
         with self._cond:
             if self._can_grant(resource, xid, mode):
                 self._granted.setdefault(resource, {})[xid] = mode
+                self._held.setdefault(xid, set()).add(resource)
                 return True
             return False
 
@@ -146,19 +152,33 @@ class LockManager:
                 del holders[xid]
                 if not holders:
                     self._granted.pop(resource, None)
+            owned = self._held.get(xid)
+            if owned is not None:
+                owned.discard(resource)
+                if not owned:
+                    self._held.pop(xid, None)
             self._clear_waits(xid)
             self._cond.notify_all()
 
     def release_all(self, xid: int) -> None:
+        """释放该事务持有的全部锁。只看自己持有的集合，不扫全表。"""
         with self._cond:
-            for resource in list(self._granted.keys()):
-                holders = self._granted[resource]
-                if xid in holders:
-                    del holders[xid]
-                    if not holders:
-                        del self._granted[resource]
+            for resource in self._held.pop(xid, set()):
+                holders = self._granted.get(resource)
+                if not holders:
+                    continue
+                holders.pop(xid, None)
+                if not holders:
+                    self._granted.pop(resource, None)
             self._clear_waits(xid)
             self._cond.notify_all()
+
+    def held_count(self, xid: Optional[int] = None) -> int:
+        """当前持有的锁数量（观测用：批量写的锁表规模）。"""
+        with self._cond:
+            if xid is None:
+                return sum(len(v) for v in self._granted.values())
+            return len(self._held.get(xid, ()))
 
     def holders(self, resource: Hashable) -> dict[int, LockMode]:
         with self._cond:
