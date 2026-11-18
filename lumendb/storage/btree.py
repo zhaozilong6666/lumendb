@@ -130,12 +130,17 @@ class BPlusTree:
         *,
         unique: bool = False,
         name: str = "index",
+        internal_cache: Optional[dict] = None,
     ) -> None:
         self._bp = buffer_pool
         self.codec = codec
         self.root_page = root_page
         self.unique = unique
         self.name = name
+        #: 只给 ``_descend`` 用的内部页解码缓存，键是 (页号, pageLSN)。
+        #: 由执行器跨语句持有（每次查询都新建 BPlusTree，缓存挂在树上没意义）。
+        #: 页被写过后 pageLSN 会推进，旧条目自然再也不会命中。
+        self._internal_cache = internal_cache
 
     # ------------------------------------------------------------------
     # 页结构
@@ -344,6 +349,30 @@ class BPlusTree:
             pos += INTERNAL_CHILD_SIZE
         return keys, children
 
+    def _read_internal_cached(self, page: Page) -> Tuple[tuple, tuple]:
+        """``_descend`` 专用的只读版本：按 (页号, pageLSN) 缓存解码结果。
+
+        内部页是"键 + 孩子指针"数组，没有叶子那种槽位目录，定位一个孩子必须
+        把整页键都解码出来。点查每下降一层就要付一次这个成本，而树的顶部几层
+        几乎不变——缓存它们是纯收益。缓存条目按页 LSN 失效：页被写过后 LSN
+        推进，旧键再也不会命中；返回元组，避免调用方原地修改缓存内容。
+        """
+        cache = self._internal_cache
+        if cache is None:
+            keys, children = self._read_internal(page)
+            return keys, children
+        key = (page.page_id, page.page_lsn)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        keys, children = self._read_internal(page)
+        entry = (tuple(keys), tuple(children))
+        if len(cache) >= 128:
+            # 逐条淘汰；树顶就那么几页，128 条足够覆盖热点。
+            cache.pop(next(iter(cache)))
+        cache[key] = entry
+        return entry
+
     # -- 序列化 -------------------------------------------------------------
 
     def _encode_leaf(
@@ -435,7 +464,7 @@ class BPlusTree:
             raise BTreeInvariantError(f"索引 {self.name} 的根页不存在")
         page = self._bp.fetch_page(self.root_page)
         while not self._is_leaf(page):
-            keys, children = self._read_internal(page)
+            keys, children = self._read_internal_cached(page)
             idx = self._child_index(keys, key)
             child_id = children[idx]
             self._bp.unpin(page.page_id)

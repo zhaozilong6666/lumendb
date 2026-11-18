@@ -200,6 +200,10 @@ class Executor:
         #: 把新对象的 ``id`` 误当成旧计划。
         self._plan_cache: dict[tuple[int, int], tuple] = {}
         self._plan_cache_limit = 256
+        #: B+ 树内部页解码缓存（跨语句共享）：(页号, pageLSN) -> (keys, children)。
+        #: DDL 改变 schema_version 时整体清空：页号可能被新索引复用。
+        self._internal_page_cache: dict[tuple[int, int], tuple] = {}
+        self._internal_cache_version = -1
         self.binder = self._new_binder()
 
     # ------------------------------------------------------------------
@@ -4449,6 +4453,9 @@ class Executor:
 
     def _tree_for(self, table: TableDef, idx: IndexDef) -> BPlusTree:
         # KeyCodec 会自动在末尾追加 RID 两列，这里只给索引列的类型
+        if self._internal_cache_version != self._catalog.schema_version:
+            self._internal_page_cache.clear()
+            self._internal_cache_version = self._catalog.schema_version
         specs = [table.column(c).type for c in idx.columns]
         return BPlusTree(
             self._bp,
@@ -4458,6 +4465,7 @@ class Executor:
             # 普通唯一索引继续由 B+ 树在插入时立刻拒绝重复。
             unique=idx.unique and not idx.deferrable,
             name=idx.name,
+            internal_cache=self._internal_page_cache,
         )
 
     def _key_for(
