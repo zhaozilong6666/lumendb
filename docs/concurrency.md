@@ -183,6 +183,12 @@ WAL 体积降到 **1/16.4（−93.9%）**。注意：批量 INSERT（一条 SQL 
 本来就只有一次 persist，所以 `bench.replication` 的批量场景看不出差异；
 受益的是逐行写入的真实路径（CLI 单条执行、pgwire 单条 INSERT）。
 
+频率护栏（`tests/unit/test_catalog_persist_frequency.py`，2026-11-18 补）：
+40 行小插入只触发 **1** 次目录保存；20 行大插入（每行 ~1KB，强制分页）触发
+**5** 次——即"按页"而不是"按行"。同组用例还钉住了两个容易回退的点：重开数据库后
+`last_page` 必须仍是可用的链尾（否则下一次插入会覆盖链尾的 `next`），以及
+`row_count_hint` 不落盘也不影响查询结果。
+
 ### 第 1.7 步：只读语句不再写 WAL（已完成，2026-11-17）
 
 自动提交的 `SELECT` / `EXPLAIN` / `SHOW` 此前也走 `txns.begin()` + `txns.commit()`，
