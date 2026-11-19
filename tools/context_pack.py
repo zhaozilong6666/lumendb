@@ -235,15 +235,19 @@ def commits_since(root: Path, sha: str) -> Optional[int]:
     return int(proc.stdout.strip() or 0)
 
 
-def changed_modules(root: Path, base: str, limit: int = 6) -> list[str]:
-    """从 base 到 HEAD 改动的模块目录，用来给快照打关键词之外的结构标签。"""
+def changed_modules(root: Path, base: str, limit: int = 8) -> list[str]:
+    """从 base 到 HEAD 改动的模块目录，用来给快照打关键词之外的结构标签。
+
+    按改动文件数降序，改动最多的模块排在前面——截断时不会把主要工作
+    所在的目录丢掉。
+    """
     try:
         proc = _git(root, "diff", "--name-only", f"{base}..HEAD")
     except ContextError:
         return []
     if proc.returncode != 0:
         return []
-    modules: list[str] = []
+    counts: dict[str, int] = {}
     for line in proc.stdout.splitlines():
         parts = line.strip().split("/")
         if len(parts) >= 3 and parts[0] in ("lumendb", "tests", "docs"):
@@ -256,9 +260,9 @@ def changed_modules(root: Path, base: str, limit: int = 6) -> list[str]:
             module = "root"
         else:
             continue
-        if module not in modules:
-            modules.append(module)
-    return modules[:limit]
+        counts[module] = counts.get(module, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [module for module, _ in ranked[:limit]]
 
 
 # ---------------------------------------------------------------------------

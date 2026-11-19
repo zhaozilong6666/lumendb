@@ -5,4 +5,4 @@
 
 | 快照 | 日期 | 任务 | 提交 | 模块 | 关键词 | 账本 | 状态 |
 |---|---|---|---|---|---|---|---|
-| （暂无） | - | - | - | - | - | - | - |
+| [20261119-context-layers.md](20261119-context-layers.md) | 2026-11-19 | T-20261119-1 | `da85bfa` | .github、root、docs/context、docs/memory、docs、tests/unit | context、snapshot、budget | f-20261119-703b68、f-20261119-b54e98、f-20261119-22fea7 | draft |
