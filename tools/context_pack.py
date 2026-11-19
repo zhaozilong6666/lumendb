@@ -252,9 +252,7 @@ def changed_modules(root: Path, base: str, limit: int = 8) -> list[str]:
         parts = line.strip().split("/")
         if len(parts) >= 3 and parts[0] in ("lumendb", "tests", "docs"):
             module = "/".join(parts[:2])
-        elif len(parts) >= 2 and parts[0] in ("lumendb", "tests", "docs"):
-            module = parts[0]
-        elif parts and parts[0].startswith("."):
+        elif len(parts) >= 2:
             module = parts[0]
         elif parts and parts[0]:
             module = "root"
