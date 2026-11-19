@@ -18,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,6 +33,9 @@ jobs:
 
       - name: Run unit and crash tests
         run: python -m pytest tests -q
+
+      - name: Check context pack
+        run: python -m tools.context_pack check
 
       - name: Smoke test the CLI
         run: |

@@ -69,6 +69,10 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 commit / 文件锚点 / 测试作为证据，`python -m tools.project_memory verify` 可一键复查，
 并会自动检测"同一主题下互相矛盾的数字"——避免把过期的测量当成当前事实。
 
+每轮读什么、写什么见 [`docs/context/README.md`](docs/context/README.md)：常驻规则、
+单任务、按需快照三层；常驻预算、快照索引和"任务完成必须封存"由
+`python -m tools.context_pack check` 校验，CI 每次都跑。
+
 ## 快速开始
 
 无需任何第三方依赖，只需要 Python 3.12+。
@@ -268,7 +272,7 @@ python -m bench.replication --rows 2000 --repeat 3
 
 ## 怎么验证它真的能跑
 
-- **1344 个自动化测试**（`python -m pytest tests -q`，约 20–120 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
+- **1360 个自动化测试**（`python -m pytest tests -q`，约 20–160 秒，视机器与平台而定），覆盖页格式、WAL 与恢复、
   B+ 树不变量、词法/语法、绑定与执行、协议收发、锁与死锁；
 - **崩溃恢复用例是"真拔电"**：绕过 buffer pool 的刷盘路径直接写数据页，模拟进程被杀，
   重启后分别校验"已提交必须存活、未提交必须回滚"；
@@ -277,7 +281,7 @@ python -m bench.replication --rows 2000 --repeat 3
 - **真实客户端互操作**：`examples/psycopg2_smoke.py` 用 libpq（psycopg2）走一遍
   握手、DDL、参数化查询、两连接事务隔离与 SQLSTATE `23505`；
 - **基准数字由脚本产出**，README 里没有手写性能；
-- CI 在 Ubuntu / Windows × Python 3.12 / 3.13 上跑全量测试 + CLI 冒烟。
+- CI 在 Ubuntu / Windows × Python 3.12 / 3.13 上跑全量测试、上下文预算校验（`tools.context_pack check`）与 CLI 冒烟。
 
 ## 开发
 
