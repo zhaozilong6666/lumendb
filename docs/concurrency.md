@@ -158,14 +158,22 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 锁序保持单向：`父页 latch → 子页 latch → 叶 latch → 后继 latch`，`_root_lock`
 只在页 latch 全部释放后获取（`_root_lock → 新根 latch`），无 ABBA。
 
+**内部页 / 叶子 B-link（high key）已落地（Step 4 后半段①的后半）**：
+
+- 页头加 high key 标志：内部页用偏移 4、叶子页用偏移 6（叶子偏移 4 已被
+  `LEAF_DATA_END_OFF` 占用），high key（右兄弟最小键）编码在记录区开头。
+- `_split_internal` / `_split_leaf`：左页 high key = sep、next 指向右页；右页
+  继承旧 high key、next 指向旧后继；旧后继 prev 回指（expected 校验）。
+- `_descend` / `_insert_recursive`：读页后先判 `key >= high key` 就沿 next 右移
+  （B-link 路由），再 `_child_index` 二分。此前只有查询路径 `_descend` 有路由，
+  插入路径仍按旧 keys 二分，key 会被错插进分裂后的左半。
+- 修两个真实 bug：①初始建根双重检查里，后到的线程发现根已被并发建好时仍
+  `return`，静默丢弃自己的 key（最左叶最小键丢 3 条）；②`_split_leaf` /
+  `_split_internal` 用 `new_page(Page).page_id` 后再 `fetch_page`，每次分裂
+  泄漏 1 个 pin，长事务最终把缓冲池 pin 满（`pool_size=64 pinned=64`）。
+- `check_invariants` 叶子/内部页的最右孩子上界改用 high key 校验。
+
 **仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
-- **内部页并发分裂的 B-link 路由**：LumenDB 内部页不是 B-link，`_split_internal`
-  后左页没有指向右页的 next 指针。并发下，线程 A 分裂某内部页 P 后释放 P.latch，
-  线程 B 再读 P（已是左半）时，若目标 key 在右半，`_child_index` 会错误路由到
-  左半的最后一个孩子——探针表现为 `check_invariants` 报"键不小于上界"。修法：
-  给内部页加 next/prev 指针 + high key（或等价的路由信息），`_descend` 在
-  key 越过当前页所有键时沿 next 右移。这是"放开 `_write_lock` 让并发分裂正确"
-  的下一块。
 - 删除合并 `_detach_if_empty` 的多页原子性（"父 + 子 + 左右邻居"），以及
   上行（子 → 父）与下行（父 → 子）两条路径的锁序统一（需 B-link 先定方向）。
 - 读者侧：`lookup`/`scan` 目前不拿 latch，靠 GIL 的"一次换页 memcpy 原子" +
@@ -176,8 +184,11 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   双线程绕过 `_write_lock` 对同一片叶并发插 200 条，断言不变量 + 条目数（修复前
   稳定丢行/乱序）。
 - `tests/unit/test_btree_split_crab.py::test_concurrent_leaf_splits_keep_invariants`
-  预置多层叶后双线程向同一片叶并发插 300 条触发叶分裂，断言键序/叶子链/条目数
-  （刻意避开内部页/根分裂——那是上面 B-link 的课题）。
+  预置多层叶后双线程向同一片叶并发插 300 条触发叶分裂，断言键序/叶子链/条目数。
+- `tests/unit/test_btree_split_crab.py::test_concurrent_inserts_from_empty_trigger_root_split`
+  4 线程从空树并发插相交键，钉住建根竞态（丢最小键）+ 根分裂 B-link 路由。
+- `tests/unit/test_btree_split_crab.py::test_concurrent_inserts_trigger_internal_splits`
+  预置 depth≥2 的多层树后 4 线程并发插相交键触发内部页分裂，断言不变量 + 条目数。
 
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 

@@ -46,6 +46,11 @@ from .txn import Transaction
 
 HEADER_SIZE = 32
 INTERNAL_CHILD_SIZE = 4
+#: 内部页页头偏移 4 的 u8 标志：1 表示记录区开头有 high key（右兄弟最小键）。
+HIGH_KEY_FLAG_OFF = 4
+#: 叶子页页头偏移 6 的 u8 标志：1 表示记录区开头有 high key（右兄弟最小键）。
+#: 叶子页偏移 4 是 LEAF_DATA_END_OFF（数据区末尾），6-7 空闲，故叶子用 6。
+LEAF_HIGH_KEY_FLAG_OFF = 6
 LEAF_RID_SIZE = 6
 #: 叶子页头 offset 4：记录区末尾偏移（记录区向上增长，槽位目录向下增长）
 LEAF_DATA_END_OFF = 4
@@ -163,6 +168,7 @@ class BPlusTree:
     def _init_leaf(self, page: Page) -> None:
         self._init_page(page, PageType.BTREE_LEAF)
         page.set_u16(LEAF_DATA_END_OFF, HEADER_SIZE)
+        page.set_u8(LEAF_HIGH_KEY_FLAG_OFF, 0)
 
     def _init_internal(self, page: Page) -> None:
         self._init_page(page, PageType.BTREE_INTERNAL)
@@ -186,6 +192,23 @@ class BPlusTree:
     def _leaf_data_end(self, page: Page) -> int:
         end = page.get_u16(LEAF_DATA_END_OFF)
         return end if end >= HEADER_SIZE else HEADER_SIZE
+
+    def _leaf_high_key(self, page: Page) -> Optional[tuple]:
+        """读叶子 high key（右兄弟最小键），可能为 None。
+
+        叶子也参与 B-link：并发分裂后，左叶必须知道自己从哪个键开始"不属于
+        本页"，插入/查找者读到 key >= high key 时沿 next 去右兄弟。
+        """
+        if not page.get_u8(LEAF_HIGH_KEY_FLAG_OFF):
+            return None
+        try:
+            high_key, _ = self.codec.decode(page.buf, HEADER_SIZE)
+            return high_key
+        except (ValueError, struct.error) as exc:
+            raise BTreeInvariantError(
+                f"叶子页 {page.page_id} 的 high key 解码失败",
+                detail=str(exc),
+            ) from exc
 
     @staticmethod
     def _leaf_slot_pos(index: int) -> int:
@@ -266,11 +289,13 @@ class BPlusTree:
     def _leaf_compact(self, txn: Transaction, page: Page) -> None:
         """把记录区重新紧凑排列，回收删除留下的碎片。"""
         with page.latch:
-            keys, rids = self._read_leaf(page)
+            keys, rids, high_key = self._read_leaf(page)
             self._commit_page(
                 txn,
                 page,
-                self._encode_leaf(page.page_id, keys, rids, page.next_page, page.prev_page),
+                self._encode_leaf(
+                    page.page_id, keys, rids, page.next_page, page.prev_page, high_key
+                ),
             )
 
     def _leaf_insert_at(
@@ -335,7 +360,7 @@ class BPlusTree:
             idx = self._leaf_insert_at(txn, page, key, rid)  # RLock 重入本页 latch
             if idx is None:
                 return None
-            keys, rids = self._read_leaf(page)
+            keys, rids, _ = self._read_leaf(page)
             keys.insert(idx, key)
             rids.insert(idx, rid)
             # `_split_leaf` 会重入 page.latch（RLock），锁序 page → right → next
@@ -356,8 +381,8 @@ class BPlusTree:
 
     # -- 解析 ---------------------------------------------------------------
 
-    def _read_leaf(self, page: Page) -> Tuple[list, list]:
-        """按槽位顺序读出整页（分裂、compact、不变量检查用）。"""
+    def _read_leaf(self, page: Page) -> Tuple[list, list, Optional[tuple]]:
+        """按槽位顺序读出整页（分裂、compact、不变量检查用），外加 high key。"""
         n = self._nkeys(page)
         keys: list = []
         rids: list = []
@@ -365,13 +390,28 @@ class BPlusTree:
             key, rid, _ = self._leaf_key_at(page, i)
             keys.append(key)
             rids.append(rid)
-        return keys, rids
+        return keys, rids, self._leaf_high_key(page)
 
-    def _read_internal(self, page: Page) -> Tuple[list, list]:
+    def _read_internal(self, page: Page) -> Tuple[list, list, Optional[tuple]]:
+        """读内部页的键/孩子，外加 high key（右兄弟的最小键，可能为 None）。
+
+        high key 是 B-link 路由的关键：内部页分裂后，左页所有键都小于右页，
+        但左页自己不知道右页从哪个键开始。high key 把"右兄弟的最小键"记在左页，
+        查找者读到 key >= high key 时就知道要沿 next 去右兄弟。
+        """
         n = self._nkeys(page)
         keys: list = []
         children: list = []
         pos = HEADER_SIZE
+        high_key: Optional[tuple] = None
+        if page.get_u8(HIGH_KEY_FLAG_OFF):
+            try:
+                high_key, pos = self.codec.decode(page.buf, pos)
+            except (ValueError, struct.error) as exc:
+                raise BTreeInvariantError(
+                    f"内部页 {page.page_id} 的 high key 解码失败",
+                    detail=str(exc),
+                ) from exc
         if pos + INTERNAL_CHILD_SIZE > PAGE_SIZE:
             raise BTreeInvariantError(f"内部页 {page.page_id} 页头越界")
         children.append(page.get_u32(pos))
@@ -391,9 +431,9 @@ class BPlusTree:
             keys.append(k)
             children.append(child)
             pos += INTERNAL_CHILD_SIZE
-        return keys, children
+        return keys, children, high_key
 
-    def _read_internal_cached(self, page: Page) -> Tuple[tuple, tuple]:
+    def _read_internal_cached(self, page: Page) -> Tuple[tuple, tuple, Optional[tuple]]:
         """``_descend`` 专用的只读版本：按 (页号, pageLSN) 缓存解码结果。
 
         内部页是"键 + 孩子指针"数组，没有叶子那种槽位目录，定位一个孩子必须
@@ -403,14 +443,13 @@ class BPlusTree:
         """
         cache = self._internal_cache
         if cache is None:
-            keys, children = self._read_internal(page)
-            return keys, children
+            return self._read_internal(page)
         key = (page.page_id, page.page_lsn)
         hit = cache.get(key)
         if hit is not None:
             return hit
-        keys, children = self._read_internal(page)
-        entry = (tuple(keys), tuple(children))
+        keys, children, high_key = self._read_internal(page)
+        entry = (tuple(keys), tuple(children), high_key)
         if len(cache) >= 128:
             # 逐条淘汰；树顶就那么几页，128 条足够覆盖热点。
             cache.pop(next(iter(cache)))
@@ -420,7 +459,13 @@ class BPlusTree:
     # -- 序列化 -------------------------------------------------------------
 
     def _encode_leaf(
-        self, page_id: int, keys: list, rids: list, next_page: int, prev_page: int
+        self,
+        page_id: int,
+        keys: list,
+        rids: list,
+        next_page: int,
+        prev_page: int,
+        high_key: Optional[tuple] = None,
     ) -> bytearray:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into("<H", buf, 0, PageType.BTREE_LEAF)
@@ -429,6 +474,13 @@ class BPlusTree:
         struct.pack_into("<I", buf, 12, prev_page)
         struct.pack_into("<I", buf, 16, page_id)
         pos = HEADER_SIZE
+        if high_key is not None:
+            struct.pack_into("<B", buf, LEAF_HIGH_KEY_FLAG_OFF, 1)
+            hkb = self.codec.encode(high_key)
+            buf[pos : pos + len(hkb)] = hkb
+            pos += len(hkb)
+        else:
+            struct.pack_into("<B", buf, LEAF_HIGH_KEY_FLAG_OFF, 0)
         for i, (k, rid) in enumerate(zip(keys, rids)):
             kb = self.codec.encode(k)
             rec_len = len(kb) + LEAF_RID_SIZE
@@ -442,7 +494,13 @@ class BPlusTree:
         return buf
 
     def _encode_internal(
-        self, page_id: int, keys: list, children: list, next_page: int, prev_page: int
+        self,
+        page_id: int,
+        keys: list,
+        children: list,
+        next_page: int,
+        prev_page: int,
+        high_key: Optional[tuple] = None,
     ) -> bytearray:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into("<H", buf, 0, PageType.BTREE_INTERNAL)
@@ -455,6 +513,13 @@ class BPlusTree:
                 f"内部页孩子数 {len(children)} 与键数 {len(keys)} 不匹配"
             )
         pos = HEADER_SIZE
+        if high_key is not None:
+            struct.pack_into("<B", buf, HIGH_KEY_FLAG_OFF, 1)
+            hkb = self.codec.encode(high_key)
+            buf[pos : pos + len(hkb)] = hkb
+            pos += len(hkb)
+        else:
+            struct.pack_into("<B", buf, HIGH_KEY_FLAG_OFF, 0)
         struct.pack_into("<I", buf, pos, children[0])
         pos += INTERNAL_CHILD_SIZE
         for k, child in zip(keys, children[1:]):
@@ -513,7 +578,20 @@ class BPlusTree:
             raise BTreeInvariantError(f"索引 {self.name} 的根页不存在")
         page = self._bp.fetch_page(self.root_page)
         while not self._is_leaf(page):
-            keys, children = self._read_internal_cached(page)
+            keys, children, high_key = self._read_internal_cached(page)
+            if (
+                high_key is not None
+                and key >= high_key
+                and page.next_page != INVALID_PAGE_ID
+            ):
+                # key 越过本页上界 → 沿 next 右移（B-link 路由）。这是内部页
+                # 并发分裂正确性的关键：分裂后左页不再包含右半的键，查找者若
+                # 仍按左页 keys 二分会把 key 路由到左半最右孩子（错），必须先
+                # 用 high key 判明"该去右兄弟"。
+                nxt = page.next_page
+                self._bp.unpin(page.page_id)
+                page = self._bp.fetch_page(nxt)
+                continue
             idx = self._child_index(keys, key)
             child_id = children[idx]
             self._bp.unpin(page.page_id)
@@ -525,7 +603,7 @@ class BPlusTree:
             raise BTreeInvariantError(f"索引 {self.name} 的根页不存在")
         page = self._bp.fetch_page(self.root_page)
         while not self._is_leaf(page):
-            _, children = self._read_internal(page)
+            _, children, _ = self._read_internal(page)
             child_id = children[0]
             self._bp.unpin(page.page_id)
             page = self._bp.fetch_page(child_id)
@@ -619,7 +697,9 @@ class BPlusTree:
                         self.root_page = page.page_id
                     finally:
                         self._bp.unpin(page.page_id, dirty=True)
-            return
+                    return  # 真的建根，本次插入完成
+            # root 已被并发线程建好：不要 return，fall through 到下面的普通
+            # 插入，否则本次 key 会被静默丢弃（丢最左叶最小键）。
 
         # 普通插入不碰根锁；只有触发根分裂时才拿锁，锁内重读 root_page，
         # 发现别的线程已经分裂过根就重试（乐观 + 重试，避免串行化所有插入）。
@@ -654,21 +734,48 @@ class BPlusTree:
     def _insert_recursive(
         self, txn: Transaction, page_id: int, key: tuple, rid: RID
     ) -> Optional[Tuple[tuple, int]]:
-        page = self._bp.fetch_page(page_id)
-        try:
+        while True:
+            page = self._bp.fetch_page(page_id)
             if self._is_leaf(page):
-                # 插入/分裂都在 `_leaf_insert_or_split` 的同一页 latch 内完成
-                return self._leaf_insert_or_split(txn, page, key, rid)
+                with page.latch:
+                    high_key = self._leaf_high_key(page)
+                    if (
+                        high_key is not None
+                        and key >= high_key
+                        and page.next_page != INVALID_PAGE_ID
+                    ):
+                        # B-link：叶子分裂后本页已是左半，key 归右兄弟，沿 next
+                        # 右移后重试。若不判，key 会被错插进左叶（漏分右半键）。
+                        page_id = page.next_page
+                        self._bp.unpin(page.page_id, dirty=True)
+                        continue
+                    # 插入/分裂都在 `_leaf_insert_or_split` 的同一页 latch 内完成
+                    result = self._leaf_insert_or_split(txn, page, key, rid)
+                self._bp.unpin(page_id, dirty=True)
+                return result
 
             # 内部页：持 latch 完成"读键 → 递归插孩子 → 插分隔键 / 分裂"。
             # 两个线程同时往同一内部页插分隔键时会各自基于同一份旧 keys 覆盖，
             # 丢分隔键 = 丢子树 = 丢行；锁序保持 父页 → 子页 → 叶 → 后继 单向，
             # 且 `_commit_page`/`_split_internal` 会重入本页 latch（RLock）。
             with page.latch:
-                keys, children = self._read_internal(page)
+                keys, children, high_key = self._read_internal(page)
+                if (
+                    high_key is not None
+                    and key >= high_key
+                    and page.next_page != INVALID_PAGE_ID
+                ):
+                    # B-link：key 越过本页上界，沿 next 右移后重试。并发下本页
+                    # 可能已被别的线程分裂成左半，若仍按 keys 二分会把 key 路由
+                    # 到左半最右孩子（错）。
+                    page_id = page.next_page
+                    self._bp.unpin(page.page_id, dirty=True)
+                    continue
+
                 idx = self._child_index(keys, key)
                 split = self._insert_recursive(txn, children[idx], key, rid)
                 if split is None:
+                    self._bp.unpin(page_id, dirty=True)
                     return None
 
                 sep, right_id = split
@@ -679,29 +786,35 @@ class BPlusTree:
                         txn,
                         page,
                         self._encode_internal(
-                            page.page_id, keys, children, page.next_page, page.prev_page
+                            page.page_id, keys, children, page.next_page,
+                            page.prev_page, high_key,
                         ),
                     )
-                    return None
+                    result = None
                 except _NodeOverflow:
-                    return self._split_internal(txn, page, keys, children)
-        finally:
-            self._bp.unpin(page_id, dirty=True)
+                    result = self._split_internal(txn, page, keys, children)
+                self._bp.unpin(page_id, dirty=True)
+                return result
 
     def _split_leaf(
         self, txn: Transaction, page: Page, keys: list, rids: list
     ) -> Tuple[tuple, int]:
         mid = (len(keys) + 1) // 2
-        right_id = self._bp.new_page(Page).page_id
-        right = self._bp.fetch_page(right_id)
+        sep = keys[mid]
+        right = self._bp.new_page(Page)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
+        right_id = right.page_id
         try:
             self._init_leaf(right)
             old_next = page.next_page
+            old_high = self._leaf_high_key(page)
 
+            # 右页继承旧 high key，next 指向旧后继，prev 指向左页
             self._commit_page(
                 txn,
                 right,
-                self._encode_leaf(right_id, keys[mid:], rids[mid:], old_next, page.page_id),
+                self._encode_leaf(
+                    right_id, keys[mid:], rids[mid:], old_next, page.page_id, old_high
+                ),
             )
             # 原来的后继页要指回新的右页
             if old_next != INVALID_PAGE_ID:
@@ -721,14 +834,15 @@ class BPlusTree:
                 finally:
                     self._bp.unpin(old_next, dirty=True)
 
+            # 左页 high key = sep（右兄弟最小键），next 指向右页
             self._commit_page(
                 txn,
                 page,
                 self._encode_leaf(
-                    page.page_id, keys[:mid], rids[:mid], right_id, page.prev_page
+                    page.page_id, keys[:mid], rids[:mid], right_id, page.prev_page, sep
                 ),
             )
-            return keys[mid], right_id
+            return sep, right_id
         finally:
             self._bp.unpin(right_id, dirty=True)
 
@@ -737,10 +851,13 @@ class BPlusTree:
     ) -> Tuple[tuple, int]:
         mid = len(keys) // 2
         sep = keys[mid]
-        right_id = self._bp.new_page(Page).page_id
-        right = self._bp.fetch_page(right_id)
+        old_high = self._read_internal(page)[2]
+        old_next = page.next_page
+        right = self._bp.new_page(Page)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
+        right_id = right.page_id
         try:
             self._init_internal(right)
+            # 右页继承旧 high key，next 指向旧后继，prev 指向左页
             self._commit_page(
                 txn,
                 right,
@@ -748,10 +865,30 @@ class BPlusTree:
                     right_id,
                     keys[mid + 1 :],
                     children[mid + 1 :],
-                    INVALID_PAGE_ID,
-                    INVALID_PAGE_ID,
+                    old_next,
+                    page.page_id,
+                    old_high,
                 ),
             )
+            # 旧后继页的 prev 要指回新的右页（与叶分裂同款）
+            if old_next != INVALID_PAGE_ID:
+                nxt = self._bp.fetch_page(old_next)
+                try:
+                    with nxt.latch:
+                        if nxt.prev_page != page.page_id:
+                            raise BTreeInvariantError(
+                                f"内部页链不一致：页 {old_next} 的 prev 是 {nxt.prev_page}，"
+                                f"期望 {page.page_id}"
+                            )
+                        old_prev = bytes(nxt.buf[12:16])
+                        new_prev = struct.pack("<I", right_id)
+                        self._bp.log_page_update(txn.xid, nxt, 12, old_prev, new_prev)
+                        nxt.buf[12:16] = new_prev
+                        self._bp.mark_dirty(nxt)
+                finally:
+                    self._bp.unpin(old_next, dirty=True)
+
+            # 左页 high key = sep（右兄弟最小键），next 指向右页
             self._commit_page(
                 txn,
                 page,
@@ -759,8 +896,9 @@ class BPlusTree:
                     page.page_id,
                     keys[:mid],
                     children[: mid + 1],
-                    INVALID_PAGE_ID,
-                    INVALID_PAGE_ID,
+                    right_id,
+                    page.prev_page,
+                    sep,
                 ),
             )
             return sep, right_id
@@ -800,7 +938,7 @@ class BPlusTree:
                 self._leaf_delete_at(txn, page, idx)
                 return True
 
-            keys, children = self._read_internal(page)
+            keys, children, _ = self._read_internal(page)
             idx = self._child_index(keys, key)
             deleted = self._delete_recursive(txn, children[idx], key)
             if not deleted:
@@ -813,7 +951,7 @@ class BPlusTree:
 
     def _detach_if_empty(self, txn: Transaction, parent: Page, idx: int) -> None:
         """孩子页变空时把它从父节点摘掉，并修复叶子链。"""
-        keys, children = self._read_internal(parent)
+        keys, children, high_key = self._read_internal(parent)
         if idx >= len(children):
             return
         child_id = children[idx]
@@ -846,7 +984,8 @@ class BPlusTree:
             txn,
             parent,
             self._encode_internal(
-                parent.page_id, keys, children, parent.next_page, parent.prev_page
+                parent.page_id, keys, children, parent.next_page, parent.prev_page,
+                high_key,
             ),
         )
 
@@ -913,7 +1052,7 @@ class BPlusTree:
             try:
                 if self._is_leaf(root):
                     return
-                keys, children = self._read_internal(root)
+                keys, children, _ = self._read_internal(root)
                 if len(children) > 1:
                     return
                 # 把唯一孩子的整页内容复制到根页：父指针不用改，树高减一
@@ -1022,7 +1161,7 @@ class BPlusTree:
         page = self._leftmost_leaf()
         try:
             while True:
-                keys, rids = self._read_leaf(page)
+                keys, rids, _ = self._read_leaf(page)
                 for k, rid in zip(keys, rids):
                     yield k, rid
                 next_id = page.next_page
@@ -1063,7 +1202,7 @@ class BPlusTree:
                         (page_id, page.next_page, page.prev_page, self._nkeys(page))
                     )
                     leaf_depths.add(depth)
-                    keys, rids = self._read_leaf(page)
+                    keys, rids, leaf_high = self._read_leaf(page)
                     stats["entries"] += len(keys)
                     if len(keys) != len(rids):
                         raise BTreeInvariantError(f"页 {page_id} 键与 RID 数量不一致")
@@ -1080,16 +1219,24 @@ class BPlusTree:
                             raise BTreeInvariantError(f"页 {page_id} 的键小于下界")
                         if high is not None and k >= high:
                             raise BTreeInvariantError(f"页 {page_id} 的键不小于上界")
+                        if leaf_high is not None and k >= leaf_high:
+                            raise BTreeInvariantError(
+                                f"页 {page_id} 的键不小于叶子 high key"
+                            )
                     return
 
-                keys, children = self._read_internal(page)
+                keys, children, high_key = self._read_internal(page)
                 if len(children) != len(keys) + 1:
                     raise BTreeInvariantError(
                         f"内部页 {page_id} 孩子数与键数不匹配"
                     )
                 for i, child in enumerate(children):
                     lo = keys[i - 1] if i > 0 else low
-                    hi = keys[i] if i < len(keys) else high
+                    # 最右孩子的上界是 high key（右兄弟最小键），没有 high key
+                    # 才退回父传上界
+                    hi = keys[i] if i < len(keys) else (
+                        high_key if high_key is not None else high
+                    )
                     walk(child, depth + 1, lo, hi)
             finally:
                 self._bp.unpin(page_id)

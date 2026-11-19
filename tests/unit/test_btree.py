@@ -221,7 +221,7 @@ class TestLeafSlots:
         try:
             assert tree._is_leaf(page)
             assert tree._nkeys(page) == 12
-            keys, _ = tree._read_leaf(page)
+            keys, _, _ = tree._read_leaf(page)
             assert keys == [(i, 1, i) for i in range(12)]
 
             data_end = tree._leaf_data_end(page)
@@ -229,14 +229,14 @@ class TestLeafSlots:
             tree._leaf_delete_at(txn, page, n // 2)
             tree._leaf_delete_at(txn, page, n // 2)
             assert tree._nkeys(page) == 10
-            keys, _ = tree._read_leaf(page)
+            keys, _, _ = tree._read_leaf(page)
             assert keys == [(i, 1, i) for i in (0, 1, 2, 3, 4, 5, 8, 9, 10, 11)]
             # 删除只摘槽位，记录区末尾不动（碎片留给 compact）
             assert tree._leaf_data_end(page) == data_end
 
             tree._leaf_compact(txn, page)
             assert tree._leaf_data_end(page) < data_end
-            keys2, _ = tree._read_leaf(page)
+            keys2, _, _ = tree._read_leaf(page)
             assert keys2 == keys
         finally:
             bp.unpin(page.page_id, dirty=True)
@@ -292,7 +292,7 @@ class TestLeafSlots:
 
             assert tree._leaf_insert_at(txn, page, new_key, (2, 7)) is None
             assert tree._leaf_data_end(page) < full_end, "插入应当触发 compact 回收碎片"
-            keys, _ = tree._read_leaf(page)
+            keys, _, _ = tree._read_leaf(page)
             assert keys == sorted(keys)
         finally:
             bp.unpin(page.page_id, dirty=True)
