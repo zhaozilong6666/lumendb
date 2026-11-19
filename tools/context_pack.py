@@ -246,8 +246,12 @@ def changed_modules(root: Path, base: str, limit: int = 6) -> list[str]:
     modules: list[str] = []
     for line in proc.stdout.splitlines():
         parts = line.strip().split("/")
-        if len(parts) >= 2:
-            module = "/".join(parts[:2]) if parts[0] in ("lumendb", "tests", "docs") else parts[0]
+        if len(parts) >= 3 and parts[0] in ("lumendb", "tests", "docs"):
+            module = "/".join(parts[:2])
+        elif len(parts) >= 2 and parts[0] in ("lumendb", "tests", "docs"):
+            module = parts[0]
+        elif parts and parts[0].startswith("."):
+            module = parts[0]
         elif parts and parts[0]:
             module = "root"
         else:
