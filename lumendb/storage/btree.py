@@ -578,17 +578,17 @@ class BPlusTree:
             raise BTreeInvariantError(f"索引 {self.name} 的根页不存在")
         page = self._bp.fetch_page(self.root_page)
         while not self._is_leaf(page):
-            keys, children, high_key = self._read_internal_cached(page)
+            keys, children, high_key, next_id = self._snapshot_internal(page)
             if (
                 high_key is not None
                 and key >= high_key
-                and page.next_page != INVALID_PAGE_ID
+                and next_id != INVALID_PAGE_ID
             ):
                 # key 越过本页上界 → 沿 next 右移（B-link 路由）。这是内部页
                 # 并发分裂正确性的关键：分裂后左页不再包含右半的键，查找者若
                 # 仍按左页 keys 二分会把 key 路由到左半最右孩子（错），必须先
                 # 用 high key 判明"该去右兄弟"。
-                nxt = page.next_page
+                nxt = next_id
                 self._bp.unpin(page.page_id)
                 page = self._bp.fetch_page(nxt)
                 continue
@@ -608,6 +608,61 @@ class BPlusTree:
             self._bp.unpin(page.page_id)
             page = self._bp.fetch_page(child_id)
         return page
+
+    def _snapshot_leaf(self, page: Page) -> Tuple[list, list, int, int]:
+        """在页 latch 内整页读出一份一致的叶子快照：(keys, rids, next, prev)。
+
+        必须一次读完：``_read_leaf`` 是先读 ``nkeys`` 再按槽位逐个解键，如果
+        中途撞上写者换页，就会拿"旧 nkeys + 新槽位表"组合去取偏移——实测会
+        throw ``叶子页 2 的槽位 150 偏移越界：0``（那条槽位在新布局里是空位）。
+        latch 内读让 nkeys 与槽位表来自同一份页内容。
+        """
+        with page.latch:
+            keys, rids, _ = self._read_leaf(page)
+            return keys, rids, page.next_page, page.prev_page
+
+    def _snapshot_internal(self, page: Page) -> Tuple[list, list, Optional[tuple], int]:
+        """内部页的整页一致快照（键/孩子/high key/next），锁语义同 ``_snapshot_leaf``。"""
+        with page.latch:
+            keys, children, high_key = self._read_internal_cached(page)
+            return list(keys), list(children), high_key, page.next_page
+
+    def _leftmost_leaf_verified(self, attempts: int = 32) -> Optional[Page]:
+        """拿到**真正链首**的叶子页（已 pin），供全表扫描起步。
+
+        并发删除时下探可能落进正在被 purge 的子树，落点有三种状态：
+
+        * 普通链中段：``prev != INVALID`` → 沿 ``prev`` 回溯到链首；
+        * 真链首（还有数据）：``prev == INVALID`` 且 ``nkeys > 0``；
+        * 已摘除的空页：``prev == INVALID`` 且 ``next == INVALID`` 且它**不是**
+          根（``_clear_links`` 把被摘页的前后指针都清零，看起来像孤立的链首，
+          沿它扫就会"扫到 0 条"）。
+
+        第三种状态无法原地修复，只能重新下探；整棵树真的为空时，根就是一片
+        空叶，那是合法结果，直接返回。
+        """
+        for _ in range(attempts):
+            page = self._leftmost_leaf()
+            # 回溯到链首；上限 64 跳，防叶子链异常时打转。
+            for _ in range(64):
+                with page.latch:
+                    prev = page.prev_page
+                    nkeys = self._nkeys(page)
+                    next_id = page.next_page
+                if prev == INVALID_PAGE_ID:
+                    break
+                pid = prev
+                self._bp.unpin(page.page_id)
+                page = self._bp.fetch_page(pid)
+            else:
+                self._bp.unpin(page.page_id)
+                continue
+            if nkeys > 0 or next_id != INVALID_PAGE_ID:
+                return page
+            if self.root_page == page.page_id and self._is_leaf(page):
+                return page  # 整棵树为空：根就是这片空叶
+            self._bp.unpin(page.page_id)
+        return None
 
     def lookup(self, txn: Transaction, values: Sequence[Any]) -> list[RID]:
         """等值查找：二分只解索引列，命中项才解整键。
@@ -632,25 +687,27 @@ class BPlusTree:
         page = self._descend(lo)
         hits: list[RID] = []
         try:
-            start = self._leaf_bisect_prefix(page, target)
             while True:
-                n = self._nkeys(page)
-                for i in range(start, n):
-                    key, rid, _ = self._leaf_key_at(page, i)
+                # 定位与逐键解码必须在同一把 latch 内：否则 bisect 用的槽位表
+                # 与随后读到的键可能来自不同版本（扫描器实测撞出过
+                # 「槽位偏移越界：0」）。
+                with page.latch:
+                    start = self._leaf_bisect_prefix(page, target)
+                    keys, rids, _ = self._read_leaf(page)
+                    next_id = page.next_page
+                for key, rid in zip(keys[start:], rids[start:]):
                     prefix = key[:width]
                     if prefix == target:
                         hits.append(rid)
                     elif prefix > target:
                         # 叶子按完整键有序，前缀一旦越过目标就不会再回来。
                         return hits
-                next_id = page.next_page
                 if next_id == INVALID_PAGE_ID:
                     return hits
                 current = page
                 page = None  # 先置空，避免 finally 重复 unpin
                 self._bp.unpin(current.page_id)
                 page = self._bp.fetch_page(next_id)
-                start = 0
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
@@ -1139,6 +1196,24 @@ class BPlusTree:
     # 扫描
     # ------------------------------------------------------------------
 
+    def _leaf_page_view(
+        self, page: Page, low: Optional[tuple]
+    ) -> Tuple[list, list, int]:
+        """latch 内取「从 low 起」的键/rid 列表与 next；``low=None`` 表示整页。
+
+        扫描器不能"先 bisect 再逐键读"：那两步之间写者换页会让下标与槽位表
+        来自不同版本。整段放进同一把 latch，顺带把 next 一起取出来，保证
+        "本页读到的内容"与"接下来去哪一页"是同一个时刻的视图。
+        """
+        with page.latch:
+            if low is None:
+                keys, rids, _ = self._read_leaf(page)
+            else:
+                start = self._leaf_bisect(page, low)
+                keys, rids, _ = self._read_leaf(page)
+                keys, rids = keys[start:], rids[start:]
+            return keys, rids, page.next_page
+
     def _scan_range(
         self,
         low: tuple,
@@ -1150,24 +1225,21 @@ class BPlusTree:
             return
         page = self._descend(low)
         try:
-            start = self._leaf_bisect(page, low)
+            keys, rids, next_id = self._leaf_page_view(page, low)
             while True:
-                n = self._nkeys(page)
-                for i in range(start, n):
-                    k, rid, _ = self._leaf_key_at(page, i)
+                for k, rid in zip(keys, rids):
                     if k < low or (not low_inclusive and k == low):
                         continue
                     if k > high or (not high_inclusive and k == high):
                         return
                     yield k, rid
-                next_id = page.next_page
                 if next_id == INVALID_PAGE_ID:
                     return
                 current = page
                 page = None  # 先置空，避免 finally 重复 unpin
                 self._bp.unpin(current.page_id)
                 page = self._bp.fetch_page(next_id)
-                start = 0
+                keys, rids, next_id = self._leaf_page_view(page, None)
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
@@ -1188,13 +1260,15 @@ class BPlusTree:
         """
         if self.root_page == INVALID_PAGE_ID:
             return
-        page = self._descend(low) if low is not None else self._leftmost_leaf()
+        page = self._descend(low) if low is not None else self._leftmost_leaf_verified()
+        if page is None:
+            raise BTreeInvariantError(
+                f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
+            )
         try:
-            start = self._leaf_bisect(page, low) if low is not None else 0
+            keys, rids, next_id = self._leaf_page_view(page, low)
             while True:
-                n = self._nkeys(page)
-                for i in range(start, n):
-                    k, rid, _ = self._leaf_key_at(page, i)
+                for k, rid in zip(keys, rids):
                     prefix = k[:width]
                     if low is not None:
                         if prefix < low:
@@ -1207,14 +1281,13 @@ class BPlusTree:
                         if not high_inclusive and prefix == high:
                             return
                     yield k, rid
-                next_id = page.next_page
                 if next_id == INVALID_PAGE_ID:
                     return
                 current = page
                 page = None
                 self._bp.unpin(current.page_id)
                 page = self._bp.fetch_page(next_id)
-                start = 0
+                keys, rids, next_id = self._leaf_page_view(page, None)
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
@@ -1222,13 +1295,16 @@ class BPlusTree:
     def scan_all(self, txn: Transaction) -> Iterator[Tuple[tuple, RID]]:
         if self.root_page == INVALID_PAGE_ID:
             return
-        page = self._leftmost_leaf()
+        page = self._leftmost_leaf_verified()
+        if page is None:
+            raise BTreeInvariantError(
+                f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
+            )
         try:
             while True:
-                keys, rids, _ = self._read_leaf(page)
+                keys, rids, next_id = self._leaf_page_view(page, None)
                 for k, rid in zip(keys, rids):
                     yield k, rid
-                next_id = page.next_page
                 if next_id == INVALID_PAGE_ID:
                     return
                 current = page
