@@ -388,3 +388,54 @@ def test_concurrent_deletes_same_leaf_no_lost_delete(tmp_path) -> None:
         db.close()
 
 
+def test_concurrent_delete_across_leaves_no_lost_delete(tmp_path) -> None:
+    """两个线程并发跨多片叶删完整棵树（走内部页摘孩子 + 叶子链修复路径）。
+
+    与"同叶"用例互补：这里两个线程各自把一半键删空，会多次触发内部页摘孩子、
+    叶子链前后邻居互接、以及根塌陷。断言一条删除都不丢、树最终为空、不变量成立。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.INT)]), unique=False, name="idx")
+
+    t0 = db.txns.begin()
+    for i in range(3000):
+        tree.insert(t0, (i,), (0, i))
+    db.txns.commit(t0)
+    assert tree.check_invariants()["leaf_pages"] > 5, "3000 条 INT 应有多片叶"
+
+    errors: list[str] = []
+    fails = [0]
+    fails_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def worker(lo: int, hi: int) -> None:
+        try:
+            txn = db.txns.begin()
+            barrier.wait(timeout=10)
+            local = 0
+            for i in range(lo, hi):
+                if not tree.delete(txn, (i,), (0, i)):
+                    local += 1
+            with fails_lock:
+                fails[0] += local
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"{lo}-{hi}: {type(exc).__name__}: {exc}")
+
+    workers = [
+        threading.Thread(target=worker, args=(0, 1500)),
+        threading.Thread(target=worker, args=(1500, 3000)),
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=180)
+
+    try:
+        assert errors == [], f"跨叶并发删除出错: {errors[:2]}"
+        assert fails[0] == 0, f"跨叶并发删除丢了 {fails[0]} 条"
+        assert tree.check_invariants()["entries"] == 0
+    finally:
+        db.close()
+
+

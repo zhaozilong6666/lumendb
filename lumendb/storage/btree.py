@@ -958,18 +958,24 @@ class BPlusTree:
                     self._leaf_delete_at(txn, page, idx)
                     return True, self._nkeys(page) == 0
 
-            keys, children, _ = self._read_internal(page)
-            idx = self._child_index(keys, key)
-            deleted, child_empty = self._delete_recursive(txn, children[idx], key)
-            if not deleted:
-                return False, False
-            if not child_empty:
+            # 内部页：读孩子下标 → 递归下探 → 摘除空孩子必须在同一个页 latch 内。
+            # 否则两个线程在同一父页下各摘一个孩子，各自基于旧 children 列表算
+            # idx，后写者会把先写者摘掉的那个槽位又摘一次（删错孩子/叶子链断）。
+            # 锁序是严格的「父 → 子」下行（孩子自身在递归里再拿自己的 latch），
+            # 返回时先释放孩子再释放父；没有任何路径是「子 → 父」，故不成环。
+            with page.latch:
+                keys, children, _ = self._read_internal(page)
+                idx = self._child_index(keys, key)
+                deleted, child_empty = self._delete_recursive(txn, children[idx], key)
+                if not deleted:
+                    return False, False
+                if not child_empty:
+                    return True, False
+                if len(children) <= 1:
+                    # 本页只有这一个孩子，摘掉就成 0 个孩子：交给上层继续塌陷。
+                    return True, True
+                self._remove_child(txn, page, idx)
                 return True, False
-            if len(children) <= 1:
-                # 本页只有这一个孩子，摘掉就成 0 个孩子：交给上层继续塌陷。
-                return True, True
-            self._remove_child(txn, page, idx)
-            return True, False
         finally:
             self._bp.unpin(page_id, dirty=True)
 
