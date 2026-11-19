@@ -77,6 +77,7 @@ def _snap_text(
     facts: str = "",
     modules: str = "tests/unit",
     keywords: str = "context",
+    supersedes: str = "",
     body: str | None = None,
 ) -> str:
     body = body or (
@@ -90,6 +91,7 @@ commit: {commit}
 modules: [{modules}]
 keywords: [{keywords}]
 facts: [{facts}]
+supersedes: [{supersedes}]
 status: {status}
 ---
 # {title}
@@ -374,3 +376,38 @@ def test_query_scores_multi_term_matches(tmp_path, capsys):
     assert out.index("both") < out.index("one")
     assert "[2/2]" in out
     assert "[1/2]" in out
+
+
+def test_supersedes_reference_must_exist(tmp_path):
+    root, sha = _make_repo(tmp_path)
+    snap = root / "docs" / "context" / "snapshots" / "20261119-new.md"
+    snap.write_text(_snap_text(sha, supersedes="20261115-nope.md"), encoding="utf-8")
+    cp.ContextRepo(root).write_index()
+    assert "CTX017" in _codes(cp.check(cp.ContextRepo(root)))
+
+
+def test_supersedes_self_fails(tmp_path):
+    root, sha = _make_repo(tmp_path)
+    snap = root / "docs" / "context" / "snapshots" / "20261119-self.md"
+    snap.write_text(_snap_text(sha, supersedes="20261119-self.md"), encoding="utf-8")
+    cp.ContextRepo(root).write_index()
+    assert "CTX017" in _codes(cp.check(cp.ContextRepo(root)))
+
+
+def test_query_marks_superseded_snapshot(tmp_path, capsys):
+    root, sha = _make_repo(tmp_path)
+    (root / "docs" / "context" / "snapshots" / "20261118-old.md").write_text(
+        _snap_text(sha, title="旧结论：单写者锁", keywords="lock"),
+        encoding="utf-8",
+    )
+    (root / "docs" / "context" / "snapshots" / "20261119-new.md").write_text(
+        _snap_text(sha, title="新结论：行锁", keywords="lock", supersedes="20261118-old.md"),
+        encoding="utf-8",
+    )
+    cp.ContextRepo(root).write_index()
+
+    assert _run(root, "query", "lock") == 0
+    out = capsys.readouterr().out
+    assert "已过时" in out
+    assert "20261119-new.md" in out
+    assert "被 20261119-new.md 替代" in out

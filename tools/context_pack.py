@@ -305,6 +305,7 @@ class Snapshot:
     modules: list[str]
     keywords: list[str]
     facts: list[str]
+    supersedes: list[str]
     status: str
     body: str
     sections: dict[str, str]
@@ -376,6 +377,7 @@ class ContextRepo:
                     modules=[str(x) for x in _as_list(meta.get("modules"))],
                     keywords=[str(x) for x in _as_list(meta.get("keywords"))],
                     facts=[str(x) for x in _as_list(meta.get("facts"))],
+                    supersedes=[str(x) for x in _as_list(meta.get("supersedes"))],
                     status=str(meta.get("status", "")),
                     body=body,
                     sections=sections,
@@ -396,13 +398,17 @@ class ContextRepo:
             "|---|---|---|---|---|---|---|---|",
         ]
         items = sorted(self.snapshots(), key=lambda s: (s.day, s.name), reverse=True)
+        stale = superseded_by(items)
         for snap in items:
             modules = "、".join(snap.modules) if snap.modules else "-"
             keywords = "、".join(snap.keywords) if snap.keywords else "-"
             facts = "、".join(snap.facts) if snap.facts else "-"
+            state = snap.status or "-"
+            if snap.name in stale:
+                state += f"·被 {'、'.join(stale[snap.name])} 替代"
             rows.append(
                 f"| [{snap.name}]({snap.name}) | {snap.day or '-'} | {snap.task or '-'} "
-                f"| `{snap.commit or '-'}` | {modules} | {keywords} | {facts} | {snap.status or '-'} |"
+                f"| `{snap.commit or '-'}` | {modules} | {keywords} | {facts} | {state} |"
             )
         if not items:
             rows.append("| （暂无） | - | - | - | - | - | - | - |")
@@ -420,6 +426,20 @@ def _as_list(value: object) -> list[object]:
         return value
     text = str(value).strip()
     return [text] if text else []
+
+
+def superseded_by(snaps: Sequence[Snapshot]) -> dict[str, list[str]]:
+    """反向索引：{被替代的快照名: [替代它的快照名, ...]}。
+
+    快照是"当时的结论"，会过期；作者在新快照里声明 ``supersedes: [旧.md]``
+    表示"我推翻了它"。这个反向索引让索引和 query 能把旧快照标成"已过时"，
+    而不是让下一个 agent 把旧结论当真。
+    """
+    out: dict[str, list[str]] = {}
+    for snap in snaps:
+        for old in snap.supersedes:
+            out.setdefault(old, []).append(snap.name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +511,16 @@ def check(repo: ContextRepo, budget: int = RESIDENT_BUDGET) -> list[Finding]:
         findings.append(Finding("fail", "CTX009", f"快照无法解析：{exc}", "docs/context/snapshots"))
         return findings
     by_name = {s.name: s for s in snaps}
+    for snap in snaps:
+        for old in snap.supersedes:
+            if old == snap.name:
+                findings.append(
+                    Finding("fail", "CTX017", "快照不能 supersedes 自己", rel(snap.path))
+                )
+            elif old not in by_name:
+                findings.append(
+                    Finding("fail", "CTX017", f"supersedes 引用的快照不存在：{old}", rel(snap.path))
+                )
     for dep in task.depends:
         if dep not in by_name:
             findings.append(Finding("fail", "CTX005", f"前置快照不存在：{dep}", rel(repo.task_path)))
@@ -619,6 +649,7 @@ def cmd_new(args: argparse.Namespace) -> int:
     commit = head_sha(repo.root) or "unknown"
     modules = changed_modules(repo.root, task.base) if task.base else []
     facts = args.fact or []
+    supersedes = args.supersedes or []
     keywords = args.keyword or [part for part in args.slug.split("-") if part]
     meta = [
         "---",
@@ -629,6 +660,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         f"modules: [{', '.join(modules)}]",
         f"keywords: [{', '.join(keywords)}]",
         f"facts: [{', '.join(facts)}]",
+        f"supersedes: [{', '.join(supersedes)}]",
         "status: draft",
         "---",
     ]
@@ -811,14 +843,20 @@ def cmd_query(args: argparse.Namespace) -> int:
     if not scored:
         print(f"没有快照命中：{'、'.join(args.terms)}")
         return 1
+    stale = superseded_by(snaps)
     for score, snap in scored:
         concl = snap.sections.get("结论", "").strip().splitlines()
         concl = concl[0] if concl else ""
-        print(f"[{score}/{len(terms)}] {snap.name}  [{snap.status}]")
+        state = snap.status
+        if snap.name in stale:
+            state += f"·被 {'、'.join(stale[snap.name])} 替代"
+        print(f"[{score}/{len(terms)}] {snap.name}  [{state}]")
         print(f"  {snap.title}  ·  {snap.day}  ·  {snap.commit}")
         print(f"  模块 {', '.join(snap.modules) or '-'}  关键词 {', '.join(snap.keywords) or '-'}")
         if concl:
             print(f"  结论 {concl[:160]}")
+        if snap.name in stale:
+            print(f"  已过时：结论被 {'、'.join(stale[snap.name])} 取代，别直接引用")
         print()
     return 0
 
@@ -908,6 +946,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_cmd.add_argument("--title", required=True)
     new_cmd.add_argument("--date", default=None, help="YYYYMMDD，默认今天")
     new_cmd.add_argument("--fact", action="append", default=[], help="关联的账本 id，可重复")
+    new_cmd.add_argument("--supersedes", action="append", default=[], help="本快照推翻的旧快照文件名，可重复")
     new_cmd.add_argument("--keyword", action="append", default=[], help="检索关键词，默认取 slug 分段")
     new_cmd.set_defaults(func=cmd_new)
 

@@ -42,6 +42,7 @@ commit: 09376cb
 modules: [lumendb/storage, lumendb/engine, tests/unit]
 keywords: [lock, row, key, ddl]
 facts: [f-20261119-abc123]
+supersedes: [20261115-single-writer.md]
 status: sealed
 ---
 # ...
@@ -58,6 +59,11 @@ status: sealed
 ## 遗留
 没做完的、以及下一步该谁接手。
 ```
+
+`supersedes` 声明"这份快照推翻了哪几份旧快照的结论"。索引和 `query` 会把
+被替代的快照标成"已过时"，避免下一个 agent 把旧结论当真。账本用
+`--supersedes` 管事实，快照用 front matter 的 `supersedes` 管叙述——同一件事
+的两个层面，都靠机器核对引用存在，而不是靠自觉。
 
 `status` 只有 `draft` / `sealed`。草稿可以有占位符，封存不行——`seal`
 会拒绝 `（待填）`、`TODO`、`TBD`，因为"封存了但没写"比"没封存"更糟：
@@ -98,6 +104,7 @@ python -m tools.context_pack next --to "……" --accept "……" --accept "…�
 | CTX014 | 封存快照仍含占位符 |
 | CTX015 | 封存快照没有 modules 或 keywords |
 | CTX016 | 封存快照正文超 `SNAPSHOT_BUDGET`（快照只写结论和证据，细节拆到下一份） |
+| CTX017 | `supersedes` 引用的快照不存在，或指向自己 |
 
 ## 70% 阈值：显式命令，不是自动触发
 
