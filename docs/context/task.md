@@ -1,6 +1,6 @@
 ---
 id: T-20261119-1
-status: active
+status: done
 opened: 2026-11-19
 base: 459d7c3
 ---
