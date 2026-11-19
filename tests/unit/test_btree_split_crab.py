@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import random
 import threading
 
 from lumendb.datatypes import DataType, TypeSpec
@@ -293,6 +294,43 @@ def test_concurrent_reader_scans_during_insert_splits(tmp_path) -> None:
         assert errors == [], f"读写并发出错: {errors[:3]}"
         assert bad_order[0] == 0, f"scan 出现 {bad_order[0]} 次键序错乱"
         assert tree.check_invariants()["entries"] == 1400
+    finally:
+        db.close()
+
+
+def test_random_order_delete_large_tree(tmp_path) -> None:
+    """随机顺序删完整棵多层树：每次 delete 都 True、最终树空。
+
+    顺序删除只踩到"最左叶一片片摘掉"这一条路径；随机删除会同时踩中间叶摘除、
+    右边界叶摘除、以及"先摘中间再摘两端"的组合，覆盖更碎的塌陷与叶子链修复。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(
+        db.bp, KeyCodec([TypeSpec(DataType.VARCHAR, 512)]), unique=False, name="idx"
+    )
+
+    def long_key(i: int) -> str:
+        return "k" + "x" * 400 + f"{i:05d}"
+
+    n = 2000
+    t0 = db.txns.begin()
+    for i in range(n):
+        tree.insert(t0, (long_key(i),), (0, i))
+    db.txns.commit(t0)
+    assert tree.check_invariants()["depth"] >= 2
+
+    order = list(range(n))
+    random.Random(42).shuffle(order)
+    t1 = db.txns.begin()
+    failed: list[int] = []
+    for i in order:
+        if not tree.delete(t1, (long_key(i),), (0, i)):
+            failed.append(i)
+    db.txns.commit(t1)
+
+    try:
+        assert failed == [], f"随机删除失败 {len(failed)} 次，前几个 {failed[:5]}"
+        assert tree.check_invariants()["entries"] == 0
     finally:
         db.close()
 
