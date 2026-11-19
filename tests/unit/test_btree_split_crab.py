@@ -194,3 +194,48 @@ def test_sequential_delete_large_tree_no_orphan(tmp_path) -> None:
     finally:
         db.close()
 
+
+def test_delete_half_keeps_leaf_depth_uniform(tmp_path) -> None:
+    """删掉一半再插回一半：数据完整、叶子深度必须唯一。
+
+    两个连环坑都在这里钉住：
+    - 只摘内部页却不清理它的空子树：留下孤儿叶，最左叶 prev 指向已删页；
+    - 把退化内部页的唯一孩子（叶子）提到内部页层：这条路径深度少一层，
+      叶子深度变成 {3,4}。
+
+    正解是自底向上递归塌陷：空叶子先摘并修链，只有「0 个孩子」的内部页
+    才跟着塌，而「只剩 1 个孩子」的退化页保留，深度对所有路径一致。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(
+        db.bp, KeyCodec([TypeSpec(DataType.VARCHAR, 512)]), unique=False, name="idx"
+    )
+
+    def long_key(i: int) -> str:
+        return "k" + "x" * 400 + f"{i:05d}"
+
+    t0 = db.txns.begin()
+    for i in range(2000):
+        tree.insert(t0, (long_key(i),), (0, i))
+    db.txns.commit(t0)
+    base = tree.check_invariants()
+    assert base["depth"] >= 2
+
+    t1 = db.txns.begin()
+    for i in range(1000):
+        assert tree.delete(t1, (long_key(i),), (0, i))
+    db.txns.commit(t1)
+    after_del = tree.check_invariants()  # 深度不一致会直接抛错
+    assert after_del["entries"] == 1000
+
+    t2 = db.txns.begin()
+    for i in range(2000, 3000):
+        tree.insert(t2, (long_key(i),), (0, i))
+    db.txns.commit(t2)
+
+    try:
+        final = tree.check_invariants()
+        assert final["entries"] == 2000
+    finally:
+        db.close()
+

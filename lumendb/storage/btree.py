@@ -914,8 +914,8 @@ class BPlusTree:
         if self.root_page == INVALID_PAGE_ID:
             return False
         key = tuple(values) + (rid[0], rid[1])
-        deleted = self._delete_recursive(txn, self.root_page, key)
-        if deleted:
+        deleted, root_empty = self._delete_recursive(txn, self.root_page, key)
+        if deleted and root_empty:
             self._collapse_root(txn)
         return deleted
 
@@ -925,80 +925,73 @@ class BPlusTree:
             self.delete(txn, values, rid)
         return len(rids)
 
-    def _delete_recursive(self, txn: Transaction, page_id: int, key: tuple) -> bool:
+    def _delete_recursive(
+        self, txn: Transaction, page_id: int, key: tuple
+    ) -> tuple[bool, bool]:
+        """删除 key，返回 ``(deleted, page_now_empty)``。
+
+        ``page_now_empty`` 表示本页已经彻底空掉（叶子 0 键 / 内部页 0 个孩子），
+        需要上层把它从 ``children`` 里摘掉。这里必须区分两种「空」：
+
+        * 叶子 0 键 → 真空，摘掉并修叶子链；
+        * 内部页「0 个孩子」→ 真空，向上塌陷；
+        * 内部页「只剩 1 个孩子」→ **不算空**，保留为退化单孩子页。
+
+        保留退化页是关键：若把它的唯一孩子（一片叶子）提升到内部页层，
+        这条路径的叶子深度会少一层，其余路径不变，``check_invariants`` 的
+        「叶子深度一致」当场失败（实测删掉前 1000 条后 depth 变成 {3,4}）。
+        只有等到这片叶子也空掉，退化页才会跟着变空并整体塌陷。
+        """
         page = self._bp.fetch_page(page_id)
         try:
             if self._is_leaf(page):
                 idx = self._leaf_bisect(page, key)
                 if idx >= self._nkeys(page):
-                    return False
+                    return False, False
                 existing, _, _ = self._leaf_key_at(page, idx)
                 if existing != key:
-                    return False
+                    return False, False
                 self._leaf_delete_at(txn, page, idx)
-                return True
+                return True, self._nkeys(page) == 0
 
             keys, children, _ = self._read_internal(page)
             idx = self._child_index(keys, key)
-            deleted = self._delete_recursive(txn, children[idx], key)
+            deleted, child_empty = self._delete_recursive(txn, children[idx], key)
             if not deleted:
-                return False
-
-            self._detach_if_empty(txn, page, idx)
-            return True
+                return False, False
+            if not child_empty:
+                return True, False
+            if len(children) <= 1:
+                # 本页只有这一个孩子，摘掉就成 0 个孩子：交给上层继续塌陷。
+                return True, True
+            self._remove_child(txn, page, idx)
+            return True, False
         finally:
             self._bp.unpin(page_id, dirty=True)
 
-    def _detach_if_empty(self, txn: Transaction, parent: Page, idx: int) -> None:
-        """孩子页变空时把它从父节点摘掉，并修复叶子链。"""
+    def _remove_child(self, txn: Transaction, parent: Page, idx: int) -> None:
+        """摘除已空的 ``parent.children[idx]``，并修复叶子链。
+
+        调用方保证 ``len(children) > 1``：只剩一个孩子的退化情形由
+        ``_delete_recursive`` 自己向上返回「本页变空」，不在这里摘成 0 个孩子。
+        """
         keys, children, high_key = self._read_internal(parent)
         if idx >= len(children):
             return
         child_id = children[idx]
         child = self._bp.fetch_page(child_id)
-        promote_id = INVALID_PAGE_ID
         try:
             if self._nkeys(child) != 0:
                 return
-            # 空叶子摘除前修复兄弟指针，避免范围扫描走进死链。
-            # 边界情形也要处理：最左叶的前驱是 INVALID 时，右邻居的 prev
-            # 必须被置成 INVALID，不能因为"没有左邻居"就跳过。
             if self._is_leaf(child):
-                prev_id, next_id = child.prev_page, child.next_page
-                if prev_id != INVALID_PAGE_ID:
-                    self._set_left_next(txn, prev_id, next_id, child_id)
-                if next_id != INVALID_PAGE_ID:
-                    self._set_right_prev(txn, next_id, prev_id, child_id)
-                self._clear_links(txn, child)
+                self._unlink_leaf(txn, child)
             else:
-                # 内部页退化（分隔键被删光、只剩 1 个孩子）：不能直接摘除，
-                # 否则唯一孩子会成为孤儿。真实 bug：删除 0..24 后，INT 3 的
-                # children 从 [6,7] 变 [7]、keys 变空，再被上层当空页摘掉，
-                # 页 7（key 25..29）整片丢失，后续 delete 25 返回 False。
-                # 正确做法：用唯一孩子替代它在 parent 中的位置。keys 不用动：
-                # 该孩子覆盖的键范围与原 child 完全一致（叶子链 / 内部页链的
-                # 下一跳即原右兄弟），其 high key 天然等于 parent 的 keys[idx]。
-                ckeys, cchildren, _ = self._read_internal(child)
-                if len(cchildren) == 1:
-                    promote_id = cchildren[0]
+                # 内部页 child：它整棵子树都已经空了，必须把里面每一片空叶
+                # 也从叶子链上摘掉。只摘内部页会留下"孤儿叶"——真实 bug：
+                # 删掉前 1000 条后，剩下的最左叶 prev 还指向已删除的页 237。
+                self._purge_empty_tree(txn, child)
         finally:
             self._bp.unpin(child_id)
-
-        if promote_id != INVALID_PAGE_ID:
-            new_children = list(children)
-            new_children[idx] = promote_id
-            self._commit_page(
-                txn,
-                parent,
-                self._encode_internal(
-                    parent.page_id, keys, new_children, parent.next_page, parent.prev_page,
-                    high_key,
-                ),
-            )
-            return
-
-        if len(children) <= 1:
-            return  # 只有一个孩子，交给 _collapse_root / 上层塌陷处理
 
         del children[idx]
         if idx > 0:
@@ -1013,6 +1006,36 @@ class BPlusTree:
                 high_key,
             ),
         )
+
+    def _unlink_leaf(self, txn: Transaction, leaf: Page) -> None:
+        """把一片空叶从叶子链上摘掉：前后邻居互接，叶子自身指针清零。
+
+        边界情形也要处理：最左叶的前驱是 INVALID 时，右邻居的 prev
+        必须被置成 INVALID，不能因为"没有左邻居"就跳过。
+        """
+        prev_id, next_id = leaf.prev_page, leaf.next_page
+        if prev_id != INVALID_PAGE_ID:
+            self._set_left_next(txn, prev_id, next_id, leaf.page_id)
+        if next_id != INVALID_PAGE_ID:
+            self._set_right_prev(txn, next_id, prev_id, leaf.page_id)
+        self._clear_links(txn, leaf)
+
+    def _purge_empty_tree(self, txn: Transaction, page: Page) -> None:
+        """把一棵整体已空的子树的叶子全部从叶子链上摘干净（内部页递归下探）。
+
+        逐叶修链对这种连续子树也成立：被摘的叶在链上首尾相接，每摘一片，
+        它的前驱 next 就自动指向下个仍待摘的叶，最后落在外部的后继上。
+        """
+        if self._is_leaf(page):
+            self._unlink_leaf(txn, page)
+            return
+        ckeys, cchildren, _ = self._read_internal(page)
+        for cid in cchildren:
+            c = self._bp.fetch_page(cid)
+            try:
+                self._purge_empty_tree(txn, c)
+            finally:
+                self._bp.unpin(cid)
 
     def _set_left_next(
         self, txn: Transaction, page_id: int, value: int, expected: int
@@ -1078,6 +1101,12 @@ class BPlusTree:
                 if self._is_leaf(root):
                     return
                 keys, children, _ = self._read_internal(root)
+                if len(children) == 0:
+                    # 根被删成了 0 个孩子的空内部页：整棵树已经空。
+                    # 正常删除路径不会走到这里（_delete_recursive 只对
+                    # 「1 个孩子」返回变空、不真摘），纯属防御。
+                    self.root_page = INVALID_PAGE_ID
+                    return
                 if len(children) > 1:
                     return
                 # 把唯一孩子的整页内容复制到根页：父指针不用改，树高减一

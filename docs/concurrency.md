@@ -173,9 +173,25 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   泄漏 1 个 pin，长事务最终把缓冲池 pin 满（`pool_size=64 pinned=64`）。
 - `check_invariants` 叶子/内部页的最右孩子上界改用 high key 校验。
 
+**删除路径递归塌陷已落地（Step 4 后半段①的另一半）**：
+
+- `_delete_recursive` 改为返回 `(deleted, page_now_empty)`：叶子键删空、或内部页
+  「0 个孩子」才算空，需要上层把它摘掉并继续向上塌陷。
+- **「只剩 1 个孩子」的退化内部页保留、不摘**：把它的唯一孩子（一片叶子）提到
+  内部页层，会让这条路径的叶子深度少一层，`check_invariants` 的「叶子深度一致」
+  当场失败（实测删掉前 1000 条后深度变成 {3,4}）。
+- `_remove_child` 摘除空孩子；孩子是内部页时用 `_purge_empty_tree` 把它整棵空子树的
+  叶子逐片从叶子链上摘掉——只摘内部页会留下孤儿叶（最左叶 prev 仍指向已删页）。
+- 修三个真实 bug（顺序删除 2000 条长键值时暴露）：①退化内部页被当空页直接摘除，
+  唯一孩子成孤儿、整片叶丢失（delete 失败 700 次，失败键每 30 个里 5 个）；②只摘
+  内部页不清理空子树，叶子链断裂；③把叶子提到内部页层，叶子深度 {3,4}。
+  正解：自底向上递归塌陷——空叶先摘并修链，只有 0 个孩子的内部页才跟着塌。
+- 根塌陷 `_collapse_root` 加「0 个孩子」防御（正常删除路径不会走到，纯防御）。
+
 **仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
-- 删除合并 `_detach_if_empty` 的多页原子性（"父 + 子 + 左右邻居"），以及
-  上行（子 → 父）与下行（父 → 子）两条路径的锁序统一（需 B-link 先定方向）。
+- 删除路径的多页原子性（"父 + 子 + 左右邻居"的 latch crabbing），以及上行（子 → 父）
+  与下行（父 → 子）两条路径的锁序统一。目前删除仍是 `_write_lock` 语句级串行，
+  单线程正确性已用回归测试钉住，并发化尚未做。
 - 读者侧：`lookup`/`scan` 目前不拿 latch，靠 GIL 的"一次换页 memcpy 原子" +
   `_write_lock` 串行写保证读到一致快照；真放开后读者需要共享 latch 或乐观读重检。
 
@@ -189,6 +205,11 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   4 线程从空树并发插相交键，钉住建根竞态（丢最小键）+ 根分裂 B-link 路由。
 - `tests/unit/test_btree_split_crab.py::test_concurrent_inserts_trigger_internal_splits`
   预置 depth≥2 的多层树后 4 线程并发插相交键触发内部页分裂，断言不变量 + 条目数。
+- `tests/unit/test_btree_split_crab.py::test_sequential_delete_large_tree_no_orphan`
+  2000 条长键值顺序全删：每次 delete 必须为 True、最终 entries=0（钉住退化内部页
+  摘除丢叶）。
+- `tests/unit/test_btree_split_crab.py::test_delete_half_keeps_leaf_depth_uniform`
+  删前 1000 条再插回 1000 条：数据完整 + 叶子深度唯一（钉住孤儿叶 / 深度 {3,4}）。
 
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 
