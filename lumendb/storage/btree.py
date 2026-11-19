@@ -945,14 +945,18 @@ class BPlusTree:
         page = self._bp.fetch_page(page_id)
         try:
             if self._is_leaf(page):
-                idx = self._leaf_bisect(page, key)
-                if idx >= self._nkeys(page):
-                    return False, False
-                existing, _, _ = self._leaf_key_at(page, idx)
-                if existing != key:
-                    return False, False
-                self._leaf_delete_at(txn, page, idx)
-                return True, self._nkeys(page) == 0
+                # 定位 → 读键 → 删必须在同一个页 latch 内：两个线程并发删
+                # 同一片叶的不同键时，各自基于旧页算 idx，后写者会把先写者
+                # 的删除结果覆盖回去（实测 300 条叶双线程删 200 条，丢 27 条）。
+                with page.latch:
+                    idx = self._leaf_bisect(page, key)
+                    if idx >= self._nkeys(page):
+                        return False, False
+                    existing, _, _ = self._leaf_key_at(page, idx)
+                    if existing != key:
+                        return False, False
+                    self._leaf_delete_at(txn, page, idx)
+                    return True, self._nkeys(page) == 0
 
             keys, children, _ = self._read_internal(page)
             idx = self._child_index(keys, key)

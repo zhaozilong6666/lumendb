@@ -213,6 +213,10 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 - `tests/unit/test_btree_split_crab.py::test_concurrent_reader_scans_during_insert_splits`
   写线程插入触发分裂 + 两个读者并发全表扫：读者结果无异常、键序单调、条目数完整。
   读者路径不拿 latch，一致依靠「分裂是一次整页提交」+「沿叶子链 next」（B-link）。
+- `tests/unit/test_btree_split_crab.py::test_concurrent_deletes_same_leaf_no_lost_delete`
+  双线程并发删同一片叶的不同键：`delete` 全部返回 True、叶内剩 100 条不丢。
+  回归：定位/读键在 latch 外时两线程基于旧页各算 idx，后写者覆盖先写者的删除
+  （实测 300 条叶丢 27 条）；修法是把定位/读/删整段放进同一个 `page.latch`。
 
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 
