@@ -261,54 +261,70 @@ class BPlusTree:
 
     def _leaf_compact(self, txn: Transaction, page: Page) -> None:
         """把记录区重新紧凑排列，回收删除留下的碎片。"""
-        keys, rids = self._read_leaf(page)
-        self._commit_page(
-            txn,
-            page,
-            self._encode_leaf(page.page_id, keys, rids, page.next_page, page.prev_page),
-        )
+        with page.latch:
+            keys, rids = self._read_leaf(page)
+            self._commit_page(
+                txn,
+                page,
+                self._encode_leaf(page.page_id, keys, rids, page.next_page, page.prev_page),
+            )
 
     def _leaf_insert_at(
-        self, txn: Transaction, page: Page, index: int, key: tuple, rid: RID
-    ) -> bool:
-        """在指定槽位插入一条记录；空间不够时先 compact，仍不够返回 False。"""
-        kb = self.codec.encode(key)
-        rec_len = len(kb) + LEAF_RID_SIZE
-        needed = rec_len + LEAF_SLOT_SIZE
-        if self._leaf_free(page) < needed:
-            self._leaf_compact(txn, page)
+        self, txn: Transaction, page: Page, key: tuple, rid: RID
+    ) -> Optional[int]:
+        """在叶内插入一条记录；空间不够时先 compact，仍不够返回插入位置（需分裂）。
+
+        整个"二分定位 → 幂等判断 → 紧凑 → 插入"都在页 latch 内：下标必须在
+        latch 内算，否则两个线程会各自基于同一份旧页算出下标，后写者把先写者
+        的槽位顶乱（探针里表现为"槽位目录未保持键序"）。返回 ``None`` 表示已
+        插入或已存在（幂等）；返回 int 表示该页已满、需要分裂，值是 key 在
+        完整键序里的插入位置。
+        """
+        with page.latch:
+            idx = self._leaf_bisect(page, key)
+            nkeys = self._nkeys(page)
+            if idx < nkeys:
+                existing, _, _ = self._leaf_key_at(page, idx)
+                if existing == key:
+                    return None  # 同一 (key, rid) 幂等
+            kb = self.codec.encode(key)
+            rec_len = len(kb) + LEAF_RID_SIZE
+            needed = rec_len + LEAF_SLOT_SIZE
             if self._leaf_free(page) < needed:
-                return False
+                self._leaf_compact(txn, page)
+                if self._leaf_free(page) < needed:
+                    return idx
 
-        n = self._nkeys(page)
-        data_end = self._leaf_data_end(page)
-        buf = bytearray(page.buf)
-        buf[data_end : data_end + len(kb)] = kb
-        struct.pack_into("<IH", buf, data_end + len(kb), rid[0], rid[1])
+            n = self._nkeys(page)
+            data_end = self._leaf_data_end(page)
+            buf = bytearray(page.buf)
+            buf[data_end : data_end + len(kb)] = kb
+            struct.pack_into("<IH", buf, data_end + len(kb), rid[0], rid[1])
 
-        # 把 index..n-1 的槽位整体向页头方向挪 2 字节，给新槽位腾位置
-        src_start = PAGE_SIZE - LEAF_SLOT_SIZE * n
-        src_end = self._leaf_slot_pos(index) + LEAF_SLOT_SIZE
-        chunk = bytes(buf[src_start:src_end])
-        buf[src_start - LEAF_SLOT_SIZE : src_end - LEAF_SLOT_SIZE] = chunk
+            # 把 index..n-1 的槽位整体向页头方向挪 2 字节，给新槽位腾位置
+            src_start = PAGE_SIZE - LEAF_SLOT_SIZE * n
+            src_end = self._leaf_slot_pos(idx) + LEAF_SLOT_SIZE
+            chunk = bytes(buf[src_start:src_end])
+            buf[src_start - LEAF_SLOT_SIZE : src_end - LEAF_SLOT_SIZE] = chunk
 
-        struct.pack_into("<H", buf, self._leaf_slot_pos(index), data_end)
-        struct.pack_into("<H", buf, 2, n + 1)
-        struct.pack_into("<H", buf, LEAF_DATA_END_OFF, data_end + rec_len)
-        self._commit_page(txn, page, buf)
-        return True
+            struct.pack_into("<H", buf, self._leaf_slot_pos(idx), data_end)
+            struct.pack_into("<H", buf, 2, n + 1)
+            struct.pack_into("<H", buf, LEAF_DATA_END_OFF, data_end + rec_len)
+            self._commit_page(txn, page, buf)
+            return None
 
     def _leaf_delete_at(self, txn: Transaction, page: Page, index: int) -> None:
         """摘掉一个槽位。记录字节留作碎片，由后续 compact 回收。"""
-        n = self._nkeys(page)
-        buf = bytearray(page.buf)
-        src_start = PAGE_SIZE - LEAF_SLOT_SIZE * n
-        src_end = self._leaf_slot_pos(index)
-        chunk = bytes(buf[src_start:src_end])
-        buf[src_start + LEAF_SLOT_SIZE : src_end + LEAF_SLOT_SIZE] = chunk
-        buf[src_start : src_start + LEAF_SLOT_SIZE] = bytes(LEAF_SLOT_SIZE)
-        struct.pack_into("<H", buf, 2, n - 1)
-        self._commit_page(txn, page, buf)
+        with page.latch:
+            n = self._nkeys(page)
+            buf = bytearray(page.buf)
+            src_start = PAGE_SIZE - LEAF_SLOT_SIZE * n
+            src_end = self._leaf_slot_pos(index)
+            chunk = bytes(buf[src_start:src_end])
+            buf[src_start + LEAF_SLOT_SIZE : src_end + LEAF_SLOT_SIZE] = chunk
+            buf[src_start : src_start + LEAF_SLOT_SIZE] = bytes(LEAF_SLOT_SIZE)
+            struct.pack_into("<H", buf, 2, n - 1)
+            self._commit_page(txn, page, buf)
 
     # -- 解析 ---------------------------------------------------------------
 
@@ -445,12 +461,17 @@ class BPlusTree:
             while last > first and old[last - 1] == newb[last - 1]:
                 last -= 1
             ranges = [(first, last)]
-        for first, last in ranges:
-            self._bp.log_page_update(
-                txn.xid, page, first, old[first:last], newb[first:last]
-            )
-        page.buf[:] = new_buf
-        self._bp.mark_dirty(page)
+        # 读旧值 → 写日志 → 写页三步在同一页 latch 内完成（与 HeapFile 的
+        # `_apply_and_log` 同款语义）：页内容的读-改-写必须原子，否则两个写者
+        # 交错时后者的 before image 已含前者的改动，WAL 重放会算错。这是
+        # Step 4 的前半段；分裂/合并的多页原子性仍需 crabbing（见 `_split_leaf`）。
+        with page.latch:
+            for first, last in ranges:
+                self._bp.log_page_update(
+                    txn.xid, page, first, old[first:last], newb[first:last]
+                )
+            page.buf[:] = new_buf
+            self._bp.mark_dirty(page)
 
     # ------------------------------------------------------------------
     # 查找
@@ -596,12 +617,8 @@ class BPlusTree:
         page = self._bp.fetch_page(page_id)
         try:
             if self._is_leaf(page):
-                idx = self._leaf_bisect(page, key)
-                if idx < self._nkeys(page):
-                    existing, _, _ = self._leaf_key_at(page, idx)
-                    if existing == key:
-                        return None  # 同一 (key, rid) 幂等
-                if self._leaf_insert_at(txn, page, idx, key, rid):
+                idx = self._leaf_insert_at(txn, page, key, rid)
+                if idx is None:
                     return None
                 # compact 之后仍放不下才分裂
                 keys, rids = self._read_leaf(page)
@@ -651,11 +668,12 @@ class BPlusTree:
             if old_next != INVALID_PAGE_ID:
                 nxt = self._bp.fetch_page(old_next)
                 try:
-                    old_prev = bytes(nxt.buf[12:16])
-                    new_prev = struct.pack("<I", right_id)
-                    self._bp.log_page_update(txn.xid, nxt, 12, old_prev, new_prev)
-                    nxt.buf[12:16] = new_prev
-                    self._bp.mark_dirty(nxt)
+                    with nxt.latch:
+                        old_prev = bytes(nxt.buf[12:16])
+                        new_prev = struct.pack("<I", right_id)
+                        self._bp.log_page_update(txn.xid, nxt, 12, old_prev, new_prev)
+                        nxt.buf[12:16] = new_prev
+                        self._bp.mark_dirty(nxt)
                 finally:
                     self._bp.unpin(old_next, dirty=True)
 
@@ -794,15 +812,16 @@ class BPlusTree:
         """把左邻居的 next 指针改成 ``value``；它当前必须指向被摘除页。"""
         page = self._bp.fetch_page(page_id)
         try:
-            if page.next_page != expected:
-                raise BTreeInvariantError(
-                    f"叶子链不一致：页 {page_id} 的 next 是 {page.next_page}，期望 {expected}"
-                )
-            old = bytes(page.buf[8:12])
-            new = struct.pack("<I", value)
-            self._bp.log_page_update(txn.xid, page, 8, old, new)
-            page.buf[8:12] = new
-            self._bp.mark_dirty(page)
+            with page.latch:
+                if page.next_page != expected:
+                    raise BTreeInvariantError(
+                        f"叶子链不一致：页 {page_id} 的 next 是 {page.next_page}，期望 {expected}"
+                    )
+                old = bytes(page.buf[8:12])
+                new = struct.pack("<I", value)
+                self._bp.log_page_update(txn.xid, page, 8, old, new)
+                page.buf[8:12] = new
+                self._bp.mark_dirty(page)
         finally:
             self._bp.unpin(page_id, dirty=True)
 
@@ -812,28 +831,30 @@ class BPlusTree:
         """把右邻居的 prev 指针改成 ``value``；它当前必须指向被摘除页。"""
         page = self._bp.fetch_page(page_id)
         try:
-            if page.prev_page != expected:
-                raise BTreeInvariantError(
-                    f"叶子链不一致：页 {page_id} 的 prev 是 {page.prev_page}，期望 {expected}"
-                )
-            old = bytes(page.buf[12:16])
-            new = struct.pack("<I", value)
-            self._bp.log_page_update(txn.xid, page, 12, old, new)
-            page.buf[12:16] = new
-            self._bp.mark_dirty(page)
+            with page.latch:
+                if page.prev_page != expected:
+                    raise BTreeInvariantError(
+                        f"叶子链不一致：页 {page_id} 的 prev 是 {page.prev_page}，期望 {expected}"
+                    )
+                old = bytes(page.buf[12:16])
+                new = struct.pack("<I", value)
+                self._bp.log_page_update(txn.xid, page, 12, old, new)
+                page.buf[12:16] = new
+                self._bp.mark_dirty(page)
         finally:
             self._bp.unpin(page_id, dirty=True)
 
     def _clear_links(self, txn: Transaction, page: Page) -> None:
         """被摘除的页把 next/prev 清零，避免它以后被误当成链上节点。"""
-        for off in (8, 12):
-            old = bytes(page.buf[off : off + 4])
-            new = struct.pack("<I", INVALID_PAGE_ID)
-            if old == new:
-                continue
-            self._bp.log_page_update(txn.xid, page, off, old, new)
-            page.buf[off : off + 4] = new
-        self._bp.mark_dirty(page)
+        with page.latch:
+            for off in (8, 12):
+                old = bytes(page.buf[off : off + 4])
+                new = struct.pack("<I", INVALID_PAGE_ID)
+                if old == new:
+                    continue
+                self._bp.log_page_update(txn.xid, page, off, old, new)
+                page.buf[off : off + 4] = new
+            self._bp.mark_dirty(page)
 
     def _collapse_root(self, txn: Transaction) -> None:
         """根是内部节点且只剩一个孩子时，把孩子的页内容搬到根上，降低树高。"""

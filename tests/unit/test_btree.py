@@ -273,9 +273,7 @@ class TestLeafSlots:
             # 直接往单页里塞，绕过分裂，直到页真的满（compact 后仍放不下）
             while True:
                 key = (f"k{i:04d}", 1, i)
-                if not tree._leaf_insert_at(
-                    txn, page, tree._leaf_bisect(page, key), key, (1, i)
-                ):
+                if tree._leaf_insert_at(txn, page, key, (1, i)) is not None:
                     break
                 n += 1
                 i += 1
@@ -292,8 +290,7 @@ class TestLeafSlots:
                 tree._leaf_delete_at(txn, page, tree._nkeys(page) // 2)
             assert tree._leaf_free(page) < needed
 
-            idx = tree._leaf_bisect(page, new_key)
-            assert tree._leaf_insert_at(txn, page, idx, new_key, (2, 7)) is True
+            assert tree._leaf_insert_at(txn, page, new_key, (2, 7)) is None
             assert tree._leaf_data_end(page) < full_end, "插入应当触发 compact 回收碎片"
             keys, _ = tree._read_leaf(page)
             assert keys == sorted(keys)

@@ -125,6 +125,32 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 仍无锁，并发写探针里表现为"页链 7 页 vs last_page=8"。这两处属于目录级
 （而非页级）竞争，修法是把目录页也纳入同一套 latch，同样安排在第 2 步。
 
+### B+ 树叶页 latch 已落地（2026-11-19，Step 4 前半段）
+
+第 2 步（行/键锁）落地后，按上文"索引页 latch 与行锁一起做"的顺序补上 B+ 树的
+**单页** latch：
+
+- `_commit_page`：读旧值 → 写变化区间日志 → 换页三步在同一 `page.latch` 内
+  （与 `HeapFile._apply_and_log` 同款语义）；
+- `_leaf_insert_at`：把"二分定位 + 幂等判断 + 紧凑 + 插入"整段搬进 latch。
+  此前定位下标在 latch 外算，两个线程各自基于同一份旧页算出下标，后写者把
+  先写者槽位顶乱（探针实测：`槽位目录未保持键序 (1050) 之后出现 (1044)`）；
+- `_leaf_delete_at` / `_leaf_compact` / 叶子链修复 `_set_left_next` /
+  `_set_right_prev` / `_clear_links` / 分裂时的后继页 prev 回指，各自单页 latch。
+
+锁序只有 `page.latch → bp._lock` 一个方向（与 heap 一致），无 ABBA。
+
+**仍未做**（Step 4 后半段，放开 `_write_lock` 前必须完成）：
+- 分裂/合并的**多页原子性**（latch crabbing）：`_split_leaf` 改"本叶 + 右叶 +
+  后继叶"，`_detach_if_empty` 改"父 + 子 + 左右邻居"。单页 latch 只保证每个
+  写原子，不保证跨页序列原子；现在仍靠 `_write_lock` 串行兜着。
+- 读者侧：`lookup`/`scan` 目前不拿 latch，靠 GIL 的"一次换页 memcpy 原子" +
+  `_write_lock` 串行写保证读到一致快照；真放开后读者需要共享 latch 或乐观读重检。
+
+验证：`tests/unit/test_btree_page_latch.py::test_concurrent_leaf_inserts_keep_order_and_count`
+双线程绕过 `_write_lock` 对同一片叶并发插 200 条，断言不变量 + 条目数（修复前
+稳定丢行/乱序）。
+
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 
 | 资源 | 何时加 | 模式 | 释放 |
