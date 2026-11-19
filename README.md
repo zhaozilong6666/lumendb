@@ -286,6 +286,8 @@ python -m bench.replication --rows 2000 --repeat 3
 ## 开发
 
 ```bash
+python scripts/gates.py            # 质量门禁：全量测试 + 变异清单 + 文档/账本漂移
+python scripts/gates.py --full     # 追加变异检查（护栏改坏后必须有用例变红）
 python -m pytest tests -q          # 全部测试
 python -m pytest tests/unit -q     # 单元测试
 python -m pytest tests/crash -q    # 崩溃恢复注入测试
