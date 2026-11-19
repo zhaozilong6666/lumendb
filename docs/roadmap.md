@@ -335,10 +335,12 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 剩余差距：follower 的 commit_lsn 仍是 leader 口头告知（标准 Raft 行为，
 见 `docs/replication-commit-index.md`，同步屏障/提升闸门已用
 `verified_commit_lsn` 独立验证，不做 match 表广播）；单事务超过一个复制批
-时 apply 的原子性（现为降级路径，彻底解决要索引项 MVCC）；写并发的第 2 步
-（行/键锁）仍未开工，三个真实阻塞写在 `docs/concurrency.md`（结构变化时仍
-写同一批目录字节、唯一索引项在 DELETE 时被物理删除、物理 undo 不按事务
-区分字节）。因此第 4 层仍只能标“MVP 验收”，不能标“生产就绪”。
+时 apply 的原子性（现为降级路径，彻底解决要索引项 MVCC）；写并发已降到
+"行/键/DDL 三级锁"（`09376cb`），但语句仍由 `_write_lock` 串行——真正放开写
+并发还需 B+ 树分裂/合并的多页 latch crabbing 再拿掉 `_write_lock`（叶页单页
+latch 已落地，见 `docs/concurrency.md`）；唯一索引项在 DELETE 时被物理删除
+仍是键锁串行兜底、未做索引项 MVCC；物理 undo 不按事务区分字节。因此第 4 层
+仍只能标"MVP 验收"，不能标"生产就绪"。
 
 ## 明确不做
 
