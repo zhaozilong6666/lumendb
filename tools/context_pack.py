@@ -66,6 +66,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 RESIDENT_BUDGET = 500
 HANDOFF_BUDGET = 4000
+SNAPSHOT_BUDGET = 2000
 WARN_RATIO = 0.50
 FORCE_RATIO = 0.70
 
@@ -532,6 +533,16 @@ def check(repo: ContextRepo, budget: int = RESIDENT_BUDGET) -> list[Finding]:
             )
         if not snap.keywords:
             findings.append(Finding("fail", "CTX015", "封存快照没有 keywords，索引里会定位不到", rel(snap.path)))
+        body_tokens = estimate_tokens(snap.body)
+        if body_tokens > SNAPSHOT_BUDGET:
+            findings.append(
+                Finding(
+                    "fail",
+                    "CTX016",
+                    f"封存快照正文 {body_tokens} token 超过 {SNAPSHOT_BUDGET}：快照只写结论和证据，细节拆到下一份",
+                    rel(snap.path),
+                )
+            )
         if snap.commit and not shallow and not commit_exists(repo.root, snap.commit):
             findings.append(Finding("fail", "CTX010", f"commit 不存在：{snap.commit}", rel(snap.path)))
 
@@ -768,6 +779,50 @@ def cmd_pack(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_query(args: argparse.Namespace) -> int:
+    """按关键词检索快照：标题/关键词/模块/正文，任一命中即可，按命中数排序。
+
+    快照的整点就是"按需单份召回"，但没有检索入口就退化成"手翻目录"——
+    这条命令把召回补上：记不清是哪份时，用词搜出候选，再只读命中的一份。
+    """
+    repo = ContextRepo(Path(args.root))
+    snaps = repo.snapshots()
+    terms = [t.strip().lower() for t in args.terms if t.strip()]
+    if not terms:
+        print("至少给一个检索词", file=sys.stderr)
+        return 1
+    if args.status:
+        snaps = [s for s in snaps if s.status == args.status]
+
+    scored: list[tuple[int, Snapshot]] = []
+    for snap in snaps:
+        hay = " ".join(
+            [snap.name, snap.title, snap.task, snap.day, snap.commit]
+            + snap.modules
+            + snap.keywords
+            + snap.facts
+            + [snap.body]
+        ).lower()
+        score = sum(1 for term in terms if term in hay)
+        if score:
+            scored.append((score, snap))
+    scored.sort(key=lambda item: (item[0], item[1].day, item[1].name), reverse=True)
+
+    if not scored:
+        print(f"没有快照命中：{'、'.join(args.terms)}")
+        return 1
+    for score, snap in scored:
+        concl = snap.sections.get("结论", "").strip().splitlines()
+        concl = concl[0] if concl else ""
+        print(f"[{score}/{len(terms)}] {snap.name}  [{snap.status}]")
+        print(f"  {snap.title}  ·  {snap.day}  ·  {snap.commit}")
+        print(f"  模块 {', '.join(snap.modules) or '-'}  关键词 {', '.join(snap.keywords) or '-'}")
+        if concl:
+            print(f"  结论 {concl[:160]}")
+        print()
+    return 0
+
+
 def cmd_budget(args: argparse.Namespace) -> int:
     if args.window <= 0:
         print("--window 必须是正数", file=sys.stderr)
@@ -869,6 +924,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     pack_cmd = sub.add_parser("pack", help="输出交接包：base + task + 前置快照")
     pack_cmd.set_defaults(func=cmd_pack)
+
+    query_cmd = sub.add_parser("query", help="按关键词检索快照（标题/关键词/模块/正文）")
+    query_cmd.add_argument("terms", nargs="+", help="检索词，可多个；任一命中即入选，按命中数排序")
+    query_cmd.add_argument("--status", default=None, choices=("draft", "sealed"), help="只查某种状态")
+    query_cmd.set_defaults(func=cmd_query)
 
     budget_cmd = sub.add_parser("budget", help="按当前用量判断是否必须封存（≥70% 退出码 2）")
     budget_cmd.add_argument("--used", type=int, required=True)

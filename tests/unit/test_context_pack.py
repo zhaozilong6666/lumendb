@@ -302,3 +302,75 @@ def test_new_fills_commit_and_modules_from_git(tmp_path):
     assert f"commit: {second}" in text
     assert "lumendb" in text
     assert "status: draft" in text
+
+
+def test_sealed_snapshot_over_budget_fails(tmp_path):
+    root, sha = _make_repo(tmp_path)
+    big = (
+        "## 结论\n做完了。\n\n## 改动\n"
+        + ("x" * 9000)  # ASCII 按 3 字符/token => 约 3000 token，超过 2000
+        + "\n\n## 证据\npytest 全绿。\n\n## 遗留\n无。\n"
+    )
+    snap = root / "docs" / "context" / "snapshots" / "20261119-big.md"
+    snap.write_text(_snap_text(sha, body=big), encoding="utf-8")
+    cp.ContextRepo(root).write_index()
+    assert "CTX016" in _codes(cp.check(cp.ContextRepo(root)))
+
+
+def test_query_recalls_snapshot_by_keyword(tmp_path, capsys):
+    root, sha = _make_repo(tmp_path)
+    (root / "docs" / "context" / "snapshots" / "20261119-row-lock.md").write_text(
+        _snap_text(
+            sha,
+            title="行锁粒度",
+            keywords="lock, row",
+            body="## 结论\n用行/键锁替换单写者锁。\n\n## 改动\n改执行器。\n\n## 证据\n全绿。\n\n## 遗留\n无。\n",
+        ),
+        encoding="utf-8",
+    )
+    (root / "docs" / "context" / "snapshots" / "20261118-other.md").write_text(
+        _snap_text(
+            sha,
+            title="别的事",
+            keywords="other",
+            body="## 结论\n无关。\n\n## 改动\nx。\n\n## 证据\ny。\n\n## 遗留\nz。\n",
+        ),
+        encoding="utf-8",
+    )
+    cp.ContextRepo(root).write_index()
+
+    assert _run(root, "query", "行锁") == 0
+    out = capsys.readouterr().out
+    assert "row-lock" in out
+    assert "other" not in out
+    assert "行锁粒度" in out
+
+
+def test_query_scores_multi_term_matches(tmp_path, capsys):
+    root, sha = _make_repo(tmp_path)
+    (root / "docs" / "context" / "snapshots" / "20261119-both.md").write_text(
+        _snap_text(
+            sha,
+            title="崩溃恢复与 WAL",
+            keywords="wal, crash",
+            body="## 结论\nWAL 支撑崩溃恢复。\n\n## 改动\nx。\n\n## 证据\ny。\n\n## 遗留\nz。\n",
+        ),
+        encoding="utf-8",
+    )
+    (root / "docs" / "context" / "snapshots" / "20261118-one.md").write_text(
+        _snap_text(
+            sha,
+            title="只有 WAL",
+            keywords="wal",
+            body="## 结论\n只有 WAL。\n\n## 改动\nx。\n\n## 证据\ny。\n\n## 遗留\nz。\n",
+        ),
+        encoding="utf-8",
+    )
+    cp.ContextRepo(root).write_index()
+
+    assert _run(root, "query", "wal", "crash") == 0
+    out = capsys.readouterr().out
+    # 命中两个词的排在命中一个词的前面
+    assert out.index("both") < out.index("one")
+    assert "[2/2]" in out
+    assert "[1/2]" in out

@@ -19,6 +19,7 @@
 ```bash
 python -m tools.context_pack status   # 常驻占用、当前任务、快照数、索引是否过期
 python -m tools.context_pack check    # 全量校验；CI 跑的就是这条
+python -m tools.context_pack query 行锁 崩溃恢复   # 按关键词召回快照，多个词按命中数排序
 python -m tools.context_pack pack     # 交接包：base + task + 前置快照
 ```
 
@@ -96,6 +97,7 @@ python -m tools.context_pack next --to "……" --accept "……" --accept "…�
 | CTX013 | 同一任务有多份 sealed 快照 |
 | CTX014 | 封存快照仍含占位符 |
 | CTX015 | 封存快照没有 modules 或 keywords |
+| CTX016 | 封存快照正文超 `SNAPSHOT_BUDGET`（快照只写结论和证据，细节拆到下一份） |
 
 ## 70% 阈值：显式命令，不是自动触发
 
