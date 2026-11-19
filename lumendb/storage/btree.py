@@ -956,6 +956,7 @@ class BPlusTree:
             return
         child_id = children[idx]
         child = self._bp.fetch_page(child_id)
+        promote_id = INVALID_PAGE_ID
         try:
             if self._nkeys(child) != 0:
                 return
@@ -969,8 +970,32 @@ class BPlusTree:
                 if next_id != INVALID_PAGE_ID:
                     self._set_right_prev(txn, next_id, prev_id, child_id)
                 self._clear_links(txn, child)
+            else:
+                # 内部页退化（分隔键被删光、只剩 1 个孩子）：不能直接摘除，
+                # 否则唯一孩子会成为孤儿。真实 bug：删除 0..24 后，INT 3 的
+                # children 从 [6,7] 变 [7]、keys 变空，再被上层当空页摘掉，
+                # 页 7（key 25..29）整片丢失，后续 delete 25 返回 False。
+                # 正确做法：用唯一孩子替代它在 parent 中的位置。keys 不用动：
+                # 该孩子覆盖的键范围与原 child 完全一致（叶子链 / 内部页链的
+                # 下一跳即原右兄弟），其 high key 天然等于 parent 的 keys[idx]。
+                ckeys, cchildren, _ = self._read_internal(child)
+                if len(cchildren) == 1:
+                    promote_id = cchildren[0]
         finally:
             self._bp.unpin(child_id)
+
+        if promote_id != INVALID_PAGE_ID:
+            new_children = list(children)
+            new_children[idx] = promote_id
+            self._commit_page(
+                txn,
+                parent,
+                self._encode_internal(
+                    parent.page_id, keys, new_children, parent.next_page, parent.prev_page,
+                    high_key,
+                ),
+            )
+            return
 
         if len(children) <= 1:
             return  # 只有一个孩子，交给 _collapse_root / 上层塌陷处理

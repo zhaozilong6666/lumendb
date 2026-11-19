@@ -155,3 +155,42 @@ def test_concurrent_inserts_trigger_internal_splits(tmp_path) -> None:
         assert stats["entries"] == base["entries"] + threads * per_thread
     finally:
         db.close()
+
+
+def test_sequential_delete_large_tree_no_orphan(tmp_path) -> None:
+    """顺序删除整棵多层长键值树：每次 delete 都要返回 True，最终树空。
+
+    回归：B-link 落地后 ``_detach_if_empty`` 会把「分隔键已删光、只剩 1 个孩子
+    的内部页」当成空页直接摘除，它的唯一孩子随之成为孤儿。实测 2000 条长键值
+    顺序删除时 ``delete`` 失败 700 次（失败键呈每 30 个里 5 个的规律），但
+    ``check_invariants`` 的 entries 却是 0——因为丢掉的整片叶已经不在树里。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(
+        db.bp, KeyCodec([TypeSpec(DataType.VARCHAR, 512)]), unique=False, name="idx"
+    )
+
+    def long_key(i: int) -> str:
+        return "k" + "x" * 400 + f"{i:05d}"
+
+    n = 2000
+    t0 = db.txns.begin()
+    for i in range(n):
+        tree.insert(t0, (long_key(i),), (0, i))
+    db.txns.commit(t0)
+    base = tree.check_invariants()
+    assert base["depth"] >= 2, f"长键值 2000 条应建立多层内部页，实际 depth={base['depth']}"
+
+    t1 = db.txns.begin()
+    failed: list[int] = []
+    for i in range(n):
+        if not tree.delete(t1, (long_key(i),), (0, i)):
+            failed.append(i)
+    db.txns.commit(t1)
+
+    try:
+        assert failed == [], f"顺序删除失败 {len(failed)} 次，前几个 {failed[:5]}"
+        assert tree.check_invariants()["entries"] == 0, "删除后树应为空"
+    finally:
+        db.close()
+
