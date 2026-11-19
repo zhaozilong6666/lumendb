@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import bisect
 import struct
+import threading
 from typing import Any, Iterator, Optional, Sequence, Tuple
 
 from ..datatypes import DataType, TypeSpec, decode_value, encode_value
@@ -137,6 +138,9 @@ class BPlusTree:
         self.root_page = root_page
         self.unique = unique
         self.name = name
+        #: 根页号是整棵树的全局状态；根分裂（建新根）与根塌陷（降树高）都改它，
+        #: 必须串行，否则两个线程同时建新根会把 `root_page` 后写覆盖、丢一棵子树。
+        self._root_lock = threading.RLock()
         #: 只给 ``_descend`` 用的内部页解码缓存，键是 (页号, pageLSN)。
         #: 由执行器跨语句持有（每次查询都新建 BPlusTree，缓存挂在树上没意义）。
         #: 页被写过后 pageLSN 会推进，旧条目自然再也不会命中。
@@ -279,6 +283,10 @@ class BPlusTree:
         的槽位顶乱（探针里表现为"槽位目录未保持键序"）。返回 ``None`` 表示已
         插入或已存在（幂等）；返回 int 表示该页已满、需要分裂，值是 key 在
         完整键序里的插入位置。
+
+        注意：本方法**只负责单页插入，不负责分裂**。分裂必须与"发现满"发生在
+        同一个页 latch 内，否则两个线程会各自基于同一份旧页分裂；需要分裂语义
+        时请用 ``_leaf_insert_or_split``。
         """
         with page.latch:
             idx = self._leaf_bisect(page, key)
@@ -312,6 +320,26 @@ class BPlusTree:
             struct.pack_into("<H", buf, LEAF_DATA_END_OFF, data_end + rec_len)
             self._commit_page(txn, page, buf)
             return None
+
+    def _leaf_insert_or_split(
+        self, txn: Transaction, page: Page, key: tuple, rid: RID
+    ) -> Optional[Tuple[tuple, int]]:
+        """在叶内插入；空间不够时在同一页 latch 内分裂。
+
+        "发现满 → 读页 → 分裂"必须发生在同一个 latch 内：若 `_leaf_insert_at`
+        释放 latch 后再分裂，两个线程会各自基于同一份旧页分裂，各建一个右页
+        并重写本叶，导致丢行 / 叶子链断裂。返回 ``None`` 表示已插入/已存在；
+        返回 ``(sep_key, right_id)`` 表示本叶已分裂，调用方需把分隔键插入父页。
+        """
+        with page.latch:
+            idx = self._leaf_insert_at(txn, page, key, rid)  # RLock 重入本页 latch
+            if idx is None:
+                return None
+            keys, rids = self._read_leaf(page)
+            keys.insert(idx, key)
+            rids.insert(idx, rid)
+            # `_split_leaf` 会重入 page.latch（RLock），锁序 page → right → next
+            return self._split_leaf(txn, page, keys, rids)
 
     def _leaf_delete_at(self, txn: Transaction, page: Page, index: int) -> None:
         """摘掉一个槽位。记录字节留作碎片，由后续 compact 回收。"""
@@ -575,41 +603,53 @@ class BPlusTree:
                 )
 
         if self.root_page == INVALID_PAGE_ID:
-            page = self._bp.new_page(Page)
-            try:
-                self._init_leaf(page)
-                self._commit_page(
-                    txn,
-                    page,
-                    self._encode_leaf(
-                        page.page_id, [key], [rid], INVALID_PAGE_ID, INVALID_PAGE_ID
-                    ),
-                )
-                self.root_page = page.page_id
-            finally:
-                self._bp.unpin(page.page_id, dirty=True)
+            # 两个线程同时插第一条时都要建根，双重检查 + 树级锁串行
+            with self._root_lock:
+                if self.root_page == INVALID_PAGE_ID:
+                    page = self._bp.new_page(Page)
+                    try:
+                        self._init_leaf(page)
+                        self._commit_page(
+                            txn,
+                            page,
+                            self._encode_leaf(
+                                page.page_id, [key], [rid], INVALID_PAGE_ID, INVALID_PAGE_ID
+                            ),
+                        )
+                        self.root_page = page.page_id
+                    finally:
+                        self._bp.unpin(page.page_id, dirty=True)
             return
 
-        split = self._insert_recursive(txn, self.root_page, key, rid)
-        if split is not None:
-            sep_key, right_id = split
-            new_root = self._bp.new_page(Page)
-            try:
-                self._init_internal(new_root)
-                self._commit_page(
-                    txn,
-                    new_root,
-                    self._encode_internal(
-                        new_root.page_id,
-                        [sep_key],
-                        [self.root_page, right_id],
-                        INVALID_PAGE_ID,
-                        INVALID_PAGE_ID,
-                    ),
-                )
-                self.root_page = new_root.page_id
-            finally:
-                self._bp.unpin(new_root.page_id, dirty=True)
+        # 普通插入不碰根锁；只有触发根分裂时才拿锁，锁内重读 root_page，
+        # 发现别的线程已经分裂过根就重试（乐观 + 重试，避免串行化所有插入）。
+        while True:
+            root_before = self.root_page
+            split = self._insert_recursive(txn, root_before, key, rid)
+            if split is None:
+                return
+            with self._root_lock:
+                if self.root_page != root_before:
+                    continue  # 根已被别的线程分裂，本次 split 基于过期根，重试
+                sep_key, right_id = split
+                new_root = self._bp.new_page(Page)
+                try:
+                    self._init_internal(new_root)
+                    self._commit_page(
+                        txn,
+                        new_root,
+                        self._encode_internal(
+                            new_root.page_id,
+                            [sep_key],
+                            [root_before, right_id],
+                            INVALID_PAGE_ID,
+                            INVALID_PAGE_ID,
+                        ),
+                    )
+                    self.root_page = new_root.page_id
+                finally:
+                    self._bp.unpin(new_root.page_id, dirty=True)
+                return
 
     def _insert_recursive(
         self, txn: Transaction, page_id: int, key: tuple, rid: RID
@@ -617,35 +657,34 @@ class BPlusTree:
         page = self._bp.fetch_page(page_id)
         try:
             if self._is_leaf(page):
-                idx = self._leaf_insert_at(txn, page, key, rid)
-                if idx is None:
+                # 插入/分裂都在 `_leaf_insert_or_split` 的同一页 latch 内完成
+                return self._leaf_insert_or_split(txn, page, key, rid)
+
+            # 内部页：持 latch 完成"读键 → 递归插孩子 → 插分隔键 / 分裂"。
+            # 两个线程同时往同一内部页插分隔键时会各自基于同一份旧 keys 覆盖，
+            # 丢分隔键 = 丢子树 = 丢行；锁序保持 父页 → 子页 → 叶 → 后继 单向，
+            # 且 `_commit_page`/`_split_internal` 会重入本页 latch（RLock）。
+            with page.latch:
+                keys, children = self._read_internal(page)
+                idx = self._child_index(keys, key)
+                split = self._insert_recursive(txn, children[idx], key, rid)
+                if split is None:
                     return None
-                # compact 之后仍放不下才分裂
-                keys, rids = self._read_leaf(page)
-                keys.insert(idx, key)
-                rids.insert(idx, rid)
-                return self._split_leaf(txn, page, keys, rids)
 
-            keys, children = self._read_internal(page)
-            idx = self._child_index(keys, key)
-            split = self._insert_recursive(txn, children[idx], key, rid)
-            if split is None:
-                return None
-
-            sep, right_id = split
-            keys.insert(idx, sep)
-            children.insert(idx + 1, right_id)
-            try:
-                self._commit_page(
-                    txn,
-                    page,
-                    self._encode_internal(
-                        page.page_id, keys, children, page.next_page, page.prev_page
-                    ),
-                )
-                return None
-            except _NodeOverflow:
-                return self._split_internal(txn, page, keys, children)
+                sep, right_id = split
+                keys.insert(idx, sep)
+                children.insert(idx + 1, right_id)
+                try:
+                    self._commit_page(
+                        txn,
+                        page,
+                        self._encode_internal(
+                            page.page_id, keys, children, page.next_page, page.prev_page
+                        ),
+                    )
+                    return None
+                except _NodeOverflow:
+                    return self._split_internal(txn, page, keys, children)
         finally:
             self._bp.unpin(page_id, dirty=True)
 
@@ -669,6 +708,11 @@ class BPlusTree:
                 nxt = self._bp.fetch_page(old_next)
                 try:
                     with nxt.latch:
+                        if nxt.prev_page != page.page_id:
+                            raise BTreeInvariantError(
+                                f"叶子链不一致：页 {old_next} 的 prev 是 {nxt.prev_page}，"
+                                f"期望 {page.page_id}"
+                            )
                         old_prev = bytes(nxt.buf[12:16])
                         new_prev = struct.pack("<I", right_id)
                         self._bp.log_page_update(txn.xid, nxt, 12, old_prev, new_prev)
@@ -858,6 +902,12 @@ class BPlusTree:
 
     def _collapse_root(self, txn: Transaction) -> None:
         """根是内部节点且只剩一个孩子时，把孩子的页内容搬到根上，降低树高。"""
+        # 根塌陷改的是根页内容，与根分裂（建新根）并发会互相覆盖；树级锁串行，
+        # 锁序保持 _root_lock → 根页 latch，与 insert 建新根路径一致，无 ABBA。
+        with self._root_lock:
+            self._collapse_root_locked(txn)
+
+    def _collapse_root_locked(self, txn: Transaction) -> None:
         while self.root_page != INVALID_PAGE_ID:
             root = self._bp.fetch_page(self.root_page)
             try:

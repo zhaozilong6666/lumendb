@@ -140,16 +140,44 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 
 锁序只有 `page.latch → bp._lock` 一个方向（与 heap 一致），无 ABBA。
 
-**仍未做**（Step 4 后半段，放开 `_write_lock` 前必须完成）：
-- 分裂/合并的**多页原子性**（latch crabbing）：`_split_leaf` 改"本叶 + 右叶 +
-  后继叶"，`_detach_if_empty` 改"父 + 子 + 左右邻居"。单页 latch 只保证每个
-  写原子，不保证跨页序列原子；现在仍靠 `_write_lock` 串行兜着。
+**叶分裂 crabbing 已落地（2026-11-19 追加，Step 4 后半段①的前半）**：
+
+- 新增 `_leaf_insert_or_split`：把"发现满 → 读页 → 分裂"整段放进同一个
+  `page.latch`（`_leaf_insert_at` 仍只做单页插入、页满返回插入位置，语义不变）。
+  此前 `_insert_recursive` 在 `_leaf_insert_at` 返回后**释放 latch 再分裂**，两个
+  线程各自基于同一份旧页分裂、各建一个右页并重写本叶 → 丢行/叶子链断裂；
+  现在第二个线程进入 latch 时叶已分裂成前半（不再满），走普通插入而非重复分裂。
+- `_insert_recursive` 内部页分支整段持 `page.latch`（读键 → 递归插孩子 → 插
+  分隔键 / `_split_internal`），两个线程不再各自基于同一份旧内部页覆盖分隔键。
+- `insert` 根分裂改成**乐观 + 重试**：普通插入不碰 `_root_lock`，只有触发根
+  分裂才拿锁，锁内重读 `root_page`，发现别的线程已分裂过根就重试；初始建根
+  也做双重检查。`_collapse_root` 拆出 `_root_lock` 包装。
+- `_split_leaf` 改后继页 prev 回指时加 `expected` 校验（`nxt.prev` 必须仍指向
+  本叶），与 `_set_left_next`/`_set_right_prev` 对齐。
+
+锁序保持单向：`父页 latch → 子页 latch → 叶 latch → 后继 latch`，`_root_lock`
+只在页 latch 全部释放后获取（`_root_lock → 新根 latch`），无 ABBA。
+
+**仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
+- **内部页并发分裂的 B-link 路由**：LumenDB 内部页不是 B-link，`_split_internal`
+  后左页没有指向右页的 next 指针。并发下，线程 A 分裂某内部页 P 后释放 P.latch，
+  线程 B 再读 P（已是左半）时，若目标 key 在右半，`_child_index` 会错误路由到
+  左半的最后一个孩子——探针表现为 `check_invariants` 报"键不小于上界"。修法：
+  给内部页加 next/prev 指针 + high key（或等价的路由信息），`_descend` 在
+  key 越过当前页所有键时沿 next 右移。这是"放开 `_write_lock` 让并发分裂正确"
+  的下一块。
+- 删除合并 `_detach_if_empty` 的多页原子性（"父 + 子 + 左右邻居"），以及
+  上行（子 → 父）与下行（父 → 子）两条路径的锁序统一（需 B-link 先定方向）。
 - 读者侧：`lookup`/`scan` 目前不拿 latch，靠 GIL 的"一次换页 memcpy 原子" +
   `_write_lock` 串行写保证读到一致快照；真放开后读者需要共享 latch 或乐观读重检。
 
-验证：`tests/unit/test_btree_page_latch.py::test_concurrent_leaf_inserts_keep_order_and_count`
-双线程绕过 `_write_lock` 对同一片叶并发插 200 条，断言不变量 + 条目数（修复前
-稳定丢行/乱序）。
+验证：
+- `tests/unit/test_btree_page_latch.py::test_concurrent_leaf_inserts_keep_order_and_count`
+  双线程绕过 `_write_lock` 对同一片叶并发插 200 条，断言不变量 + 条目数（修复前
+  稳定丢行/乱序）。
+- `tests/unit/test_btree_split_crab.py::test_concurrent_leaf_splits_keep_invariants`
+  预置多层叶后双线程向同一片叶并发插 300 条触发叶分裂，断言键序/叶子链/条目数
+  （刻意避开内部页/根分裂——那是上面 B-link 的课题）。
 
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 
