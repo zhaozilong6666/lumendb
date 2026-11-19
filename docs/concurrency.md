@@ -210,6 +210,9 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   摘除丢叶）。
 - `tests/unit/test_btree_split_crab.py::test_delete_half_keeps_leaf_depth_uniform`
   删前 1000 条再插回 1000 条：数据完整 + 叶子深度唯一（钉住孤儿叶 / 深度 {3,4}）。
+- `tests/unit/test_btree_split_crab.py::test_concurrent_reader_scans_during_insert_splits`
+  写线程插入触发分裂 + 两个读者并发全表扫：读者结果无异常、键序单调、条目数完整。
+  读者路径不拿 latch，一致依靠「分裂是一次整页提交」+「沿叶子链 next」（B-link）。
 
 ### 第 2 步：行锁 + 键锁 + 目录锁（已完成，2026-11-18）
 

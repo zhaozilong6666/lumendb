@@ -239,3 +239,60 @@ def test_delete_half_keeps_leaf_depth_uniform(tmp_path) -> None:
     finally:
         db.close()
 
+
+def test_concurrent_reader_scans_during_insert_splits(tmp_path) -> None:
+    """写线程插入触发叶/内部页分裂时，读线程的 scan 必须看到有序、完整的键。
+
+    读者路径（`_descend` / `scan_all`）不拿页 latch，靠两点保证一致：
+    - 分裂的"左页改半 + high key + next 指向右页"是**一次整页提交**，读者
+      要么看到分裂前、要么看到分裂后，不会看到"左页还含右半但 next 已指向右页"；
+    - 读者沿叶子链 next 走，天然跳过正在分裂的中间态（B-link 的语义）。
+    这个用例把"写者分裂 + 两个读者并发全表扫"的组合钉住：结果无异常、键序单调。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.INT)]), unique=False, name="idx")
+
+    t0 = db.txns.begin()
+    for i in range(600):
+        tree.insert(t0, (i,), (0, i))
+    db.txns.commit(t0)
+
+    stop = threading.Event()
+    errors: list[str] = []
+    bad_order = [0]
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                keys = [k for k, _ in tree.scan_all(None)]
+                if any(keys[j] > keys[j + 1] for j in range(len(keys) - 1)):
+                    bad_order[0] += 1
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"reader: {type(exc).__name__}: {exc}")
+
+    def writer() -> None:
+        try:
+            txn = db.txns.begin()
+            for i in range(600, 1400):
+                tree.insert(txn, (i,), (1, i))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"writer: {type(exc).__name__}: {exc}")
+
+    readers = [threading.Thread(target=reader) for _ in range(2)]
+    for r in readers:
+        r.start()
+    w = threading.Thread(target=writer)
+    w.start()
+    w.join(timeout=120)
+    stop.set()
+    for r in readers:
+        r.join(timeout=10)
+
+    try:
+        assert errors == [], f"读写并发出错: {errors[:3]}"
+        assert bad_order[0] == 0, f"scan 出现 {bad_order[0]} 次键序错乱"
+        assert tree.check_invariants()["entries"] == 1400
+    finally:
+        db.close()
+
