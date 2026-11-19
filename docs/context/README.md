@@ -11,8 +11,8 @@
 | 快照 | `snapshots/*.md` | 按需单份 | 当时为什么那么做、证据在哪 |
 
 常驻层有硬预算：`base.md` + `task.md` 的估算 token 超过 `RESIDENT_BUDGET`
-（`tools/context_pack.py` 顶部，500）就检查失败。估算刻意偏大——ASCII 按
-3 字符/token，真实分词器约 4 字符——所以实际占用只会比这个数字小。
+（`tools/context_pack.py` 顶部，500）就检查失败。估算整体偏保守：ASCII 按
+3 字符/token（真实分词器约 4），中文按 1 字 1 token；中英混排时通常高于实际。
 
 ## 一条命令
 

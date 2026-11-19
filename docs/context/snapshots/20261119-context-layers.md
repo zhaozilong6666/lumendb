@@ -12,7 +12,7 @@ status: sealed
 # 三层上下文与可校验预算
 
 ## 结论
-上下文从"每轮重新塞历史"改成三层：base 常驻 450 token（估算上界）、task 单任务、
+上下文从"每轮重新塞历史"改成三层：base 常驻 450 token（估算值，偏保守）、task 单任务、
 snapshots 按需；索引、预算、封存状态由 `context_pack check` 校验，不靠人记得。
 
 ## 改动
