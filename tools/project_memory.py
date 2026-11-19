@@ -71,9 +71,13 @@ FACT_KINDS = (
     "open_question", # 还没定的事，等谁拍板
     "commit",        # 由 git 自动灌入的提交记录
     "contract",      # 对使用者的承诺（语义/不变量）
+    "external",      # 引用仓库外的知识（PG 语义、论文、规范）：必须带 source 出处
 )
 
 CONFIDENCE = ("verified", "measured", "inferred", "unverified")
+
+# 外部事实的"新鲜度"门控：verified_at 超过这个天数没核对，视为需重新核对出处。
+FRESHNESS_DAYS = 180
 
 # 单位归一表：先匹配长的，避免 "ms" 被 "s" 抢走。
 _UNIT_PATTERNS = (
@@ -240,6 +244,8 @@ class Fact:
     evidence: list[dict] = field(default_factory=list)
     supersedes: Optional[str] = None
     verify: dict = field(default_factory=dict)
+    source: str = ""
+    verified_at: str = ""
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -250,7 +256,7 @@ class Fact:
         return cls(**{k: v for k, v in data.items() if k in known})
 
     def search_text(self) -> str:
-        parts = [self.claim, self.kind, " ".join(self.tags)]
+        parts = [self.claim, self.kind, " ".join(self.tags), self.source]
         parts.extend(str(e.get("value", "")) for e in self.evidence)
         return " ".join(parts)
 
@@ -571,6 +577,76 @@ def verify_fact(
     return aggregate, details
 
 
+def contract_findings(fact: Fact, now: Optional[datetime] = None) -> list[dict]:
+    """外部事实的知识契约检查：source 非空、verified_at 不在未来、180 天新鲜度。
+
+    内部事实（decision/measurement/...）的证据在仓库里，靠锚点核对；外部事实
+    （"PG 的 X 是这样"）的证据在仓库外，没法跑锚点，只能靠"带出处 + 记录核对
+    时间 + 过期重查"。这条契约就是让"编造的外部知识"在落账时被机器拦住。
+    """
+    if fact.kind != "external":
+        return []
+    now = now or datetime.now().astimezone()
+    out: list[dict] = []
+    if not fact.source.strip():
+        out.append(
+            {
+                "type": "contract",
+                "value": "source",
+                "anchor": "",
+                "status": "failed",
+                "detail": "外部事实没有 source 出处（编造的外部知识最危险）",
+            }
+        )
+    verified = fact.verified_at.strip()
+    if not verified:
+        out.append(
+            {
+                "type": "contract",
+                "value": "verified_at",
+                "anchor": "",
+                "status": "failed",
+                "detail": "外部事实没有 verified_at 核对时间",
+            }
+        )
+    else:
+        try:
+            stamp = datetime.fromisoformat(verified)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=now.tzinfo)
+            if stamp > now:
+                out.append(
+                    {
+                        "type": "contract",
+                        "value": "verified_at",
+                        "anchor": "",
+                        "status": "failed",
+                        "detail": "verified_at 在未来（核对时间不能晚于现在）",
+                    }
+                )
+            elif (now - stamp).days > FRESHNESS_DAYS:
+                out.append(
+                    {
+                        "type": "contract",
+                        "value": "verified_at",
+                        "anchor": "",
+                        "status": "partial",
+                        "detail": f"超过 {FRESHNESS_DAYS} 天未核对出处，引用前需重查",
+                    }
+                )
+        except ValueError:
+            out.append(
+                {
+                    "type": "contract",
+                    "value": "verified_at",
+                    "anchor": "",
+                    "status": "failed",
+                    "detail": "verified_at 不是合法 ISO 时间",
+                }
+            )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 从 git 灌入（机器生成的锚点，最不容易出错的那类记录）
 # ---------------------------------------------------------------------------
@@ -637,6 +713,8 @@ def _print_fact(fact: Fact, prefix: str = "") -> None:
     status = fact.verify.get("status", "-") if fact.verify else "-"
     print(f"{prefix}{fact.id}  [{fact.kind}] {fact.claim}")
     print(f"    conf={fact.confidence} verify={status} tags={','.join(fact.tags) or '-'}")
+    if fact.source or fact.verified_at:
+        print(f"    source={fact.source or '-'}  verified_at={fact.verified_at or '-'}")
     for item in fact.evidence:
         anchor = f" :: {item['anchor']}" if item.get("anchor") else ""
         print(f"    · {item['type']}:{item['value']}{anchor}")
@@ -656,9 +734,14 @@ def cmd_add(args: argparse.Namespace) -> int:
             for e in (args.evidence or [])
         ],
         supersedes=args.supersedes,
+        source=(args.source or "").strip(),
+        verified_at=args.verified_at or _now_iso(),
     )
     if fact.kind not in FACT_KINDS:
         print(f"kind 必须是 {FACT_KINDS} 之一", file=sys.stderr)
+        return 2
+    if fact.kind == "external" and not fact.source:
+        print("外部事实必须带 --source 出处（URL/文档/规范），否则无法核对真伪", file=sys.stderr)
         return 2
     if not fact.evidence:
         print("警告：没有证据的记录以后无法校验（建议至少给一条 file/commit/test）", file=sys.stderr)
@@ -716,6 +799,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
         status, details = verify_fact(
             fact, root=Path(args.root), run_tests=args.run_tests, run_commands=args.run_commands
         )
+        # 外部事实额外套一层"知识契约"：出处 + 核对时间 + 新鲜度
+        details = details + contract_findings(fact)
+        statuses = {d["status"] for d in details}
+        if "failed" in statuses:
+            status = "failed"
+        elif not details:
+            status = "unverified"
+        elif statuses <= {"ok"}:
+            status = "ok"
+        else:
+            status = "partial"
         fact.verify = {"status": status, "checked_at": _now_iso(), "detail": details}
         print(f"{status:8s} {fact.id}  {fact.claim[:60]}")
         for detail in details:
@@ -1194,6 +1288,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--confidence", default="measured", choices=CONFIDENCE)
     add.add_argument("--evidence", action="append", type=_parse_evidence, default=[])
     add.add_argument("--supersedes", default=None)
+    add.add_argument("--source", default="", help="外部事实的出处（URL/文档/规范）；kind=external 时必填")
+    add.add_argument("--verified-at", default="", help="核对出处的时间（ISO），默认=现在")
     add.set_defaults(func=cmd_add)
 
     query = sub.add_parser("query", help="按问题检索（BM25 + 时间衰减）")

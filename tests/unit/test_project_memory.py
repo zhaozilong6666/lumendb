@@ -15,6 +15,7 @@ from tools.project_memory import (
     Ledger,
     _parse_when,
     _readme_checklist,
+    contract_findings,
     extract_metrics,
     facts_from_git,
     find_git,
@@ -437,6 +438,69 @@ def test_plan_command_orders_p0_to_p3(tmp_path, capsys):
     assert "[P0]" in out and "是否 push 到远端" in out
     assert "[P1]" in out and "[P2]" in out
     assert "[P3]" in out and "分歧尾巴截断" in out
+
+
+def test_contract_findings_ignores_non_external():
+    fact = _fact("d1", "某内部决策", kind="decision")
+    assert contract_findings(fact) == []
+
+
+def test_contract_findings_requires_source_for_external():
+    fact = _fact("e1", "PG 的 RI 触发器用 SnapshotDirty", kind="external")
+    fact.verified_at = datetime.now().astimezone().isoformat()
+    findings = contract_findings(fact)
+    assert any(f["status"] == "failed" and f["value"] == "source" for f in findings)
+
+
+def test_contract_findings_flags_stale_external():
+    fact = _fact("e2", "某外部规范", kind="external")
+    fact.source = "https://example.com/spec"
+    fact.verified_at = (datetime.now().astimezone() - timedelta(days=400)).isoformat()
+    findings = contract_findings(fact)
+    assert any(f["status"] == "partial" and "未核对" in f["detail"] for f in findings)
+
+
+def test_contract_findings_flags_future_verified_at():
+    fact = _fact("e3", "某外部规范", kind="external")
+    fact.source = "https://example.com/spec"
+    fact.verified_at = (datetime.now().astimezone() + timedelta(days=1)).isoformat()
+    findings = contract_findings(fact)
+    assert any(f["status"] == "failed" and "未来" in f["detail"] for f in findings)
+
+
+def test_add_external_without_source_rejected(tmp_path, capsys):
+    from tools.project_memory import main
+
+    ledger = tmp_path / "ledger.jsonl"
+    rc = main(
+        [
+            "--ledger", str(ledger), "--root", str(tmp_path),
+            "add", "--kind", "external",
+            "--claim", "PG 的某外部语义",
+            "--tags", "postgres",
+        ]
+    )
+    assert rc == 2
+    assert "source" in capsys.readouterr().err
+
+
+def test_add_external_with_source_round_trips(tmp_path, capsys):
+    from tools.project_memory import main
+
+    ledger = tmp_path / "ledger.jsonl"
+    rc = main(
+        [
+            "--ledger", str(ledger), "--root", str(tmp_path),
+            "add", "--kind", "external",
+            "--claim", "PG 的 RI 触发器用 SnapshotDirty",
+            "--tags", "postgres",
+            "--source", "https://example.com/ri-trigger",
+        ]
+    )
+    assert rc == 0
+    loaded = Ledger(ledger, root=tmp_path)
+    assert loaded.facts[-1].source == "https://example.com/ri-trigger"
+    assert loaded.facts[-1].verified_at
 
 
 

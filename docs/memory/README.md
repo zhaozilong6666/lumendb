@@ -33,6 +33,12 @@
 | `open_question` | 还没定、等拍板的事 | 160 个提交要不要 push |
 | `contract` | 对使用者的承诺/不变量 | 副本原子应用单元 = 一个事务 |
 | `commit` | 由 git 自动灌入，最硬的锚点 | `perf(parser): 解析加 LRU 缓存` |
+| `external` | 引用仓库外的知识（PG 语义/论文/规范），**必须带 `--source` 出处** | PG 的 RI 触发器用 SnapshotDirty |
+
+`external` 的"知识契约"：外部知识的证据在仓库外、没法跑锚点核对，所以用三条
+机器检查代替自觉——`source` 出处非空、`verified_at` 核对时间不在未来、超过
+180 天未核对就标"需重查"。`add` 会在落账时拦住没出处的外部事实；`verify` 会
+把过期/无出处/时间非法的外部事实判为 `partial`/`failed`。
 
 ## 三条使用规则
 
@@ -70,6 +76,11 @@ python -m tools.project_memory add --kind measurement `
   --tags bench,point-lookup --confidence measured `
   --evidence commit:cf22311 `
   --evidence file:bench/results/benchmark.md:量级参考
+
+# 追加一条"仓库外的知识"（必须带出处，否则拒绝落账）
+python -m tools.project_memory add --kind external `
+  --claim "PG 的 RI 触发器用 SnapshotDirty 看未提交行" `
+  --tags postgres,foreign-key --source "https://www.postgresql.org/docs/.../trigger.html"
 
 # 按问题检索（BM25 + 120 天半衰期；--kind/--tag 可过滤）
 python -m tools.project_memory query "点查延迟为什么变慢"
