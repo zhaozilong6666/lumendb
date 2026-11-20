@@ -674,8 +674,13 @@ class Executor:
         heap = HeapFile(self._bp, table, self._txns)
         for rid in tree.lookup(txn, list(node.key)):
             values = heap.get(txn, rid)
-            if values is not None:
-                yield tuple(values)
+            if values is None:
+                continue
+            # 索引项可能陈旧（删除/更新后不摘项，等 VACUUM 回收）：以堆里的
+            # 当前版本为准复核键，否则会把已经改走键的行当成命中返回。
+            if self._key_for(table, index, values) != list(node.key):
+                continue
+            yield tuple(values)
 
     def _index_range(self, node: IndexRange, txn: Transaction) -> Iterator[tuple]:
         table = self._catalog.get_table(node.table)
@@ -687,16 +692,21 @@ class Executor:
             return
         tree = self._tree_for(table, index)
         heap = HeapFile(self._bp, table, self._txns)
-        for _key, rid in tree.scan_range(
-            len(node.index_columns),
+        prefix = len(node.index_columns)
+        for key, rid in tree.scan_range(
+            prefix,
             low=node.low,
             high=node.high,
             low_inclusive=node.low_inclusive,
             high_inclusive=node.high_inclusive,
         ):
             values = heap.get(txn, rid)
-            if values is not None:
-                yield tuple(values)
+            if values is None:
+                continue
+            row_key = self._key_for(table, index, values)
+            if row_key is None or tuple(row_key) != tuple(key[:prefix]):
+                continue  # 陈旧索引项：这一行的当前键已不在该范围内
+            yield tuple(values)
 
     def _scan(self, node: Scan, txn: Transaction) -> Iterator[tuple]:
         table = self._catalog.get_table(node.table)
@@ -3022,10 +3032,20 @@ class Executor:
         entries_total = 0
         for idx in table.indexes.values():
             entries: list[tuple[list, tuple[int, int]]] = []
+            seen: Optional[set[tuple]] = set() if idx.unique else None
             for rid, values in snapshot:
                 key = self._key_for(table, idx, values)
-                if key is not None:
-                    entries.append((key, rid))
+                if key is None:
+                    continue
+                if seen is not None:
+                    # 树级唯一检查已关掉（索引项延迟回收后它分不清陈旧键），
+                    # 这里从"当前可见行"重建，重复就是真冲突（ALTER TYPE
+                    # 把 '1'/'01' 都转成 1 的用例靠这一句报错）。
+                    normalized = tuple(key)
+                    if normalized in seen:
+                        raise self._duplicate_key_error(idx)
+                    seen.add(normalized)
+                entries.append((key, rid))
             tree = self._tree_for(table, idx)
             tree.rebuild(txn, entries)
             idx.root_page = tree.root_page
@@ -3482,10 +3502,6 @@ class Executor:
             self._lock_key(table, idx, self._key_for(table, idx, prepared), txn)
         for idx in changed_indexes:
             self._check_update_unique(table, idx, old_tuple, prepared, txn, rid)
-        for idx in changed_indexes:
-            old_key = self._key_for(table, idx, old_tuple)
-            if old_key is not None:
-                self._tree_for(table, idx).delete(txn, old_key, rid)
 
         heap.update(txn, rid, prepared)
 
@@ -3493,7 +3509,11 @@ class Executor:
             tree = self._tree_for(table, idx)
             new_key = self._key_for(table, idx, prepared)
             if new_key is not None:
-                tree.insert(txn, new_key, rid)
+                # 旧键的索引项不摘（等 VACUUM 回收），但同一 rid 可能已经有一条
+                # 同键的陈旧项（键改回原值），重复插会造出 (key, rid) 重复项，
+                # 让索引扫描把同一行返回两次。
+                if rid not in tree.lookup(txn, new_key):
+                    tree.insert(txn, new_key, rid)
             idx.root_page = tree.root_page
         self._track_deferred_fk_row(table, rid, txn)
         for child, child_rid, child_old, child_new in pending:
@@ -3906,7 +3926,7 @@ class Executor:
                 table, values, txn, deleted_rids, processing, deferred
             )
             self._lock_row(table, rid, txn)
-            self._delete_index_entries(table, values, txn, rid)
+            self._lock_index_keys(table, values, txn, rid)
             txn.touched_tables.add(table.name)
             if ret_fns:
                 returned.append(
@@ -4000,8 +4020,14 @@ class Executor:
 
         INSERT、UPDATE、upsert 和 DO NOTHING 都走这一个查询入口，
         避免各路径对"NULL 不进索引""忽略当前行"的理解出现分歧。
+
+        索引项可能陈旧（DELETE/UPDATE 不再当场摘项，等 VACUUM 回收），所以
+        命中后必须回堆里看**当前可见版本**：行已删/本事务已删 → 不算占用；
+        行还在但键已改走 → 也是陈旧项。唯一性只能按 heap 可见性判，不能只看
+        "索引里还有没有这个键"。
         """
         candidates = indexes if indexes is not None else table.indexes.values()
+        heap = HeapFile(self._bp, table, self._txns)
         for idx in candidates:
             if not idx.unique:
                 continue
@@ -4011,12 +4037,14 @@ class Executor:
             if key is None:
                 continue
             tree = self._tree_for(table, idx)
-            if idx.deferrable:
-                hits = tree.lookup(txn, key)
-                rid = hits[0] if hits else None
-            else:
-                rid = tree.lookup_one(txn, key)
-            if rid is not None and rid != ignore_rid:
+            for rid in tree.lookup(txn, key):
+                if rid == ignore_rid:
+                    continue
+                occupant = heap.get(txn, rid)
+                if occupant is None:
+                    continue
+                if self._key_for(table, idx, occupant) != key:
+                    continue
                 return idx, rid
         return None
 
@@ -4370,16 +4398,23 @@ class Executor:
                     hint="先插入/更新被引用行，或检查外键列的值",
                 )
 
-    def _delete_index_entries(
+    def _lock_index_keys(
         self, table: TableDef, values: list[Any], txn: Transaction, rid: RID
     ) -> None:
+        """DELETE/UPDATE 时只**锁键**，不物理摘索引项。
+
+        为什么不能当场摘：MVCC 里删除/更新在提交前，别的快照仍应看到旧版本。
+        索引项一摘，并发读者走索引扫描就找不到这一行（键锁只防重复键，不解决
+        读可见性）。所以索引项与 heap 里的死版本一起，等到 VACUUM 重建索引时
+        再回收；这期间唯一性判断改按 heap 可见性做（见 ``_find_unique_conflict``），
+        索引扫描也要用堆里的当前版本复核键（见 ``_index_lookup`` / ``_index_range``）。
+        """
         for idx in table.indexes.values():
             key = self._key_for(table, idx, values)
             if key is not None:
-                # 删索引项前锁键：否则并发 INSERT 看不到这次未提交的删除，
+                # 删/改索引键前锁键：否则并发 INSERT 看不到这次未提交的删除，
                 # 删除方一回滚，索引里就出现两个相同的键。
                 self._lock_key(table, idx, key, txn)
-                self._tree_for(table, idx).delete(txn, key, rid)
 
     def _fk_child_rows(
         self,
@@ -4513,7 +4548,7 @@ class Executor:
                         child, child_values, txn, deleted, processing, deferred
                     )
                     self._lock_row(child, child_rid, txn)
-                    self._delete_index_entries(child, child_values, txn, child_rid)
+                    self._lock_index_keys(child, child_values, txn, child_rid)
                     txn.touched_tables.add(child.name)
                     child_heap.delete(txn, child_rid)
                     txn.deferred_fk_rows.discard((child.name, child_rid))
@@ -4554,9 +4589,11 @@ class Executor:
             self._bp,
             KeyCodec(specs),
             idx.root_page,
-            # 延迟唯一索引在事务内可能暂时容纳重复键，由提交前扫描校验；
-            # 普通唯一索引继续由 B+ 树在插入时立刻拒绝重复。
-            unique=idx.unique and not idx.deferrable,
+            # 不再让 B+ 树自己判唯一：索引项现在延迟到 VACUUM 才回收，
+            # 树里可能存在"已删除/键已改走"的陈旧键，树级 lookup 分不清
+            # 它是否还该算占用。唯一性统一由 `_find_unique_conflict` 按
+            # heap 可见性判定（键锁负责并发窗口）。
+            unique=False,
             name=idx.name,
             internal_cache=self._internal_page_cache,
         )
