@@ -439,3 +439,68 @@ def test_concurrent_delete_across_leaves_no_lost_delete(tmp_path) -> None:
         db.close()
 
 
+def test_concurrent_reader_scan_during_delete_never_truncates(tmp_path) -> None:
+    """删除并发进行时，读者全表扫不许看到"比最终还少"的行数。
+
+    回归（2026-11-19 实测）：读者在空叶被摘 / 根塌陷窗口会撞到两种坏结果——
+    ①读到旧 nkeys + 新槽位表，抛 `槽位偏移越界：0`；
+    ②下探落进正在被 purge 的子树，拿到一片已摘除的空叶（prev 也是 INVALID，
+    看起来像链首），沿链 next 已清零 → 扫到 0 条。
+
+    修法三件：整页快照在页 latch 内一次读完（`_leaf_page_view`）；链首必须
+    「prev==INVALID 且有键」（`_scan_head`，空树除外）；跳页用期望前驱校验，
+    陈旧 next 就回前驱找回真正后继（`_advance_leaf`）。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.INT)]), unique=False, name="idx")
+
+    total, keep = 3000, 1500
+    t0 = db.txns.begin()
+    for i in range(total):
+        tree.insert(t0, (i,), (0, i))
+    db.txns.commit(t0)
+
+    counts: list[int] = []
+    errors: list[str] = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                ks = [k for k, _ in tree.scan_all(None)]
+                if any(ks[j] > ks[j + 1] for j in range(len(ks) - 1)):
+                    errors.append("键序错乱")
+                    return
+                counts.append(len(ks))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    def writer() -> None:
+        try:
+            txn = db.txns.begin()
+            for i in range(total - keep):
+                tree.delete(txn, (i,), (0, i))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"writer: {type(exc).__name__}: {exc}")
+
+    readers = [threading.Thread(target=reader) for _ in range(2)]
+    for r in readers:
+        r.start()
+    w = threading.Thread(target=writer)
+    w.start()
+    w.join(timeout=180)
+    stop.set()
+    for r in readers:
+        r.join(timeout=20)
+
+    try:
+        assert errors == [], f"读写并发出错: {errors[:3]}"
+        assert counts, "读者一次都没扫完"
+        # 物理删除只会让可见行数单调下降，任何一次扫描都不该少于最终行数。
+        assert min(counts) >= keep, f"扫到 {min(counts)} 条，少于最终 {keep} 条"
+        assert tree.check_invariants()["entries"] == keep
+    finally:
+        db.close()
+
+

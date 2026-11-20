@@ -657,10 +657,13 @@ class BPlusTree:
             else:
                 self._bp.unpin(page.page_id)
                 continue
-            if nkeys > 0 or next_id != INVALID_PAGE_ID:
+            if nkeys > 0:
                 return page
             if self.root_page == page.page_id and self._is_leaf(page):
                 return page  # 整棵树为空：根就是这片空叶
+            # 空页且不是"整棵空树"：要么正被摘除（next 可能还没清零），
+            # 要么是刚建出来还没落键的过渡态。两者都不适合当扫描起点——
+            # 前者会让"读到空页 + next 已清"直接扫到 0 条（实测）。
             self._bp.unpin(page.page_id)
         return None
 
@@ -1222,6 +1225,105 @@ class BPlusTree:
                 keys, rids = keys[start:], rids[start:]
             return keys, rids, page.next_page
 
+    def _scan_head(self, attempts: int = 8):
+        """取一个**非空**的链首并顺带读好首页内容：(page, keys, rids, next_id)。
+
+        ``_leftmost_leaf_verified`` 只保证"拿到的瞬间它是链首且有键"；从校验到
+        真正读内容之间，写者仍可能把这页删空并摘掉（它原本就可能是最左叶，
+        正在被左半边删除吃掉）。那会让扫描从一片已清零的空页出发直接扫到
+        0 条（实测 795 次里剩 1 次）。这里把"校验 + 读内容"合并重试：读出
+        0 键且又不是整棵空树，就重新下探一次；重试仍失败则返回最后一次的
+        视图（宁可少一次也不抛异常，抛出会打断调用方）。
+        """
+        for _ in range(attempts):
+            page = self._leftmost_leaf_verified()
+            if page is None:
+                break
+            keys, rids, next_id = self._leaf_page_view(page, None)
+            if keys:
+                return page, keys, rids, next_id
+            if self.root_page == page.page_id and self._is_leaf(page):
+                return page, keys, rids, next_id  # 整棵树为空
+            self._bp.unpin(page.page_id)
+
+        # 兜底：写者的插入/删除在内部页分支里整段持页 latch（含根页），
+        # 所以持住根页 latch 时树的结构与叶子链都是静止的。重试耗尽时在
+        # 根锁内再取一次，避免把"并发太密"变成对调用方抛异常。
+        root = self._bp.fetch_page(self.root_page)
+        try:
+            with root.latch:
+                page = self._leftmost_leaf_verified(attempts=4)
+                if page is not None:
+                    keys, rids, next_id = self._leaf_page_view(page, None)
+                    return page, keys, rids, next_id
+        finally:
+            self._bp.unpin(root.page_id)
+        raise BTreeInvariantError(
+            f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
+        )
+
+    def _advance_leaf(
+        self, page: Page, next_id: int, prev_expected: int
+    ) -> Optional[Page]:
+        """校验性地从 ``page`` 跳到后继页，返回已 pin 的后继（None=链到尽头）。
+
+        为什么不能直接 `fetch(next_id)`：读者读到的 next 可能已经是陈旧值——
+        写者摘空叶的顺序是"先重写前驱的 next、再清零被摘页的 next/prev"，
+        所以读者若在这两步之间出发，会跳到一片已被摘除的空叶，读到
+        它的 `next == INVALID` 就误判成链尾（实测扫到 0 条）。
+
+        判"真链尾"不能只看 `prev == INVALID`：页的清零发生在读完 next 之后，
+        被摘页的 prev 同样会被清零。这里用**期望前驱** ``prev_expected``
+        判定——读本页时它的前驱必须是上一页（链首必须是 INVALID）；不一致
+        说明本页在这段时间里被摘掉了，退到 ``prev_expected`` 读它**当前**的
+        后继，把扫描接回链上。
+
+        无论成功还是返回 None，本方法都会 unpin ``page``；调用方别重复 unpin。
+        """
+        for _ in range(8):
+            if next_id == INVALID_PAGE_ID:
+                with page.latch:
+                    own_prev = page.prev_page
+                    own_next = page.next_page
+                if own_next != INVALID_PAGE_ID:
+                    next_id = own_next
+                    continue
+                if own_prev == prev_expected:
+                    self._bp.unpin(page.page_id)
+                    return None  # 真链尾（或被读时就是单页链）
+                # 本页已被摘除：回到期望前驱读它当前的后继。
+                if prev_expected == INVALID_PAGE_ID:
+                    self._bp.unpin(page.page_id)
+                    return None
+                prev = self._bp.fetch_page(prev_expected)
+                try:
+                    with prev.latch:
+                        fresh = prev.next_page
+                finally:
+                    self._bp.unpin(prev_expected)
+                if fresh == INVALID_PAGE_ID or fresh == page.page_id:
+                    self._bp.unpin(page.page_id)
+                    return None
+                next_id = fresh
+                continue
+
+            nxt = self._bp.fetch_page(next_id)
+            with nxt.latch:
+                nxt_prev = nxt.prev_page
+            if nxt_prev == page.page_id:
+                self._bp.unpin(page.page_id)
+                return nxt
+            # 陈旧 next：释放误取的后继，重读本页当前 next。
+            self._bp.unpin(nxt.page_id)
+            with page.latch:
+                fresh = page.next_page
+            if fresh == INVALID_PAGE_ID or fresh == next_id:
+                self._bp.unpin(page.page_id)
+                return None
+            next_id = fresh
+        self._bp.unpin(page.page_id)
+        return None
+
     def _scan_range(
         self,
         low: tuple,
@@ -1234,20 +1336,31 @@ class BPlusTree:
         page = self._descend(low)
         try:
             keys, rids, next_id = self._leaf_page_view(page, low)
+            prev_expected = INVALID_PAGE_ID
+            last_key = None
             while True:
                 for k, rid in zip(keys, rids):
                     if k < low or (not low_inclusive and k == low):
                         continue
                     if k > high or (not high_inclusive and k == high):
                         return
+                    last_key = k
                     yield k, rid
-                if next_id == INVALID_PAGE_ID:
+                cur_id = page.page_id  # 必须在 unpin 之前取：页码可能被缓冲池回收复用
+                nxt = self._advance_leaf(page, next_id, prev_expected)
+                if nxt is None:
+                    page = None  # _advance_leaf 已 unpin
                     return
-                current = page
-                page = None  # 先置空，避免 finally 重复 unpin
-                self._bp.unpin(current.page_id)
-                page = self._bp.fetch_page(next_id)
+                prev_expected = cur_id
+                page = nxt
                 keys, rids, next_id = self._leaf_page_view(page, None)
+                if last_key is not None:
+                    # B-link 分裂竞态：本页可能在上一页快照之后分裂，把一部分
+                    # 键搬到了右页。已产出的键不再重复产出（否则出现
+                    # "787 → 633" 这种倒序/重复）。叶子按完整键有序，
+                    # bisect_right 一次定位即可。
+                    cut = bisect.bisect_right(keys, last_key)
+                    keys, rids = keys[cut:], rids[cut:]
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
@@ -1275,6 +1388,8 @@ class BPlusTree:
             )
         try:
             keys, rids, next_id = self._leaf_page_view(page, low)
+            prev_expected = INVALID_PAGE_ID
+            last_key = None
             while True:
                 for k, rid in zip(keys, rids):
                     prefix = k[:width]
@@ -1288,14 +1403,19 @@ class BPlusTree:
                             return
                         if not high_inclusive and prefix == high:
                             return
+                    last_key = k
                     yield k, rid
-                if next_id == INVALID_PAGE_ID:
+                cur_id = page.page_id  # 必须在 unpin 之前取：页码可能被缓冲池回收复用
+                nxt = self._advance_leaf(page, next_id, prev_expected)
+                if nxt is None:
+                    page = None  # _advance_leaf 已 unpin
                     return
-                current = page
-                page = None
-                self._bp.unpin(current.page_id)
-                page = self._bp.fetch_page(next_id)
+                prev_expected = cur_id
+                page = nxt
                 keys, rids, next_id = self._leaf_page_view(page, None)
+                if last_key is not None:
+                    cut = bisect.bisect_right(keys, last_key)
+                    keys, rids = keys[cut:], rids[cut:]
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
@@ -1303,22 +1423,25 @@ class BPlusTree:
     def scan_all(self, txn: Transaction) -> Iterator[Tuple[tuple, RID]]:
         if self.root_page == INVALID_PAGE_ID:
             return
-        page = self._leftmost_leaf_verified()
-        if page is None:
-            raise BTreeInvariantError(
-                f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
-            )
+        page, keys, rids, next_id = self._scan_head()
         try:
+            prev_expected = INVALID_PAGE_ID
+            last_key = None
             while True:
-                keys, rids, next_id = self._leaf_page_view(page, None)
                 for k, rid in zip(keys, rids):
+                    last_key = k
                     yield k, rid
-                if next_id == INVALID_PAGE_ID:
+                cur_id = page.page_id  # 必须在 unpin 之前取：页码可能被缓冲池回收复用
+                nxt = self._advance_leaf(page, next_id, prev_expected)
+                if nxt is None:
+                    page = None  # _advance_leaf 已 unpin
                     return
-                current = page
-                page = None
-                self._bp.unpin(current.page_id)
-                page = self._bp.fetch_page(next_id)
+                prev_expected = cur_id
+                page = nxt
+                keys, rids, next_id = self._leaf_page_view(page, None)
+                if last_key is not None:
+                    cut = bisect.bisect_right(keys, last_key)
+                    keys, rids = keys[cut:], rids[cut:]
         finally:
             if page is not None:
                 self._bp.unpin(page.page_id)
