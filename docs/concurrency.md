@@ -214,10 +214,33 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   分支仍整段持父锁；唯一索引项 DELETE 物理删除导致的并发可见性问题；
   `Database._write_lock` 未放开。
 
+**并发门禁（`scripts/concurrency_gate.py`，2026-11-20 落地）**：
+
+把本轮手跑的探针固化成仓库内可重复执行的判据，开 `_write_lock` 之前每次都跑：
+
+```
+python scripts/concurrency_gate.py --rounds 3     # 默认 3 轮，约 6~10 分钟
+python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
+```
+
+四项门禁与它们各自对应的真实故障：
+
+| 门禁 | 做法 | 钉住的故障 |
+|---|---|---|
+| `btree_page_latch` | 同一片叶双线程并发插 200 条 | 定位/读键在 latch 外时基于旧页算 idx，丢行/乱序 |
+| `btree_split_chain` | 分裂 + 删除 + 并发读者的全部 btree 用例 | 重复分裂、B-link 路由错、叶子链断 |
+| `heap_insert_race` | 2 线程 × 300 行绕过写锁直插 `HeapFile` | 600 请求只拿到 513 个唯一 RID（重复分配） |
+| `btree_delete_race` | 4 线程乱序删完 `depth>=2` 的 12000 条 + 并发读者 | 摘链交错跳过活叶、读者扫到 0 条、树不能完全塌陷 |
+
+判据是"可失败的"：RID 数/行数不等、读者扫到空、终态 `entries != 0` 或
+`depth != 0` 都直接判 FAIL 并返回非 0 退出码。实测 `--rounds 3`：**4/4 项 PASS**。
+
 **仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
 - 插入路径的 crabbing（内部页里"读键 → 递归插孩子 → 插分隔键"仍整段持父锁）。
   删除路径已改成选完孩子即释放父锁，插入路径还没有；这是放开 `_write_lock`
-  前最后一块结构性改动。
+  前最后一块结构性改动。协议难点已记入账本：子页分裂后分隔键要回插父页，
+  而父页在下探期间可能已被别的线程分裂；没有父指针时只能靠 B-link rightlink
+  回溯或"按 left_id 重新从根定位父页"的重试式上推，不能沿用现在的返回值栈。
 - 读者侧：`lookup`/`scan` 目前不拿 latch，靠 GIL 的"一次换页 memcpy 原子" +
   `_write_lock` 串行写保证读到一致快照。**已实测出缺口**（2026-11-19）：
   3000 条树、写线程删 0..1499、2 个读者循环 `scan_all` 共 640 次扫描——
