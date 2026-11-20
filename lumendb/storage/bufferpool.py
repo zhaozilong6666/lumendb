@@ -79,6 +79,12 @@ class BufferPoolManager:
         self._undo: dict[int, list[tuple[int, int, bytes]]] = {}
         # 新分配、尚未写入 WAL 的页；第一次更新时先记一条完整页镜像。
         self._fresh_pages: set[int] = set()
+        # page_id -> 单调版本号：任何一次内容变化（写日志、新分配、从磁盘换入）
+        # 都 +1。B+ 树的内部页解码缓存用它当键的一部分——不能拿 pageLSN 当键：
+        # 页被换出再换入后 pageLSN 归零，缓存里 (页号, 0) 的旧条目会一直命中，
+        # 按旧分隔键路由（实测：父页已收下新孩子，缓存仍回旧 children）。
+        self._page_versions: dict[int, int] = {}
+        self._version_seq = 0
         self.stats = BufferPoolStats()
 
     # -- 查询状态 -----------------------------------------------------------
@@ -102,6 +108,15 @@ class BufferPoolManager:
 
     def is_dirty(self, page_id: int) -> bool:
         return page_id in self._dirty
+
+    def page_version(self, page_id: int) -> int:
+        """页内容的单调版本号（0 = 从未被读过/写过）。供解码缓存做失效键。"""
+        with self._lock:
+            return self._page_versions.get(page_id, 0)
+
+    def _bump_version(self, page_id: int) -> None:
+        self._version_seq += 1
+        self._page_versions[page_id] = self._version_seq
 
     # -- 获取 / 释放 --------------------------------------------------------
 
@@ -128,6 +143,7 @@ class BufferPoolManager:
             page = Page(page_id, raw)
             self._frames[page_id] = page
             self._pins[page_id] = 1
+            self._bump_version(page_id)
             return page if page_cls is Page else page.view(page_cls)
 
     def new_page(self, page_cls: type[Page] = Page) -> Page:
@@ -141,6 +157,7 @@ class BufferPoolManager:
             self._pins[page_id] = 1
             self._dirty.add(page_id)
             self._fresh_pages.add(page_id)
+            self._bump_version(page_id)
             return page if page_cls is Page else page.view(page_cls)
 
     def unpin(self, page_id: int, *, dirty: bool = False) -> None:
@@ -185,6 +202,7 @@ class BufferPoolManager:
             )
             page.page_lsn = lsn
             self._dirty.add(page.page_id)
+            self._bump_version(page.page_id)
             if not clr:
                 self._undo.setdefault(xid, []).append(
                     (page.page_id, offset, bytes(old))

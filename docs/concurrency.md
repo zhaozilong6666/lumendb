@@ -210,9 +210,50 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   `{depth:0, entries:0, pages:1}` 且 `check_invariants` 通过。
 - 回归用例 `test_concurrent_adjacent_deletes_keep_leaf_chain`（4000 条长键、
   4 线程、断言叶子链与 depth>=2）连跑 3/3；全量 **1386 passed**。
-- 仍未做：写入路径（分裂回插分隔键）的 crabbing——`_insert_recursive` 内部页
-  分支仍整段持父锁；唯一索引项 DELETE 物理删除导致的并发可见性问题；
-  `Database._write_lock` 未放开。
+- 仍未做：唯一索引项 DELETE 物理删除导致的并发可见性问题；
+  `Database._write_lock` 未放开。插入路径的 crabbing 已在下一节落地。
+
+**插入 crabbing 已落地（2026-11-20，Step 4 后半段①的收口）**：
+
+`insert` 不再用"返回值栈"（父页 latch 内递归孩子、孩子把 `(sep,right)` 返给还持
+着父页的调用者），改为**重试式上推**：
+
+- 下行：`_insert_owned` 持父页 latch 选孩子 → `fetch + latch` 子页 → 释放父页，
+  递归进子页；叶子层在叶 latch 内判断 high key，越界就释放、沿 `next` 右移。
+- 叶分裂：`_leaf_insert_or_split` 返回 `(left_id, sep, right_id)`。分裂需要叶链
+  指针手术时**先释放叶 latch 再取 `_link_lock`**（锁序链锁 → 页 latch），重新
+  取锁后**再判一次 high key**：若本键已越过本页 high key（说明这页在让锁窗口里
+  被别人分裂成了左半），返回哨兵 `_REDIRECT`，调用方沿链右移重试。少了这一判，
+  本应进右页的键会写进左半（实测现场：`L488 n=7 [11/4.11..13/2.13] high=13/0.13`）。
+- 上推：`_install_sep` 不信任下行时的旧下标，`_locate_parent(left_id, sep)` 从
+  **当前** `root_page` 重新下探找 `children` 含 `left_id` 的内部页；latch 后若
+  `left_id not in children`（父页已被并发分裂）就重新定位；插入位置按
+  `bisect_left(keys, sep)` 定，**不用 `children.index(left_id)`**——左半页在
+  "装分隔键"之前可能又被分裂过一次，旧下标会指向旧边界。装不下就
+  `_split_internal` 后把 `left_id/sep/right_id` 换成父页自己的 `(P, sep2, right2)`
+  继续上推；`root_page == left_id` 时在 `_root_lock` 内建新根。
+- 修掉的三个实测 bug：①surplus 不带分裂页身份，父页按旧 `child_id` 装错位置
+  （报"页 553 的键不小于上界"）；②用旧下标定位（报"页 494 的键不小于上界"）；
+  ③重新取锁后不判 high key（上述 `_REDIRECT` 场景）。
+
+**顺带修掉的缓存失效 bug（内部页解码缓存）**：
+
+- 现象：`test_internal_cache_*` / `test_plan_cache` / 三例 lookup 报
+  "索引 idx_id 找不到页 32 的父页"，而父页 31 实际已收下 32。
+- 根因：缓存键是 `(页号, pageLSN)`，页被换出再换入后 `page_lsn` 归零，缓存里
+  `(31, 0)` 的旧条目**永久命中**，按旧 `children` 路由（插桩证据：`kids=[29,30]`
+  vs `fresh_kids=[29,30,32]`）。改"LSN=0 不缓存"也不行——该场景页 LSN 长期为 0，
+  缓存彻底不填（`assert db.executor._internal_page_cache` 得 `{}`，也丢掉 +29% 收益）。
+- 正解：`BufferPoolManager` 维护**单调页版本号** `page_version(page_id)`，在
+  `log_page_update`、`fetch_page` miss（换入）、`new_page` 三处 bump；缓存键改为
+  `(页号, pageLSN, 页版本号)`。页号复用不会撞旧条目，因为新页一分配版本就变。
+- DDL 收口：`Executor.run` 的 `finally` 里对 schema 变更语句整体清空缓存。只靠
+  `_tree_for` 的版本比对会漏——索引构建过程已把缓存喂满、版本号也拉到新值，
+  事后不再清（`test_internal_cache_cleared_on_ddl` 钉住）。
+
+- 实测：`test_btree.py + test_btree_page_latch.py` 22 passed、
+  `test_btree_split_crab.py` 11 passed；压测探针（2000 长键 + 4 线程 × 200 插入）
+  5/5 轮 `errors []`、不变量 `depth 4 / entries 2800`；全量 **1386 passed**（4m40s）。
 
 **并发门禁（`scripts/concurrency_gate.py`，2026-11-20 落地）**：
 
@@ -223,24 +264,26 @@ python scripts/concurrency_gate.py --rounds 3     # 默认 3 轮，约 6~10 分�
 python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
 ```
 
-四项门禁与它们各自对应的真实故障：
+五项门禁与它们各自对应的真实故障：
 
 | 门禁 | 做法 | 钉住的故障 |
 |---|---|---|
 | `btree_page_latch` | 同一片叶双线程并发插 200 条 | 定位/读键在 latch 外时基于旧页算 idx，丢行/乱序 |
 | `btree_split_chain` | 分裂 + 删除 + 并发读者的全部 btree 用例 | 重复分裂、B-link 路由错、叶子链断 |
 | `heap_insert_race` | 2 线程 × 300 行绕过写锁直插 `HeapFile` | 600 请求只拿到 513 个唯一 RID（重复分配） |
+| `btree_insert_crab` | 2000 长键预置 `depth>=2` 树 + 4 线程 × 200 插入 | 上推时用旧下标装错分隔键、丢条目、键序越界 |
 | `btree_delete_race` | 4 线程乱序删完 `depth>=2` 的 12000 条 + 并发读者 | 摘链交错跳过活叶、读者扫到 0 条、树不能完全塌陷 |
 
-判据是"可失败的"：RID 数/行数不等、读者扫到空、终态 `entries != 0` 或
-`depth != 0` 都直接判 FAIL 并返回非 0 退出码。实测 `--rounds 3`：**4/4 项 PASS**。
+判据是"可失败的"：RID 数/行数不等、读者扫到空、条目数不等、终态 `entries != 0`
+或 `depth != 0` 都直接判 FAIL 并返回非 0 退出码。实测 `--rounds 3`：**5/5 项 PASS**。
 
 **仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
-- 插入路径的 crabbing（内部页里"读键 → 递归插孩子 → 插分隔键"仍整段持父锁）。
-  删除路径已改成选完孩子即释放父锁，插入路径还没有；这是放开 `_write_lock`
-  前最后一块结构性改动。**协议草案见下节**，实现前先照它写测试。
+- 唯一索引项的 DELETE 物理删除 → 并发读者走索引扫描会漏掉"未提交删除仍应可见"
+  的旧版本行（键锁只防重复键，不解决读可见性）。正解：索引项随 VACUUM 延迟回收，
+  唯一性按 heap 可见性判 rid，不在 DELETE 当场物理摘除。
+- 物理 undo 不按事务区分子节区间，"没有两个事务写同一字节区间"的前提未满足。
 
-### 插入 crabbing 的协议草案（未实现，先定契约）
+### 插入 crabbing 的协议（已按此实现，保留作契约）
 
 现在的插入是"返回值栈"：`_insert_recursive` 在父页 latch 内递归孩子，孩子分裂
 就把 `(sep, right_id)` 返回给这一层，由**还持着父页**的调用者插分隔键。要让
@@ -304,8 +347,10 @@ fetch 下一页并在同一临界区里校验 `next.prev == 当前页号`，这�
 
 1. `_scan_head`：把"校验链首"和"读首页内容"合并重试——链首必须有键
    （整棵空树除外）。空页不可能是扫描起点，它要么正被摘除（next 可能还没清
-   零，读下去就 0 条），要么是刚建出来还没落键的过渡态。重试耗尽时持**根页
-   latch** 兜底（写者的插入/删除在内部页分支里整段持锁，此刻结构静止）。
+   零，读下去就 0 条），要么是刚建出来还没落键的过渡态。重试耗尽时**不再**指望
+   "持根锁即结构静止"（插入/删除两条写路径都已 crabbing，父锁在下探时就放了），
+   改为重试到拿到非空链首、或 `_tree_is_empty()` 确认整棵树为空；只有预算耗尽
+   且树仍非空才抛 `BTreeInvariantError`。
 2. `_advance_leaf(page, next_id, prev_expected)`：跳页前用**期望前驱**校验
    `next.prev == 当前页号`；不一致说明 next 已陈旧，重读当前页 next 改道；
    若当前页自己已被摘空（prev/next 双清零），退到 `prev_expected` 读它**当前**
@@ -321,10 +366,10 @@ fetch 下一页并在同一临界区里校验 `next.prev == 当前页号`，这�
 5. 点查 `lookup` 也补了跨页去重：页被分裂时同一 RID 不再被重复计入
    （否则唯一索引会把并发分裂误判成"重复键"）。
 
-**剩余（Step 4 后半段）**：删除路径的真 crabbing 已落地（选完孩子即释放父锁 +
-叶链 `_link_lock`，见下节）；插入路径仍是「整段持父锁」；放开
-`Database._write_lock` 之前还要给 HeapPage / 目录页做同样的锁纪律
-（见上文 L2 的四条原因）。
+**剩余（Step 4 后半段）**：删除与插入两条写路径的真 crabbing 都已落地（选完
+孩子即释放父锁 + 叶链 `_link_lock` + 重试式上推）；放开 `Database._write_lock`
+之前还要给 HeapPage / 目录页做同样的锁纪律（见上文 L2 的四条原因），并处理
+唯一索引项 DELETE 的可见性缺口。
 
 验证：
 - `tests/unit/test_btree_page_latch.py::test_concurrent_leaf_inserts_keep_order_and_count`

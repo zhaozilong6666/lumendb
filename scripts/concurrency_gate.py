@@ -149,6 +149,50 @@ def _probe_btree_delete_race(db: Database) -> dict:
     }
 
 
+def _probe_btree_insert_crab(db: Database) -> dict:
+    """4 线程并发插相交长键，触发叶/内部页/根分裂（插入 crabbing 的核心场景）。"""
+    tree = BPlusTree(
+        db.bp, KeyCodec([TypeSpec(DataType.VARCHAR, 512)]), unique=False, name="idx"
+    )
+
+    def long_key(i: int) -> str:
+        return "k" + "x" * 400 + f"{i:05d}"
+
+    t0 = db.txns.begin()
+    for i in range(2000):
+        tree.insert(t0, (long_key(i),), (0, i))
+    db.txns.commit(t0)
+    base = tree.check_invariants()
+
+    threads, per = 4, 200
+    errors: list[str] = []
+    barrier = threading.Barrier(threads)
+
+    def worker(wid: int) -> None:
+        try:
+            txn = db.txns.begin()
+            barrier.wait(timeout=10)
+            for i in range(per):
+                tree.insert(txn, (long_key(i),), (wid + 1, i))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"w{wid}: {type(exc).__name__}: {exc}")
+
+    workers = [threading.Thread(target=worker, args=(w,)) for w in range(threads)]
+    for th in workers:
+        th.start()
+    for th in workers:
+        th.join(timeout=180)
+
+    post = tree.check_invariants()
+    return {
+        "errors": errors[:3],
+        "pre": base,
+        "post": post,
+        "expect_entries": base["entries"] + threads * per,
+    }
+
+
 # ----------------------------------------------------------------------
 # pytest 组
 # ----------------------------------------------------------------------
@@ -213,6 +257,11 @@ def _probe_failed(name: str, detail: dict) -> bool:
         if post["entries"] != 0 or post["depth"] != 0:
             return True
         return detail["final_rows"] != 0 or detail["scans"] == 0
+    if name == "btree_insert_crab":
+        post = detail["post"]
+        if post["entries"] != detail["expect_entries"]:
+            return True
+        return post["depth"] < 2  # 本场景必须造出多层树，否则没测到内部页/根分裂
     return False
 
 
@@ -225,6 +274,11 @@ def _build_heap(tmp: pathlib.Path):
 def _build_btree(tmp: pathlib.Path):
     db = Database(tmp, checkpoint_wal_bytes=0)
     return db, _probe_btree_delete_race(db)
+
+
+def _build_insert_crab(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0)
+    return db, _probe_btree_insert_crab(db)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -243,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{'PASS' if ok else 'FAIL'}", flush=True)
 
     for name, build in (("heap_insert_race", _build_heap),
+                        ("btree_insert_crab", _build_insert_crab),
                         ("btree_delete_race", _build_btree)):
         res = _check_probe(name, build, rounds, name)
         checks.append(res)

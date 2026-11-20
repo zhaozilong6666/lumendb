@@ -208,9 +208,9 @@ class Executor:
         #: 把新对象的 ``id`` 误当成旧计划。
         self._plan_cache: dict[tuple[int, int], tuple] = {}
         self._plan_cache_limit = 256
-        #: B+ 树内部页解码缓存（跨语句共享）：(页号, pageLSN) -> (keys, children)。
+        #: B+ 树内部页解码缓存（跨语句共享）：(页号, pageLSN, 页版本号) -> (keys, children)。
         #: DDL 改变 schema_version 时整体清空：页号可能被新索引复用。
-        self._internal_page_cache: dict[tuple[int, int], tuple] = {}
+        self._internal_page_cache: dict[tuple[int, int, int], tuple] = {}
         self._internal_cache_version = -1
         self.binder = self._new_binder()
 
@@ -328,6 +328,12 @@ class Executor:
             )
         finally:
             self._txn = None
+            if type(stmt) in _SCHEMA_CHANGING_STATEMENTS:
+                # DDL 结束（无论成败）后页号可能被复用或替换，内部页解码缓存
+                # 整体作废。只靠 `_tree_for` 里的版本比对不够：索引构建过程中
+                # 缓存已经被喂进新条目、版本号也被拉到新值，事后就不会再清。
+                self._internal_page_cache.clear()
+                self._internal_cache_version = self._catalog.schema_version
 
     # ------------------------------------------------------------------
     # 查询

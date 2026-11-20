@@ -99,6 +99,11 @@ class _NodeOverflow(Exception):
     """内部信号：序列化后超出页容量，需要分裂。"""
 
 
+#: ``_leaf_insert_or_split`` 的哨兵返回值：本次要插的键已经越过本页 high key，
+#: 调用方应沿 next 右移重试（而不是把键硬插进已经分裂成左半的页）。
+_REDIRECT = object()
+
+
 class KeyCodec:
     """索引键 = 列值 + RID，编码后保持字典序。"""
 
@@ -355,15 +360,32 @@ class BPlusTree:
 
     def _leaf_insert_or_split(
         self, txn: Transaction, page: Page, key: tuple, rid: RID
-    ) -> Optional[Tuple[tuple, int]]:
+    ):
         """在叶内插入；空间不够时在同一页 latch 内分裂。
 
         "发现满 → 读页 → 分裂"必须发生在同一个 latch 内：若 `_leaf_insert_at`
         释放 latch 后再分裂，两个线程会各自基于同一份旧页分裂，各建一个右页
         并重写本叶，导致丢行 / 叶子链断裂。返回 ``None`` 表示已插入/已存在；
-        返回 ``(sep_key, right_id)`` 表示本叶已分裂，调用方需把分隔键插入父页。
+        返回 ``(sep_key, right_id)`` 表示本叶已分裂，调用方需把分隔键插入父页；
+        返回 ``_REDIRECT`` 表示 key 已越过本页 high key，调用方应沿 next 右移。
+
+        为什么要返回 ``_REDIRECT``：调用方判 high key 是"上一次持锁时"的事，
+        中间可能释放过 latch；若这段时间本页被别的线程分裂，再持锁重插就会把
+        本该进右页的键硬塞进左半（实测：`页 488 high=13.0` 却装着 `13.2`，
+        最终撞「键不小于上界」）。所以每次重新拿锁都要再判一次 high key。
         """
+
+        def _check_high() -> bool:
+            high = self._leaf_high_key(page)
+            return (
+                high is not None
+                and key >= high
+                and page.next_page != INVALID_PAGE_ID
+            )
+
         with page.latch:
+            if _check_high():
+                return _REDIRECT
             idx = self._leaf_insert_at(txn, page, key, rid)  # RLock 重入本页 latch
             if idx is None:
                 return None
@@ -376,6 +398,8 @@ class BPlusTree:
         # 摘叶改写前后邻居 next-prev），是低频操作，代价可接受。
         with self._link_lock:
             with page.latch:
+                if _check_high():
+                    return _REDIRECT  # 这段窗口里本页被分裂了
                 idx = self._leaf_insert_at(txn, page, key, rid)
                 if idx is None:
                     return None
@@ -462,7 +486,7 @@ class BPlusTree:
         cache = self._internal_cache
         if cache is None:
             return self._read_internal(page)
-        key = (page.page_id, page.page_lsn)
+        key = (page.page_id, page.page_lsn, self._bp.page_version(page.page_id))
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -640,7 +664,11 @@ class BPlusTree:
             return keys, rids, page.next_page, page.prev_page
 
     def _snapshot_internal(self, page: Page) -> Tuple[list, list, Optional[tuple], int]:
-        """内部页的整页一致快照（键/孩子/high key/next），锁语义同 ``_snapshot_leaf``。"""
+        """内部页的整页一致快照（键/孩子/high key/next），锁语义同 ``_snapshot_leaf``。
+
+        缓存键带缓冲池的页版本号，页内容一变（写日志 / 重新换入）就天然失效，
+        所以结构判断也能安全走缓存。
+        """
         with page.latch:
             keys, children, high_key = self._read_internal_cached(page)
             return list(keys), list(children), high_key, page.next_page
@@ -797,85 +825,109 @@ class BPlusTree:
             # 插入，否则本次 key 会被静默丢弃（丢最左叶最小键）。
 
         # 普通插入不碰根锁；只有触发根分裂时才拿锁，锁内重读 root_page，
-        # 发现别的线程已经分裂过根就重试（乐观 + 重试，避免串行化所有插入）。
-        while True:
-            root_before = self.root_page
-            split = self._insert_recursive(txn, root_before, key, rid)
-            if split is None:
-                return
-            with self._root_lock:
-                if self.root_page != root_before:
-                    continue  # 根已被别的线程分裂，本次 split 基于过期根，重试
-                sep_key, right_id = split
-                new_root = self._bp.new_page(Page)
-                try:
-                    self._init_internal(new_root)
-                    self._commit_page(
-                        txn,
-                        new_root,
-                        self._encode_internal(
-                            new_root.page_id,
-                            [sep_key],
-                            [root_before, right_id],
-                            INVALID_PAGE_ID,
-                            INVALID_PAGE_ID,
-                        ),
-                    )
-                    self.root_page = new_root.page_id
-                finally:
-                    self._bp.unpin(new_root.page_id, dirty=True)
-                return
+        # 发现别的线程已经分裂过根就把 surplus 装进**新根**（不能直接丢弃：
+        # 丢弃等于让刚分裂出的右半页不可达 = 丢行）。
+        left_id = self.root_page
+        surplus = self._insert_recursive(txn, left_id, key, rid)
+        if surplus is not None:
+            # 正常路径下每层帧自己就把分隔键装好了；这里只兜底（例如根页被
+            # 并发分裂后 left_id 已不是根，需要重新定位父页）。
+            self._install_sep(txn, *surplus)
 
-    def _insert_recursive(
-        self, txn: Transaction, page_id: int, key: tuple, rid: RID
-    ) -> Optional[Tuple[tuple, int]]:
-        while True:
-            page = self._bp.fetch_page(page_id)
-            if self._is_leaf(page):
-                with page.latch:
-                    high_key = self._leaf_high_key(page)
-                    if (
-                        high_key is not None
-                        and key >= high_key
-                        and page.next_page != INVALID_PAGE_ID
-                    ):
-                        # B-link：叶子分裂后本页已是左半，key 归右兄弟，沿 next
-                        # 右移后重试。若不判，key 会被错插进左叶（漏分右半键）。
-                        page_id = page.next_page
-                        self._bp.unpin(page.page_id, dirty=True)
-                        continue
-                    # 插入/分裂都在 `_leaf_insert_or_split` 的同一页 latch 内完成
-                    result = self._leaf_insert_or_split(txn, page, key, rid)
-                self._bp.unpin(page_id, dirty=True)
-                return result
+    def _locate_parent(self, left_id: int, sep: tuple) -> Optional[int]:
+        """按 ``sep`` 从当前根下探，找 ``children`` 里含 ``left_id`` 的内部页。
 
-            # 内部页：持 latch 完成"读键 → 递归插孩子 → 插分隔键 / 分裂"。
-            # 两个线程同时往同一内部页插分隔键时会各自基于同一份旧 keys 覆盖，
-            # 丢分隔键 = 丢子树 = 丢行；锁序保持 父页 → 子页 → 叶 → 后继 单向，
-            # 且 `_commit_page`/`_split_internal` 会重入本页 latch（RLock）。
-            with page.latch:
-                keys, children, high_key = self._read_internal(page)
+        为什么按 sep 走：``sep`` 是被分裂出来的右半页的最小键，路由到右半页
+        所在的父页；那个父页的 children 里同时有 ``left_id``（左半页）。到每一
+        层先查 ``left_id in children``，命中即父页，未命中才按 key 下行。
+        返回页号（不持 latch——调用方要重新 fetch + latch 后再校验，避免 TOCTOU）。
+        """
+        if self.root_page == INVALID_PAGE_ID:
+            return None
+        page = self._bp.fetch_page(self.root_page)
+        hops = 0
+        try:
+            while not self._is_leaf(page):
+                hops += 1
+                if hops > 256:
+                    return None
+                keys, children, high_key, next_id = self._snapshot_internal(page)
+                if left_id in children:
+                    return page.page_id
                 if (
                     high_key is not None
-                    and key >= high_key
-                    and page.next_page != INVALID_PAGE_ID
+                    and sep >= high_key
+                    and next_id != INVALID_PAGE_ID
                 ):
-                    # B-link：key 越过本页上界，沿 next 右移后重试。并发下本页
-                    # 可能已被别的线程分裂成左半，若仍按 keys 二分会把 key 路由
-                    # 到左半最右孩子（错）。
-                    page_id = page.next_page
-                    self._bp.unpin(page.page_id, dirty=True)
+                    nxt = next_id
+                    self._bp.unpin(page.page_id)
+                    page = self._bp.fetch_page(nxt)
                     continue
+                child_id = children[self._child_index(keys, sep)]
+                self._bp.unpin(page.page_id)
+                page = self._bp.fetch_page(child_id)
+            return None
+        finally:
+            self._bp.unpin(page.page_id)
 
-                idx = self._child_index(keys, key)
-                split = self._insert_recursive(txn, children[idx], key, rid)
-                if split is None:
-                    self._bp.unpin(page_id, dirty=True)
+    def _install_sep(
+        self, txn: Transaction, left_id: int, sep: tuple, right_id: int
+    ) -> None:
+        """把 ``(sep, right_id)`` 装到 ``left_id`` 的父页；父页溢出就继续往上装。
+
+        一律按 ``left_id`` **页号**重新定位父页，绝不用下探时的旧下标——下探
+        期间父页可能已被别的线程分裂，`children.index(old_idx)` 会摘错/插错。
+        """
+        for _ in range(32):
+            if self.root_page == left_id:
+                # left_id 仍是根：建新根，整棵树长高一层
+                with self._root_lock:
+                    if self.root_page != left_id:
+                        continue  # 根已被别的线程分裂，重新定位
+                    new_root = self._bp.new_page(Page)
+                    try:
+                        self._init_internal(new_root)
+                        self._commit_page(
+                            txn,
+                            new_root,
+                            self._encode_internal(
+                                new_root.page_id,
+                                [sep],
+                                [left_id, right_id],
+                                INVALID_PAGE_ID,
+                                INVALID_PAGE_ID,
+                            ),
+                        )
+                        self.root_page = new_root.page_id
+                    finally:
+                        self._bp.unpin(new_root.page_id, dirty=True)
                     return None
 
-                sep, right_id = split
-                keys.insert(idx, sep)
-                children.insert(idx + 1, right_id)
+            parent_id = self._locate_parent(left_id, sep)
+            if parent_id is None:
+                raise BTreeInvariantError(
+                    f"索引 {self.name} 找不到页 {left_id} 的父页",
+                    detail=f"sep={tuple(sep)!r}",
+                )
+            page = self._bp.fetch_page(parent_id)
+            page.latch.acquire()
+            held = True
+            try:
+                keys, children, high_key = self._read_internal(page)
+                if left_id not in children:
+                    continue  # 父页已被并发分裂，重新定位（finally 会解锁）
+                # **按 sep 的键序定位，不用 left_id 的下标**：left_id 这一页在
+                # 我们装分隔键之前可能又被分裂过一次（left 又分裂出 R2），此时
+                # "children.index(left_id)" 指的是旧边界，会把 right 插到 R2 的
+                # 左边，形成 children=[L,R,R2] 而 keys 顺序却是 [R2sep,Rsep] ——
+                # 实测就是这样撞出「页 494 的键不小于上界」。
+                pos = bisect.bisect_left(keys, sep)
+                if pos < len(keys) and keys[pos] == sep:
+                    # 同一个 (sep,right) 已经装过（并发重试），幂等返回
+                    if right_id in children:
+                        return None
+                keys.insert(pos, sep)
+                children.insert(pos + 1, right_id)
                 try:
                     self._commit_page(
                         txn,
@@ -885,11 +937,113 @@ class BPlusTree:
                             page.prev_page, high_key,
                         ),
                     )
-                    result = None
+                    return None
                 except _NodeOverflow:
-                    result = self._split_internal(txn, page, keys, children)
-                self._bp.unpin(page_id, dirty=True)
-                return result
+                    new_sep, new_right = self._split_internal(txn, page, keys, children)
+                    left_id, sep, right_id = page.page_id, new_sep, new_right
+                    continue
+            finally:
+                if held:
+                    page.latch.release()
+                self._bp.unpin(page.page_id, dirty=True)
+        raise BTreeInvariantError(
+            f"索引 {self.name} 插分隔键时父页持续变化，重试 32 次未收敛"
+        )
+
+    def _insert_recursive(
+        self, txn: Transaction, page_id: int, key: tuple, rid: RID
+    ) -> Optional[Tuple[int, tuple, int]]:
+        """从 ``page_id`` 下行插入；本函数不持有任何 latch。
+
+        返回 ``(分裂页号, sep, right_id)`` 表示这一页分裂了——调用方必须按
+        **分裂页号**（而不是自己下探时选的孩子页号）定位父页装分隔键。
+        """
+        page = self._bp.fetch_page(page_id)
+        page.latch.acquire()
+        return self._insert_owned(txn, page, key, rid)
+
+    def _insert_owned(
+        self, txn: Transaction, page: Page, key: tuple, rid: RID
+    ) -> Optional[Tuple[int, tuple, int]]:
+        """``page.latch`` 已由调用方 acquire 一次；本函数负责最终 release + unpin。
+
+        **latch crabbing**：拿到孩子页 latch 之后立刻释放父页 latch，只在
+        "回到本页装分隔键 / 本页自己分裂"时才重新拿回来。这样不同子树上的
+        插入（含各自的分裂）可以并行，父页只被短暂占用。
+
+        锁序：每次都是"先拿子、再放父"，重新拿父时子锁已释放，**不存在子→父**
+        路径；``_link_lock`` 只在叶分裂的指针手术里取（见 `_leaf_insert_or_split`，
+        它要求调用方不持页 latch）。
+        """
+        held = True
+        try:
+            while True:
+                if self._is_leaf(page):
+                    high_key = self._leaf_high_key(page)
+                    if (
+                        high_key is not None
+                        and key >= high_key
+                        and page.next_page != INVALID_PAGE_ID
+                    ):
+                        # B-link：key 归右兄弟（本页已是分裂后的左半）
+                        nxt = page.next_page
+                        page.latch.release()
+                        held = False
+                        self._bp.unpin(page.page_id, dirty=True)
+                        page = self._bp.fetch_page(nxt)
+                        page.latch.acquire()
+                        held = True
+                        continue
+                    # 叶分裂要拿 _link_lock（锁序：链锁 → 页 latch），所以先放掉
+                    # 本页 latch 再交给 `_leaf_insert_or_split` 自己按序重取。
+                    page.latch.release()
+                    held = False
+                    result = self._leaf_insert_or_split(txn, page, key, rid)
+                    if result is None:
+                        return None
+                    if result is _REDIRECT:
+                        # 这段窗口里本页被分裂成左半：重新拿锁、回到循环顶部按
+                        # high key 沿 next 右移（本页 pin 还在，不用重新 fetch）。
+                        page.latch.acquire()
+                        held = True
+                        continue
+                    sep, right_id = result
+                    # surplus 必须带「到底哪一页分裂了」：B-link 右移后本帧操作的
+                    # 可能已不是调用方以为的那个孩子，父页装错位置就会把分隔键
+                    # 插到别的子树边界（实测：页 553 的键不小于上界）。
+                    return (page.page_id, sep, right_id)
+
+                keys, children, high_key = self._read_internal(page)
+                if (
+                    high_key is not None
+                    and key >= high_key
+                    and page.next_page != INVALID_PAGE_ID
+                ):
+                    nxt = page.next_page
+                    page.latch.release()
+                    held = False
+                    self._bp.unpin(page.page_id, dirty=True)
+                    page = self._bp.fetch_page(nxt)
+                    page.latch.acquire()
+                    held = True
+                    continue
+
+                child_id = children[self._child_index(keys, key)]
+                child = self._bp.fetch_page(child_id)
+                child.latch.acquire()  # 先拿到孩子，才允许放父
+                page.latch.release()
+                held = False
+                surplus = self._insert_owned(txn, child, key, rid)
+                if surplus is None:
+                    return None
+                # 孩子分裂：按「分裂页页号」重新定位父页装分隔键，装完（含向上
+                # 级联分裂/建新根）才返回，保证任何时刻都不会有半截不可达子树。
+                self._install_sep(txn, *surplus)
+                return None
+        finally:
+            if held:
+                page.latch.release()
+            self._bp.unpin(page.page_id, dirty=True)
 
     def _split_leaf(
         self, txn: Transaction, page: Page, keys: list, rids: list
