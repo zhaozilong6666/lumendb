@@ -34,6 +34,12 @@ jobs:
       - name: Run unit and crash tests
         run: python -m pytest tests -q
 
+      - name: Run tests (concurrent DML mode)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          LUMEN_CONCURRENT_DML: "1"
+        run: python -m pytest tests -q
+
       - name: Check context pack
         run: python -m tools.context_pack check
 

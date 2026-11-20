@@ -73,6 +73,13 @@ class Transaction:
     #: 提交失败后要靠这个标记区分"没持久化（必须回滚）"与"记录已落盘、
     #: 只是后续步骤失败（事实上已提交，不能 undo）"。
     commit_record_written: bool = False
+    #: 本事务是否已经把目录锁握到事务结束（DDL 必须如此：未提交的 schema
+    #: 变化不能被别的 DML 的目录快照写进磁盘）。并发 DML 的目录保存只做
+    #: 短锁，保存完立即释放。
+    catalog_hold: bool = False
+    #: 该事务是否进入"保存点物理回滚"模式（并发 DML 下由数据库门面置位）：
+    #: 事务持有写者锁、暂时关闭逻辑回滚，保证 ROLLBACK TO 能真正撤回。
+    physical_savepoint: bool = False
     #: DDL 的内存逆操作；abort 时逆序执行，页级 undo 由 WAL 负责。
     undo_log: list = field(default_factory=list)
     #: SAVEPOINT 栈；ROLLBACK TO 只撤销保存点之后的页/对象变更。

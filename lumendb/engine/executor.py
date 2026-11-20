@@ -181,12 +181,18 @@ class Executor:
         disk=None,
         locks: Optional[LockManager] = None,
         read_only: bool = False,
+        concurrent_dml: bool = False,
     ) -> None:
         self._bp = buffer_pool
         self._catalog = catalog
         self._txns = txns
         self._wal = wal
         self._locks = locks if locks is not None else LockManager()
+        #: 写并发模式：DML 不拿数据库写者锁，由行/键锁 + 页 latch 保护。
+        self._concurrent_dml = concurrent_dml
+        #: 当前语句是否是 DDL/schema 变更（目录锁要持有到事务结束、页回滚
+        #: 必须走物理路径）。run() 每条语句都重设。
+        self._schema_statement = False
         #: 只读副本标记。必须在执行器入口再拦一次：线协议会话直接调用
         #: ``Executor.run``，绕过了 ``Database._run`` 里的只读检查。
         self._read_only = read_only
@@ -225,6 +231,7 @@ class Executor:
         params: Optional[list[Any]] = None,
     ) -> Result:
         self._txn = txn
+        self._schema_statement = type(stmt) in _SCHEMA_CHANGING_STATEMENTS
         if self._read_only and type(stmt).__name__ not in _NON_WRITING_STATEMENTS:
             from ..errors import NotSupportedError
 
@@ -243,6 +250,11 @@ class Executor:
         # 否则上一条 WITH 的 CTE 会泄漏到下一句（曾经确实泄漏过）。
         self.binder = self._new_binder()
         self.binder.params = self._params
+        # DDL 必须能真正撤回（TRUNCATE/DROP 会在原地清空堆页），所以在这条
+        # schema 语句执行期间强制关闭"逻辑回滚"；DML 仍走逻辑路径。
+        _physical_undo = self._concurrent_dml and self._schema_statement
+        if _physical_undo:
+            self._bp._undo_override.value = False
         try:
             if isinstance(stmt, Query):
                 return self._select(stmt, txn)
@@ -327,6 +339,8 @@ class Executor:
                 hint="BEGIN / COMMIT / ROLLBACK 由会话层处理",
             )
         finally:
+            if _physical_undo:
+                self._bp._undo_override.value = None
             self._txn = None
             if type(stmt) in _SCHEMA_CHANGING_STATEMENTS:
                 # DDL 结束（无论成败）后页号可能被复用或替换，内部页解码缓存
@@ -430,16 +444,43 @@ class Executor:
         )
 
     def _persist_catalog(self, txn: Transaction) -> None:
-        """目录保存：短锁 + 整份落盘（目录是单根指针 + 页链）。"""
-        self._acquire_or_fail(
-            txn,
-            catalog_resource(),
-            LockMode.EXCLUSIVE,
-            "另一个事务正在保存目录",
-            "重试事务；目录保存是整链重写，必须独占",
-        )
-        self._catalog.mark_dirty()
-        self._catalog.persist(txn)
+        """目录保存：短锁 + 整份落盘（目录是单根指针 + 页链）。
+
+        并发写模式下 DML 的保存用**阻塞获取、保存完立即释放**：否则每个
+        发生过分裂的写事务会把目录锁握到提交，别的写者只能收 40001。
+        DDL 仍然持锁到事务结束。
+        """
+        hold = not self._concurrent_dml or txn.catalog_hold
+        if self._concurrent_dml and not hold:
+            self._locks.acquire(txn.xid, catalog_resource(), LockMode.EXCLUSIVE)
+        else:
+            self._acquire_or_fail(
+                txn,
+                catalog_resource(),
+                LockMode.EXCLUSIVE,
+                "另一个事务正在保存目录",
+                "重试事务；目录保存是整链重写，必须独占",
+            )
+        if self._schema_statement:
+            txn.catalog_hold = True
+            hold = True
+        try:
+            # 并发 DML 的目录页不能物理回滚：A 保存目录后回滚，旧镜像会把
+            # B 随后保存的新根一起抹掉，重启后整棵新子树失联。
+            if (
+                self._concurrent_dml
+                and not self._schema_statement
+                and not txn.physical_savepoint
+            ):
+                with self._bp.logical_undo_scope():
+                    self._catalog.mark_dirty()
+                    self._catalog.persist(txn)
+            else:
+                self._catalog.mark_dirty()
+                self._catalog.persist(txn)
+        finally:
+            if not hold:
+                self._locks.release(txn.xid, catalog_resource())
 
     def describe(self, stmt: Statement, params: Optional[list[Any]] = None) -> list[ColumnMeta]:
         """只绑定、不执行，返回语句的结果列。
@@ -2971,7 +3012,14 @@ class Executor:
                 if idx is not None:
                     idx.root_page = root_page
 
-        txn.undo_log.append(undo)
+        if not (
+            self._concurrent_dml
+            and not self._schema_statement
+            and not txn.physical_savepoint
+        ):
+            # 并发 DML 走逻辑回滚：页内容不回滚，根页指针也不能退回旧值，
+            # 否则会覆盖别的事务刚建好的新根。DDL / 保存点事务仍然要恢复。
+            txn.undo_log.append(undo)
         return state
 
     def _catalog_structure_fingerprint(self) -> tuple:
@@ -4596,6 +4644,10 @@ class Executor:
             unique=False,
             name=idx.name,
             internal_cache=self._internal_page_cache,
+            # 根页号跨语句共享：索引定义对象就是那个"根页单元"，根锁由目录
+            # 按索引共享；否则 A 分裂根后 B 用旧实例回写会覆盖新根。
+            root_cell=idx,
+            root_lock=self._catalog.index_root_lock(table.name, idx.name),
         )
 
     def _key_for(

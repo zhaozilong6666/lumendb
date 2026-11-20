@@ -300,9 +300,46 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
   下的读者可见性、同事务删后重插同键、活行重复键仍报 23505、未提交删除时插
   同键 40001、陈旧键点查/范围扫描、键改回原值不重复、VACUUM 回收后条目数回落。
 
-**仍未做**（Step 4 后半段剩余，放开 `_write_lock` 前必须完成）：
-- 物理 undo 不按事务区分子节区间，"没有两个事务写同一字节区间"的前提未满足。
-- HeapPage / 目录页的锁纪律（见上文 L2 的四条原因）。
+### 并发 DML 实验模式（`concurrent_dml=True`，默认关闭）
+
+默认模式仍是 `_write_lock` 串行所有写语句；`Database(concurrent_dml=True)`（或
+`LUMEN_CONCURRENT_DML=1`）切到真正的写并发路径，Step 4 的前置项在这条路径上落地：
+
+- **DML 不拿 `_write_lock`**：`Database._run_locked` / `PGWireServer._run_statement`
+  的普通写语句改走 `read_guard()`，只与 DDL 的 `exclusive_guard`、`close()` 互斥；
+  行/键锁与页 latch 负责写冲突。
+- **目录保存短锁**：DML 的 `_persist_catalog` 阻塞获取目录锁、保存完立即释放；
+  DDL 仍 `txn.catalog_hold=True` 持锁到事务结束，避免未提交 schema 被别的快照落盘。
+- **索引根页跨实例共享**：每语句新建的 `BPlusTree` 通过 `root_cell`（共享 `IndexDef`）
+  直读/直写根页号，`Catalog.index_root_lock()` 提供全库同索引根锁；否则 A 分裂根后
+  B 用旧实例回写会覆盖新根，整棵子树失联（实测 800 行只落 122/48）。
+- **逻辑回滚**：并发 DML 的 HEAP / BTREE 页不记物理 undo，死行/陈旧索引项靠
+  xmin/xmax 可见性与 VACUUM 回收；WAL `PAGE_UPDATE` 用 `old_len=0xFFFF` 哨兵省略
+  before image，恢复时跳过。目录页在 DML 保存时也走逻辑（线程局部
+  `BufferPool.logical_undo_scope()`），避免 A 回滚把 B 随后保存的新根抹掉；
+  DDL 用 `_undo_override=False` 强制物理原像，保证 TRUNCATE/DROP 能真正撤回。
+- **保存点**：逻辑回滚无法撤回"保存点之后的 DML"，所以并发模式下第一次
+  `SAVEPOINT` 要求数据库里没有其它活跃事务（否则返回 `0A000`，不静默走危险
+  路径），随后该事务持有 `_write_lock` 到事务结束并临时关掉逻辑回滚
+  （`Transaction.physical_savepoint`）。正确性优先，代价是保存点事务存续期间
+  写串行。
+
+回归：
+- `tests/unit/test_concurrent_dml.py`（4 例：并发插入全提交、混合 DML + 半数回滚、
+  逻辑回滚不可见 + VACUUM 回收、并发删除与读者）；
+- `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
+  undo，已提交行完整、VACUUM 回收逻辑垃圾）；
+- `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
+  半回滚，校验行数/去重/索引不变量）。
+
+**仍未做 / 切默认模式前必须解决**：
+- 默认模式（`concurrent_dml=False`）仍是串行；把并发路径切成默认前，要补
+  HeapPage / 目录页在高并发下的锁纪律审计，并让 `LUMEN_CONCURRENT_DML=1` 全量
+  进入 CI 门禁（当前已手工跑绿 1400 例）。
+- 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）；要支持高并发保存点，
+  需要行级逻辑 undo log。
+- `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
+  基于 oldest-active-xmin 的水位。
 
 ### 插入 crabbing 的协议（已按此实现，保留作契约）
 

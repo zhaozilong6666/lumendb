@@ -311,3 +311,17 @@ class TestGroupCommit:
         assert len(flush_calls) < 8
         dm.close()
         wal.close()
+
+
+def test_page_update_no_undo_sentinel_roundtrip():
+    """逻辑回滚页：old_len=0xFFFF 哨兵，before image 整段省略。"""
+    payload = encode_page_update(
+        42, 16, b"", b"new-bytes", no_undo=True
+    )
+    page_id, offset, old, new = decode_page_update(payload)
+    assert (page_id, offset, new) == (42, 16, b"new-bytes")
+    assert old == b""
+    assert len(payload) == 8 + 2 + len(b"new-bytes")
+
+    normal = encode_page_update(7, 32, b"old", b"new")
+    assert decode_page_update(normal) == (7, 32, b"old", b"new")

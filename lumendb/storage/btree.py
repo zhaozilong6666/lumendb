@@ -143,15 +143,23 @@ class BPlusTree:
         unique: bool = False,
         name: str = "index",
         internal_cache: Optional[dict] = None,
+        root_cell: object | None = None,
+        root_lock: threading.RLock | None = None,
     ) -> None:
         self._bp = buffer_pool
         self.codec = codec
-        self.root_page = root_page
+        #: 根页号不能只存实例字段：执行器每条语句都会新建一棵 BPlusTree。
+        #: A 线程根分裂后把新根写回 IndexDef，B 线程随后用它**旧实例**里的
+        #: 根页号又写回，覆盖掉新根 → 整棵子树失联。传入 ``root_cell``
+        #: （通常是共享的 IndexDef 对象）后，root_page 变成直读/直写那个共享
+        #: 单元；``root_lock`` 也由目录按索引共享，跨实例串行根分裂。
+        self._root_cell = root_cell
+        self._root_value = root_page
         self.unique = unique
         self.name = name
         #: 根页号是整棵树的全局状态；根分裂（建新根）与根塌陷（降树高）都改它，
         #: 必须串行，否则两个线程同时建新根会把 `root_page` 后写覆盖、丢一棵子树。
-        self._root_lock = threading.RLock()
+        self._root_lock = root_lock or threading.RLock()
         #: 叶子链指针手术锁：分裂要改写左叶 next / 右叶 prev / 旧后继 prev，
         #: 摘叶要改写前驱 next / 后继 prev 并清零自身。两组操作若与相邻页的
         #: 另一组操作交错，会留下"跳过一片还在树上的叶"的断链（实测：四线程
@@ -166,6 +174,18 @@ class BPlusTree:
     # ------------------------------------------------------------------
     # 页结构
     # ------------------------------------------------------------------
+
+    @property
+    def root_page(self) -> int:
+        if self._root_cell is not None:
+            return getattr(self._root_cell, "root_page", INVALID_PAGE_ID)
+        return self._root_value
+
+    @root_page.setter
+    def root_page(self, page_id: int) -> None:
+        self._root_value = page_id
+        if self._root_cell is not None:
+            self._root_cell.root_page = page_id
 
     def _init_page(self, page: Page, page_type: PageType) -> None:
         page.buf[:] = bytes(PAGE_SIZE)
@@ -904,6 +924,15 @@ class BPlusTree:
                     return None
 
             parent_id = self._locate_parent(left_id, sep)
+            if parent_id is None:
+                # 并发根分裂：别的事务可能刚换了根，而本线程手里的树实例还没
+                # 看到（root_cell 共享后通常立刻可见）。短暂重试，避免把一次
+                # 正常的并发分裂误报成"子树失联"。
+                for _ in range(8):
+                    time.sleep(0.002)
+                    parent_id = self._locate_parent(left_id, sep)
+                    if parent_id is not None:
+                        break
             if parent_id is None:
                 raise BTreeInvariantError(
                     f"索引 {self.name} 找不到页 {left_id} 的父页",

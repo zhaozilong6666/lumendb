@@ -187,6 +187,7 @@ class PGWireServer:
                 try:
                     with self.database._write_lock:
                         self.database.txns.abort(session.txn)
+                        self.database._exit_savepoint_mode(session.txn)
                 except Exception:  # pragma: no cover
                     pass
                 session.txn = None
@@ -327,13 +328,18 @@ class PGWireServer:
                         session.engine().validate_deferred_unique_constraints(txn)
                     except BaseException:
                         database.txns.abort(txn)
+                        database._exit_savepoint_mode(txn)
                         raise
-                    database.txns.commit(txn)
-                    database.maybe_checkpoint()
+                    try:
+                        database.txns.commit(txn)
+                        database.maybe_checkpoint()
+                    finally:
+                        database._exit_savepoint_mode(txn)
                     result = Result(tag="COMMIT")
                 else:
                     # 失败事务里的 COMMIT 按 PostgreSQL 语义等价于 ROLLBACK
                     database.txns.abort(txn)
+                    database._exit_savepoint_mode(txn)
                     session.failed = False
                     result = Result(tag="ROLLBACK")
                 # 门户在事务结束时关闭；预处理语句仍然保留。
@@ -363,6 +369,7 @@ class PGWireServer:
                     raise StorageError("数据库已关闭")
                 if session.txn is None:
                     raise TransactionError("SAVEPOINT 必须在事务中执行")
+                database._enter_savepoint_mode(session.txn)
                 database.txns.savepoint(session.txn, statement.name)
                 return Result(tag="SAVEPOINT")
 
@@ -384,9 +391,16 @@ class PGWireServer:
                 # 结构性语句（VACUUM/TRUNCATE/shadow heap 重写）还要与在途
                 # 只读语句互斥：它们不拿写者锁，会扫到重排中的页。
                 guard = (
-                    database.exclusive_guard()
-                    if type(statement).__name__ in _STRUCTURAL_STATEMENTS
-                    else database._write_lock
+                    database.read_guard()
+                    if (
+                        database._concurrent_dml
+                        and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+                    )
+                    else (
+                        database.exclusive_guard()
+                        if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                        else database._write_lock
+                    )
                 )
                 with guard:
                     database.assert_writable()
@@ -410,9 +424,16 @@ class PGWireServer:
                 return result
 
         guard = (
-            database.exclusive_guard()
-            if type(statement).__name__ in _STRUCTURAL_STATEMENTS
-            else database._write_lock
+            database.read_guard()
+            if (
+                database._concurrent_dml
+                and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+            )
+            else (
+                database.exclusive_guard()
+                if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                else database._write_lock
+            )
         )
         with guard:
             if database._closed:

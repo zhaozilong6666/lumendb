@@ -106,6 +106,10 @@ class Catalog:
         self.dirty = False
         #: schema 形状版本：DDL 与副本重载目录时递增，供绑定计划缓存失效。
         self.schema_version = 0
+        #: (表名, 索引名) -> 根页锁。B+ 树是每语句新建的短命对象，根分裂的
+        #: 串行化必须挂在目录上才能跨实例共享；否则两个线程各拿一把实例锁，
+        #: 同时建新根并各自回写，后写者覆盖前者，子树失联。
+        self._index_root_locks: dict[tuple[str, str], threading.RLock] = {}
 
     @_locked
     def bump_schema(self) -> None:
@@ -115,6 +119,16 @@ class Catalog:
     @_locked
     def mark_dirty(self) -> None:
         self.dirty = True
+
+    @_locked
+    def index_root_lock(self, table_name: str, index_name: str) -> threading.RLock:
+        """返回某索引的根页锁（同库同名共享一把）。"""
+        key = (table_name, index_name)
+        lock = self._index_root_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            self._index_root_locks[key] = lock
+        return lock
 
     # ------------------------------------------------------------------
     # 加载 / 持久化

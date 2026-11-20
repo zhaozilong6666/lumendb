@@ -6,7 +6,13 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1395 passed。
+- 全量测试：1402 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+  用例也全绿）。
+- 并发 DML 实验模式已落地（`Database(concurrent_dml=True)`，默认关闭）：
+  DML 走 `read_guard` + 行/键锁 + 页 latch，目录保存短锁，索引根页跨语句
+  共享（`root_cell` + `Catalog.index_root_lock`），回滚走逻辑路径（WAL
+  `no_undo` 哨兵 + VACUUM 回收），DDL 仍物理可回滚；保存点事务靠独占写者
+  锁保证 `ROLLBACK TO` 正确性。详见 `docs/concurrency.md`。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
   标注；已接入 3–8 个逗号连接源的左深动态规划。
@@ -336,11 +342,13 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 见 `docs/replication-commit-index.md`，同步屏障/提升闸门已用
 `verified_commit_lsn` 独立验证，不做 match 表广播）；单事务超过一个复制批
 时 apply 的原子性（现为降级路径，彻底解决要索引项 MVCC）；写并发已降到
-"行/键/DDL 三级锁"（`09376cb`），但语句仍由 `_write_lock` 串行——真正放开写
-并发还需 B+ 树分裂/合并的多页 latch crabbing 再拿掉 `_write_lock`（叶页单页
-latch 已落地，见 `docs/concurrency.md`）；唯一索引项的 DELETE/UPDATE 已改为
+"行/键/DDL 三级锁"（`09376cb`），并新增 opt-in `concurrent_dml` 模式：DML
+不再拿 `_write_lock`，B+ 树插入/删除均已 crabbing，索引根页跨语句共享，回滚
+走逻辑路径（堆页/B+ 树页 `no_undo`，VACUUM 回收），保存点事务靠独占写者锁
+保正确性（见 `docs/concurrency.md`）；唯一索引项的 DELETE/UPDATE 已改为
 延迟回收（索引项随 VACUUM 重建清理，唯一性按 heap 可见性判，不再当场物理摘），
-但仍未做完整索引项 MVCC；物理 undo 不按事务区分字节。因此第 4 层仍只能标
+但仍未做完整索引项 MVCC；默认模式尚未切换，HeapPage/目录页锁纪律审计与
+`LUMEN_CONCURRENT_DML=1` CI 门禁未完成。因此第 4 层仍只能标
 "MVP 验收"，不能标"生产就绪"。
 
 ## 明确不做

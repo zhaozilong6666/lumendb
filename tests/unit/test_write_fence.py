@@ -117,7 +117,10 @@ class TestCommitPointRecheck:
             original()
 
         db.assert_writable = spy  # type: ignore[method-assign]
-        db.execute_one("INSERT INTO t VALUES (1)")
+        # 用结构性写：它在两种并发模式下都走 ``exclusive_guard``（持有
+        # ``_write_lock``）；并发 DML 模式的普通 INSERT 只登记 read_guard，
+        # 本来就刻意不拿写者锁。
+        db.execute_one("TRUNCATE t")
         assert observed and all(observed), "围栏检查必须在 _write_lock 之内执行"
 
 

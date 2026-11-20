@@ -136,6 +136,10 @@ class RecoveryManager:
                 if rec.rtype != LogType.UPDATE or rec.xid not in losers:
                     continue
                 page_id, offset, old, new = decode_page_update(rec.payload)
+                if not old:
+                    # 逻辑回滚记录（old_len 哨兵）：DML 的堆页/B+ 树页不参与
+                    # 物理 undo，死行靠 xmin/xmax 可见性与 VACUUM 回收。
+                    continue
                 page = self._bp.fetch_page(page_id)
                 try:
                     # [Review-Fix] 条件 undo：只有页面上仍是本记录的 after

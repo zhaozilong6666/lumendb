@@ -107,9 +107,27 @@ class LogRecord:
 
 _PAGE_UPDATE_HEAD = struct.Struct("<IHH")  # page_id, offset, old_len
 
+#: old_len 哨兵：该 UPDATE 没有 before image（逻辑回滚页），恢复时不做 undo。
+#: 真实的 old_len 不可能等于 65535（页最多 4096 字节）。
+_NO_UNDO = 0xFFFF
 
-def encode_page_update(page_id: int, offset: int, old: bytes, new: bytes) -> bytes:
-    """``u32 page_id | u16 offset | u16 old_len | old | u16 new_len | new``"""
+
+def encode_page_update(
+    page_id: int, offset: int, old: bytes, new: bytes, *, no_undo: bool = False
+) -> bytes:
+    """``u32 page_id | u16 offset | u16 old_len | old | u16 new_len | new``
+
+    ``no_undo=True`` 时 old_len 写哨兵、old 字节整段省略：并发 DML 的堆页/
+    B+ 树页回滚走逻辑路径（可见性 + VACUUM），不需要物理原像。
+    """
+    if no_undo:
+        if not new:
+            raise StorageError("页更新日志的 after image 不能为空")
+        return (
+            _PAGE_UPDATE_HEAD.pack(page_id, offset, _NO_UNDO)
+            + struct.pack("<H", len(new))
+            + new
+        )
     return (
         _PAGE_UPDATE_HEAD.pack(page_id, offset, len(old))
         + old
@@ -123,10 +141,13 @@ def decode_page_update(payload: bytes) -> tuple[int, int, bytes, bytes]:
         raise StorageError("页更新日志头被截断")
     page_id, offset, old_len = _PAGE_UPDATE_HEAD.unpack_from(payload, 0)
     pos = _PAGE_UPDATE_HEAD.size
-    if pos + old_len + 2 > len(payload):
-        raise StorageError("页更新日志的 before image 被截断")
-    old = payload[pos : pos + old_len]
-    pos += old_len
+    if old_len == _NO_UNDO:
+        old = b""
+    else:
+        if pos + old_len + 2 > len(payload):
+            raise StorageError("页更新日志的 before image 被截断")
+        old = payload[pos : pos + old_len]
+        pos += old_len
     new_len = struct.unpack_from("<H", payload, pos)[0]
     pos += 2
     if pos + new_len > len(payload):
@@ -269,8 +290,12 @@ class WAL:
         new: bytes,
         *,
         clr: bool = False,
+        no_undo: bool = False,
     ) -> int:
-        payload = encode_page_update(page_id, offset, old, new)
+        # CLR 自身永远带原像（恢复时靠它推进 pageLSN 的语义），不能标哨兵。
+        payload = encode_page_update(
+            page_id, offset, old, new, no_undo=no_undo and not clr
+        )
         return self.append(xid, LogType.CLR if clr else LogType.UPDATE, payload)
 
     def log_page_image(self, xid: int, page_id: int, image: bytes) -> int:

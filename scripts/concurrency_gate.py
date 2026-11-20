@@ -13,6 +13,8 @@
    RID 不重复分配、行数不丢。
 4. ``btree_delete_race``   4 线程乱序删除 + 1 并发读者（120 字节 TEXT 键造
    depth>=2 的树）：读者不截断、不重复；删完叶子链不断、树能完全塌陷。
+5. ``sql_concurrent_dml``  4 个线协议会话并发跑 SQL DML（半数回滚）：
+   提交行数/去重数正确，索引不变量成立。走 ``concurrent_dml=True`` 路径。
 
 输出是机器可读的 ``GATE <name> rounds=.. ok=.. status=PASS|FAIL``，退出码非 0
 表示有门禁未通过。所有临时库都建在系统临时目录，跑完即删，不碰工作树。
@@ -35,6 +37,8 @@ sys.path.insert(0, str(REPO))
 
 from lumendb.datatypes import DataType, TypeSpec          # noqa: E402
 from lumendb.engine.database import Database              # noqa: E402
+from lumendb.server.pgwire import PGWireServer, Session  # noqa: E402
+from lumendb.sql.parser import parse_sql                  # noqa: E402
 from lumendb.storage.btree import BPlusTree, KeyCodec     # noqa: E402
 from lumendb.storage.heap import HeapFile                 # noqa: E402
 
@@ -79,6 +83,70 @@ def _probe_heap_insert_race(db: Database) -> dict:
         "uniq_rids": len(set(rids)),
         "inserted": threads * per_thread,
         "scan_rows": rows,
+    }
+
+
+def _probe_sql_concurrent_dml(db: Database) -> dict:
+    """SQL 级并发 DML：4 会话各 150 行，半数提交/半数回滚。
+
+    这是 ``concurrent_dml=True`` 的端到端探针：DML 不拿 ``_write_lock``，
+    走 read_guard + 行/键锁 + 页 latch；校验提交行数、索引不变量和逻辑回滚
+    留下的死行不污染可见结果。
+    """
+    server = PGWireServer(db)
+    per_writer = 150
+    writers = 4
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    def worker(wid: int) -> None:
+        try:
+            session = Session(database=db)
+            run_sql(session, "BEGIN")
+            base = wid * per_writer
+            for i in range(base, base + per_writer):
+                run_sql(
+                    session,
+                    f"INSERT INTO t VALUES ({i}, {i % 7}, 'p{i}')",
+                )
+            if wid % 2:
+                run_sql(session, "COMMIT")
+            else:
+                run_sql(session, "ROLLBACK")
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(f"w{wid}: {type(exc).__name__}: {exc}")
+
+    workers = [threading.Thread(target=worker, args=(w,), daemon=True)
+               for w in range(writers)]
+    for th in workers:
+        th.start()
+    for th in workers:
+        th.join(timeout=120)
+
+    session = Session(database=db)
+    count = run_sql(session, "SELECT COUNT(*) FROM t")[0].rows[0][0]
+    distinct = run_sql(
+        session, "SELECT COUNT(DISTINCT id) FROM t"
+    )[0].rows[0][0]
+    table = db.catalog.get_table("t")
+    entries = {}
+    invariants = {}
+    for idx in table.indexes.values():
+        tree = db.executor._tree_for(table, idx)
+        inv = tree.check_invariants()
+        entries[idx.name] = inv["entries"]
+        invariants[idx.name] = inv
+    return {
+        "errors": errors[:3],
+        "count": count,
+        "distinct": distinct,
+        "expected": (writers // 2) * per_writer,
+        "entries": entries,
+        "invariants": invariants,
     }
 
 
@@ -262,6 +330,13 @@ def _probe_failed(name: str, detail: dict) -> bool:
         if post["entries"] != detail["expect_entries"]:
             return True
         return post["depth"] < 2  # 本场景必须造出多层树，否则没测到内部页/根分裂
+    if name == "sql_concurrent_dml":
+        if detail["count"] != detail["expected"]:
+            return True
+        if detail["distinct"] != detail["expected"]:
+            return True
+        return any(entries < detail["expected"]
+                   for entries in detail["entries"].values())
     return False
 
 
@@ -281,6 +356,15 @@ def _build_insert_crab(tmp: pathlib.Path):
     return db, _probe_btree_insert_crab(db)
 
 
+def _build_sql_dml(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
+    db.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))"
+    )
+    db.execute("CREATE INDEX idx_v ON t (v)")
+    return db, _probe_sql_concurrent_dml(db)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="LumenDB Step 4 并发门禁")
     ap.add_argument("--rounds", type=int, default=3)
@@ -298,7 +382,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for name, build in (("heap_insert_race", _build_heap),
                         ("btree_insert_crab", _build_insert_crab),
-                        ("btree_delete_race", _build_btree)):
+                        ("btree_delete_race", _build_btree),
+                        ("sql_concurrent_dml", _build_sql_dml)):
         res = _check_probe(name, build, rounds, name)
         checks.append(res)
         print(f"GATE {name} rounds={res['rounds']} ok={res['ok']} "

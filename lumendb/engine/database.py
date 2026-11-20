@@ -8,6 +8,7 @@ from __future__ import annotations
 import threading
 import logging
 import contextlib
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -86,10 +87,17 @@ class Database:
         fence_path: str | Path | None = None,
         lease_path: str | Path | None = None,
         node_id: str = "primary",
+        concurrent_dml: bool = False,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        #: 写并发模式：DML 不拿 ``_write_lock``，改由行/键锁 + 页 latch +
+        #: ``read_guard`` 与 DDL/close 互斥。默认关闭；环境变量可让全套测试
+        #: 用同一条路径跑一遍（CI 门禁用）。
+        if not concurrent_dml:
+            concurrent_dml = os.environ.get("LUMEN_CONCURRENT_DML") == "1"
+        self._concurrent_dml = concurrent_dml
         if fence_path is not None:
             # 共享 fencing marker：旧主库崩溃重启后重新打开数据库时，必须
             # 立即知道"别的节点已经被提升过"，否则裸 Database 打开不检查
@@ -145,6 +153,7 @@ class Database:
         if wal_retain_lsn > 0 and isinstance(self.wal, SegmentedWAL):
             self.wal.retain_lsn = wal_retain_lsn
         self.bp = BufferPoolManager(self.disk, self.wal, pool_size=pool_size)
+        self.bp.logical_abort = concurrent_dml
         #: 关闭标志：放在 TransactionManager 之前，提交点围栏回调在初始化
         #: 阶段就能安全读取它。
         self._closed = False
@@ -188,6 +197,7 @@ class Database:
             self.disk,
             self.locks,
             read_only=self._read_only,
+            concurrent_dml=self._concurrent_dml,
         )
 
         self._txn: Optional[Transaction] = None
@@ -220,6 +230,7 @@ class Database:
             self.disk,
             self.locks,
             read_only=self._read_only,
+            concurrent_dml=self._concurrent_dml,
         )
 
     def assert_writable(self) -> None:
@@ -326,13 +337,54 @@ class Database:
         with self._statement_lock:
             return self._run_locked(statement, params)
 
+    def _enter_savepoint_mode(self, txn: Transaction) -> None:
+        """并发 DML 下第一次 SAVEPOINT：把事务切回"物理可回滚"并独占写者锁。
+
+        逻辑回滚没法实现 ``ROLLBACK TO SAVEPOINT``——保存点之后的 INSERT 已经
+        写进堆页且没有原像，回滚只能靠"整事务可见性"，而事务还要继续提交。
+        正确性优先：保存点事务拿住 ``_write_lock`` 到事务结束，期间没有别的
+        写者，页原像就不会被并发写撕裂；代价是该事务存续期间写操作串行。
+        默认（非并发）模式不需要这一层。
+        """
+        if not self._concurrent_dml or txn.physical_savepoint:
+            return
+        # 物理 undo 只有在"没有其它活跃事务"时才能保证原像不被后来者覆盖。
+        # 并发模式下保存点因此要求独占：有别的活跃事务就明确报错，别退化成
+        # 一个会写坏页的静默路径。默认（串行）模式不受影响。
+        others = [x for x in self.txns.active_xids if x != txn.xid]
+        if others:
+            raise NotSupportedError(
+                "并发 DML 模式下的 SAVEPOINT 需要独占数据库",
+                detail=f"仍有活跃事务 {sorted(others)[:8]}",
+                hint="等其它事务结束后再建保存点，或改用默认串行模式",
+            )
+        self._write_lock.acquire()
+        txn.physical_savepoint = True
+        self.bp.logical_abort = False
+
+    def _exit_savepoint_mode(self, txn: Transaction) -> None:
+        """事务结束：恢复逻辑回滚并释放保存点模式占用的写者锁。"""
+        if not getattr(txn, "physical_savepoint", False):
+            return
+        txn.physical_savepoint = False
+        self.bp.logical_abort = self._concurrent_dml
+        self._write_lock.release()
+
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
-            guard = (
-                self.exclusive_guard()
-                if type(statement).__name__ in _STRUCTURAL_STATEMENTS
-                else self._write_lock
-            )
+            if (
+                self._concurrent_dml
+                and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+            ):
+                # 并发写模式：DML 只登记为"读者"，与 DDL/close 的独占门互斥；
+                # 真正的写冲突交给行/键锁与页 latch。
+                guard = self.read_guard()
+            else:
+                guard = (
+                    self.exclusive_guard()
+                    if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                    else self._write_lock
+                )
             with guard:
                 # [Review-Fix] 关闭/围栏检查必须在拿到 _write_lock **之后**：
                 # 入口检查通过后可能在等锁期间被 close 关掉，此时再写就会
@@ -371,6 +423,7 @@ class Database:
                 self.executor.validate_deferred_unique_constraints(txn)
             except BaseException:
                 self.txns.abort(txn)
+                self._exit_savepoint_mode(txn)
                 raise
             try:
                 self.txns.commit(txn)
@@ -382,8 +435,10 @@ class Database:
                 # 不能 undo：事务事实上已提交，调用方拿到的是"结果未知"。
                 if not getattr(txn, "commit_record_written", False):
                     self.txns.abort(txn)
+                self._exit_savepoint_mode(txn)
                 raise
             self._maybe_checkpoint()
+            self._exit_savepoint_mode(txn)
             return Result(tag="COMMIT")
 
         if isinstance(statement, Rollback):
@@ -392,11 +447,13 @@ class Database:
             txn = self._txn
             self._txn = None
             self.txns.abort(txn)
+            self._exit_savepoint_mode(txn)
             return Result(tag="ROLLBACK")
 
         if isinstance(statement, Savepoint):
             if self._txn is None:
                 raise TransactionError("SAVEPOINT 必须在事务中执行")
+            self._enter_savepoint_mode(self._txn)
             self.txns.savepoint(self._txn, statement.name)
             return Result(tag="SAVEPOINT")
 

@@ -15,11 +15,12 @@ Buffer Pool 是"磁盘页"与"内存页"之间的唯一桥梁。它做三件事�
 from __future__ import annotations
 
 import threading
+import contextlib
 from collections import OrderedDict
 from typing import Optional
 
 from ..errors import StorageError
-from .page import INVALID_PAGE_ID, PAGE_SIZE, Page
+from .page import INVALID_PAGE_ID, PAGE_SIZE, Page, PageType
 from .pager import DiskManager
 from .wal import WAL
 
@@ -79,6 +80,12 @@ class BufferPoolManager:
         self._undo: dict[int, list[tuple[int, int, bytes]]] = {}
         # 新分配、尚未写入 WAL 的页；第一次更新时先记一条完整页镜像。
         self._fresh_pages: set[int] = set()
+        #: 逻辑回滚：并发 DML 下堆页/B+ 树页不记物理原像；死行靠 xmin/xmax
+        #: 可见性与 VACUUM 回收。物理 undo 在并发写者交错时必然撕裂。
+        self.logical_abort = False
+        #: 线程局部覆盖（None=跟随 logical_abort，True=强制逻辑，False=强制物理）：
+        #: DDL 需要物理原像来撤回 TRUNCATE/DROP，DML 的目录保存则不能物理回滚。
+        self._undo_override = threading.local()
         # page_id -> 单调版本号：任何一次内容变化（写日志、新分配、从磁盘换入）
         # 都 +1。B+ 树的内部页解码缓存用它当键的一部分——不能拿 pageLSN 当键：
         # 页被换出再换入后 pageLSN 归零，缓存里 (页号, 0) 的旧条目会一直命中，
@@ -197,17 +204,41 @@ class BufferPoolManager:
                 # 让副本/恢复不依赖主库磁盘上的页分配状态。
                 self._wal.log_page_image(xid, page.page_id, bytes(page.buf))
                 self._fresh_pages.discard(page.page_id)
+            logical = self._undo_is_logical(page)
             lsn = self._wal.log_page_update(
-                xid, page.page_id, offset, old, new, clr=clr
+                xid, page.page_id, offset, old, new, clr=clr, no_undo=logical
             )
             page.page_lsn = lsn
             self._dirty.add(page.page_id)
             self._bump_version(page.page_id)
-            if not clr:
+            if not clr and not logical:
                 self._undo.setdefault(xid, []).append(
                     (page.page_id, offset, bytes(old))
                 )
             return lsn
+
+    def _undo_is_logical(self, page: Page) -> bool:
+        """这一页的回滚是否走逻辑路径（不记物理原像）。"""
+        override = getattr(self._undo_override, "value", None)
+        if override is not None:
+            return override
+        if not self.logical_abort:
+            return False
+        return page.page_type in (
+            PageType.HEAP,
+            PageType.BTREE_INTERNAL,
+            PageType.BTREE_LEAF,
+        )
+
+    @contextlib.contextmanager
+    def logical_undo_scope(self):
+        """本线程内强制把页写入标成"无物理原像"（并发 DML 的目录保存）。"""
+        previous = getattr(self._undo_override, "value", None)
+        self._undo_override.value = True
+        try:
+            yield
+        finally:
+            self._undo_override.value = previous
 
     def clear_undo(self, xid: int) -> None:
         """事务提交后丢弃页级撤销信息，避免长事务让缓冲池无限增长。"""
