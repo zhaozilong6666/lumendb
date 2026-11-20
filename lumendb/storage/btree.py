@@ -31,6 +31,7 @@ from __future__ import annotations
 import bisect
 import struct
 import threading
+import time
 from typing import Any, Iterator, Optional, Sequence, Tuple
 
 from ..datatypes import DataType, TypeSpec, decode_value, encode_value
@@ -146,6 +147,12 @@ class BPlusTree:
         #: 根页号是整棵树的全局状态；根分裂（建新根）与根塌陷（降树高）都改它，
         #: 必须串行，否则两个线程同时建新根会把 `root_page` 后写覆盖、丢一棵子树。
         self._root_lock = threading.RLock()
+        #: 叶子链指针手术锁：分裂要改写左叶 next / 右叶 prev / 旧后继 prev，
+        #: 摘叶要改写前驱 next / 后继 prev 并清零自身。两组操作若与相邻页的
+        #: 另一组操作交错，会留下"跳过一片还在树上的叶"的断链（实测：四线程
+        #: 并发删完 12000 条后，页 197 的 next 是 224，但中序下一叶是 203）。
+        #: 锁序固定「链锁 → 页 latch」：任何持叶 latch 的路径都不得再取链锁。
+        self._link_lock = threading.RLock()
         #: 只给 ``_descend`` 用的内部页解码缓存，键是 (页号, pageLSN)。
         #: 由执行器跨语句持有（每次查询都新建 BPlusTree，缓存挂在树上没意义）。
         #: 页被写过后 pageLSN 会推进，旧条目自然再也不会命中。
@@ -363,8 +370,19 @@ class BPlusTree:
             keys, rids, _ = self._read_leaf(page)
             keys.insert(idx, key)
             rids.insert(idx, rid)
-            # `_split_leaf` 会重入 page.latch（RLock），锁序 page → right → next
-            return self._split_leaf(txn, page, keys, rids)
+        # 需要分裂：**先释放本页 latch**，再按「链锁 → 页 latch」的固定顺序重来。
+        # 若持着叶 latch 去拿链锁，会与「持链锁摘叶、正等这片叶 latch」的删除
+        # 线程成环（ABBA）。链锁只保护叶子链的指针手术（分裂改写邻居 prev /
+        # 摘叶改写前后邻居 next-prev），是低频操作，代价可接受。
+        with self._link_lock:
+            with page.latch:
+                idx = self._leaf_insert_at(txn, page, key, rid)
+                if idx is None:
+                    return None
+                keys, rids, _ = self._read_leaf(page)
+                keys.insert(idx, key)
+                rids.insert(idx, rid)
+                return self._split_leaf(txn, page, keys, rids)
 
     def _leaf_delete_at(self, txn: Transaction, page: Page, index: int) -> None:
         """摘掉一个槽位。记录字节留作碎片，由后续 compact 回收。"""
@@ -1035,23 +1053,32 @@ class BPlusTree:
                     self._leaf_delete_at(txn, page, idx)
                     return True, self._nkeys(page) == 0
 
-            # 内部页：读孩子下标 → 递归下探 → 摘除空孩子必须在同一个页 latch 内。
-            # 否则两个线程在同一父页下各摘一个孩子，各自基于旧 children 列表算
-            # idx，后写者会把先写者摘掉的那个槽位又摘一次（删错孩子/叶子链断）。
-            # 锁序是严格的「父 → 子」下行（孩子自身在递归里再拿自己的 latch），
-            # 返回时先释放孩子再释放父；没有任何路径是「子 → 父」，故不成环。
+            # 内部页采用**crabbing**而不是全程持父锁：
+            #   ① 在父锁内只做"选孩子"这一步，随后立刻释放父锁；
+            #   ② 下探子页时只持子页自己的 latch（父子不再嵌套）；
+            #   ③ 只有孩子确实变空、需要摘除时，才重新取父锁，并**按页号重新
+            #      定位孩子**——这期间父页可能已被别的删除线程改过（孩子被
+            #      摘走、或兄弟页塌陷），用旧下标去 del 会摘错孩子/叶子链断。
+            # 这样不同子树上的删除可以真正并行；父页只在"摘孩子"那一小段被占。
             with page.latch:
                 keys, children, _ = self._read_internal(page)
-                idx = self._child_index(keys, key)
-                deleted, child_empty = self._delete_recursive(txn, children[idx], key)
-                if not deleted:
+                if not children:
                     return False, False
-                if not child_empty:
+                child_id = children[self._child_index(keys, key)]
+            deleted, child_empty = self._delete_recursive(txn, child_id, key)
+            if not deleted:
+                return False, False
+            if not child_empty:
+                return True, False
+            with page.latch:
+                keys, children, _ = self._read_internal(page)
+                if child_id not in children:
+                    # 另一个线程已经把这片空子树摘掉了，父页状态由它负责。
                     return True, False
                 if len(children) <= 1:
                     # 本页只有这一个孩子，摘掉就成 0 个孩子：交给上层继续塌陷。
                     return True, True
-                self._remove_child(txn, page, idx)
+                self._remove_child(txn, page, children.index(child_id))
                 return True, False
         finally:
             self._bp.unpin(page_id, dirty=True)
@@ -1100,12 +1127,17 @@ class BPlusTree:
         边界情形也要处理：最左叶的前驱是 INVALID 时，右邻居的 prev
         必须被置成 INVALID，不能因为"没有左邻居"就跳过。
         """
-        prev_id, next_id = leaf.prev_page, leaf.next_page
-        if prev_id != INVALID_PAGE_ID:
-            self._set_left_next(txn, prev_id, next_id, leaf.page_id)
-        if next_id != INVALID_PAGE_ID:
-            self._set_right_prev(txn, next_id, prev_id, leaf.page_id)
-        self._clear_links(txn, leaf)
+        # 整个摘链动作（改写前驱 next、后继 prev、清零自身）在链锁内一次做完。
+        # 否则"摘 A"与"摘 A 的相邻叶 B"交错时，会把已摘页重新写回链上，或让
+        # 某片仍在树上的叶被跳过（断链）。链锁只圈指针手术，不含页内容读写。
+        with self._link_lock:
+            with leaf.latch:
+                prev_id, next_id = leaf.prev_page, leaf.next_page
+            if prev_id != INVALID_PAGE_ID:
+                self._set_left_next(txn, prev_id, next_id, leaf.page_id)
+            if next_id != INVALID_PAGE_ID:
+                self._set_right_prev(txn, next_id, prev_id, leaf.page_id)
+            self._clear_links(txn, leaf)
 
     def _purge_empty_tree(self, txn: Transaction, page: Page) -> None:
         """把一棵整体已空的子树的叶子全部从叶子链上摘干净（内部页递归下探）。
@@ -1234,42 +1266,72 @@ class BPlusTree:
                 keys, rids = keys[start:], rids[start:]
             return keys, rids, page.next_page
 
-    def _scan_head(self, attempts: int = 8):
+    def _tree_is_empty(self) -> bool:
+        """树此刻是否确实没有任何条目（根缺失 / 根叶 0 键 / 根内部页 0 孩子）。
+
+        crabbing 之后不能再靠"持根页 latch 就结构静止"来判断空树：内部页在
+        下探子页时会**释放父锁**，根锁不冻结整棵树。所以这里显式查根页状态，
+        由调用方重试，而不是拿根锁当同步屏障。
+        """
+        if self.root_page == INVALID_PAGE_ID:
+            return True
+        root = self._bp.fetch_page(self.root_page)
+        try:
+            with root.latch:
+                if self._is_leaf(root):
+                    return self._nkeys(root) == 0
+                _keys, children, _high = self._read_internal(root)
+                return not children
+        finally:
+            self._bp.unpin(root.page_id)
+
+    def _scan_head(self, attempts: int = 2000, budget_s: float = 3.0):
         """取一个**非空**的链首并顺带读好首页内容：(page, keys, rids, next_id)。
 
         ``_leftmost_leaf_verified`` 只保证"拿到的瞬间它是链首且有键"；从校验到
         真正读内容之间，写者仍可能把这页删空并摘掉（它原本就可能是最左叶，
         正在被左半边删除吃掉）。那会让扫描从一片已清零的空页出发直接扫到
-        0 条（实测 795 次里剩 1 次）。这里把"校验 + 读内容"合并重试：读出
-        0 键且又不是整棵空树，就重新下探一次；重试仍失败则返回最后一次的
-        视图（宁可少一次也不抛异常，抛出会打断调用方）。
+        0 条（实测 795 次里剩 1 次）。这里把"校验 + 读内容"合并重试。
+
+        返回 ``None`` 表示**此刻树确实为空**（``_tree_is_empty`` 已确认）。
+        绝不能把"重试耗尽"当成空——那会把并发竞争变成一次静默的 0 行扫描
+        （实测：删除并发时读者拿 min=0 条）。树非空就必须一直重试到拿到非空
+        链首；只有预算耗尽且树仍非空才抛 ``BTreeInvariantError``，让问题可见。
         """
-        for _ in range(attempts):
+        deadline = time.monotonic() + budget_s
+        for i in range(attempts):
             page = self._leftmost_leaf_verified()
             if page is None:
-                break
+                # 没有可用链首：只有"根为空"才算真空，否则继续。
+                if self._tree_is_empty():
+                    return None
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.001)
+                continue
             keys, rids, next_id = self._leaf_page_view(page, None)
             if keys:
                 return page, keys, rids, next_id
-            if self.root_page == page.page_id and self._is_leaf(page):
+            if self._tree_is_empty():
                 return page, keys, rids, next_id  # 整棵树为空
             self._bp.unpin(page.page_id)
-
-        # 兜底：写者的插入/删除在内部页分支里整段持页 latch（含根页），
-        # 所以持住根页 latch 时树的结构与叶子链都是静止的。重试耗尽时在
-        # 根锁内再取一次，避免把"并发太密"变成对调用方抛异常。
-        root = self._bp.fetch_page(self.root_page)
-        try:
-            with root.latch:
-                page = self._leftmost_leaf_verified(attempts=4)
-                if page is not None:
-                    keys, rids, next_id = self._leaf_page_view(page, None)
-                    return page, keys, rids, next_id
-        finally:
-            self._bp.unpin(root.page_id)
+            if time.monotonic() >= deadline:
+                break
+            if i >= 2:
+                time.sleep(0.0005)  # 让写者推进，避免纯自旋吃满 GIL
         raise BTreeInvariantError(
             f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
         )
+
+    def _empty_head(self):
+        """给 ``scan_all`` 用的空结果：根仍是一片空叶时返回它，否则返回 None。"""
+        if self.root_page == INVALID_PAGE_ID:
+            return None
+        page = self._bp.fetch_page(self.root_page)
+        if self._is_leaf(page) and self._nkeys(page) == 0:
+            return page, [], [], page.next_page
+        self._bp.unpin(page.page_id)
+        return None
 
     def _advance_leaf(
         self, page: Page, next_id: int, prev_expected: int
@@ -1391,12 +1453,22 @@ class BPlusTree:
         if self.root_page == INVALID_PAGE_ID:
             return
         page = self._descend(low) if low is not None else self._leftmost_leaf_verified()
-        if page is None:
-            raise BTreeInvariantError(
-                f"索引 {self.name} 的叶子链在并发改写中无法稳定读到链首"
-            )
-        try:
+        if page is not None:
             keys, rids, next_id = self._leaf_page_view(page, low)
+            if keys or low is None:
+                start = (page, keys, rids, next_id)
+            else:
+                # 下探落进了一片已被删空的叶/将塌陷的子树：这次下探不算数，
+                # 退到链首重扫（low 过滤会跳过前面的键）。crabbing 后父锁在
+                # 下探途中会释放，落点为空的可能性比之前更高，必须能自愈。
+                self._bp.unpin(page.page_id)
+                start = self._scan_head()
+        else:
+            start = self._scan_head()
+        if start is None:
+            return
+        page, keys, rids, next_id = start
+        try:
             prev_expected = INVALID_PAGE_ID
             last_key = None
             while True:
@@ -1432,7 +1504,13 @@ class BPlusTree:
     def scan_all(self, txn: Transaction) -> Iterator[Tuple[tuple, RID]]:
         if self.root_page == INVALID_PAGE_ID:
             return
-        page, keys, rids, next_id = self._scan_head()
+        head = self._scan_head()
+        if head is None:
+            empty = self._empty_head()  # 根还是一片空叶（整棵空树）时给它收尾
+            if empty is None:
+                return
+            head = empty
+        page, keys, rids, next_id = head
         try:
             prev_expected = INVALID_PAGE_ID
             last_key = None

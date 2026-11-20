@@ -504,3 +504,61 @@ def test_concurrent_reader_scan_during_delete_never_truncates(tmp_path) -> None:
         db.close()
 
 
+def test_concurrent_adjacent_deletes_keep_leaf_chain(tmp_path) -> None:
+    """四线程乱序删**相邻叶**时，叶子链必须始终首尾相接。
+
+    回归（2026-11-20 实测，crabbing 删除落地后暴露）：4 线程各删四分之一、
+    顺序随机，删完 12000 条后 ``check_invariants`` 报
+    「叶子链断裂：页 197 的 next 是 224，但中序下一个叶是 203」。根因是
+    「摘 A」与「摘 A 的相邻叶 B」交错：两边各自基于旧的 prev/next 做指针
+    手术，A 把 B 重新写回链上、或让仍在树上的叶被跳过。修法是链锁
+    ``_link_lock`` 把摘链的三次指针写做成原子（分裂改写邻居 prev 同样持锁）。
+
+    用 120 字节 TEXT 键压低扇出，4000 条即可造出 depth>=2 的多层树，
+    让"祖父-父-子"的摘除与塌陷都参与并发。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.TEXT)]), unique=False, name="idx")
+    total, pad = 4000, 120
+
+    def key_of(i: int) -> tuple:
+        return (f"{i:08d}".ljust(pad, "x"),)
+
+    t0 = db.txns.begin()
+    for i in range(total):
+        tree.insert(t0, key_of(i), (0, i))
+    db.txns.commit(t0)
+    assert tree.check_invariants()["depth"] >= 2, "键长不够，没造出多层树"
+
+    errors: list[str] = []
+    barrier = threading.Barrier(4)
+
+    def worker(wid: int) -> None:
+        try:
+            rnd = random.Random(wid + 7)
+            keys = list(range(wid, total, 4))
+            rnd.shuffle(keys)
+            txn = db.txns.begin()
+            barrier.wait(timeout=10)
+            for k in keys:
+                tree.delete(txn, key_of(k), (0, k))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"worker{wid}: {type(exc).__name__}: {exc}")
+
+    try:
+        workers = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
+        for th in workers:
+            th.start()
+        for th in workers:
+            th.join(timeout=180)
+
+        assert errors == [], f"并发删除出错: {errors[:3]}"
+        stats = tree.check_invariants()  # 叶子链 / 键序 / 深度不一致会在这里抛错
+        assert stats["entries"] == 0, f"还有 {stats['entries']} 条没删掉"
+        assert list(tree.scan_all(None)) == []
+    finally:
+        db.close()
+
+
+
