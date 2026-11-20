@@ -241,8 +241,12 @@ fetch 下一页并在同一临界区里校验 `next.prev == 当前页号`，这�
    的键——有界、O(log n)，不牺牲顺序。
 4. 代价与实测：删并发探针 683 次扫描 **0 截断、0 异常、最小行数 1500**；插入
    并发 + 两读者测试连跑 **3/3 通过**；全量 **1385 passed**。
-5. 尚未覆盖：点查 `lookup` 在同一页被分裂时仍可能重复返回同一 RID（唯一索引会
-   报重复键），需要同样的 `last_key` 去重或页内快照重读，留待下一步。
+5. 点查 `lookup` 也补了跨页去重：页被分裂时同一 RID 不再被重复计入
+   （否则唯一索引会把并发分裂误判成"重复键"）。
+
+**剩余（Step 4 后半段）**：真正的 crabbing（拿住孩子后释放父锁）仍未做，
+写并发度目前被根页 latch 串行；放开 `Database._write_lock` 之前还要给
+HeapPage / 目录页做同样的锁纪律（见上文 L2 的四条原因）。
 
 验证：
 - `tests/unit/test_btree_page_latch.py::test_concurrent_leaf_inserts_keep_order_and_count`

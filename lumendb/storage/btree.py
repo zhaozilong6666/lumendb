@@ -689,6 +689,7 @@ class BPlusTree:
         lo = target + MIN_RID
         page = self._descend(lo)
         hits: list[RID] = []
+        last_hit_key: Optional[tuple] = None
         try:
             while True:
                 # 定位与逐键解码必须在同一把 latch 内：否则 bisect 用的槽位表
@@ -696,6 +697,13 @@ class BPlusTree:
                 # 「槽位偏移越界：0」）。
                 with page.latch:
                     start = self._leaf_bisect_prefix(page, target)
+                    if last_hit_key is not None:
+                        # 跨页去重：本页可能在上一页快照之后被分裂，把上半搬到
+                        # 右页；已命中的完整键不再重复计入（唯一索引会误报重复）。
+                        while start < self._nkeys(page):
+                            if self._leaf_key_at(page, start)[0] > last_hit_key:
+                                break
+                            start += 1
                     n = self._nkeys(page)
                     # 逐条解码、**读到第一个更大的前缀就停**：等值查找通常只有
                     # 1 条命中，把 ``start`` 之后的槽位一次性物化会把 O(log n)
@@ -706,6 +714,7 @@ class BPlusTree:
                         prefix = key[:width]
                         if prefix == target:
                             hits.append(rid)
+                            last_hit_key = key
                             start += 1
                             continue
                         if prefix > target:
