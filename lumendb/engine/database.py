@@ -162,10 +162,13 @@ class Database:
         #: 结构性写（VACUUM / TRUNCATE / shadow heap 重写）正在独占期间为 True：
         #: 新的只读语句必须等它结束，否则会读到重排中的页。
         self._no_readers = False
-        #: 注意这个 Condition 绑在 ``_write_lock`` 上：``with self._readers_cv``
-        #: 等于拿写者锁。读语句只在此处进出各一次（计数 +1/-1），粒度极短，
-        #: 所以并发读仍然成立。
-        self._readers_cv = threading.Condition(self._write_lock)
+        #: 读者计数用独立的小锁，不再借 ``_write_lock``。并发 DML 的每条语句
+        #: 都要进出 ``read_guard``；如果这里拿写者锁，等于把并发语句重新串行
+        #: 到同一把全局锁上（实测 4 线程插入吞吐反而低于默认模式）。
+        #: ``exclusive_guard`` / ``close`` 仍持有 ``_write_lock`` 挡住默认写者，
+        #: 再通过本 Condition 等读者退出。
+        self._readers_lock = threading.Lock()
+        self._readers_cv = threading.Condition(self._readers_lock)
         #: 锁管理器：写语句在 ``Executor.run`` 里申请事务级写者锁（单写者模型）。
         self.locks = LockManager()
         self.txns = TransactionManager(
@@ -259,7 +262,7 @@ class Database:
         锁做 reader 计数：close 置位 ``_closed`` 后等所有在途读者退出。
         """
         with self._readers_cv:
-            while self._no_readers:
+            while self._no_readers and not self._closed:
                 self._readers_cv.wait()
             if self._closed:
                 raise StorageError(
@@ -313,15 +316,17 @@ class Database:
         "VACUUM 需要表上没有并发事务"，读密集型系统里永远跑不起来；现在它
         先等读者退出（毫秒级）再独占执行，然后放行。
         """
-        with self._readers_cv:  # 等价于拿 _write_lock（本方法本来就是写路径）
-            self._no_readers = True
-            while self._readers:
-                self._readers_cv.wait()
+        with self._write_lock:
+            with self._readers_cv:
+                self._no_readers = True
+                while self._readers:
+                    self._readers_cv.wait()
             try:
                 yield
             finally:
-                self._no_readers = False
-                self._readers_cv.notify_all()
+                with self._readers_cv:
+                    self._no_readers = False
+                    self._readers_cv.notify_all()
 
     def _run(self, statement, params: Optional[list[Any]] = None) -> Result:
         if self._closed:
@@ -617,9 +622,13 @@ class Database:
             self._closed = True
             # 先等只读语句退出，再 abort 事务/关闭句柄；反过来的话，一个
             # 正在扫描页的 SELECT 可能在 undo 之后继续用已失效的页。
-            self._readers_cv.notify_all()
-            while self._readers:
-                self._readers_cv.wait()
+            # 关闭期间置 no_readers：新读者不再进门，而是直接收到
+            # "数据库已关闭"；否则持续涌入的读者会让这里等不到 0。
+            with self._readers_cv:
+                self._no_readers = True
+                self._readers_cv.notify_all()
+                while self._readers:
+                    self._readers_cv.wait()
             if self._txn is not None:
                 self.txns.abort(self._txn)
                 self._txn = None

@@ -318,6 +318,10 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
   before image，恢复时跳过。目录页在 DML 保存时也走逻辑（线程局部
   `BufferPool.logical_undo_scope()`），避免 A 回滚把 B 随后保存的新根抹掉；
   DDL 用 `_undo_override=False` 强制物理原像，保证 TRUNCATE/DROP 能真正撤回。
+- **读者计数锁独立**：`read_guard()` 不再借 `_write_lock` 做计数（此前每条
+  并发 DML 都要在这把全局锁上进/出一次，等于把语句重新串行）。现在读者计数用
+  独立的 `_readers_lock`，`exclusive_guard` / `close()` 仍持 `_write_lock` 挡默认
+  写者，再通过读者条件变量等在途读者退出。
 - **保存点**：逻辑回滚无法撤回"保存点之后的 DML"，所以并发模式下第一次
   `SAVEPOINT` 要求数据库里没有其它活跃事务（否则返回 `0A000`，不静默走危险
   路径），随后该事务持有 `_write_lock` 到事务结束并临时关掉逻辑回滚
@@ -325,8 +329,8 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
   写串行。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（4 例：并发插入全提交、混合 DML + 半数回滚、
-  逻辑回滚不可见 + VACUUM 回收、并发删除与读者）；
+- `tests/unit/test_concurrent_dml.py`（5 例：并发插入全提交、混合 DML + 半数回滚、
+  逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点独占检查）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
@@ -335,11 +339,27 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式（`concurrent_dml=False`）仍是串行；把并发路径切成默认前，要补
   HeapPage / 目录页在高并发下的锁纪律审计，并让 `LUMEN_CONCURRENT_DML=1` 全量
-  进入 CI 门禁（当前已手工跑绿 1400 例）。
+  进入 CI 门禁（当前已手工跑绿 1402 例，两种模式各一遍）。
 - 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）；要支持高并发保存点，
   需要行级逻辑 undo log。
 - `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
   基于 oldest-active-xmin 的水位。
+
+**实测（2026-11-21，Windows / Python 3.13，单机）**
+
+`benchmarks/concurrency_throughput.py` 用同一条 SQL 路径跑两种模式，每个
+INSERT 是自动提交的短事务：
+
+- 4 线程 × 300 行插入：默认 `_write_lock` 约 436 ops/s，`concurrent_dml`
+  约 269 ops/s；
+- 1 线程 × 300 行插入：两种模式都在 490 ops/s 左右，说明并发路径没有额外的
+  单线程开销，多线程反而被共享锁/页 latch 拖慢；
+- 4 线程热点行更新：默认约 43 ops/s；并发模式约 10 ops/s，并出现 504 次
+  `40001` 重试（同一行只能串行，重试成本高于默认模式的直接排队）。
+
+结论：`concurrent_dml` 目前只在"多事务、写不同行"的正确性路径上成立，
+**短事务吞吐还不优于默认模式**，因此继续保持 opt-in，不切默认。下一步要
+先定位 B+ 根页锁 / 页 latch 的争用，再谈吞吐；这份基准先作为负结果留档。
 
 ### 插入 crabbing 的协议（已按此实现，保留作契约）
 
