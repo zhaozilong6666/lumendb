@@ -32,7 +32,23 @@ jobs:
           python -m pip install pytest
 
       - name: Run unit and crash tests
-        run: python -m pytest tests -q
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -o pipefail
+          python -m pytest tests -q 2>&1 | tee pytest.log
+
+      - name: Publish pytest failure tail
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Pytest failure tail"
+            echo '```'
+            tail -n 200 pytest.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run tests (concurrent DML mode)
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
