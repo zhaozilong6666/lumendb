@@ -981,6 +981,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Windows 的默认控制台编码可能是 cp1252；本工具会打印中文摘要，
+    # 直接 print 会在 CI/重定向场景里抛 UnicodeEncodeError。显式切 UTF-8，
+    # 不改调用方的 locale，只影响本进程的标准输出。
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
     args = build_parser().parse_args(argv)
     return int(args.func(args))
 

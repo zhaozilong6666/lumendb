@@ -10,6 +10,11 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Windows runner 的默认控制台编码是 cp1252；context_pack 等工具会打印
+      # 中文摘要，必须强制 UTF-8，否则测试全绿后仍会在 Check context pack 挂掉。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:
@@ -33,8 +38,6 @@ jobs:
 
       - name: Run unit and crash tests
         shell: bash
-        env:
-          PYTHONIOENCODING: utf-8
         run: |
           set -o pipefail
           python -m pytest tests -q 2>&1 | tee pytest.log
