@@ -339,7 +339,7 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式（`concurrent_dml=False`）仍是串行；把并发路径切成默认前，要补
   HeapPage / 目录页在高并发下的锁纪律审计，并让 `LUMEN_CONCURRENT_DML=1` 全量
-  进入 CI 门禁（当前已手工跑绿 1402 例，两种模式各一遍）。
+  进入 CI 门禁（当前 Linux 3.12 job 已加该步骤，手工跑绿 1404 例）。
 - 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）；要支持高并发保存点，
   需要行级逻辑 undo log。
 - `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
@@ -385,6 +385,31 @@ INSERT 是自动提交的短事务：
 
 回归：默认模式 1403 passed，`LUMEN_CONCURRENT_DML=1` 1403 passed；门禁 6 项
 × 3 轮全 PASS。结论不变：`concurrent_dml` 保持 opt-in，暂不切默认。
+
+**2026-11-22 WAL 分段刷盘锁拆分（Linux / Python 3.12，单机）**
+
+组提交本身已经在 `TransactionManager._run_commit_group` 里，但
+`SegmentedWAL.flush` 仍把 `_pending` 交换、分段轮转、文件写入和 fsync 全包在
+`_lock` 里：leader 刷盘时所有提交线程都无法追加 COMMIT，批次被压到约 1 个
+事务，测到 1200 次插入对应 930 次 flush。
+
+本轮把文件 I/O 拆到独立的 `_flush_lock`：
+
+- `flush` 只在 `_lock` 内交换 `_pending`，随后在 `_flush_lock` 下做轮转、
+  `write`、`fsync`，完成后只回写 `_size`；
+- 写失败时把这一批放回 `_pending` 队首，行为与旧实现“pending 不清空”一致；
+- `iter_records` / `truncate_before` / `close` 按 `_flush_lock → _lock` 的
+  固定锁序执行；`flush_upto` 先查 `_size`，不在持 `_lock` 时调用 `flush`。
+
+实测（4 线程 × 300 行自动提交插入，基线来自 HEAD 的独立 worktree）：
+基线默认 786 / 817 ops/s、并发 785 / 788；改动后默认 782 / 799 / 803、
+并发 867 / 870 / 872。8 线程 × 200 行：默认 792 / 794，并发 884 / 852。
+并发插入首次稳定超过默认约 8%–10%；热点行更新仍由同行冲突主导（4 线程
+36 vs 默认 140，460 次 `40001`），没有改善，继续保留 opt-in。
+
+回归：默认 1404 passed，`LUMEN_CONCURRENT_DML=1` 1404 passed；门禁 6 项
+× 3 轮全 PASS；新增 `test_append_during_flush_is_not_blocked_or_lost` 用可控
+慢 fsync 验证刷盘期间 append 不阻塞且下一轮不丢记录。
 
 ### 插入 crabbing 的协议（已按此实现，保留作契约）
 
