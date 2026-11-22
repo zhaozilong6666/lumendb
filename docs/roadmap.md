@@ -347,10 +347,10 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 不再拿 `_write_lock`，B+ 树插入/删除均已 crabbing，索引根页跨语句共享，回滚
 走逻辑路径（堆页/B+ 树页 `no_undo`，VACUUM 回收），保存点事务改为排空在途
 语句后独占写者锁（不再 `0A000`，但存续期间写者排队）；`concurrent_dml` 仍保持
-opt-in，默认模式尚未切换，卡在保存点仍串行、`VACUUM` 缺
-oldest-active-xmin 水位（已加 5s 等待窗口，只能在有界时间内等活跃事务退出）、
-自动提交 UPDATE 的 READ COMMITTED 语义需发布说明。并发全量 1411 passed 与门禁
-脚本 3 轮（8 项，含保存点并发与 VACUUM 等待探针）已进 CI，Windows 插入
+opt-in，默认模式尚未切换，卡在保存点仍串行、`VACUUM` 在线模式只保 RID 不回收
+根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错）、自动提交 UPDATE
+的 READ COMMITTED 语义需发布说明。并发全量 1414 passed 与门禁脚本 3 轮
+（9 项，含保存点并发、VACUUM 等待与在线回收探针）已进 CI，Windows 插入
 退化复测未复现（受 fsync 抖动
 主导）。HeapPage/目录页锁纪律还缺逐路径审计清单，因此第 4 层仍只能标
 "MVP 验收"，不能标"生产就绪"。

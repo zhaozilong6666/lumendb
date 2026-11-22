@@ -467,6 +467,111 @@ class HeapFile:
         self.table.row_count_hint = max(0, self.table.row_count_hint - 1)
         return 1
 
+    def vacuum_online(  # noqa: C901 - 版本链遍历与逐页回收集中在一个流程里
+        self,
+        txn: Transaction,
+        active_txns: Sequence[Transaction] = (),
+    ) -> tuple[int, int, int]:
+        """保 RID 的在线回收：不重排槽位、不重建索引，保留活跃快照要的版本。
+
+        与 ``vacuum`` 的区别：
+        - 不把存活行重新打包，槽位号不变，所有 RID 与索引项继续有效；
+        - 只删除“对 VACUUM 事务和所有传入的活跃事务都不可见”的旧版本；
+        - 每个逻辑行保留根记录，并保留从 ``newest`` 到最老可见版本的整条
+          前缀链；更老的版本才回收。这样活跃快照沿 ``prev`` 仍能走得到；
+        - 页内只做 tombstone + ``compact``，回收记录体空间，但页链不缩短。
+
+        前提：调用方已经让所有在途语句退出（``exclusive_guard``）；活跃事务
+        只能处于“空闲”状态，不能在扫描/回收期间写页。
+        """
+        txn.require_active()
+        txn.wrote = True
+
+        records: dict[RID, DecodedRecord] = {}
+        page_ids: list[int] = []
+        page_id = self.table.root_page
+        while page_id != INVALID_PAGE_ID:
+            page = self._fetch(page_id)
+            next_id = page.next_page
+            page_ids.append(page_id)
+            try:
+                for slot in range(page.nslots):
+                    rec = self._decode(page, slot)
+                    if rec is not None:
+                        records[(page_id, slot)] = rec
+            finally:
+                self._release(page)
+            page_id = next_id
+
+        viewers: list[Transaction] = [txn]
+        viewers.extend(t for t in active_txns if t.xid != txn.xid)
+
+        def visible(rec: DecodedRecord) -> bool:
+            return any(self._visible(viewer, rec) for viewer in viewers)
+
+        keep: set[RID] = set()
+        for rid, rec in records.items():
+            if not rec.header.is_root:
+                continue
+            # 根 RID 是索引入口：即使整行对所有人都不可见也保留，
+            # 否则索引会指向一个不存在的槽位。
+            keep.add(rid)
+            cur = rec.header.newest_rid or rid
+            chain: list[RID] = []
+            seen: set[RID] = set()
+            while cur in records and cur not in seen:
+                chain.append(cur)
+                seen.add(cur)
+                cur = records[cur].header.prev_rid
+            if not chain:
+                continue
+            keep.add(chain[0])
+            deepest = 0
+            for i, version_rid in enumerate(chain):
+                if visible(records[version_rid]):
+                    deepest = i
+            keep.update(chain[: deepest + 1])
+
+        # 可见但不在任何根链上的孤儿版本（历史遗留）也保留，避免在线
+        # 回收把某个活跃快照还能扫到的版本删掉。
+        for rid, rec in records.items():
+            if rid not in keep and visible(rec):
+                keep.add(rid)
+
+        dead = 0
+        compacted = 0
+        for pid in page_ids:
+            page = self._fetch(pid)
+            dirty = False
+            try:
+                with page.latch:
+                    old = bytes(page.buf)
+                    removed = 0
+                    for slot in range(page.nslots):
+                        rid = (pid, slot)
+                        if (
+                            rid in records
+                            and rid not in keep
+                            and page.record_length(slot) > 0
+                        ):
+                            page.delete_record(slot)
+                            removed += 1
+                    if removed:
+                        page.compact()
+                        self._log_page_image(txn, page, old)
+                        dead += removed
+                        compacted += 1
+                        dirty = True
+            finally:
+                self._release(page, dirty=dirty)
+
+        live_roots: set[RID] = set()
+        for rid, rec in records.items():
+            if self._visible(txn, rec):
+                live_roots.add(self.resolve_root(rid, rec.header))
+        self.table.row_count_hint = len(live_roots)
+        return len(live_roots), dead, compacted
+
     def vacuum(self, txn: Transaction) -> tuple[int, int, int]:
         """回收死版本，并把存活行重排成"每行只剩一条根元组"。
 

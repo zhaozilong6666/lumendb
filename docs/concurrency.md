@@ -333,30 +333,33 @@ Step 4 的前置项在这条路径上落地：
   "cannot release a lock owned by another thread"。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（9 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（10 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
-  保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、热点行无丢失更新）；
+  保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
+  热点行无丢失更新）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
-  半回滚，校验行数/去重/索引不变量）与 `sql_savepoint_concurrent`（A 未提交时
-  B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）。
+  半回滚，校验行数/去重/索引不变量）、`sql_savepoint_concurrent`（A 未提交时
+  B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）
+  与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，快照看旧版本）。
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1411 passed**，门禁脚本 3 轮 PASS（8 项，前两项 pytest 探针固定
-  1 轮，已含 VACUUM 等待探针）。
+  并发各 **1414 passed**，门禁脚本 3 轮 PASS（9 项，前两项 pytest 探针固定
+  1 轮，已含 VACUUM 等待与在线回收探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
 - 保存点已经能并发使用：不再因为"有别的活跃事务"直接 `0A000`，而是排空在途
   语句后独占写者锁。它仍然是"功能正确但并发度低"的兜底路径——保存点事务存续
   期间其它写者排队。要恢复高并发保存点，仍需要行级逻辑 undo log。
-- `VACUUM` 仍要求表上没有其它活跃事务，但不再一看到 `active_xids` 就拒绝：
-  它在进入 `exclusive_guard` 前最多等 5s，让在途事务先结束；仍没有
-  oldest-active-xmin 水位，空闲显式事务超时后依旧只能报错。线协议自动提交与
-  `Database.execute` 两条入口都已接这个等待窗口。
-  等待返回与拿到 `exclusive_guard` 之间仍有新事务 `BEGIN` 的极小窗口；命中时
-  仍按原门禁报错，目前不做退门重试。
+- `VACUUM` 不再因为活跃事务失败：入口先等最多 5s；等不到空窗口就转“保 RID 的
+  在线回收”（`HeapFile.vacuum_online`）。在线模式按 VACUUM 事务与所有活跃事务的
+  快照逐版本判可见性，保留根记录、链头到最老可见版本的整条前缀链；只删对所有
+  快照都不可见的版本，槽位不重排、索引不重建。持有 DDL 目录锁/物理 undo 的活跃
+  事务仍会让 VACUUM 按原门禁报错——DDL abort 的页原像不能和在线整页日志交错。
+  剩余边界是根记录/空洞槽位不回收，文件不缩小；离线模式（无活跃事务）仍重排
+  RID 并重建索引。
 
 **实测（2026-11-21，Windows / Python 3.13，单机）**
 
@@ -805,9 +808,9 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1411 passed；门禁
-  脚本 3 轮 PASS（8 项，含保存点并发与 VACUUM 等待探针）；CI run 279/280/281
-  四矩阵全绿（含看门狗竞态修复后重跑）。
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1414 passed；门禁
+  脚本 3 轮 PASS（9 项，含保存点并发、VACUUM 等待与在线回收探针）；CI run
+  279/280/281 四矩阵全绿（含看门狗竞态修复后重跑）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
@@ -820,14 +823,14 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
   事务（不再 `0A000`）：它排空在途语句后独占写者锁，事务自己的后续语句继续执行，
   其它写者排队到事务结束。功能可用、跨线程 COMMIT/ROLLBACK 已回归；但空闲保存点
   事务仍会长期占住写者锁，切默认前要么接受"保存点即串行"，要么补行级逻辑 undo。
-- **VACUUM：部分过关。** 重排 RID / 重建索引仍要求没有其它活跃事务，但入口会先
-  在独占门外最多等 5s，给在途事务一个结束窗口；空闲显式事务超时后仍会拒绝。
-  这不是 oldest-active-xmin 水位，真正的在线回收仍未实现。
+- **VACUUM：在线 MVP 过关。** 活跃事务存在时不再报错：等 5s 后自动转保 RID
+  在线回收，保留所有活跃快照需要的版本与根 RID，不重建索引。剩余是空间回收
+  效率：根记录和空洞槽位不回收、文件不缩小；离线模式仍可做完整重排。
 - **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务
   才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
 
-所以下一步优先级是：保存点语义 → VACUUM 水位；两关都过再谈把
-`concurrent_dml` 设为默认。
+所以下一步优先级是：保存点行级逻辑 undo → 自动提交 UPDATE 的隔离级别说明；
+VACUUM 在线回收已不再作为硬阻塞项。
 
 ### 锁表的规模（已处理）
 
@@ -838,8 +841,8 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ## 3. 已知的取舍（写在这里，避免下一轮再讨论一遍）
 
-- **`VACUUM` 仍是停机维护**：它重排 RID、重建索引，需要"没有其它活跃事务"。
-  行锁放开后这个前提不再天然成立，执行器已经在检查 `active_xids`。
+- **`VACUUM` 有离线/在线两模式**：没有活跃事务时重排 RID、重建索引；有活跃
+  事务时走保 RID 在线回收，只删对所有人不可见的版本，根记录与空洞槽位不回收。
 - **witness 节点不参与 durability**：不存数据的投票节点**不计入**"多数派真正持有"
   的提交水位。水位由 `match_lsn`（真正 apply 到）算出，`last_lsn`（听到过）只
   用于投票安全性比较；心跳与投票响应都带两个字段、`campaign()` 与 `heartbeat_round`

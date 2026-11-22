@@ -449,15 +449,17 @@ class Database:
             self._readers_cv.notify_all()
         self._write_lock.release()
 
-    def wait_for_vacuum_window(self, xid: Optional[int] = None) -> None:
-        """并发模式下等一个没有其它活跃事务的 VACUUM 窗口。
+    def wait_for_vacuum_window(self, xid: Optional[int] = None) -> bool:
+        """并发模式下先等一个没有其它活跃事务的 VACUUM 窗口。
 
         重排 RID / 重建索引不能和别的活跃事务共存；旧行为是一进独占门就撞
-        ``active_xids`` 直接报错。现在先在门外等（读语句不被挡），最多 5s；
-        超时仍按原门禁报错，不会把调用方永久挂住。
+        ``active_xids`` 直接报错。现在先在门外等，最多 5s；超时不报错，
+        执行器会转“保 RID 的在线回收”，保留活跃快照仍需要的版本。
+        返回是否真的等到了空窗口。
         """
         if self._concurrent_dml:
-            self.txns.wait_until_no_others(xid, timeout=5.0)
+            return self.txns.wait_until_no_others(xid, timeout=5.0)
+        return True
 
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
         # 保存点事务已经持有写者锁并置了 ``_no_readers``：它自己的后续语句

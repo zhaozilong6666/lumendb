@@ -17,6 +17,7 @@
    提交行数/去重数正确，索引不变量成立。走 ``concurrent_dml=True`` 路径。
 6. ``sql_savepoint_concurrent`` 别的会话活跃时建保存点：等待独占而非 ``0A000``。
 7. ``sql_vacuum_window``  别的会话活跃时自动提交 VACUUM：在独占门外等它结束。
+8. ``sql_vacuum_online``  等不到空窗口时转保 RID 在线回收：活跃快照仍看旧版本。
 
 输出是机器可读的 ``GATE <name> rounds=.. ok=.. status=PASS|FAIL``，退出码非 0
 表示有门禁未通过。所有临时库都建在系统临时目录，跑完即删，不碰工作树。
@@ -242,6 +243,54 @@ def _probe_sql_vacuum_window(db: Database) -> dict:
     }
 
 
+def _probe_sql_vacuum_online(db: Database) -> dict:
+    """活跃快照存在时 VACUUM 转保 RID 在线回收，而不是等超时报错。
+
+    模拟 5s 等待超时：A 持有快照不提交；B 更新并删除行后，VACUUM 必须在
+    A 仍活跃的情况下完成，A 继续看到旧版本，新事务看到新版本。
+    """
+    server = PGWireServer(db)
+    errors: list[str] = []
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    seed = Session(database=db)
+    run_sql(seed, "INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')")
+    snap = Session(database=db)
+    run_sql(snap, "BEGIN")
+    before = run_sql(snap, "SELECT COUNT(*) FROM t")[0].rows[0][0]
+
+    writer = Session(database=db)
+    run_sql(writer, "BEGIN")
+    run_sql(writer, "UPDATE t SET v = 11 WHERE id = 1")
+    run_sql(writer, "DELETE FROM t WHERE id = 2")
+    run_sql(writer, "COMMIT")
+
+    original = db.txns.wait_until_no_others
+    db.txns.wait_until_no_others = lambda *args, **kwargs: False
+    try:
+        result = server._run_statement(
+            Session(database=db), parse_sql("VACUUM")[0]
+        )
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(f"{type(exc).__name__}: {exc}")
+        result = None
+    finally:
+        db.txns.wait_until_no_others = original
+
+    old_view = run_sql(snap, "SELECT COUNT(*) FROM t")[0].rows[0][0]
+    new_view = run_sql(Session(database=db), "SELECT COUNT(*) FROM t")[0].rows[0][0]
+    run_sql(snap, "COMMIT")
+    return {
+        "errors": errors[:3],
+        "tag": getattr(result, "tag", None),
+        "before": before,
+        "old_view": old_view,
+        "new_view": new_view,
+    }
+
+
 def _probe_btree_delete_race(db: Database) -> dict:
     """4 线程乱序删完 12000 条长键树 + 1 并发读者，校验叶子链与终态。"""
     tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.TEXT)]), unique=False, name="idx")
@@ -440,6 +489,13 @@ def _probe_failed(name: str, detail: dict) -> bool:
             or not detail["waited"]
             or not str(detail.get("tag", "")).startswith("VACUUM")
         )
+    if name == "sql_vacuum_online":
+        return (
+            "online" not in str(detail.get("tag", ""))
+            or detail["before"] != 3
+            or detail["old_view"] != 3
+            or detail["new_view"] != 2
+        )
     return False
 
 
@@ -480,6 +536,13 @@ def _build_vacuum(tmp: pathlib.Path):
     return db, _probe_sql_vacuum_window(db)
 
 
+def _build_vacuum_online(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    db.execute("CREATE INDEX idx_v ON t (v)")
+    return db, _probe_sql_vacuum_online(db)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="LumenDB Step 4 并发门禁")
     ap.add_argument("--rounds", type=int, default=3)
@@ -500,7 +563,8 @@ def main(argv: list[str] | None = None) -> int:
                         ("btree_delete_race", _build_btree),
                         ("sql_concurrent_dml", _build_sql_dml),
                         ("sql_savepoint_concurrent", _build_savepoint),
-                        ("sql_vacuum_window", _build_vacuum)):
+                        ("sql_vacuum_window", _build_vacuum),
+                        ("sql_vacuum_online", _build_vacuum_online)):
         res = _check_probe(name, build, rounds, name)
         checks.append(res)
         print(f"GATE {name} rounds={res['rounds']} ok={res['ok']} "

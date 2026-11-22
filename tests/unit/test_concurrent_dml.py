@@ -206,6 +206,44 @@ def test_savepoint_lock_can_be_released_by_another_thread(env):
     ]
 
 
+def test_vacuum_falls_back_to_online_with_idle_snapshot(env, monkeypatch):
+    """5s 等不到空窗口时转保 RID 在线回收，活跃快照仍看到旧版本。"""
+    db, server = env
+    seed = Session(database=db)
+    _run(server, seed, "INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')")
+
+    snap = Session(database=db)
+    _run(server, snap, "BEGIN")
+    assert _rows(server, snap, "SELECT id, v FROM t ORDER BY id") == [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+    ]
+
+    writer = Session(database=db)
+    _run(server, writer, "BEGIN")
+    _run(server, writer, "UPDATE t SET v = 11 WHERE id = 1")
+    _run(server, writer, "DELETE FROM t WHERE id = 2")
+    _run(server, writer, "COMMIT")
+
+    # 直接模拟 5s 超时：不让测试真的等 5 秒，但保留“活跃事务还在”的状态。
+    monkeypatch.setattr(db.txns, "wait_until_no_others", lambda *a, **k: False)
+    result = server._run_statement(
+        Session(database=db), parse_sql("VACUUM")[0]
+    )
+    assert "online" in result.tag
+    assert _rows(server, snap, "SELECT id, v FROM t ORDER BY id") == [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+    ]
+    assert _rows(server, Session(database=db), "SELECT id, v FROM t ORDER BY id") == [
+        (1, 11),
+        (3, 3),
+    ]
+    _run(server, snap, "COMMIT")
+
+
 def test_vacuum_waits_for_active_transaction(env):
     """线协议 VACUUM 先等在途事务退出，而不是看到 active_xids 就报错。"""
     db, server = env

@@ -508,26 +508,29 @@ class TransactionManager:
                 return None
             return min(self._active_starts.values())
 
+    def active_transactions(self) -> list[Transaction]:
+        """当前活跃事务对象快照；在线 VACUUM 用它逐快照判断要保留哪些版本。"""
+        with self._lock:
+            return [
+                self._txns[xid] for xid in sorted(self._active) if xid in self._txns
+            ]
+
     def wait_until_no_others(
         self, xid: int | None = None, timeout: float = 5.0
-    ) -> None:
-        """等其它活跃事务退出，最多 ``timeout`` 秒。
+    ) -> bool:
+        """等其它活跃事务退出，最多 ``timeout`` 秒；返回是否等到了空窗口。
 
         ``xid`` 是调用方自己的事务（自动提交 VACUUM 还没有事务，传 None）。
-        VACUUM 用它等一个没有别的活跃事务的窗口；空闲显式事务如果一直不结束，
-        超时后仍按原门禁报错，调用方不会被永久挂住。
+        超时不再报错：VACUUM 会在 5s 后转在线保 RID 模式，让空闲事务继续存在。
         """
         with self._active_cv:
             deadline = time.monotonic() + timeout
             while self._active - ({xid} if xid is not None else set()):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TransactionError(
-                        "等待其它事务退出超时",
-                        detail=f"当前活跃事务：{sorted(self._active)[:8]}",
-                        hint="VACUUM 需要没有其它活跃事务；等它们结束或改用停机维护",
-                    )
+                    return False
                 self._active_cv.wait(remaining)
+            return True
 
     def state_of(self, xid: int) -> Optional[TxnState]:
         return self._states.get(xid)

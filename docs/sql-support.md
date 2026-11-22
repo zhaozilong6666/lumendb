@@ -400,7 +400,8 @@ EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / row
 SHOW TABLES;
 CHECKPOINT;
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
-VACUUM [FULL] [table];  -- 回收死版本、压实堆页并重建索引；不带表名则处理所有表
+VACUUM [FULL] [table];  -- 回收死版本；无活跃事务时重排堆页并重建索引，
+                         -- 有活跃事务时转保 RID 在线回收；不带表名处理所有表
 TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
                          -- 清空一到多张表（页链保留、逐页重置）；RESTRICT 要求
                          -- 所有引用目标表的子表同时出现在列表中，CASCADE 自动递归清空
@@ -420,8 +421,8 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | `ON CONFLICT` 约束目标 | 支持 `DO NOTHING` / `DO UPDATE SET` / `DO UPDATE ... WHERE` / `excluded.col`；列组合或 `ON CONSTRAINT name` 必须映射到一个唯一索引 |
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
-| autovacuum / 并发 VACUUM | `VACUUM` 要求没有其它活跃事务；不做后台自动触发 |
-| 缩小数据文件 | `VACUUM` / `VACUUM FULL` 回收页内空间，但文件大小不缩，空页留在链上 |
+| autovacuum / 后台触发 | 不做后台自动触发，只能显式执行 `VACUUM` |
+| 缩小数据文件 / 回收根记录 | 离线 `VACUUM` 回收页内空间但文件不缩；在线模式保 RID，不回收根记录与空洞槽位 |
 
 ## 已知的行为细节
 

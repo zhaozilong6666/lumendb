@@ -3118,27 +3118,47 @@ class Executor:
         return rebuilt, entries_total
 
     def _vacuum(self, stmt: Vacuum, txn: Transaction) -> Result:
-        """回收死版本。堆页重排会改变 RID，所以随后必须重建索引。"""
+        """回收死版本。堆页重排会改变 RID，所以随后必须重建索引。
+
+        并发模式下如果还有空闲的活跃事务，走保 RID 的 ``vacuum_online``：
+        只回收对所有活跃快照都不可见的版本，槽位与索引项保持不变。
+        """
         tables = (
             [self._catalog.get_table(stmt.table)]
             if stmt.table
             else self._catalog.list_tables()
         )
+        active_others = [
+            t for t in self._txns.active_transactions() if t.xid != txn.xid
+        ]
+        # 只对“没有持有 DDL 目录锁/物理 undo”的空闲事务走在线模式；
+        # DDL 的 abort 会按页面原像回滚，和在线回收整页写日志不能交错。
+        online = (
+            self._concurrent_dml
+            and bool(active_others)
+            and all(not t.catalog_hold and not t.undo_log for t in active_others)
+        )
         kept = dead = pages = 0
+        online_tables = 0
         for table in tables:
             self._snapshot_table_state(table, txn)
             heap = HeapFile(self._bp, table, self._txns)
-            k, d, p = heap.vacuum(txn)
+            if online:
+                k, d, p = heap.vacuum_online(txn, active_others)
+                online_tables += 1
+            else:
+                k, d, p = heap.vacuum(txn)
+                self._rebuild_indexes(table, txn)
             kept += k
             dead += d
             pages += p
-            self._rebuild_indexes(table, txn)
         self._persist_catalog(txn)
+        suffix = ", online" if online_tables else ""
         return Result(
             affected=dead,
             tag=(
                 f"VACUUM {len(tables)} tables ({kept} rows kept, "
-                f"{dead} versions reclaimed, {pages} pages rewritten)"
+                f"{dead} versions reclaimed, {pages} pages rewritten{suffix})"
             ),
         )
 

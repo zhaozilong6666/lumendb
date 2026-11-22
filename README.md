@@ -311,7 +311,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 火山模型执行器（Scan/Filter/Project/Join/Aggregate/Sort/Limit）
 - [x] 等值与范围的索引选择（`EXPLAIN` 可见）
 - [x] PostgreSQL wire protocol（simple + extended query，支持 `$1` 参数绑定）
-- [x] `VACUUM`：回收死版本、压实堆页、重建索引（要求无并发事务）
+- [x] `VACUUM`：离线重排 RID/重建索引；有活跃事务时转保 RID 在线回收
 - [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接/投影/聚合/排序/集合/`LIMIT` 基数与 CPU 估算，`EXPLAIN` 输出 `rows≈/cpu≈` 标注，并作为左深连接顺序与哈希构建侧选择的输入
 - [x] 哈希连接构建侧选择：INNER 连接按估算选择较小的一侧建表，`EXPLAIN` 显示 `[build=left/right]`
 - [x] 左深动态规划连接顺序：3–8 个源按子集枚举选择 `rows + cpu` 最小的顺序；逗号连接和纯 INNER 显式 `JOIN` 链都会重排，外连接/混合 `JOIN`/超过 8 源保持原序；输出列顺序由投影还原；`EXPLAIN` 标记 `[order=dp] [candidates=N]`
@@ -381,10 +381,10 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
   不再因别的活跃事务直接 `0A000`，但事务存续期间其它写者排队。
 - **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
   少了一套最容易出错的分支，代价是稀疏页要靠 `REINDEX table` 重建来回收。
-- **`VACUUM` 是停机维护，不是在线回收**：重写堆页会改变 RID，随后必须重建索引；
-  没有 autovacuum、没有 oldest-xmin 水位、文件不会缩小。并发模式下它会在
-  独占门外最多等 5s 让在途事务结束，超时仍按原门禁报错。换来的是回收逻辑
-  可以被一条 SQL 触发、也可以被崩溃恢复测试断言。
+- **`VACUUM` 有离线/在线两模式**：没有活跃事务时重排堆页、改变 RID 并重建索引；
+  有活跃事务时先等最多 5s，等不到就转保 RID 在线回收——只删对所有活跃快照都
+  不可见的版本，槽位与索引项不动，根记录和空洞槽位不回收，文件不会缩小。
+  换来的是维护操作不再被一个空闲事务直接拒掉。
 - **目录存进数据文件的页链**：不用独立的 `catalog.json`，让表定义和用户数据
   共享同一份 WAL——否则"表建好了但数据没落盘"这类中间状态要另立机制处理。
 - **Python**：这个项目的目标是"把机制写清楚、可被测出来"，不是吞吐量竞赛。

@@ -420,6 +420,62 @@ class TestVacuum:
         txns.abort(txn2)
         txns.commit(txn1)
 
+    def test_vacuum_online_keeps_active_snapshot_and_root_rids(self, env):
+        """保 RID 回收：活跃快照仍能沿版本链看到旧值，根 RID 不变。"""
+        heap, txns, bp, table = env
+        txn = txns.begin()
+        r1 = heap.insert(txn, [1, "a", 10])
+        r2 = heap.insert(txn, [2, "b", 20])
+        txns.commit(txn)
+
+        snap = txns.begin()
+        assert sorted(v[0] for _, v in heap.scan(snap)) == [1, 2]
+
+        txn = txns.begin()
+        heap.update(txn, r1, [1, "a2", 11])
+        heap.delete(txn, r2)
+        txns.commit(txn)
+
+        vac = txns.begin()
+        kept, dead, pages = heap.vacuum_online(
+            vac, txns.active_transactions()
+        )
+        txns.commit(vac)
+        # 活跃快照仍需要两条旧版本，不能回收；根记录也全部保留。
+        assert (kept, dead, pages) == (1, 0, 0)
+        assert sorted(v for _, v in heap.scan(snap)) == [
+            [1, "a", 10],
+            [2, "b", 20],
+        ]
+
+        txn = txns.begin()
+        assert heap.get(txn, r1) == [1, "a2", 11]
+        assert heap.get(txn, r2) is None
+        txns.commit(txn)
+        txns.abort(snap)
+
+    def test_vacuum_online_reclaims_middle_version_without_moving_rids(self, env):
+        heap, txns, bp, table = env
+        txn = txns.begin()
+        rid = heap.insert(txn, [1, "a", 1])
+        txns.commit(txn)
+        for age in (2, 3):
+            txn = txns.begin()
+            heap.update(txn, rid, [1, "a", age])
+            txns.commit(txn)
+
+        vac = txns.begin()
+        kept, dead, pages = heap.vacuum_online(vac)
+        assert (kept, dead, pages) == (1, 1, 1)
+        assert heap.get(vac, rid) == [1, "a", 3]
+        page, rec = heap._read_rid(rid)
+        try:
+            assert rec.header.is_root
+            assert rec.header.newest_rid is not None
+        finally:
+            bp.unpin(page.page_id)
+        txns.commit(vac)
+
 
 class TestTxnGuard:
     def test_operations_require_active_txn(self, env):
