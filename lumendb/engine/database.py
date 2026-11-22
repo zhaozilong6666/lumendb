@@ -24,6 +24,7 @@ from ..sql.ast import (
     RollbackToSavepoint,
     Savepoint,
     SetConstraints,
+    Vacuum,
 )
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
@@ -448,6 +449,16 @@ class Database:
             self._readers_cv.notify_all()
         self._write_lock.release()
 
+    def wait_for_vacuum_window(self, xid: Optional[int] = None) -> None:
+        """并发模式下等一个没有其它活跃事务的 VACUUM 窗口。
+
+        重排 RID / 重建索引不能和别的活跃事务共存；旧行为是一进独占门就撞
+        ``active_xids`` 直接报错。现在先在门外等（读语句不被挡），最多 5s；
+        超时仍按原门禁报错，不会把调用方永久挂住。
+        """
+        if self._concurrent_dml:
+            self.txns.wait_until_no_others(xid, timeout=5.0)
+
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
         # 保存点事务已经持有写者锁并置了 ``_no_readers``：它自己的后续语句
         # 不能再进 ``read_guard``，否则会等自己放行。这里直接执行，关闭/围栏
@@ -489,6 +500,13 @@ class Database:
                 # 保存点还没登记成功就失败了：不能把库一直锁在独占模式。
                 self._exit_savepoint_mode(self._txn)
                 raise
+
+        # VACUUM 要重排 RID/重建索引：先在独占门外等其它活跃事务退出，
+        # 再走结构性写的 exclusive_guard。默认模式没有并发活跃事务，不额外等。
+        if isinstance(statement, Vacuum):
+            self.wait_for_vacuum_window(
+                self._txn.xid if self._txn is not None else None
+            )
 
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             if (

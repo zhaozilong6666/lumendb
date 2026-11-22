@@ -48,15 +48,32 @@ class Lease:
         self.lock_path = self.path.with_name(self.path.name + ".lock")
 
     def read(self) -> dict | None:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
+        # Windows 上 ``atomic_replace`` 把临时文件改名到 ``lease.json`` 的瞬间，
+        # 读者可能拿到瞬时 ``PermissionError``（文件正被替换）。这不是状态损坏，
+        # 短暂退避重试即可；否则 keeper 每 50ms 续租一次，读者会被误判成坏文件。
+        last_permission: PermissionError | None = None
+        raw = None
+        for attempt in range(5):
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                break
+            except FileNotFoundError:
+                return None
+            except PermissionError as exc:
+                last_permission = exc
+                if attempt < 4:
+                    time.sleep(0.005 * (attempt + 1))
+            except (OSError, ValueError) as exc:
+                raise StorageError(
+                    "租约状态损坏，拒绝用默认租约继续",
+                    detail=str(self.path),
+                ) from exc
+        else:
             raise StorageError(
-                "租约状态损坏，拒绝用默认租约继续",
+                "租约状态暂时不可读，拒绝用默认租约继续",
                 detail=str(self.path),
-            ) from exc
+                hint="文件可能正被原子替换占用；稍后重试",
+            ) from last_permission
         if not isinstance(raw, dict):
             raise StorageError("租约状态必须是 JSON 对象", detail=str(self.path))
         return {

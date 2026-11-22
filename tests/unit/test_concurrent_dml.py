@@ -206,6 +206,52 @@ def test_savepoint_lock_can_be_released_by_another_thread(env):
     ]
 
 
+def test_vacuum_waits_for_active_transaction(env):
+    """线协议 VACUUM 先等在途事务退出，而不是看到 active_xids 就报错。"""
+    db, server = env
+    holder = Session(database=db)
+    ready = threading.Event()
+    release = threading.Event()
+    errors: list[str] = []
+    result: list = []
+
+    def hold_transaction():
+        try:
+            _run(server, holder, "BEGIN")
+            _run(server, holder, "INSERT INTO t VALUES (999, 9, 'hold')")
+            ready.set()
+            release.wait(2.0)
+            _run(server, holder, "COMMIT")
+        except Exception:
+            errors.append(traceback.format_exc())
+
+    def vacuum():
+        try:
+            result.append(
+                server._run_statement(
+                    Session(database=db), parse_sql("VACUUM")[0]
+                )
+            )
+        except Exception:
+            errors.append(traceback.format_exc())
+
+    ht = threading.Thread(target=hold_transaction)
+    vt = threading.Thread(target=vacuum)
+    ht.start()
+    assert ready.wait(2.0), "持有事务未启动"
+    vt.start()
+    # VACUUM 此刻应真的停在等待窗口里；如果它直接返回，说明门禁没生效。
+    vt.join(timeout=0.2)
+    assert vt.is_alive(), "VACUUM 未等待活跃事务就返回了"
+    release.set()
+    vt.join(timeout=10)
+    ht.join(timeout=10)
+    assert not vt.is_alive() and not ht.is_alive()
+    assert errors == [], errors[0]
+    assert result and result[0].tag.startswith("VACUUM")
+    assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(1,)]
+
+
 def test_close_with_savepoint_releases_the_gate(env):
     """同线程 close 进到保存点事务：abort 后必须放门，不能留下 no_readers。"""
     db, server = env

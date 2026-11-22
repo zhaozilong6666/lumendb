@@ -42,6 +42,7 @@ from ..sql.ast import (
     RollbackToSavepoint,
     Savepoint,
     Statement,
+    Vacuum,
 )
 from ..sql.parser import parse_sql
 
@@ -421,6 +422,8 @@ class PGWireServer:
                 if type(statement).__name__ not in _PURE_READ_STATEMENTS:
                     database.assert_writable()
                 return session.engine().run(statement, session.txn, params)
+            if isinstance(statement, Vacuum):
+                database.wait_for_vacuum_window(session.txn.xid)
             # [Review-Fix] 线协议会话不经过 Database._run，写围栏必须在这里
             # 单独调用；提交点还有 TransactionManager.commit 的复检兜底。
             if type(statement).__name__ not in _PURE_READ_STATEMENTS:
@@ -461,6 +464,8 @@ class PGWireServer:
                 session.portals.clear()
                 return result
 
+        if isinstance(statement, Vacuum):
+            database.wait_for_vacuum_window(None)
         guard = (
             database.read_guard()
             if (

@@ -333,9 +333,9 @@ Step 4 的前置项在这条路径上落地：
   "cannot release a lock owned by another thread"。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（8 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（9 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
-  保存点跨线程释放、保存点事务内关闭、热点行无丢失更新）；
+  保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、热点行无丢失更新）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
@@ -344,14 +344,19 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1408 passed**，门禁脚本 3 轮 PASS（7 项，前两项 pytest 探针固定 1 轮）。
+  并发各 **1411 passed**，门禁脚本 3 轮 PASS（8 项，前两项 pytest 探针固定
+  1 轮，已含 VACUUM 等待探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
 - 保存点已经能并发使用：不再因为"有别的活跃事务"直接 `0A000`，而是排空在途
   语句后独占写者锁。它仍然是"功能正确但并发度低"的兜底路径——保存点事务存续
   期间其它写者排队。要恢复高并发保存点，仍需要行级逻辑 undo log。
-- `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
-  基于 oldest-active-xmin 的水位；一个空闲显式事务就能让维护操作被拒。
+- `VACUUM` 仍要求表上没有其它活跃事务，但不再一看到 `active_xids` 就拒绝：
+  它在进入 `exclusive_guard` 前最多等 5s，让在途事务先结束；仍没有
+  oldest-active-xmin 水位，空闲显式事务超时后依旧只能报错。线协议自动提交与
+  `Database.execute` 两条入口都已接这个等待窗口。
+  等待返回与拿到 `exclusive_guard` 之间仍有新事务 `BEGIN` 的极小窗口；命中时
+  仍按原门禁报错，目前不做退门重试。
 
 **实测（2026-11-21，Windows / Python 3.13，单机）**
 
@@ -800,9 +805,9 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1408 passed；门禁脚本
-  3 轮 PASS（7 项，含新增保存点并发探针）；CI run 279/280/281 四矩阵全绿（含看门狗
-  竞态修复后重跑）。
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1411 passed；门禁
+  脚本 3 轮 PASS（8 项，含保存点并发与 VACUUM 等待探针）；CI run 279/280/281
+  四矩阵全绿（含看门狗竞态修复后重跑）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
@@ -815,8 +820,9 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
   事务（不再 `0A000`）：它排空在途语句后独占写者锁，事务自己的后续语句继续执行，
   其它写者排队到事务结束。功能可用、跨线程 COMMIT/ROLLBACK 已回归；但空闲保存点
   事务仍会长期占住写者锁，切默认前要么接受"保存点即串行"，要么补行级逻辑 undo。
-- **VACUUM：不过关。** 重排 RID / 重建索引仍要求“没有其它活跃事务”。虽然
-  `exclusive_guard` 会挡住新语句，但一个空闲的显式事务就足以让 VACUUM 直接被拒。
+- **VACUUM：部分过关。** 重排 RID / 重建索引仍要求没有其它活跃事务，但入口会先
+  在独占门外最多等 5s，给在途事务一个结束窗口；空闲显式事务超时后仍会拒绝。
+  这不是 oldest-active-xmin 水位，真正的在线回收仍未实现。
 - **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务
   才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
 

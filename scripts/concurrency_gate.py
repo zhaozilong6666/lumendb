@@ -15,6 +15,8 @@
    depth>=2 的树）：读者不截断、不重复；删完叶子链不断、树能完全塌陷。
 5. ``sql_concurrent_dml``  4 个线协议会话并发跑 SQL DML（半数回滚）：
    提交行数/去重数正确，索引不变量成立。走 ``concurrent_dml=True`` 路径。
+6. ``sql_savepoint_concurrent`` 别的会话活跃时建保存点：等待独占而非 ``0A000``。
+7. ``sql_vacuum_window``  别的会话活跃时自动提交 VACUUM：在独占门外等它结束。
 
 输出是机器可读的 ``GATE <name> rounds=.. ok=.. status=PASS|FAIL``，退出码非 0
 表示有门禁未通过。所有临时库都建在系统临时目录，跑完即删，不碰工作树。
@@ -186,6 +188,57 @@ def _probe_sql_savepoint(db: Database) -> dict:
         "final": final,
         "expected": 1,
         "visible_after_rollback": visible if "visible" in locals() else None,
+    }
+
+
+def _probe_sql_vacuum_window(db: Database) -> dict:
+    """VACUUM 等待窗口：持有事务未提交时，VACUUM 等在独占门外而不是立刻拒绝。
+
+    A 先插入但不提交；B 的自动提交 VACUUM 应阻塞在等待窗口里，A 提交后完成。
+    终态必须保留 A 的行，且 VACUUM 确实等了至少一个轮询间隔。
+    """
+    server = PGWireServer(db)
+    errors: list[str] = []
+    started = threading.Event()
+    finished = threading.Event()
+    result: dict = {}
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    a = Session(database=db)
+    vacuum = Session(database=db)
+
+    def vacuum_worker() -> None:
+        started.set()
+        try:
+            tag = server._run_statement(vacuum, parse_sql("VACUUM")[0]).tag
+            result["tag"] = tag
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            finished.set()
+
+    run_sql(a, "BEGIN")
+    run_sql(a, "INSERT INTO t VALUES (1, 1, 'hold')")
+    th = threading.Thread(target=vacuum_worker, name="gate-vacuum")
+    th.start()
+    started.wait(timeout=5)
+    # 给 VACUUM 足够时间真正进入等待窗口；A 提交后它应立刻完成。
+    th.join(timeout=0.15)
+    waited = not finished.is_set()
+    run_sql(a, "COMMIT")
+    th.join(timeout=8)
+    if th.is_alive():
+        errors.append("VACUUM 在 A 提交后仍未返回")
+
+    final = run_sql(Session(database=db), "SELECT COUNT(*) FROM t")[0].rows[0][0]
+    return {
+        "errors": errors[:3],
+        "final": final,
+        "expected": 1,
+        "waited": waited,
+        "tag": result.get("tag"),
     }
 
 
@@ -381,6 +434,12 @@ def _probe_failed(name: str, detail: dict) -> bool:
             detail["final"] != detail["expected"]
             or detail["visible_after_rollback"] != 0
         )
+    if name == "sql_vacuum_window":
+        return (
+            detail["final"] != detail["expected"]
+            or not detail["waited"]
+            or not str(detail.get("tag", "")).startswith("VACUUM")
+        )
     return False
 
 
@@ -415,6 +474,12 @@ def _build_savepoint(tmp: pathlib.Path):
     return db, _probe_sql_savepoint(db)
 
 
+def _build_vacuum(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    return db, _probe_sql_vacuum_window(db)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="LumenDB Step 4 并发门禁")
     ap.add_argument("--rounds", type=int, default=3)
@@ -434,7 +499,8 @@ def main(argv: list[str] | None = None) -> int:
                         ("btree_insert_crab", _build_insert_crab),
                         ("btree_delete_race", _build_btree),
                         ("sql_concurrent_dml", _build_sql_dml),
-                        ("sql_savepoint_concurrent", _build_savepoint)):
+                        ("sql_savepoint_concurrent", _build_savepoint),
+                        ("sql_vacuum_window", _build_vacuum)):
         res = _check_probe(name, build, rounds, name)
         checks.append(res)
         print(f"GATE {name} rounds={res['rounds']} ok={res['ok']} "

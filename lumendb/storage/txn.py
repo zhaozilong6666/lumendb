@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -150,6 +151,9 @@ class TransactionManager:
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
         self._active: set[int] = set()
+        #: 活跃事务集合变化时唤醒等待者。VACUUM 用它等一个"没有别的活跃
+        #: 事务"的窗口，避免空闲显式事务把维护操作直接拒掉。
+        self._active_cv = threading.Condition(self._lock)
         #: 活动事务对象表。线协议事务不一定挂在 Database._txn 上；关闭数据库
         #: 时需要能逐个 abort，否则它们会继续持有写者锁/未提交页。
         self._txns: dict[int, Transaction] = {}
@@ -209,6 +213,7 @@ class TransactionManager:
             txn.last_lsn = txn.first_lsn
             self._active_starts[xid] = txn.first_lsn
             self._current = txn
+            self._active_cv.notify_all()
             return txn
 
     def commit(self, txn: Transaction) -> None:
@@ -318,6 +323,7 @@ class TransactionManager:
             self._current = None
         self._release_locks(txn.xid)
         self._prune_states()
+        self._active_cv.notify_all()
 
     def _release_locks(self, xid: int) -> None:
         """事务结束时释放它持有的全部锁（写者锁在这里被交出）。"""
@@ -360,6 +366,7 @@ class TransactionManager:
                     self._current = None
                 self._release_locks(txn.xid)
                 self._prune_states()
+                self._active_cv.notify_all()
                 return
             try:
                 # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
@@ -404,6 +411,7 @@ class TransactionManager:
                     self._current = None
                 self._release_locks(txn.xid)
                 self._prune_states()
+                self._active_cv.notify_all()
 
     def abort_all(self) -> int:
         """回滚所有仍处于 ACTIVE 的事务；返回回滚数量。
@@ -499,6 +507,27 @@ class TransactionManager:
             if not self._active_starts:
                 return None
             return min(self._active_starts.values())
+
+    def wait_until_no_others(
+        self, xid: int | None = None, timeout: float = 5.0
+    ) -> None:
+        """等其它活跃事务退出，最多 ``timeout`` 秒。
+
+        ``xid`` 是调用方自己的事务（自动提交 VACUUM 还没有事务，传 None）。
+        VACUUM 用它等一个没有别的活跃事务的窗口；空闲显式事务如果一直不结束，
+        超时后仍按原门禁报错，调用方不会被永久挂住。
+        """
+        with self._active_cv:
+            deadline = time.monotonic() + timeout
+            while self._active - ({xid} if xid is not None else set()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransactionError(
+                        "等待其它事务退出超时",
+                        detail=f"当前活跃事务：{sorted(self._active)[:8]}",
+                        hint="VACUUM 需要没有其它活跃事务；等它们结束或改用停机维护",
+                    )
+                self._active_cv.wait(remaining)
 
     def state_of(self, xid: int) -> Optional[TxnState]:
         return self._states.get(xid)

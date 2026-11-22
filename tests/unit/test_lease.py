@@ -172,6 +172,36 @@ def test_lease_keeper_renews_until_stopped(tmp_path):
         keeper.stop()
 
 
+def test_lease_read_retries_transient_permission_error(tmp_path, monkeypatch):
+    """Windows 原子替换瞬间的 PermissionError 应重试，而不是判成租约损坏。"""
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=10)
+    lease.acquire(term=1)
+    original = Path.read_text
+    calls = {"n": 0}
+
+    def flaky(path, *args, **kwargs):
+        if path == lease.path and calls["n"] < 2:
+            calls["n"] += 1
+            raise PermissionError(13, "file is being replaced", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert lease.read()["holder"] == "n0"
+    assert calls["n"] == 2
+
+
+def test_lease_read_reports_persistent_permission_error(tmp_path, monkeypatch):
+    lease = Lease(tmp_path / "lease.json", "n0", ttl=10)
+    lease.acquire(term=1)
+
+    def always_denied(path, *args, **kwargs):
+        raise PermissionError(13, "locked", str(path))
+
+    monkeypatch.setattr(Path, "read_text", always_denied)
+    with pytest.raises(StorageError, match="暂时不可读"):
+        lease.read()
+
+
 def test_lease_rejects_stale_term(tmp_path):
     lease = Lease(tmp_path / "lease.json", "n0", ttl=30)
     lease.acquire(term=1)
