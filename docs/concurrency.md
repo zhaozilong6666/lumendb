@@ -333,12 +333,14 @@ Step 4 的前置项在这条路径上落地：
   "cannot release a lock owned by another thread"。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（10 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（11 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
-  热点行无丢失更新）；
+  活跃 DDL 时拒绝在线回收、热点行无丢失更新）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
+- `tests/crash/test_online_vacuum_recovery.py`（在线 VACUUM 的整页回收落盘后崩溃：
+  恢复可重放或撤销，但可见行/索引扫描/后续离线 VACUUM 必须一致）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
   半回滚，校验行数/去重/索引不变量）、`sql_savepoint_concurrent`（A 未提交时
   B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）
@@ -346,7 +348,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1414 passed**，门禁脚本 3 轮 PASS（9 项，前两项 pytest 探针固定
+  并发各 **1416 passed**，门禁脚本 3 轮 PASS（9 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待与在线回收探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -808,7 +810,7 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1414 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1416 passed；门禁
   脚本 3 轮 PASS（9 项，含保存点并发、VACUUM 等待与在线回收探针）；CI run
   279/280/281 四矩阵全绿（含看门狗竞态修复后重跑）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程

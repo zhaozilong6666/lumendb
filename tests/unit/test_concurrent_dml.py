@@ -15,6 +15,7 @@ import traceback
 import pytest
 
 from lumendb.engine.database import Database
+from lumendb.errors import TransactionError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 
@@ -242,6 +243,20 @@ def test_vacuum_falls_back_to_online_with_idle_snapshot(env, monkeypatch):
         (3, 3),
     ]
     _run(server, snap, "COMMIT")
+
+
+def test_vacuum_with_active_ddl_refuses_online(env, monkeypatch):
+    """活跃 DDL 事务持有目录锁/物理 undo，VACUUM 不能和它交错。"""
+    db, server = env
+    ddl = Session(database=db)
+    _run(server, ddl, "BEGIN")
+    _run(server, ddl, "CREATE TABLE u (id INT PRIMARY KEY)")
+    monkeypatch.setattr(db.txns, "wait_until_no_others", lambda *a, **k: False)
+    try:
+        with pytest.raises(TransactionError):
+            server._run_statement(Session(database=db), parse_sql("VACUUM t")[0])
+    finally:
+        _run(server, ddl, "ROLLBACK")
 
 
 def test_vacuum_waits_for_active_transaction(env):

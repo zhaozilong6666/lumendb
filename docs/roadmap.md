@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1411 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1416 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
 - 并发 DML 实验模式已落地（`Database(concurrent_dml=True)`，默认关闭）：
   DML 走 `read_guard` + 行/键锁 + 页 latch，目录保存短锁，索引根页跨语句
@@ -349,7 +349,7 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 语句后独占写者锁（不再 `0A000`，但存续期间写者排队）；`concurrent_dml` 仍保持
 opt-in，默认模式尚未切换，卡在保存点仍串行、`VACUUM` 在线模式只保 RID 不回收
 根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1414 passed 与门禁脚本 3 轮
+的 READ COMMITTED 语义需发布说明。并发全量 1416 passed 与门禁脚本 3 轮
 （9 项，含保存点并发、VACUUM 等待与在线回收探针）已进 CI，Windows 插入
 退化复测未复现（受 fsync 抖动
 主导）。HeapPage/目录页锁纪律还缺逐路径审计清单，因此第 4 层仍只能标
