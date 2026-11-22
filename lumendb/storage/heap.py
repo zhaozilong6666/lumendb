@@ -373,14 +373,20 @@ class HeapFile:
             flags=0,
         )
 
-        page = self._find_page_with_space(txn, len(payload))
-        try:
-            slot = self._insert_raw(txn, page, payload)
-            if slot is None:
-                raise StorageError("页空间核算与实际写入不一致")
-            new_rid = (page.page_id, slot)
-        finally:
-            self._release(page, dirty=True)
+        slot = None
+        for _ in range(4):
+            page = self._find_page_with_space(txn, len(payload))
+            try:
+                slot = self._insert_raw(txn, page, payload)
+            finally:
+                self._release(page, dirty=True)
+            if slot is not None:
+                break
+        if slot is None:
+            # 选页到真正插入之间可能被别的写者占满；和 _insert_row 一样重试，
+            # 不能把"竞争导致的空间变化"当成页损坏。
+            raise StorageError("连续多页都装不下这条更新版本，放弃更新")
+        new_rid = (page.page_id, slot)
 
         # 旧版本打上 xmax，并把根的 newest 指向新版本
         old_page = self._fetch(old_rid[0])

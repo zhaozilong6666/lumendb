@@ -198,23 +198,29 @@ class BufferPoolManager:
         把"写日志 + 设 pageLSN + 标脏"绑成一个操作，是为了让上层没有机会
         只做其中一两个——那是 WAL 规则最常见的破坏方式。
         """
-        with self._lock:
-            if page.page_id in self._fresh_pages:
+        # 页 latch 先串行同一页的"记日志 + 盖 pageLSN"；全局 _lock 只保护
+        # fresh/dirty/undo/version 这些簿记，不再把 WAL append 的磁盘等待
+        # 包进缓冲池全局锁里。否则多线程写不同页也会在 WAL 上排成一队。
+        with page.latch:
+            with self._lock:
+                fresh = page.page_id in self._fresh_pages
+                logical = self._undo_is_logical(page)
+                if not clr and not logical:
+                    self._undo.setdefault(xid, []).append(
+                        (page.page_id, offset, bytes(old))
+                    )
+                self._dirty.add(page.page_id)
+                self._bump_version(page.page_id)
+            if fresh:
                 # 页分配与初始化不单独记日志；第一次修改前补一条完整镜像，
                 # 让副本/恢复不依赖主库磁盘上的页分配状态。
                 self._wal.log_page_image(xid, page.page_id, bytes(page.buf))
-                self._fresh_pages.discard(page.page_id)
-            logical = self._undo_is_logical(page)
+                with self._lock:
+                    self._fresh_pages.discard(page.page_id)
             lsn = self._wal.log_page_update(
                 xid, page.page_id, offset, old, new, clr=clr, no_undo=logical
             )
             page.page_lsn = lsn
-            self._dirty.add(page.page_id)
-            self._bump_version(page.page_id)
-            if not clr and not logical:
-                self._undo.setdefault(xid, []).append(
-                    (page.page_id, offset, bytes(old))
-                )
             return lsn
 
     def _undo_is_logical(self, page: Page) -> bool:
@@ -254,7 +260,10 @@ class BufferPoolManager:
         """逆序恢复该事务写过的全部页，并写 CLR 推进 pageLSN。"""
         with self._lock:
             entries = self._undo.pop(xid, [])
-            return self._apply_undo_entries(xid, entries)
+        # 不在 _lock 里应用页原像：应用过程要拿页 latch，锁序固定
+        # 「页 latch → 缓冲池锁」，与 log_page_update 一致；否则会和并发
+        # 写者形成 ABBA。
+        return self._apply_undo_entries(xid, entries)
 
     def undo_to(self, xid: int, mark: int) -> int:
         """只撤销 ``mark`` 之后的页写，保留更早的撤销记录。
@@ -270,12 +279,12 @@ class BufferPoolManager:
                 return 0
             tail = entries[mark:]
             del entries[mark:]
-            return self._apply_undo_entries(xid, tail)
+        return self._apply_undo_entries(xid, tail)
 
     def _apply_undo_entries(
         self, xid: int, entries: list[tuple[int, int, bytes]]
     ) -> int:
-        """在已持有 ``_lock`` 的前提下逆序应用页原像。"""
+        """逆序应用页原像；本方法不要求调用方持有 ``_lock``。"""
         if not entries:
             return 0
         touched: set[int] = set()

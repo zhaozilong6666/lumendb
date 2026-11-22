@@ -175,6 +175,39 @@ class TestUpdateAndSnapshot:
         assert heap.get(reader, rid) == [1, "Ada", 37]
         txns.commit(reader)
 
+    def test_update_retries_when_chosen_page_fills_before_insert(self, env, monkeypatch):
+        """选页之后、真正写入之前，别的写者可能把页占满。
+
+        并发模式放开全局锁后这条窗口变宽了；不能把竞争造成的空间变化
+        当成页损坏直接抛错，必须重新选页。
+        """
+        heap, txns, bp, table = env
+        t = txns.begin()
+        rid = heap.insert(t, [1, "Ada", 36])
+        txns.commit(t)
+
+        original = heap._insert_raw
+        calls = {"n": 0}
+
+        def flaky_insert_raw(txn, page, payload):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return original(txn, page, payload)
+
+        monkeypatch.setattr(heap, "_insert_raw", flaky_insert_raw)
+
+        writer = txns.begin()
+        heap.update(writer, rid, [1, "Ada", 37])
+        txns.commit(writer)
+
+        assert calls["n"] == 2
+        reader = txns.begin()
+        rows = list(heap.scan(reader))
+        assert len(rows) == 1
+        assert rows[0][1] == [1, "Ada", 37]
+        txns.commit(reader)
+
     def test_old_snapshot_still_sees_old_version(self, env):
         """快照隔离的核心承诺：别人改了，我的事务里还是旧值。"""
         heap, txns, bp, table = env

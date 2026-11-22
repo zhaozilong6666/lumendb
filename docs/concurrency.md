@@ -361,6 +361,31 @@ INSERT 是自动提交的短事务：
 **短事务吞吐还不优于默认模式**，因此继续保持 opt-in，不切默认。下一步要
 先定位 B+ 根页锁 / 页 latch 的争用，再谈吞吐；这份基准先作为负结果留档。
 
+**2026-11-22 缓冲池锁拆分（Linux / Python 3.12，单机）**
+
+缓冲池探针显示 `BufferPoolManager._lock` 是并发插入的主要争用点之一：
+4 线程 × 300 行时累计等待 2.11s，占 wall 115.9%（跨线程累计可超过 wall）。
+本轮把 `log_page_update` 的临界区拆开：
+
+- `_lock` 内只做 fresh / dirty / undo / version 簿记，WAL append 与
+  `page.page_lsn` 推进放到 `page.latch` 内、`_lock` 外，避免不同页的写者在
+  WAL 磁盘等待上排成一队；
+- `undo_xid` / `undo_to` 在 `_lock` 内只弹出/切片撤销记录，页原像的应用移到
+  锁外，固定「页 latch → 缓冲池锁」的锁序，避免与 `log_page_update` 形成 ABBA；
+- `HeapFile.update` 的"选页 → `_insert_raw`"窗口补了最多 4 轮重选页：并发写者
+  可能在两步之间把页占满，不能把竞争导致的空间变化当成页损坏（新增
+  `tests/unit/test_heap.py::test_update_retries_when_chosen_page_fills_before_insert`）。
+
+探针复测：4 线程 × 300 行 `_lock` 累计等待从 2.11s 降到 0.118s，占 wall 从
+115.9% 降到 6.8%，wall 1.729s。但短事务吞吐没有实质变化：4 线程 × 300 行三轮
+默认 709 / 798 / 775 ops/s，并发 697 / 760 / 780；8 线程 × 200 行两轮默认
+789 / 787，并发 799 / 734。热点行更新仍显著退化（4 线程并发 37 ops/s vs 默认
+140，443 次 `40001` 重试；8 线程 15/12 vs 106/103，约 2000 次重试）。说明
+剩余瓶颈主要在每事务提交的 WAL fsync 与同行冲突重试，而不是缓冲池全局锁。
+
+回归：默认模式 1403 passed，`LUMEN_CONCURRENT_DML=1` 1403 passed；门禁 6 项
+× 3 轮全 PASS。结论不变：`concurrent_dml` 保持 opt-in，暂不切默认。
+
 ### 插入 crabbing 的协议（已按此实现，保留作契约）
 
 现在的插入是"返回值栈"：`_insert_recursive` 在父页 latch 内递归孩子，孩子分裂
