@@ -312,12 +312,42 @@ class PGWireServer:
                 session.failed = False
                 return Result(tag="BEGIN")
         if isinstance(statement, (Commit, Rollback)):
+            if database._closed:
+                raise StorageError("数据库已关闭")
+            if session.txn is None:
+                raise TransactionError("没有活动事务")
+            txn = session.txn
+            # 保存点事务已经持有独占门；它可能是在另一个线程池 worker 里
+            # 建的，不能再走 ``with database._write_lock`` 重新加锁（会自锁）。
+            # 这里在独占门下直接校验/提交/回滚，最后统一放门。
+            if getattr(txn, "physical_savepoint", False):
+                session.txn = None
+                try:
+                    if isinstance(statement, Commit) and not session.failed:
+                        try:
+                            session.engine().validate_deferred_foreign_keys(txn)
+                            session.engine().validate_deferred_unique_constraints(txn)
+                        except BaseException:
+                            database.txns.abort(txn)
+                            raise
+                        try:
+                            database.txns.commit(txn)
+                            database.maybe_checkpoint()
+                        except BaseException:
+                            if not getattr(txn, "commit_record_written", False):
+                                database.txns.abort(txn)
+                            raise
+                        result = Result(tag="COMMIT")
+                    else:
+                        database.txns.abort(txn)
+                        session.failed = False
+                        result = Result(tag="ROLLBACK")
+                finally:
+                    database._exit_savepoint_mode(txn)
+                session.portals.clear()
+                return result
+
             with database._write_lock:
-                if database._closed:
-                    raise StorageError("数据库已关闭")
-                if session.txn is None:
-                    raise TransactionError("没有活动事务")
-                txn = session.txn
                 session.txn = None
                 if isinstance(statement, Commit) and not session.failed:
                     # [Review-Fix] 线协议提交必须走与进程内提交相同的延迟约束
@@ -383,6 +413,14 @@ class PGWireServer:
                 return Result(tag="RELEASE")
 
         if session.txn is not None:
+            # 保存点事务持有写者锁且已置 ``_no_readers``：它自己的后续语句
+            # 不能再进 read_guard，否则会等自己放行。
+            if getattr(session.txn, "physical_savepoint", False):
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                    database.assert_writable()
+                return session.engine().run(statement, session.txn, params)
             # [Review-Fix] 线协议会话不经过 Database._run，写围栏必须在这里
             # 单独调用；提交点还有 TransactionManager.commit 的复检兜底。
             if type(statement).__name__ not in _PURE_READ_STATEMENTS:

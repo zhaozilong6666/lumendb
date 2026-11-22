@@ -150,6 +150,45 @@ def _probe_sql_concurrent_dml(db: Database) -> dict:
     }
 
 
+def _probe_sql_savepoint(db: Database) -> dict:
+    """并发保存点：别的会话已有活跃事务时，SAVEPOINT 等独占而不是 0A000。
+
+    场景：A 先插入但不提交；B 建保存点、插入、回滚到保存点、提交；最后 A 提交。
+    正确终态是只剩 A 的那一行。探针同时验证保存点事务自己的后续语句能越过
+    ``_no_readers`` 门，而不是等自己放行。
+    """
+    server = PGWireServer(db)
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    a = Session(database=db)
+    b = Session(database=db)
+    try:
+        run_sql(a, "BEGIN")
+        run_sql(a, "INSERT INTO t VALUES (1, 1, 'a')")
+        run_sql(b, "BEGIN")
+        run_sql(b, "SAVEPOINT s")
+        run_sql(b, "INSERT INTO t VALUES (2, 2, 'b')")
+        run_sql(b, "ROLLBACK TO SAVEPOINT s")
+        visible = run_sql(b, "SELECT COUNT(*) FROM t WHERE id = 2")[0].rows[0][0]
+        run_sql(b, "COMMIT")
+        run_sql(a, "COMMIT")
+    except BaseException as exc:  # noqa: BLE001
+        with lock:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    final = run_sql(Session(database=db), "SELECT COUNT(*) FROM t")[0].rows[0][0]
+    return {
+        "errors": errors[:3],
+        "final": final,
+        "expected": 1,
+        "visible_after_rollback": visible if "visible" in locals() else None,
+    }
+
+
 def _probe_btree_delete_race(db: Database) -> dict:
     """4 线程乱序删完 12000 条长键树 + 1 并发读者，校验叶子链与终态。"""
     tree = BPlusTree(db.bp, KeyCodec([TypeSpec(DataType.TEXT)]), unique=False, name="idx")
@@ -337,6 +376,11 @@ def _probe_failed(name: str, detail: dict) -> bool:
             return True
         return any(entries < detail["expected"]
                    for entries in detail["entries"].values())
+    if name == "sql_savepoint_concurrent":
+        return (
+            detail["final"] != detail["expected"]
+            or detail["visible_after_rollback"] != 0
+        )
     return False
 
 
@@ -365,6 +409,12 @@ def _build_sql_dml(tmp: pathlib.Path):
     return db, _probe_sql_concurrent_dml(db)
 
 
+def _build_savepoint(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    return db, _probe_sql_savepoint(db)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="LumenDB Step 4 并发门禁")
     ap.add_argument("--rounds", type=int, default=3)
@@ -383,7 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, build in (("heap_insert_race", _build_heap),
                         ("btree_insert_crab", _build_insert_crab),
                         ("btree_delete_race", _build_btree),
-                        ("sql_concurrent_dml", _build_sql_dml)):
+                        ("sql_concurrent_dml", _build_sql_dml),
+                        ("sql_savepoint_concurrent", _build_savepoint)):
         res = _check_probe(name, build, rounds, name)
         checks.append(res)
         print(f"GATE {name} rounds={res['rounds']} ok={res['ok']} "

@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--concurrent-dml",
             action="store_true",
-            help="开启并发 DML（opt-in；保存点仍要求独占，VACUUM 仍要求无活跃事务）",
+            help="开启并发 DML（opt-in；保存点会等独占并串行化，VACUUM 仍要求无活跃事务）",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

@@ -324,25 +324,32 @@ Step 4 的前置项在这条路径上落地：
   独立的 `_readers_lock`，`exclusive_guard` / `close()` 仍持 `_write_lock` 挡默认
   写者，再通过读者条件变量等在途读者退出。
 - **保存点**：逻辑回滚无法撤回"保存点之后的 DML"，所以并发模式下第一次
-  `SAVEPOINT` 要求数据库里没有其它活跃事务（否则返回 `0A000`，不静默走危险
-  路径），随后该事务持有 `_write_lock` 到事务结束并临时关掉逻辑回滚
-  （`Transaction.physical_savepoint`）。正确性优先，代价是保存点事务存续期间
-  写串行。
+  `SAVEPOINT` 会先置 `_no_readers`、排空在途语句，再拿 `_write_lock` 并把事务
+  切到物理回滚（`Transaction.physical_savepoint`）。已经有活跃事务不再报
+  `0A000`，但它们在保存点事务结束前不能进入下一条语句；保存点事务自己的后续
+  语句走无 guard 的独占路径。正确性优先，代价仍是保存点事务存续期间写串行。
+  写锁改成可跨线程释放的 `_CrossThreadRLock`：线协议语句跑在线程池，保存点可能
+  在一个 worker 建、COMMIT 在另一个 worker 释放，`threading.RLock` 会报
+  "cannot release a lock owned by another thread"。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（5 例：并发插入全提交、混合 DML + 半数回滚、
-  逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点独占检查）；
+- `tests/unit/test_concurrent_dml.py`（8 例：并发插入全提交、混合 DML + 半数回滚、
+  逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
+  保存点跨线程释放、保存点事务内关闭、热点行无丢失更新）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
-  半回滚，校验行数/去重/索引不变量）。
+  半回滚，校验行数/去重/索引不变量）与 `sql_savepoint_concurrent`（A 未提交时
+  B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）。
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1406 passed**，门禁 6 项 × 3 轮 PASS。HeapPage / 目录页的锁纪律还缺
+  并发各 **1408 passed**，门禁脚本 3 轮 PASS（7 项，前两项 pytest 探针固定 1 轮）。
+  HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
-- 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）：第一次 `SAVEPOINT`
-  要求全库没有其它活跃事务（`0A000`）。要支持高并发保存点，需要行级逻辑 undo log。
+- 保存点已经能并发使用：不再因为"有别的活跃事务"直接 `0A000`，而是排空在途
+  语句后独占写者锁。它仍然是"功能正确但并发度低"的兜底路径——保存点事务存续
+  期间其它写者排队。要恢复高并发保存点，仍需要行级逻辑 undo log。
 - `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
   基于 oldest-active-xmin 的水位；一个空闲显式事务就能让维护操作被拒。
 
@@ -793,8 +800,9 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1406 passed；并发门禁
-  6 项 × 3 轮 PASS；CI run 279/280/281 四矩阵全绿（含看门狗竞态修复后重跑）。
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1408 passed；门禁脚本
+  3 轮 PASS（7 项，含新增保存点并发探针）；CI run 279/280/281 四矩阵全绿（含看门狗
+  竞态修复后重跑）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
@@ -803,9 +811,10 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
   257/246/277 vs 353/193/187，受 fsync 抖动主导，2.7× 退化未复现；单线程并发
   198.4 vs 默认 277.4，固定开销约 28%，是“吞吐换并发能力”的代价。平台差异记录，
   不作为切默认门禁。
-- **保存点：不过关。** 并发模式下第一次 `SAVEPOINT` 仍要求全库没有其它活跃事务
-  （`0A000`）；空闲保存点事务还会长期持有 `_write_lock`。切默认会让普通用户第一次
-  用保存点就撞边界。
+- **保存点：部分过关。** 并发模式下第一次 `SAVEPOINT` 不再要求全库没有其它活跃
+  事务（不再 `0A000`）：它排空在途语句后独占写者锁，事务自己的后续语句继续执行，
+  其它写者排队到事务结束。功能可用、跨线程 COMMIT/ROLLBACK 已回归；但空闲保存点
+  事务仍会长期占住写者锁，切默认前要么接受"保存点即串行"，要么补行级逻辑 undo。
 - **VACUUM：不过关。** 重排 RID / 重建索引仍要求“没有其它活跃事务”。虽然
   `exclusive_guard` 会挡住新语句，但一个空闲的显式事务就足以让 VACUUM 直接被拒。
 - **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务

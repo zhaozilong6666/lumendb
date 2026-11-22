@@ -15,7 +15,6 @@ import traceback
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import NotSupportedError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 
@@ -179,18 +178,60 @@ def test_concurrent_delete_and_readers(env):
     assert all(150 <= c <= 300 for c in seen_counts), seen_counts
 
 
-def test_savepoint_requires_exclusive_when_other_txn_active(env):
-    """并发模式下保存点要独占：有别的活跃事务就明确 0A000，不静默走危险路径。"""
+def test_savepoint_lock_can_be_released_by_another_thread(env):
+    """保存点可能在别的 worker 建；COMMIT 跨线程释放不能自锁/报 owner 错。"""
+    db, server = env
+    s = Session(database=db)
+    ready = threading.Event()
+    errors: list[str] = []
+
+    def begin_with_savepoint():
+        try:
+            _run(server, s, "BEGIN")
+            _run(server, s, "SAVEPOINT cross_thread")
+            ready.set()
+        except Exception:
+            errors.append(traceback.format_exc())
+            ready.set()
+
+    thread = threading.Thread(target=begin_with_savepoint)
+    thread.start()
+    assert ready.wait(2.0), "建保存点超时"
+    _run(server, s, "INSERT INTO t VALUES (7, 7, 'x')")
+    _run(server, s, "COMMIT")
+    thread.join()
+    assert errors == [], errors[0]
+    assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t WHERE id = 7") == [
+        (1,)
+    ]
+
+
+def test_close_with_savepoint_releases_the_gate(env):
+    """同线程 close 进到保存点事务：abort 后必须放门，不能留下 no_readers。"""
+    db, server = env
+    session = Session(database=db)
+    _run(server, session, "BEGIN")
+    _run(server, session, "SAVEPOINT s")
+    _run(server, session, "INSERT INTO t VALUES (9, 9, 'z')")
+    db.close()
+    assert db._no_readers is False
+
+
+def test_savepoint_waits_for_exclusive_and_rolls_back(env):
+    """并发模式下保存点不再 0A000：排空在途语句后独占，回滚只撤保存点后写入。"""
     db, server = env
     a = Session(database=db)
     b = Session(database=db)
     _run(server, a, "BEGIN")
     _run(server, b, "BEGIN")
     _run(server, a, "INSERT INTO t VALUES (1, 1, 'a')")
-    with pytest.raises(NotSupportedError):
-        _run(server, b, "SAVEPOINT s")
-    _run(server, b, "ROLLBACK")
+    _run(server, b, "SAVEPOINT s")
+    _run(server, b, "INSERT INTO t VALUES (2, 2, 'b')")
+    _run(server, b, "ROLLBACK TO SAVEPOINT s")
+    assert _rows(server, b, "SELECT COUNT(*) FROM t WHERE id = 2") == [(0,)]
+    _run(server, b, "COMMIT")
     _run(server, a, "COMMIT")
+    assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(1,)]
 
 
 def _wrap(errors: list[str], fn):

@@ -9,6 +9,7 @@ import threading
 import logging
 import contextlib
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -35,6 +36,64 @@ from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result
 
 _log = logging.getLogger(__name__)
+
+
+class _CrossThreadRLock:
+    """可跨线程释放的重入锁。
+
+    线协议把每条语句丢进线程池执行，事务级保存点却要把写者锁一直握到
+    COMMIT/ROLLBACK。``threading.RLock`` 的释放必须由加锁线程完成，保存点
+    事务跨 worker 时会在 COMMIT 路径抛 "cannot release a lock owned by
+    another thread"。这里保留同线程重入语义，但允许持有者之外的线程释放：
+    锁的互斥性由 ``_owner`` 与条件变量维护，谁释放只影响深度计数。
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._owner: Optional[int] = None
+        self._depth = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        with self._condition:
+            if not blocking and self._owner not in (None, me):
+                return False
+            if timeout is not None and timeout >= 0:
+                # 目前没有调用方用超时；保留参数兼容 threading.Lock 签名。
+                deadline = time.monotonic() + timeout
+                while self._owner not in (None, me):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+            else:
+                while self._owner not in (None, me):
+                    self._condition.wait()
+            self._owner = me
+            self._depth += 1
+            return True
+
+    def release(self) -> None:
+        with self._condition:
+            if self._depth <= 0:
+                raise RuntimeError("release unlocked lock")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._condition.notify()
+
+    def __enter__(self) -> "_CrossThreadRLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+    def _is_owned(self) -> bool:
+        """兼容内部诊断：当前线程是否持有这把锁。"""
+        with self._condition:
+            return self._owner == threading.get_ident()
+
 
 _READ_ONLY_STATEMENTS = {
     "Query",
@@ -126,7 +185,7 @@ class Database:
         #: 同步复制的提交屏障（参数是 COMMIT 记录的 LSN）。
         self._commit_barrier = commit_barrier
         # 写路径串行化：既保护单文件 DiskManager，也作为基准备份的写冻结门。
-        self._write_lock = threading.RLock()
+        self._write_lock = _CrossThreadRLock()
         #: **引擎级语句锁**：Executor 把每条语句的状态（binder / 参数 / CTE
         #: 作用域 / 递归工作表）存在实例字段上，所以同一个 Database 上不能
         #: 有两条语句同时在跑。读语句不走 ``_write_lock``（备份期间要能继续
@@ -204,6 +263,9 @@ class Database:
         )
 
         self._txn: Optional[Transaction] = None
+        #: 当前持有保存点独占门的事务。线协议事务不挂在 ``_txn`` 上，close
+        #: 时也要靠它找到并释放保存点模式。
+        self._savepoint_txn: Optional[Transaction] = None
 
     # ------------------------------------------------------------------
 
@@ -350,21 +412,27 @@ class Database:
         正确性优先：保存点事务拿住 ``_write_lock`` 到事务结束，期间没有别的
         写者，页原像就不会被并发写撕裂；代价是该事务存续期间写操作串行。
         默认（非并发）模式不需要这一层。
+
+        [修正] 旧实现要求"全库没有其它活跃事务"，否则直接 0A000。这个门禁
+        过严：只要把在途语句排空、再让后续语句在 ``_no_readers`` 门口排队，
+        保存点事务就不会和别的写者交错，物理原像也不会被覆盖。已经开始的
+        未提交事务可以留着，它们在保存点事务结束前不能进入下一条写语句。
         """
         if not self._concurrent_dml or txn.physical_savepoint:
             return
-        # 物理 undo 只有在"没有其它活跃事务"时才能保证原像不被后来者覆盖。
-        # 并发模式下保存点因此要求独占：有别的活跃事务就明确报错，别退化成
-        # 一个会写坏页的静默路径。默认（串行）模式不受影响。
-        others = [x for x in self.txns.active_xids if x != txn.xid]
-        if others:
-            raise NotSupportedError(
-                "并发 DML 模式下的 SAVEPOINT 需要独占数据库",
-                detail=f"仍有活跃事务 {sorted(others)[:8]}",
-                hint="等其它事务结束后再建保存点，或改用默认串行模式",
-            )
         self._write_lock.acquire()
+        try:
+            with self._readers_cv:
+                # 先置位再等：新语句不得进入，已有语句执行完退出。
+                self._no_readers = True
+                self._readers_cv.notify_all()
+                while self._readers:
+                    self._readers_cv.wait()
+        except BaseException:
+            self._write_lock.release()
+            raise
         txn.physical_savepoint = True
+        self._savepoint_txn = txn
         self.bp.logical_abort = False
 
     def _exit_savepoint_mode(self, txn: Transaction) -> None:
@@ -372,10 +440,56 @@ class Database:
         if not getattr(txn, "physical_savepoint", False):
             return
         txn.physical_savepoint = False
+        if self._savepoint_txn is txn:
+            self._savepoint_txn = None
         self.bp.logical_abort = self._concurrent_dml
+        with self._readers_cv:
+            self._no_readers = False
+            self._readers_cv.notify_all()
         self._write_lock.release()
 
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
+        # 保存点事务已经持有写者锁并置了 ``_no_readers``：它自己的后续语句
+        # 不能再进 ``read_guard``，否则会等自己放行。这里直接执行，关闭/围栏
+        # 检查仍然保留。
+        if (
+            self._concurrent_dml
+            and self._txn is not None
+            and getattr(self._txn, "physical_savepoint", False)
+        ):
+            if self._closed:
+                raise StorageError(
+                    "数据库已关闭",
+                    hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+                )
+            if not self._read_only:
+                self.assert_writable()
+            return self._run_unlocked(statement, params)
+
+        # 并发模式下第一次 SAVEPOINT：先拿写者锁、排空在途语句，再把事务
+        # 切到物理回滚。必须在进 ``read_guard`` 之前做，否则当前语句自己
+        # 也在读者计数里，会永远等不到 0。
+        if (
+            isinstance(statement, Savepoint)
+            and self._concurrent_dml
+            and self._txn is not None
+            and not getattr(self._txn, "physical_savepoint", False)
+        ):
+            self._enter_savepoint_mode(self._txn)
+            try:
+                if self._closed:
+                    raise StorageError(
+                        "数据库已关闭",
+                        hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+                    )
+                if not self._read_only:
+                    self.assert_writable()
+                return self._run_unlocked(statement, params)
+            except BaseException:
+                # 保存点还没登记成功就失败了：不能把库一直锁在独占模式。
+                self._exit_savepoint_mode(self._txn)
+                raise
+
         if type(statement).__name__ not in _PURE_READ_STATEMENTS:
             if (
                 self._concurrent_dml
@@ -631,8 +745,12 @@ class Database:
                 while self._readers:
                     self._readers_cv.wait()
             if self._txn is not None:
-                self.txns.abort(self._txn)
+                txn = self._txn
                 self._txn = None
+                self.txns.abort(txn)
+                # 保存点事务还握着写者锁并置了 _no_readers；同线程 close 是
+                # 可重入进来的，不在这里放门会留下永久 no_readers。
+                self._exit_savepoint_mode(txn)
             # 线协议事务不经过 self._txn；不 abort 它们会在 close 之后继续
             # 持有写者锁/未提交页，甚至把 COMMIT 写进已关闭的 WAL。
             try:
@@ -641,6 +759,10 @@ class Database:
                     _log.info("关闭数据库时回滚了 %s 个活动事务", aborted)
             except Exception:
                 _log.exception("关闭数据库时回滚活动事务失败")
+            # abort_all 不带数据库门面的保存点状态；线协议事务也可能握着
+            # 保存点写者锁，这里统一释放，避免 close 之后 no_readers 永久为真。
+            if self._savepoint_txn is not None:
+                self._exit_savepoint_mode(self._savepoint_txn)
             try:
                 self.bp.flush_all()
             finally:
