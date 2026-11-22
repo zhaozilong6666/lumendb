@@ -63,7 +63,8 @@ LumenDB 是一个**从零手写**的关系型数据库系统。它不依赖任�
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)、[`docs/storage-format.md`](docs/storage-format.md)；
 部署与排障（租约/fence/水位/故障剧本）见 [`docs/operations.md`](docs/operations.md)；
-并发模型（三层串行化、为什么写并发度是 1、放开它的三步）见 [`docs/concurrency.md`](docs/concurrency.md)。
+并发模型（默认写串行、opt-in `concurrent_dml` 的行/键锁与 B+ 树 crabbing、
+切默认还差哪些门禁）见 [`docs/concurrency.md`](docs/concurrency.md)。
 
 长周期开发的事实账本见 [`docs/memory/README.md`](docs/memory/README.md)：每条结论都挂
 commit / 文件锚点 / 测试作为证据，`python -m tools.project_memory verify` 可一键复查，
@@ -368,10 +369,11 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 ## 设计取舍
 
 - **单文件页式存储 + 物理日志**：牺牲了压缩率，换来恢复逻辑的可验证性。
-- **读并发、写按行/键互斥**：读走各自的 MVCC 快照，互不阻塞；写只在真正冲突时
-  `40001` 快速失败——不同行、不同唯一键、不同表可以同时写。锁是**不等待**的：语句级
-  串行化还在，阻塞等锁会造出"持语句锁等行锁、持行锁等语句锁"的环。DDL 拿全库 DDL 锁
-  （schema 形状不能并发），目录保存另有短锁（整链重写必须独占）。
+- **读并发、写按行/键互斥**：读走各自的 MVCC 快照，互不阻塞。默认写仍由
+  `_write_lock` 串行；opt-in 的 `--concurrent-dml` / `concurrent_dml=True`
+  让 DML 不再拿全局写锁，不同行、不同唯一键、不同表可以同时写。自动提交
+  UPDATE 对热点行会阻塞拿行锁、再读最新已提交版本重算；显式事务、唯一键、
+  DDL、目录锁仍保持快速失败（`40001` 或 `0A000`），不引入"持语句锁等行锁"的环。
 - **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
   少了一套最容易出错的分支，代价是稀疏页要靠 `REINDEX table` 重建来回收。
 - **`VACUUM` 是停机维护，不是在线回收**：重写堆页会改变 RID，随后必须重建索引；
