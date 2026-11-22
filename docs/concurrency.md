@@ -780,7 +780,7 @@ test_lease_expiry_after_open_blocks_the_next_write` 的时间敏感失败：租�
 run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lease_keeper`
 的调度抖动：keeper 间隔 0.05s，测试固定 sleep 0.15s 后就断言 `expires_at`
 变大，慢 runner 上一次都没续租。改为轮询到租约真正续上（上限 2s），默认/并发
-各连续 10 次通过；其后 run 287/288 同代码四矩阵全绿。顺带把
+各连续 10 次通过；287/288 是修复前的四矩阵基线，本轮修复由 run 289/290 验证。顺带把
 `test_lease_keeper_uses_renew_callback` / `test_lease_keeper_calls_on_failure`
 的固定 `sleep(0.12)` 断言、`test_open_after_expiry...` 的固定 `sleep(0.2)` 和
 `test_promote_with_quorum_steps_down_on_lease_loss` 的固定 `sleep(0.3)` 都改成

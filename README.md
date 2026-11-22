@@ -91,6 +91,9 @@ python -m lumendb exec --path ./mydb "CREATE TABLE t (a INT)"
 # 启动 PostgreSQL 协议服务端
 python -m lumendb serve --path ./mydb --port 5432
 
+# 需要时显式开启并发 DML（默认串行；保存点/VACUUM 门禁见 docs/concurrency.md）
+python -m lumendb serve --path ./mydb --port 5432 --concurrent-dml
+
 # 另开一个终端，用原生 psql 直连
 psql -h 127.0.0.1 -p 5432 -U lumendb -d lumendb
 ```
