@@ -777,6 +777,11 @@ test_lease_expiry_after_open_blocks_the_next_write` 的时间敏感失败：租�
 0.15s，构造时直接判租约过期。改为先用 10s TTL 打开建表，再把 `lease.ttl`
 缩短并 `renew`，随后 sleep 0.25 断言下一次写被拒；默认/并发各连续 10 次通过。
 
+run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lease_keeper`
+的调度抖动：keeper 间隔 0.05s，测试固定 sleep 0.15s 后就断言 `expires_at`
+变大，慢 runner 上一次都没续租。改为轮询到租约真正续上（上限 2s），默认/并发
+各连续 10 次通过；其后 run 287/288 同代码四矩阵全绿。
+
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
 仍是快照隔离 + 冲突即 40001。`concurrent_dml` 因此仍保持 opt-in，不切默认：下一步

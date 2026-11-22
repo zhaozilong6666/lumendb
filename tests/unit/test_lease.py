@@ -263,8 +263,15 @@ def test_promote_with_quorum_starts_lease_keeper(tmp_path):
             lease_renew_with_quorum=True,
         )
         first = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
-        time.sleep(0.15)
-        renewed = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
+        # keeper 线程间隔 0.05s，但 Linux CI 的调度抖动可能让 0.15s 内一次都没跑；
+        # 等到真正续上为止，别把线程起不来当成 keeper 坏了。
+        deadline = time.monotonic() + 2.0
+        renewed = first
+        while time.monotonic() < deadline:
+            time.sleep(0.02)
+            renewed = Lease(lease_path, "n0", ttl=0.4).read()["expires_at"]
+            if renewed > first:
+                break
         assert renewed > first
     finally:
         replica.close()
