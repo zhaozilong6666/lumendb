@@ -337,13 +337,13 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
   半回滚，校验行数/去重/索引不变量）。
 
 **仍未做 / 切默认模式前必须解决**：
-- 默认模式（`concurrent_dml=False`）仍是串行；把并发路径切成默认前，要补
-  HeapPage / 目录页在高并发下的锁纪律审计，并让 `LUMEN_CONCURRENT_DML=1` 全量
-  进入 CI 门禁（当前 Linux 3.12 job 已加该步骤，手工跑绿 1404 例）。
-- 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）；要支持高并发保存点，
-  需要行级逻辑 undo log。
+- 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
+  并发各 **1405 passed**，门禁 6 项 × 3 轮 PASS。HeapPage / 目录页的锁纪律还缺
+  一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
+- 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）：第一次 `SAVEPOINT`
+  要求全库没有其它活跃事务（`0A000`）。要支持高并发保存点，需要行级逻辑 undo log。
 - `VACUUM` 仍要求表上没有其它活跃事务（`len(active_xids) > 1` 即拒绝），未改成
-  基于 oldest-active-xmin 的水位。
+  基于 oldest-active-xmin 的水位；一个空闲显式事务就能让维护操作被拒。
 
 **实测（2026-11-21，Windows / Python 3.13，单机）**
 
