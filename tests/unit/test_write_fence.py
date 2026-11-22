@@ -224,7 +224,13 @@ class TestLeasePathOnOpen:
 
         lease = Lease(lease_path, "new-leader", ttl=0.1)
         lease.acquire(term=2)
-        time.sleep(0.2)
+        deadline = time.monotonic() + 2.0
+        while (
+            time.monotonic() < deadline
+            and lease.read()["expires_at"] > time.time()
+        ):
+            time.sleep(0.01)
+        assert lease.read()["expires_at"] <= time.time()
         # 过期不等于放行：旧主库必须显式重新 acquire。
         with pytest.raises(NotSupportedError, match="租约"):
             Database(data, lease_path=lease_path, node_id="old-primary")

@@ -209,7 +209,11 @@ def test_lease_keeper_uses_renew_callback(tmp_path):
 
     keeper = LeaseKeeper(lease, interval=0.05, renew=renew).start()
     try:
-        time.sleep(0.12)
+        # 慢 runner 上 keeper 线程可能 0.12s 内还没轮到；等它真的续一次，
+        # 而不是用固定 sleep 猜调度。
+        deadline = time.monotonic() + 2.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert calls
         assert keeper.last_error is None
     finally:
@@ -231,7 +235,9 @@ def test_lease_keeper_calls_on_failure(tmp_path):
         on_failure=lambda item: failures.append(item.last_error),
     ).start()
     try:
-        time.sleep(0.12)
+        deadline = time.monotonic() + 2.0
+        while not failures and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert failures
         assert keeper.lost is True
     finally:
@@ -294,7 +300,9 @@ def test_promote_with_quorum_steps_down_on_lease_loss(tmp_path):
         replica.execute_one("INSERT INTO t VALUES (1)")
         assert replica.db._read_only is False
         Lease(lease_path, "n0", ttl=0.4).release()
-        time.sleep(0.3)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and replica.db._read_only is False:
+            time.sleep(0.02)
         assert replica.db._read_only is True
         with pytest.raises(NotSupportedError, match="只读"):
             replica.execute_one("INSERT INTO t VALUES (2)")
