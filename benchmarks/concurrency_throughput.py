@@ -147,11 +147,15 @@ def bench_mode(concurrent: bool, threads: int, rows: int, updates: int) -> dict:
         insert = _bench_insert(server, threads, rows)
         hot = _bench_hot_update(server, threads, updates)
         count = _run(server, Session(database=database), "SELECT COUNT(*) FROM bench")[0].rows
+        hot_value = _run(
+            server, Session(database=database), "SELECT v FROM bench WHERE id = 999999"
+        )[0].rows[0][0]
         return {
             "mode": "concurrent_dml" if concurrent else "default_write_lock",
             "threads": threads,
             "insert": insert,
             "hot_update": hot,
+            "hot_value": hot_value,
             "final_rows": count[0][0],
         }
     finally:

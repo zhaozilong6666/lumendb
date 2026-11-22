@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from lumendb.engine.database import Database
@@ -180,18 +183,48 @@ class TestWriteWriteConflict:
         assert names == ["a", "b"]
 
     def test_autocommit_statement_waits_behind_a_row_lock(self, env):
-        """自动提交语句也要受行锁约束：它撞的是"那一行"，不是整个库。"""
+        """自动提交语句受行锁约束：它撞的是"那一行"，不是整个库。
+
+        默认模式仍然快速失败；并发 DML 模式改成排队等待，所以这个用例在
+        两种模式下断言不同：并发模式下必须等到 holder 回滚后再成功。
+        """
         db, server = env
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         db.execute_one("INSERT INTO t VALUES (1, 0)")
         holder = Session(database=db)
         _run(server, holder, "BEGIN")
         _run(server, holder, "UPDATE t SET v = 1 WHERE id = 1")
-        with pytest.raises(SerializationError):
-            db.execute_one("UPDATE t SET v = 2 WHERE id = 1")
+
+        if not db._concurrent_dml:
+            with pytest.raises(SerializationError):
+                db.execute_one("UPDATE t SET v = 2 WHERE id = 1")
+        else:
+            errors: list[BaseException] = []
+            done = threading.Event()
+
+            def waiter() -> None:
+                try:
+                    db.execute_one("UPDATE t SET v = 2 WHERE id = 1")
+                except BaseException as exc:  # pragma: no cover - 失败时打印
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            # 让它先撞上行锁；即便这里提前回滚，下面的断言仍然成立。
+            time.sleep(0.2)
+            assert not done.is_set(), "并发模式下的自动提交 UPDATE 应当等待行锁"
+            _run(server, holder, "ROLLBACK")
+            assert done.wait(10.0), "回滚后等待方应当被唤醒"
+            thread.join(1.0)
+            assert errors == [], errors[0] if errors else None
+            assert db.execute_one("SELECT v FROM t WHERE id = 1").rows == [(2,)]
+
         # 不同行不受影响
         db.execute_one("INSERT INTO t VALUES (2, 2)")
-        _run(server, holder, "ROLLBACK")
+        if not db._concurrent_dml:
+            _run(server, holder, "ROLLBACK")
 
 
 # ---------------------------------------------------------------------------

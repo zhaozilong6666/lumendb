@@ -344,8 +344,20 @@ class HeapFile:
         """
         return self.newest_rid(root_rid)
 
-    def update(self, txn: Transaction, root_rid: RID, values: Sequence[Any]) -> RID:
-        """写一条新版本，返回新版本的 RID。"""
+    def update(
+        self,
+        txn: Transaction,
+        root_rid: RID,
+        values: Sequence[Any],
+        *,
+        ri: bool = False,
+    ) -> RID:
+        """写一条新版本，返回新版本的 RID。
+
+        ``ri=True`` 只在并发 DML 的自动提交 UPDATE 上使用：该语句已经在
+        行锁上等到前一个写者提交，必须从"最新已提交版本"继续，否则快照里
+        的旧版本会让 first-updater-wins 把刚等到的写机会又判成 40001。
+        """
         txn.require_active()
         txn.wrote = True
         newest = self._latest_version_rid(root_rid)
@@ -353,7 +365,7 @@ class HeapFile:
         # abort 只写 ABORT 记录、不做进程内 undo，newest 可能仍指向一个
         # 已中止的版本。若直接从那版继续，根记录的 xmax 永远不会被设置，
         # 根和最新版本会同时可见，扫描出两行。
-        found = self.find_version(txn, newest)
+        found = self.find_version(txn, newest, ri=ri)
         if found is None:
             raise StorageError(f"要更新的行 {root_rid} 不存在")
         old_rid, old_rec = found

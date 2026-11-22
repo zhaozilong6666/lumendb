@@ -198,3 +198,32 @@ def _wrap(errors: list[str], fn):
         fn()
     except Exception:
         errors.append(traceback.format_exc())
+
+
+def test_hot_row_increments_serialize_without_lost_updates(env):
+    """自动提交的热点自增：锁后重读必须保住每一次增量，且不再是 40001 风暴。"""
+    db, server = env
+    _run(server, Session(database=db), "INSERT INTO t VALUES (999999, 0, 'hot')")
+    threads = 4
+    per_thread = 25
+    barrier = threading.Barrier(threads)
+    errors = _run_threads(
+        [
+            lambda: (
+                barrier.wait(),
+                [
+                    _run(
+                        server,
+                        Session(database=db),
+                        "UPDATE t SET v = v + 1 WHERE id = 999999",
+                    )
+                    for _ in range(per_thread)
+                ],
+            )
+            for _ in range(threads)
+        ]
+    )
+    assert errors == [], errors[0]
+    assert _rows(
+        server, Session(database=db), "SELECT v FROM t WHERE id = 999999"
+    ) == [(threads * per_thread,)]

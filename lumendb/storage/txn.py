@@ -65,6 +65,10 @@ class Transaction:
     xid: int
     snapshot_xid: int
     active_at_start: frozenset[int]
+    #: 由 Database 自动提交的"单语句事务"（客户端没有显式 BEGIN）。
+    #: 并发 DML 的 UPDATE 只能在这类事务里做锁后重读最新已提交版本：
+    #: 显式事务的快照必须稳定，不能因为等锁而漂移。
+    statement_scoped: bool = False
     state: TxnState = TxnState.ACTIVE
     first_lsn: int = 0
     last_lsn: int = 0

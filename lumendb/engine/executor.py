@@ -406,11 +406,27 @@ class Executor:
             hint=hint,
         )
 
-    def _lock_row(self, table: TableDef, rid: RID, txn: Transaction) -> None:
-        """给一行拿 X 锁（改/删之前）。"""
+    def _lock_row(
+        self,
+        table: TableDef,
+        rid: RID,
+        txn: Transaction,
+        *,
+        wait: bool = False,
+    ) -> None:
+        """给一行拿 X 锁（改/删之前）。
+
+        ``wait=True`` 只给并发 DML 的自动提交 UPDATE 用：语句没有语句级写
+        锁，行锁是唯一冲突点，阻塞等到前一个写者结束才能做锁后重读。显式
+        事务仍然快速失败，避免把事务快照冻结在等锁前的旧版本上。
+        """
+        resource = row_resource(table.name, rid)
+        if wait:
+            self._locks.acquire(txn.xid, resource, LockMode.EXCLUSIVE)
+            return
         self._acquire_or_fail(
             txn,
-            row_resource(table.name, rid),
+            resource,
             LockMode.EXCLUSIVE,
             f"行 {table.name}{tuple(rid)} 正被另一个事务修改",
             "重试事务；并发改同一行在快照隔离下必须失败",
@@ -3520,8 +3536,14 @@ class Executor:
         old_values: Iterable[Any],
         new_values: list[Any],
         _updating: Optional[set[tuple[str, RID]]] = None,
+        *,
+        latest: bool = False,
     ) -> list[Any]:
-        """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。"""
+        """UPDATE 与 upsert 共用的行重写入口：校验、维护索引、写堆。
+
+        ``latest=True`` 用于并发 DML 的自动提交 UPDATE：调用方已经在行锁上
+        等待并重读过最新已提交版本，写堆也必须按同一版本落地。
+        """
         old_tuple = tuple(old_values)
         txn.touched_tables.add(table.name)
         prepared = self._prepare_values(table, None, new_values)
@@ -3543,7 +3565,7 @@ class Executor:
             != self._key_for(table, idx, prepared)
         ]
         # 行锁：改这一行之前独占；随后 `heap.update` 里的版本检查才可靠。
-        self._lock_row(table, rid, txn)
+        self._lock_row(table, rid, txn, wait=latest)
         # 键锁：改唯一键时，新旧两个键都要独占（别人可能正插/删同一个键）。
         for idx in changed_indexes:
             self._lock_key(table, idx, self._key_for(table, idx, old_tuple), txn)
@@ -3551,7 +3573,7 @@ class Executor:
         for idx in changed_indexes:
             self._check_update_unique(table, idx, old_tuple, prepared, txn, rid)
 
-        heap.update(txn, rid, prepared)
+        heap.update(txn, rid, prepared, ri=latest)
 
         for idx in changed_indexes:
             tree = self._tree_for(table, idx)
@@ -3862,9 +3884,13 @@ class Executor:
         )
         returned: list[tuple] = []
         updated = 0
+        # 并发 DML 的自动提交 UPDATE：行锁上等待后必须重读"最新已提交版本"。
+        # 否则语句快照仍停在等锁前，SET v = v + 1 会把对方刚提交的增量覆盖掉，
+        # 或者被 heap.update 的 first-updater-wins 再判成一次 40001。
+        latest = self._concurrent_dml and txn.statement_scoped
         # 必须先物化目标行：更新会向堆里追加新版本，边扫边写会让扫描器
         # 不断看到刚写进去的新版本（root RID 不变），从而反复更新同一行。
-        targets = list(heap.scan(txn))
+        targets = list(heap.scan(txn, ri=latest))
         for rid, old_values in targets:
             old_tuple = tuple(old_values)
             if source_table is None:
@@ -3880,11 +3906,32 @@ class Executor:
                         break
                 if ctx is None:
                     continue
+            if latest:
+                # 先等到这一行的写锁，再从版本链头取最新已提交版本重算。
+                self._lock_row(table, rid, txn, wait=True)
+                fresh = heap.get(txn, rid, ri=True)
+                if fresh is None:
+                    continue
+                old_tuple = tuple(fresh)
+                if source_table is None:
+                    ctx = EvalContext(old_tuple)
+                    if where_fn is not None and not _truthy(where_fn(ctx)):
+                        continue
+                else:
+                    ctx = None
+                    for source_values in source_rows:
+                        candidate = EvalContext(old_tuple + tuple(source_values))
+                        if where_fn is None or _truthy(where_fn(candidate)):
+                            ctx = candidate
+                            break
+                    if ctx is None:
+                        continue
+            assert ctx is not None
             new_values = list(old_tuple)
             for index, fn in assignment_fns:
                 new_values[index] = fn(ctx)
             prepared = self._rewrite_row(
-                table, heap, txn, rid, old_tuple, new_values
+                table, heap, txn, rid, old_tuple, new_values, latest=latest
             )
             if ret_fns:
                 returned.append(

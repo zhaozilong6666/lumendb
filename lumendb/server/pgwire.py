@@ -439,6 +439,7 @@ class PGWireServer:
             if database._closed:
                 raise StorageError("数据库已关闭")
             txn = database.txns.begin()
+            txn.statement_scoped = True
             try:
                 if type(statement).__name__ not in _PURE_READ_STATEMENTS:
                     database.assert_writable()
