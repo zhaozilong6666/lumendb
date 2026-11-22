@@ -812,7 +812,7 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 - **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1416 passed；门禁
   脚本 3 轮 PASS（9 项，含保存点并发、VACUUM 等待与在线回收探针）；CI run
-  279/280/281 四矩阵全绿（含看门狗竞态修复后重跑）。
+  296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
