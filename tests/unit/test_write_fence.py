@@ -256,11 +256,16 @@ class TestLeasePathOnOpen:
 
         data = tmp_path / "old-primary"
         lease_path = tmp_path / "lease.json"
-        Lease(lease_path, "old-primary", ttl=0.15).acquire(term=2)
+        # 先用长 TTL 打开并建表，避免 Windows 上“打开数据库”本身超过
+        # 0.15s 就把租约耗光（见 test 的历史 flake）；随后再缩短租约续期。
+        lease = Lease(lease_path, "old-primary", ttl=10.0)
+        lease.acquire(term=2)
         db = Database(data, lease_path=lease_path, node_id="old-primary")
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
         try:
             db.execute_one("INSERT INTO t VALUES (1)")
+            lease.ttl = 0.15
+            lease.renew(term=2)
             time.sleep(0.25)
             with pytest.raises(NotSupportedError, match="租约"):
                 db.execute_one("INSERT INTO t VALUES (2)")

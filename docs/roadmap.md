@@ -350,7 +350,7 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 但仍未做完整索引项 MVCC；`concurrent_dml` 仍保持 opt-in，默认模式尚未切换，
 卡在保存点需独占、`VACUUM` 缺
 oldest-active-xmin 水位、自动提交 UPDATE 的 READ COMMITTED 语义需发布说明。并发
-全量 1405 passed 与门禁 6×3 已进 CI，Windows 插入退化复测未复现（受 fsync 抖动
+全量 1406 passed 与门禁 6×3 已进 CI，Windows 插入退化复测未复现（受 fsync 抖动
 主导）。HeapPage/目录页锁纪律还缺逐路径审计清单，因此第 4 层仍只能标
 "MVP 验收"，不能标"生产就绪"。
 

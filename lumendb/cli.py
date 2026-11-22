@@ -54,6 +54,7 @@ def _open_database(args: argparse.Namespace) -> Database:
         read_only=bool(getattr(args, "read_only", False)),
         fence_path=getattr(args, "fence_path", None),
         node_id=getattr(args, "node_id", "primary"),
+        concurrent_dml=bool(getattr(args, "concurrent_dml", False)),
     )
 
 
@@ -221,6 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--read-only",
             action="store_true",
             help="以只读方式打开（副本/观察者）",
+        )
+        p.add_argument(
+            "--concurrent-dml",
+            action="store_true",
+            help="开启并发 DML（opt-in；保存点仍要求独占，VACUUM 仍要求无活跃事务）",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

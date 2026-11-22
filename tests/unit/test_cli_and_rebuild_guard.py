@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from lumendb.cli import build_parser, main
+from lumendb.cli import _open_database, build_parser, main
 from lumendb.engine.database import Database
 from lumendb.errors import NotSupportedError
 from lumendb.replication import Replica
@@ -42,6 +42,21 @@ class TestCliFence:
         for command in (["exec", "SELECT 1"], ["shell"]):
             args = _args(command[0], *command[1:], "--fence-path", str(tmp_path / "f.json"))
             assert args.fence_path == tmp_path / "f.json"
+
+    def test_concurrent_dml_switch_reaches_the_database(self, tmp_path):
+        """CLI 也能开并发 DML，不用只靠环境变量。"""
+        args = _args(
+            "exec",
+            "--path", str(tmp_path / "db"),
+            "--concurrent-dml",
+            "SELECT 1",
+        )
+        assert args.concurrent_dml is True
+        db = _open_database(args)
+        try:
+            assert db._concurrent_dml is True
+        finally:
+            db.close()
 
     def test_exec_refuses_to_write_when_another_node_is_promoted(self, tmp_path):
         path = tmp_path / "db"

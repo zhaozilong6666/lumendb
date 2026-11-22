@@ -303,7 +303,8 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
 ### 并发 DML 实验模式（`concurrent_dml=True`，默认关闭）
 
 默认模式仍是 `_write_lock` 串行所有写语句；`Database(concurrent_dml=True)`（或
-`LUMEN_CONCURRENT_DML=1`）切到真正的写并发路径，Step 4 的前置项在这条路径上落地：
+`LUMEN_CONCURRENT_DML=1`，或 CLI 的 `--concurrent-dml`）切到真正的写并发路径，
+Step 4 的前置项在这条路径上落地：
 
 - **DML 不拿 `_write_lock`**：`Database._run_locked` / `PGWireServer._run_statement`
   的普通写语句改走 `read_guard()`，只与 DDL 的 `exclusive_guard`、`close()` 互斥；
@@ -338,7 +339,7 @@ python scripts/concurrency_gate.py --quick        # 1 轮，冒烟用
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1405 passed**，门禁 6 项 × 3 轮 PASS。HeapPage / 目录页的锁纪律还缺
+  并发各 **1406 passed**，门禁 6 项 × 3 轮 PASS。HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
 - 保存点事务仍靠"独占写者锁"兜底（功能正确但并发度低）：第一次 `SAVEPOINT`
   要求全库没有其它活跃事务（`0A000`）。要支持高并发保存点，需要行级逻辑 undo log。
@@ -770,6 +771,12 @@ WAL 尾已经是 41k，0.15s 同步屏障必然超时。这是测试的等待条
 实现的问题；已改为等水位 >= leader 自己的 `state.last_lsn`，并断言目标 >0。
 目标用例连续跑 20 次、`test_sync_replication.py` 13 例均通过。
 
+并发全量本地还碰到 `test_write_fence.py::TestLeasePathOnOpen::
+test_lease_expiry_after_open_blocks_the_next_write` 的时间敏感失败：租约 TTL
+只有 0.15s，而 Windows 慢盘上“打开 Database + CREATE TABLE”本身就可能超过
+0.15s，构造时直接判租约过期。改为先用 10s TTL 打开建表，再把 `lease.ttl`
+缩短并 `renew`，随后 sleep 0.25 断言下一次写被拒；默认/并发各连续 10 次通过。
+
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
 仍是快照隔离 + 冲突即 40001。`concurrent_dml` 因此仍保持 opt-in，不切默认：下一步
@@ -777,7 +784,7 @@ WAL 尾已经是 41k，0.15s 同步屏障必然超时。这是测试的等待条
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1405 passed；并发门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1406 passed；并发门禁
   6 项 × 3 轮 PASS；CI run 279/280/281 四矩阵全绿（含看门狗竞态修复后重跑）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
