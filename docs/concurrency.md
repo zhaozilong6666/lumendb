@@ -763,6 +763,13 @@ Linux / Windows 四矩阵）全绿。
 `test_quorum.py` 两条时间敏感用例偶发（看门狗心跳重置竞态、`append_entries`
 连接超时），同树在 run 279 重跑即绿。已作为 flake 记进账本，后续单独硬化。
 
+run 282（仅 docs 改动）又在 Windows 3.13 撞到另一条时间敏感用例：
+`test_sync_replication.py::test_end_to_end_commit_waits_for_the_majority` 在
+`CREATE TABLE` 后只等 `quorum_commit_lsn > 0` 就插入，但此时水位只追到 12k、
+WAL 尾已经是 41k，0.15s 同步屏障必然超时。这是测试的等待条件不完整，不是屏障
+实现的问题；已改为等水位 >= leader 自己的 `state.last_lsn`，并断言目标 >0。
+目标用例连续跑 20 次、`test_sync_replication.py` 13 例均通过。
+
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
 仍是快照隔离 + 冲突即 40001。`concurrent_dml` 因此仍保持 opt-in，不切默认：下一步

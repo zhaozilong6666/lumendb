@@ -158,13 +158,18 @@ class TestReplicaSyncReplication:
                 db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
             assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
 
-            # 多数派追上之后（副本 attach 后会上报 match_lsn），写就能成功
+            # 多数派追上之后（副本 attach 后会上报 match_lsn），写就能成功。
+            # 注意要等水位追上 leader 自己的 WAL 尾，而不是只等 ">0"：
+            # CREATE TABLE 已经把 WAL 推到 41k，只等到 12k 就插入会立刻再次
+            # 撞 0.15s 屏障超时（Windows CI 上实际发生过）。
             nodes[1].observe_applied(10**9)
             nodes[2].observe_applied(10**9)
+            target = max(nodes[0].quorum_commit_lsn, nodes[0].state.last_lsn)
+            assert target > 0
             deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and nodes[0].quorum_commit_lsn == 0:
+            while time.monotonic() < deadline and nodes[0].quorum_commit_lsn < target:
                 time.sleep(0.02)
-            assert nodes[0].quorum_commit_lsn > 0
+            assert nodes[0].quorum_commit_lsn >= target
             db.execute_one("INSERT INTO t VALUES (1)")
             assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
             assert replica.commit_barrier() is not None
