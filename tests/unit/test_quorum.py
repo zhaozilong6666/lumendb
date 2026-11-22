@@ -1189,6 +1189,9 @@ def test_append_entries_moves_a_real_replica_forward(tmp_path):
             0,
             [_record_to_json(record) for record in records],
             commit_lsn=records[-1].lsn,
+            # Windows CI 上重放这批记录偶发超过默认 2s（run 278 的 TimeoutError）；
+            # 这里只是测试的传输等待，放大到 5s，避免把慢盘抖动记成代码失败。
+            timeout=5.0,
         )
         assert response["ok"] is True
         assert response["match_lsn"] == records[-1].lsn
