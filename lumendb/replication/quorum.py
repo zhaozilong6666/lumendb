@@ -663,14 +663,27 @@ class QuorumNode:
                 return
             with self._lock:
                 last = self._last_heartbeat_at
+            if self._watchdog_stop.is_set():
+                return
             if last is None:
                 # 从未收到过心跳：集群可能还没有 leader，超时同样触发。
-                callback = self.on_leader_lost
-            elif time.time() - last > base:
-                callback = self.on_leader_lost
+                stale = True
             else:
+                stale = time.time() - last > base
+            if not stale:
                 continue
+            # 等待结束后到真正回调之间还有窗口：可能刚收到心跳（应重置计时），
+            # 也可能上层刚 stop（不应再回调）。决定前再核一次，避免测试与真实
+            # 提升路径里“stop 之后还收到一次 on_leader_lost”。
+            with self._lock:
+                if self._watchdog_stop.is_set():
+                    return
+                if self._last_heartbeat_at != last:
+                    continue
+                callback = self.on_leader_lost
             if callback is not None:
+                if self._watchdog_stop.is_set():
+                    return
                 try:
                     callback()
                 except Exception:  # noqa: BLE001 - 回调异常不能打死看门狗线程
