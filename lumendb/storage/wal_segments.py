@@ -65,6 +65,10 @@ class SegmentedWAL(WAL):
         self.path.mkdir(parents=True, exist_ok=True)
         self.segment_bytes = segment_bytes
         self._lock = threading.RLock()
+        # 文件写入/轮转/回收单独一把锁：flush 在 fsync 期间释放 _lock，
+        # 让其它线程继续 append 到 _pending，下一轮 flush 就能搭上更大的一批。
+        # 锁序固定为 _flush_lock → _lock。
+        self._flush_lock = threading.RLock()
         self._pending: list[tuple[int, bytes]] = []
         self._fh = None
         self._current_path: Path | None = None
@@ -199,37 +203,68 @@ class SegmentedWAL(WAL):
         self._current_size = 0
 
     def flush(self) -> int:
-        with self._lock:
-            if not self._pending:
-                if self._fh is not None:
-                    self._fh.flush()
-                return self._size
-            last_written = self._size
-            for lsn, data in self._pending:
-                if (
-                    self._fh is not None
-                    and self._current_size > 0
-                    and self._current_size + len(data) > self.segment_bytes
-                ):
-                    self._finish_current()
-                self._ensure_current(lsn)
+        """把 pending 记录写盘并 fsync，返回已持久化的最后 LSN。
+
+        只把 ``_pending`` 的交换放在 ``_lock`` 里；文件写入/轮转/fsync 在
+        ``_flush_lock`` 下进行，不再长期占着追加锁。这样提交线程在 leader
+        刷盘期间仍能追加 COMMIT 记录，落到下一轮同一批 flush 里。
+        """
+        with self._flush_lock:
+            with self._lock:
+                if not self._pending:
+                    if self._fh is not None:
+                        self._fh.flush()
+                    return self._size
+                pending = self._pending
+                self._pending = []
+                last_written = self._size
+            try:
+                for lsn, data in pending:
+                    if (
+                        self._fh is not None
+                        and self._current_size > 0
+                        and self._current_size + len(data) > self.segment_bytes
+                    ):
+                        self._finish_current()
+                    self._ensure_current(lsn)
+                    assert self._fh is not None
+                    self._fh.write(data)
+                    self._current_size += len(data)
+                    last_written = lsn
                 assert self._fh is not None
-                self._fh.write(data)
-                self._current_size += len(data)
-                last_written = lsn
-            assert self._fh is not None
-            self._fh.flush()
-            os.fsync(self._fh.fileno())
-            self._pending.clear()
-            self._size = last_written
-            return self._size
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+            except BaseException:
+                # 写失败时把这一批放回队首，避免 pending 凭空消失；文件里
+                # 可能已有半批记录，重试的重复记录由恢复端按 LSN 去重语义
+                # 处理（与旧实现 flush 失败后 pending 未清空的行为一致）。
+                with self._lock:
+                    self._pending[0:0] = pending
+                raise
+            with self._lock:
+                self._size = last_written
+            return last_written
+
+    def flush_upto(self, lsn: int) -> None:
+        """确保所有 lsn <= 目标值的记录都已落盘。
+
+        不能沿用基类的“持 _lock 调 flush”：本类的 flush 要先拿 _flush_lock，
+        锁序是 _flush_lock → _lock，持锁调用会 ABBA。
+        """
+        if lsn <= 0:
+            return
+        with self._lock:
+            if lsn <= self._size:
+                return
+        self.flush()
 
     # -- 读取与回收 ---------------------------------------------------------
 
     def iter_records(self, start_lsn: int = 1) -> Iterator[LogRecord]:
-        with self._lock:
-            self.flush()
-            chunks = [(path, path.read_bytes()) for path in self._discover()]
+        with self._flush_lock:
+            with self._lock:
+                self.flush()
+                chunks = [(path, path.read_bytes()) for path in self._discover()]
         for _path, data in chunks:
             pos = 0
             while pos + HEADER_SIZE <= len(data):
@@ -249,31 +284,33 @@ class SegmentedWAL(WAL):
         当前正在写的段永远保留；即使它里面全是旧记录，下一次追加也会继续
         使用它，避免出现“文件句柄指向已删除文件”的状态。
         """
-        with self._lock:
-            self.flush()
-            removed = 0
-            if self._retain_lsn > 0:
-                # retain_lsn 是下游还需要的最早 LSN；不能按 checkpoint
-                # 的安全 LSN 把 retain 之后、checkpoint 之前的记录删掉。
-                safe_lsn = min(safe_lsn, self._retain_lsn)
-            files = self._discover()
-            for path in files[:-1]:
-                records, _ = _read_segment(path)
-                if not records:
-                    path.unlink()
-                    removed += 1
-                    continue
-                if records[-1].lsn < safe_lsn:
-                    path.unlink()
-                    removed += 1
-            return removed
+        with self._flush_lock:
+            with self._lock:
+                self.flush()
+                removed = 0
+                if self._retain_lsn > 0:
+                    # retain_lsn 是下游还需要的最早 LSN；不能按 checkpoint
+                    # 的安全 LSN 把 retain 之后、checkpoint 之前的记录删掉。
+                    safe_lsn = min(safe_lsn, self._retain_lsn)
+                files = self._discover()
+                for path in files[:-1]:
+                    records, _ = _read_segment(path)
+                    if not records:
+                        path.unlink()
+                        removed += 1
+                        continue
+                    if records[-1].lsn < safe_lsn:
+                        path.unlink()
+                        removed += 1
+                return removed
 
     def close(self) -> None:
-        with self._lock:
-            self.flush()
-            if self._fh is not None:
-                self._fh.close()
-                self._fh = None
+        with self._flush_lock:
+            with self._lock:
+                self.flush()
+                if self._fh is not None:
+                    self._fh.close()
+                    self._fh = None
 
 
 __all__ = ["SegmentedWAL"]

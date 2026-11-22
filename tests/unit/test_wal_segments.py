@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 
+import lumendb.storage.wal_segments as wal_segments
 from lumendb.storage.wal import LogType, encode_page_update
 from lumendb.storage.wal_segments import SegmentedWAL
 
@@ -102,4 +103,59 @@ class TestSegmentedWal:
         records = wal.read_all()
         assert len(records) == 120
         assert len({record.lsn for record in records}) == 120
+        wal.close()
+
+    def test_append_during_flush_is_not_blocked_or_lost(self, tmp_path, monkeypatch):
+        """leader 在 fsync 期间必须让其它线程继续 append。
+
+        旧实现把整个 flush（含 fsync）包在 _lock 里，提交线程会被磁盘等待
+        卡住，组提交批次被压到 1 个事务；这里用一次可控的慢 fsync 验证
+        append 不再阻塞，并且下一轮 flush 能把它落盘。
+        """
+        wal = make_wal(tmp_path, segment_bytes=1024)
+        first = wal.append(1, LogType.BEGIN)
+        entered = threading.Event()
+        release = threading.Event()
+        real_fsync = wal_segments.os.fsync
+        calls = {"n": 0}
+
+        def blocking_fsync(fd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                entered.set()
+                assert release.wait(timeout=5)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(wal_segments.os, "fsync", blocking_fsync)
+
+        errors: list[BaseException] = []
+
+        def leader() -> None:
+            try:
+                wal.flush()
+            except BaseException as exc:  # noqa: BLE001 - 带回主线程断言
+                errors.append(exc)
+
+        flush_thread = threading.Thread(target=leader)
+        flush_thread.start()
+        assert entered.wait(timeout=5), "flush 没有进入 fsync"
+
+        appended: list[int] = []
+
+        def writer() -> None:
+            appended.append(wal.append(2, LogType.COMMIT))
+
+        append_thread = threading.Thread(target=writer)
+        append_thread.start()
+        append_thread.join(timeout=1.0)
+        assert not append_thread.is_alive(), "append 被正在 fsync 的 flush 阻塞了"
+        release.set()
+        flush_thread.join(timeout=5)
+        assert not flush_thread.is_alive()
+        assert errors == []
+
+        wal.flush()
+        records = wal.read_all()
+        assert [record.lsn for record in records] == [first, appended[0]]
+        assert [record.xid for record in records] == [1, 2]
         wal.close()
