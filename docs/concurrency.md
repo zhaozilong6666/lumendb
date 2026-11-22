@@ -756,7 +756,12 @@ first-updater-wins 仍会发现链头已变，于是继续报冲突。等待只�
 也是并发模式第一次在热点写上不低于默认模式。新增回归
 `tests/unit/test_concurrent_dml.py::test_hot_row_increments_serialize_without_lost_updates`
 （4 线程各 25 次自增，最终值必须恰好 100）。默认与并发全量各 **1405 passed**，
-并发门禁 6 项 × 3 轮全 PASS。
+并发门禁 6 项 × 3 轮全 PASS，GitHub Actions run **279**（Python 3.12 / 3.13 ×
+Linux / Windows 四矩阵）全绿。
+
+前一个 docs 提交 `4fbb6df` 的 CI #278 失败与本次改动无关：Windows 3.13 上
+`test_quorum.py` 两条时间敏感用例偶发（看门狗心跳重置竞态、`append_entries`
+连接超时），同树在 run 279 重跑即绿。已作为 flake 记进账本，后续单独硬化。
 
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
