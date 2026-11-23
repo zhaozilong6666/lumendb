@@ -33,6 +33,7 @@ from .record import (
     DecodedRecord,
     RecordHeader,
     RID,
+    decode_header,
     decode_record,
     encode_record,
     rid_tuple,
@@ -41,6 +42,11 @@ from .txn import Transaction, TransactionManager, TxnState
 
 #: 一页最多能放多少槽位（受页头之后的目录空间限制）
 _MAX_SLOTS = (PAGE_SIZE - 32) // 4
+
+#: 在线 VACUUM 一次性建立版本链索引时允许的物理版本上限。
+#: 每个版本只保留 RecordHeader（几十字节），但 100 万版本仍会到百 MB 级；
+#: 超过上限就失败关闭，提示改用离线 VACUUM，避免"在线"把内存打满。
+VACUUM_ONLINE_MAX_VERSIONS = 250_000
 
 #: 找空闲页时最多向前回退多少页，超过就新开一页，避免退化成 O(n²)
 _MAX_BACKWARD_SCAN = 8
@@ -578,7 +584,10 @@ class HeapFile:
         txn.require_active()
         txn.wrote = True
 
-        records: dict[RID, DecodedRecord] = {}
+        # 只保留每个版本的 RecordHeader，不保留 DecodedRecord 里的值。
+        # 在线 VACUUM 的决策只需要 xmin/xmax/flags 与版本链指针；把整行
+        # 反序列化进 dict 会让 10 万行表在"在线"路径上吃掉几百 MB 到 GB。
+        headers: dict[RID, RecordHeader] = {}
         page_ids: list[int] = []
         page_id = self.table.root_page
         while page_id != INVALID_PAGE_ID:
@@ -587,9 +596,23 @@ class HeapFile:
             page_ids.append(page_id)
             try:
                 for slot in range(page.nslots):
-                    rec = self._decode(page, slot)
-                    if rec is not None:
-                        records[(page_id, slot)] = rec
+                    raw = page.get_record(slot)
+                    if raw is None:
+                        continue
+                    if len(headers) >= VACUUM_ONLINE_MAX_VERSIONS:
+                        raise StorageError(
+                            "在线 VACUUM 的版本数超过上限",
+                            detail=(
+                                f"表 {self.table.name} 超过 "
+                                f"{VACUUM_ONLINE_MAX_VERSIONS} 个物理版本；"
+                                "在线模式只保留 header 元数据，但仍需一次性"
+                                "建立版本链索引"
+                            ),
+                            hint="对大表改用离线 VACUUM，或先清理历史版本",
+                        )
+                    # 只解 38 字节头，不碰列值。旧实现 decode_record 会把
+                    # 每一行的值都物化，10 万行表直接吃掉几百 MB。
+                    headers[(page_id, slot)] = decode_header(raw)
             finally:
                 self._release(page)
             page_id = next_id
@@ -597,36 +620,41 @@ class HeapFile:
         viewers: list[Transaction] = [txn]
         viewers.extend(t for t in active_txns if t.xid != txn.xid)
 
-        def visible(rec: DecodedRecord) -> bool:
-            return any(self._visible(viewer, rec) for viewer in viewers)
+        def visible(header: RecordHeader) -> bool:
+            return any(
+                self._txns.is_visible(
+                    viewer, header.xmin, header.xmax, header.flags
+                )
+                for viewer in viewers
+            )
 
         keep: set[RID] = set()
-        for rid, rec in records.items():
-            if not rec.header.is_root:
+        for rid, header in headers.items():
+            if not header.is_root:
                 continue
             # 根 RID 是索引入口：即使整行对所有人都不可见也保留，
             # 否则索引会指向一个不存在的槽位。
             keep.add(rid)
-            cur = rec.header.newest_rid or rid
+            cur = header.newest_rid or rid
             chain: list[RID] = []
             seen: set[RID] = set()
-            while cur in records and cur not in seen:
+            while cur in headers and cur not in seen:
                 chain.append(cur)
                 seen.add(cur)
-                cur = records[cur].header.prev_rid
+                cur = headers[cur].prev_rid
             if not chain:
                 continue
             keep.add(chain[0])
             deepest = 0
             for i, version_rid in enumerate(chain):
-                if visible(records[version_rid]):
+                if visible(headers[version_rid]):
                     deepest = i
             keep.update(chain[: deepest + 1])
 
         # 可见但不在任何根链上的孤儿版本（历史遗留）也保留，避免在线
         # 回收把某个活跃快照还能扫到的版本删掉。
-        for rid, rec in records.items():
-            if rid not in keep and visible(rec):
+        for rid, header in headers.items():
+            if rid not in keep and visible(header):
                 keep.add(rid)
 
         dead = 0
@@ -641,7 +669,7 @@ class HeapFile:
                     for slot in range(page.nslots):
                         rid = (pid, slot)
                         if (
-                            rid in records
+                            rid in headers
                             and rid not in keep
                             and page.record_length(slot) > 0
                         ):
@@ -657,9 +685,11 @@ class HeapFile:
                 self._release(page, dirty=dirty)
 
         live_roots: set[RID] = set()
-        for rid, rec in records.items():
-            if self._visible(txn, rec):
-                live_roots.add(self.resolve_root(rid, rec.header))
+        for rid, header in headers.items():
+            if self._txns.is_visible(
+                txn, header.xmin, header.xmax, header.flags
+            ):
+                live_roots.add(self.resolve_root(rid, header))
         self.table.row_count_hint = len(live_roots)
         return len(live_roots), dead, compacted
 

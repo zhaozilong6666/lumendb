@@ -360,7 +360,7 @@ Step 4 的前置项在这条路径上落地：
   读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（31 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（34 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
@@ -369,7 +369,13 @@ Step 4 的前置项在这条路径上落地：
   升级物理保存点、有 DML 后拒绝结构变更、TRUNCATE 升级后回滚、VACUUM 拒绝、
   `Database.execute` 路径同样升级、其它会话 DDL 被行 undo 挡住并返回 40001、
   晚升级路径也检查其它行 undo、其它未提交写入挡住 DDL、活跃只读事务挡住
-  shadow 重写、ADD COLUMN 与 DROP TABLE）；
+  shadow 重写、ADD COLUMN 与 DROP TABLE、唯一键 UPDATE 回滚后旧键仍占用而新键
+  释放、`ON DELETE CASCADE` 删掉的子行随保存点回滚全部恢复、upsert 冲突
+  `DO UPDATE` 的新值被撤销）；
+- `tests/unit/test_concurrency.py` 与 `tests/integration/test_cross_layer_invariants.py`
+  的 `env` fixture 已参数化为默认/并发两模式，同一批写写冲突、唯一键回滚、外键
+  并发、延迟约束、DDL 串行化、RI 可见性用例在同一个 pytest 进程里各跑两遍；
+  CI 仍保留 Linux 3.12 的 `LUMEN_CONCURRENT_DML=1` 全量任务作为整库兜底；
 - `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
   逐条撤销、嵌套保存点按深度逆序撤销）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
@@ -388,7 +394,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1443 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1471 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -402,6 +408,9 @@ Step 4 的前置项在这条路径上落地：
   快照逐版本判可见性，保留根记录、链头到最老可见版本的整条前缀链；只删对所有
   快照都不可见的版本，槽位不重排、索引不重建。持有 DDL 目录锁/物理 undo 的活跃
   事务仍会让 VACUUM 按原门禁报错——DDL abort 的页原像不能和在线整页日志交错。
+  内存模型只保留每个版本的 38 字节 `RecordHeader`（用 `decode_header` 直读，
+  不物化列值），并对物理版本数设 250,000 的硬上限；超限直接失败关闭、提示改用
+  离线 VACUUM，避免“在线”把大表整表解码进内存。
   剩余边界是根记录/空洞槽位不回收，文件不缩小；离线模式（无活跃事务）仍重排
   RID 并重建索引。
 
@@ -871,7 +880,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1443 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1471 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

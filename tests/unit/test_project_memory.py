@@ -504,3 +504,53 @@ def test_add_external_with_source_round_trips(tmp_path, capsys):
 
 
 
+
+
+def test_verify_external_evidence_is_partial_not_failed():
+    """CI URL 在离线门禁里读不到，不能把"无法核对"记成"事实是假的"。"""
+    fact = _fact(
+        "ci",
+        "CI run 四矩阵全绿",
+        evidence=[{"type": "external", "value": "https://example.com/run/1"}],
+    )
+    status, details = verify_fact(fact, root=Path("."))
+    assert status == "partial"
+    assert details[0]["status"] == "external"
+    assert "离线未核对" in details[0]["detail"]
+
+
+def test_verify_check_is_read_only_and_only_fails_on_real_evidence(tmp_path, capsys):
+    from tools.project_memory import main
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "mod.py").write_text("def present():\n    pass\n", encoding="utf-8")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(
+        json.dumps(
+            _fact(
+                "good",
+                "文件锚点存在",
+                evidence=[
+                    {"type": "file", "value": "pkg/mod.py", "anchor": "def present"},
+                    {"type": "external", "value": "https://example.com/ci/1"},
+                ],
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = ledger.read_bytes()
+    assert main(["--ledger", str(ledger), "--root", str(tmp_path), "verify", "--check"]) == 0
+    assert ledger.read_bytes() == before, "--check 不能改写账本"
+    out = capsys.readouterr().out
+    assert "失败 0 条" in out
+
+    bad = _fact(
+        "bad",
+        "锚点已消失",
+        evidence=[{"type": "file", "value": "pkg/mod.py", "anchor": "def gone"}],
+    )
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(bad.to_dict(), ensure_ascii=False) + "\n")
+    assert main(["--ledger", str(ledger), "--root", str(tmp_path), "verify", "--check"]) == 1

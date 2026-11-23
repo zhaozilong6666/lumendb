@@ -557,6 +557,11 @@ def verify_fact(
                     status, detail = "manual", "已记录；自动执行复现命令不默认开启"
                 else:
                     status, detail = "manual", "复现命令，需人工执行"
+            elif kind == "external":
+                # URL / CI 页面这类外部证据无法在离线门禁里打开；把它记为
+                # external 而不是 failed，避免"读不到 GitHub"被当成"事实是假的"。
+                # 外部事实的可信度由 contract_findings 的 source/新鲜度契约兜。
+                status, detail = "external", "外部证据，离线未核对"
             else:
                 status, detail = "failed", f"未知证据类型：{kind}"
         except subprocess.TimeoutExpired:
@@ -565,16 +570,23 @@ def verify_fact(
             status, detail = "failed", f"校验失败：{exc}"
         details.append({"type": kind, "value": value, "anchor": anchor, "status": status, "detail": detail})
 
+    return aggregate_status(details), details
+
+
+def aggregate_status(details: Sequence[dict]) -> str:
+    """证据状态聚合：failed 优先；否则全部 ok 才是 ok，其余为 partial。
+
+    ``unchecked`` / ``manual`` / ``external`` 都表示"离线没能判"，不是"判假"；
+    门禁只应把 ``failed`` 当红，否则 CI URL 会让告警长期常亮。
+    """
     statuses = {d["status"] for d in details}
     if "failed" in statuses:
-        aggregate = "failed"
-    elif not details:
-        aggregate = "unverified"
-    elif statuses <= {"ok"}:
-        aggregate = "ok"
-    else:
-        aggregate = "partial"
-    return aggregate, details
+        return "failed"
+    if not details:
+        return "unverified"
+    if statuses <= {"ok"}:
+        return "ok"
+    return "partial"
 
 
 def contract_findings(fact: Fact, now: Optional[datetime] = None) -> list[dict]:
@@ -801,22 +813,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
         )
         # 外部事实额外套一层"知识契约"：出处 + 核对时间 + 新鲜度
         details = details + contract_findings(fact)
-        statuses = {d["status"] for d in details}
-        if "failed" in statuses:
-            status = "failed"
-        elif not details:
-            status = "unverified"
-        elif statuses <= {"ok"}:
-            status = "ok"
-        else:
-            status = "partial"
+        status = aggregate_status(details)
         fact.verify = {"status": status, "checked_at": _now_iso(), "detail": details}
         print(f"{status:8s} {fact.id}  {fact.claim[:60]}")
         for detail in details:
-            if detail["status"] != "ok":
+            if detail["status"] not in ("ok",):
                 print(f"         - {detail['type']}:{detail['value']} → {detail['status']}（{detail['detail']}）")
         if status == "failed":
             failures += 1
+    if args.check:
+        print(f"\n校验完成（只读）：{len(targets)} 条，失败 {failures} 条")
+        return 1 if failures else 0
     ledger.rewrite()
     print(f"\n校验完成：{len(targets)} 条，失败 {failures} 条")
     return 1 if failures else 0
@@ -1305,6 +1312,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--only-stale", action="store_true")
     verify.add_argument("--run-tests", action="store_true")
     verify.add_argument("--run-commands", action="store_true")
+    verify.add_argument(
+        "--check",
+        action="store_true",
+        help="只读模式：不改写账本，只在存在 failed 证据时返回 1（供门禁使用）",
+    )
     verify.set_defaults(func=cmd_verify)
 
     ingest = sub.add_parser("ingest-git", help="把 git 提交灌成 anchor 记录")

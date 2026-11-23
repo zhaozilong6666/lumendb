@@ -15,7 +15,7 @@ import traceback
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import NotSupportedError, TransactionError
+from lumendb.errors import DuplicateKeyError, NotSupportedError, TransactionError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 
@@ -842,5 +842,98 @@ def test_logical_savepoint_reuses_key_and_row_after_rollback(tmp_path):
         _run(server, session, "DELETE FROM t WHERE id = 2")
         _run(server, session, "COMMIT")
         assert _rows(server, Session(database=db), "SELECT id, v FROM t") == [(1, 11)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_restores_unique_key_on_update_rollback(tmp_path):
+    """保存点内 UPDATE 唯一键后回滚：旧键仍被占用，新键可以重新插入。"""
+    db = Database(
+        tmp_path / "logical_sp_unique_update",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE u (id INT PRIMARY KEY, v INT UNIQUE)")
+    db.execute_one("INSERT INTO u VALUES (1, 10), (2, 20)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT sp")
+        _run(server, session, "UPDATE u SET v = 30 WHERE id = 1")
+        _run(server, session, "ROLLBACK TO SAVEPOINT sp")
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM u ORDER BY id"
+        ) == [(1, 10), (2, 20)]
+        # 旧键恢复占用，新键释放
+        with pytest.raises(DuplicateKeyError):
+            db.execute_one("INSERT INTO u VALUES (3, 10)")
+        db.execute_one("INSERT INTO u VALUES (3, 30)")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM u ORDER BY id"
+        ) == [(1, 10), (2, 20), (3, 30)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_restores_cascade_deleted_children(tmp_path):
+    """保存点内 DELETE 父行触发 ON DELETE CASCADE，回滚后子行必须全部回来。"""
+    db = Database(
+        tmp_path / "logical_sp_cascade",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE p (id INT PRIMARY KEY)")
+    db.execute_one(
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id) "
+        "ON DELETE CASCADE)"
+    )
+    db.execute_one("INSERT INTO p VALUES (1)")
+    db.execute_one("INSERT INTO c VALUES (10, 1), (11, 1)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT sp")
+        _run(server, session, "DELETE FROM p WHERE id = 1")
+        assert _rows(server, session, "SELECT COUNT(*) FROM c") == [(0,)]
+        _run(server, session, "ROLLBACK TO SAVEPOINT sp")
+        _run(server, session, "COMMIT")
+        fresh = Session(database=db)
+        assert _rows(server, fresh, "SELECT COUNT(*) FROM p") == [(1,)]
+        assert _rows(
+            server, fresh, "SELECT id, pid FROM c ORDER BY id"
+        ) == [(10, 1), (11, 1)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_undoes_upsert_conflict_update(tmp_path):
+    """ON CONFLICT DO UPDATE 走的是 UPDATE 路径，保存点回滚要撤掉新值。"""
+    db = Database(
+        tmp_path / "logical_sp_upsert",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT sp")
+        _run(
+            server,
+            session,
+            "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE "
+            "SET v = excluded.v",
+        )
+        assert _rows(server, session, "SELECT id, v FROM t") == [(1, 99)]
+        _run(server, session, "ROLLBACK TO SAVEPOINT sp")
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t"
+        ) == [(1, 10)]
     finally:
         db.close()

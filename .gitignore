@@ -20,3 +20,7 @@ bench/results/*.jsonl
 .DS_Store
 Thumbs.db
 *.lock
+
+# 本地调试残留
+.tmp-*
+pytest.log

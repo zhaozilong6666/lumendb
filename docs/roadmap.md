@@ -6,8 +6,12 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1443 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1471 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
+- 质量门禁：`python scripts/gates.py` 跑全量测试、变异清单有效性、账本 drift
+  与账本证据校验。证据校验用只读的 `verify --check`：`failed` 才红；
+  `unchecked/manual/external` 记为 partial，CI 页面 URL 不会因为“这台机器
+  读不到 GitHub”被误判成假事实。
 - 并发 DML 实验模式已落地（`Database(concurrent_dml=True)`，默认关闭）：
   DML 走 `read_guard` + 行/键锁 + 页 latch，目录保存短锁，索引根页跨语句
   共享（`root_cell` + `Catalog.index_root_lock`），回滚走逻辑路径（WAL
@@ -356,8 +360,9 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 `FLAG_ABORTED`、根记录不物理回收。`concurrent_dml` 仍保持
 opt-in，默认模式尚未切换，卡在撤销插入的空间回收（根记录/空洞槽位）、`VACUUM`
 在线模式只保 RID 不回收
-根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1443 passed 与门禁脚本 3 轮
+根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留
+38 字节记录头，并对物理版本数设 250,000 硬上限，超限失败关闭）、自动提交 UPDATE
+的 READ COMMITTED 语义需发布说明。并发全量 1471 passed 与门禁脚本 3 轮
 （10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动

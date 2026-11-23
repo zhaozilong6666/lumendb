@@ -33,11 +33,25 @@ def _run(server: PGWireServer, session: Session, sql: str):
 
 
 @pytest.fixture
-def env(tmp_path):
-    db = Database(tmp_path / "db", checkpoint_wal_bytes=0)
+def env(tmp_path, request, monkeypatch):
+    concurrent = bool(getattr(request, "param", False))
+    if not concurrent:
+        # Database 把 concurrent_dml=False 当成"未显式设置"，会读环境变量；
+        # 跑并发全量时必须清掉它，否则参数化的默认分支也会被带成并发。
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(
+        tmp_path / "db",
+        checkpoint_wal_bytes=0,
+        concurrent_dml=concurrent,
+    )
     server = PGWireServer(db)
     yield db, server
     db.close()
+
+
+# 跨层不变量必须同时在默认与并发两条路径上成立；参数化 fixture 避免
+# "并发模式只有 CI 一条单独 job 在守、本地只跑主路径"的漂移。
+pytestmark = pytest.mark.parametrize("env", [False, True], indirect=True)
 
 
 def test_deferred_fk_cannot_be_smuggled_in_through_the_wire(env):

@@ -40,11 +40,22 @@ def _rows(server: PGWireServer, session: Session, sql: str) -> list:
 
 
 @pytest.fixture
-def env(tmp_path):
-    db = Database(tmp_path / "db")
+def env(tmp_path, request, monkeypatch):
+    concurrent = bool(getattr(request, "param", False))
+    if not concurrent:
+        # Database 把 concurrent_dml=False 当成"未显式设置"，会读环境变量；
+        # 跑并发全量时必须清掉它，否则参数化的默认分支也会被带成并发。
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
     server = PGWireServer(db)
     yield db, server
     db.close()
+
+
+# 同一批不变量在默认/并发两条执行路径上各跑一遍。只靠 CI 里单独一条
+# LUMEN_CONCURRENT_DML=1 的全量任务，本地改动很容易只验证主路径；参数化
+# fixture 让两种模式在同一个 pytest 进程里都被断言。
+pytestmark = pytest.mark.parametrize("env", [False, True], indirect=True)
 
 
 # ---------------------------------------------------------------------------

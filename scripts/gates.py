@@ -58,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
     memory = ROOT / "tools" / "project_memory.py"
     if memory.exists():
         steps.append(("账本漂移检查", [python, str(memory), "drift"]))
+        # 只读校验：failed 证据才红；CI URL 这类 external 证据记为 partial，
+        # 不把"这台机器读不到 GitHub"误判成"事实是假的"。
+        steps.append(("账本证据检查", [python, str(memory), "verify", "--check"]))
 
     if args.full:
         steps.append(("变异检查", [python, "scripts/mutation_check.py"]))
