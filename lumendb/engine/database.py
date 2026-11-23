@@ -136,13 +136,18 @@ def _blocks_active_readers(statement) -> bool:
 
     ``ALTER TABLE`` 的任何子命令都会改目录里的表定义；旧快照事务在 DDL
     之后继续查询时，可能按新列布局解码旧计划，或看到新列默认值，破坏
-    快照隔离。``TRUNCATE`` 更是直接换掉页链。``CREATE TABLE`` / 新建
+    快照隔离。``TRUNCATE`` 更是直接换掉页链；``DROP TABLE/VIEW/INDEX`` 与
+    ``REINDEX`` 会让旧快照手里的对象/索引根失效。``CREATE TABLE`` / 新建
     索引不影响已有表的快照，不必为此挡住只读事务。
     """
     if statement is None:
         return False
     name = type(statement).__name__
-    return name == "Truncate" or name.startswith("AlterTable")
+    return (
+        name == "Truncate"
+        or name.startswith("AlterTable")
+        or name in {"DropTable", "DropView", "DropIndex", "Reindex"}
+    )
 
 
 class Database:

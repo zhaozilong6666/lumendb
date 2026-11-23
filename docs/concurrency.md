@@ -353,13 +353,14 @@ Step 4 的前置项在这条路径上落地：
   解码旧版本而报列数不符；检查与拿门之间新产生的行 undo 由第二次检查兜住。
   `ddl_guard` 还拒绝其它事务的未提交写入：shadow heap 只复制对 DDL 事务可见
   的行，未提交行不会被复制，等它 COMMIT 就会落进已被目录替换掉的旧 heap，
-  查询静默少行。对 `ALTER TABLE*` / `TRUNCATE` 这类会改旧快照表定义或页链的
-  语句，还要求没有其它活跃事务——旧快照在结构切换后继续查询会读到空表或
-  新列布局。逻辑保存点的晚升级（保存点后尚无行 DML、DDL 触发物理保存点）
-  在拿到写者锁、排空在途读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
+  查询静默少行。对 `ALTER TABLE*` / `TRUNCATE` / `DROP TABLE/VIEW/INDEX` /
+  `REINDEX` 这类会改旧快照表定义、页链或对象根的语句，还要求没有其它活跃事务
+  ——旧快照在结构切换后继续查询会读到空表、新列布局或已摘掉的对象。逻辑保存点
+  的晚升级（保存点后尚无行 DML、DDL 触发物理保存点）在拿到写者锁、排空在途
+  读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（30 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（31 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
@@ -368,7 +369,7 @@ Step 4 的前置项在这条路径上落地：
   升级物理保存点、有 DML 后拒绝结构变更、TRUNCATE 升级后回滚、VACUUM 拒绝、
   `Database.execute` 路径同样升级、其它会话 DDL 被行 undo 挡住并返回 40001、
   晚升级路径也检查其它行 undo、其它未提交写入挡住 DDL、活跃只读事务挡住
-  shadow 重写与 ADD COLUMN）；
+  shadow 重写、ADD COLUMN 与 DROP TABLE）；
 - `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
   逐条撤销、嵌套保存点按深度逆序撤销）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
@@ -387,7 +388,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1442 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1443 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -853,10 +854,10 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 `31b6fd2` 的 run 45101946693 四矩阵全绿；随后 `dbcad2b` 的 run 45104750954 与
 `c3a0087`（DDL/TRUNCATE 安全升级）的 run 45109114642 均四矩阵全绿；
 `5105553`（跨会话 DDL 行 undo 门禁）的 run 45115443255 四矩阵全绿。
-`d6d8d54`（并发保存点默认逻辑 undo）的 run 45117937745 在 Windows 3.12/3.13
-与 Ubuntu 3.13 上成功，Ubuntu 3.12 长时间停在并发全量步骤；其后的
-`9f2f64d`（CLI 开关测试）run 45119005136 四矩阵全绿，因此以 `9f2f64d`
-作为 CI 基线。本轮新增的 DDL 活跃写/旧快照门禁提交待在 `9f2f64d` 之后验证。
+`d6d8d54`（并发保存点默认逻辑 undo）的 run 45117937745 四矩阵全绿；其中
+Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
+`9f2f64d`（CLI 开关测试）run 45119005136 四矩阵全绿。
+`7f7f5e9`（DDL 活跃写/旧快照门禁 + 保存点晚升级）的 run 45166209530 四矩阵全绿。
 
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
@@ -865,7 +866,7 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1442 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1443 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

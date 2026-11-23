@@ -690,6 +690,31 @@ def test_alter_add_column_blocks_active_reader(tmp_path):
         db.close()
 
 
+def test_drop_table_blocks_active_reader(tmp_path):
+    """DROP TABLE 不能把活跃旧快照手里的表悄悄摘掉。"""
+    db = Database(
+        tmp_path / "ddl_guard_drop_table_reader",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("INSERT INTO t VALUES (1, 1)")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1)]
+        with pytest.raises(TransactionError, match="仍在活跃"):
+            _run(server, b, "DROP TABLE t")
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1)]
+        _run(server, a, "COMMIT")
+        _run(server, b, "DROP TABLE t")
+        assert _rows(server, Session(database=db), "SHOW TABLES") == []
+    finally:
+        db.close()
+
+
 def test_logical_savepoint_upgrade_ddl_blocks_other_row_undo(tmp_path):
     """保存点后无 DML 的 DDL 升级路径也必须检查别的会话行 undo。
 
