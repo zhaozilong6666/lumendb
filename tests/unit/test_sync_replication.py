@@ -159,17 +159,23 @@ class TestReplicaSyncReplication:
             assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
 
             # 多数派追上之后（副本 attach 后会上报 match_lsn），写就能成功。
-            # 注意要等水位追上 leader 自己的 WAL 尾，而不是只等 ">0"：
-            # CREATE TABLE 已经把 WAL 推到 41k，只等到 12k 就插入会立刻再次
-            # 撞 0.15s 屏障超时（Windows CI 上实际发生过）。
+            # 注意屏障信的是 verified_commit_lsn（多数派自证），不是
+            # quorum_commit_lsn：后者可能是 follower 抄来的口头水位。只等
+            # commit_lsn 会在“水位已到、下一轮心跳还没自证”的窗口里再次撞
+            # 0.15s 超时（Windows CI 上实际发生过）。
             nodes[1].observe_applied(10**9)
             nodes[2].observe_applied(10**9)
             target = max(nodes[0].quorum_commit_lsn, nodes[0].state.last_lsn)
             assert target > 0
             deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and nodes[0].quorum_commit_lsn < target:
+            while (
+                time.monotonic() < deadline
+                and nodes[0].verified_commit_lsn < target
+            ):
+                # 用心跳已经收到的 match_lsn 立即重算，避免多等一个心跳周期。
+                nodes[0].refresh_commit_lsn(nodes[0].state.last_lsn)
                 time.sleep(0.02)
-            assert nodes[0].quorum_commit_lsn >= target
+            assert nodes[0].verified_commit_lsn >= target
             db.execute_one("INSERT INTO t VALUES (1)")
             assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
             assert replica.commit_barrier() is not None
