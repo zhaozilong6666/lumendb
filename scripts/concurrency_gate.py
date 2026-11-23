@@ -192,6 +192,40 @@ def _probe_sql_savepoint(db: Database) -> dict:
     }
 
 
+def _probe_sql_savepoint_logical(db: Database) -> dict:
+    """行级逻辑保存点：保存点事务存续时，另一个写者还能提交。"""
+    server = PGWireServer(db)
+    errors: list[str] = []
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    a = Session(database=db)
+    b = Session(database=db)
+    try:
+        run_sql(a, "BEGIN")
+        run_sql(a, "SAVEPOINT s")
+        run_sql(a, "INSERT INTO t VALUES (1, 1, 'a')")
+        # 这一句在旧的独占保存点模式下会排在写者锁后面；逻辑模式必须直接成功。
+        run_sql(b, "INSERT INTO t VALUES (2, 2, 'b')")
+        run_sql(a, "ROLLBACK TO SAVEPOINT s")
+        after_rollback = run_sql(
+            Session(database=db), "SELECT id FROM t ORDER BY id"
+        )[0].rows
+        run_sql(a, "COMMIT")
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(f"{type(exc).__name__}: {exc}")
+        after_rollback = None
+
+    final = run_sql(Session(database=db), "SELECT id FROM t ORDER BY id")[0].rows
+    return {
+        "errors": errors[:3],
+        "after_rollback": after_rollback,
+        "final": final,
+        "expected": [(2,)],
+    }
+
+
 def _probe_sql_vacuum_window(db: Database) -> dict:
     """VACUUM 等待窗口：持有事务未提交时，VACUUM 等在独占门外而不是立刻拒绝。
 
@@ -483,6 +517,12 @@ def _probe_failed(name: str, detail: dict) -> bool:
             detail["final"] != detail["expected"]
             or detail["visible_after_rollback"] != 0
         )
+    if name == "sql_savepoint_logical":
+        return (
+            bool(detail["errors"])
+            or detail["after_rollback"] != [(2,)]
+            or detail["final"] != detail["expected"]
+        )
     if name == "sql_vacuum_window":
         return (
             detail["final"] != detail["expected"]
@@ -530,6 +570,17 @@ def _build_savepoint(tmp: pathlib.Path):
     return db, _probe_sql_savepoint(db)
 
 
+def _build_savepoint_logical(tmp: pathlib.Path):
+    db = Database(
+        tmp,
+        checkpoint_wal_bytes=0,
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    return db, _probe_sql_savepoint_logical(db)
+
+
 def _build_vacuum(tmp: pathlib.Path):
     db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
@@ -563,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:
                         ("btree_delete_race", _build_btree),
                         ("sql_concurrent_dml", _build_sql_dml),
                         ("sql_savepoint_concurrent", _build_savepoint),
+                        ("sql_savepoint_logical", _build_savepoint_logical),
                         ("sql_vacuum_window", _build_vacuum),
                         ("sql_vacuum_online", _build_vacuum_online)):
         res = _check_probe(name, build, rounds, name)

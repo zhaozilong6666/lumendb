@@ -52,6 +52,9 @@ class TxnSavepoint:
     name: str
     page_depth: int
     undo_depth: int
+    #: 行级逻辑 undo 深度；并发 DML 的保存点不靠整页原像，而是把保存点之后
+    #: 的 INSERT/UPDATE/DELETE 记成闭包，回滚时逐条反向撤销。
+    row_undo_depth: int = 0
     #: 保存点建立时的延迟外键队列；ROLLBACK TO 必须一并恢复，否则保存点
     #: 之后的 INSERT/DELETE 会把已撤销的检查残留到提交阶段。
     deferred_fk_rows: frozenset[tuple[str, "RID"]] = field(default_factory=frozenset)
@@ -87,6 +90,12 @@ class Transaction:
     physical_savepoint: bool = False
     #: DDL 的内存逆操作；abort 时逆序执行，页级 undo 由 WAL 负责。
     undo_log: list = field(default_factory=list)
+    #: 行级逻辑 undo：并发 DML 保存点模式下，保存点之后的堆写逐条记录闭包。
+    #: ROLLBACK TO 逆序执行；它不是整事务 abort，不能只靠可见性状态。
+    row_undo_log: list[Callable[[], None]] = field(default_factory=list)
+    #: 是否正在记录行级逻辑 undo。由 Database 在第一次 SAVEPOINT 时打开；
+    #: 默认保持关闭，物理保存点模式不受影响。
+    capture_row_undo: bool = False
     #: SAVEPOINT 栈；ROLLBACK TO 只撤销保存点之后的页/对象变更。
     savepoints: list[TxnSavepoint] = field(default_factory=list)
     #: 延迟外键：提交时需要重新检查的行，以及被删除/改写的被引用键。
@@ -387,6 +396,8 @@ class TransactionManager:
                             txn.xid,
                         )
                 txn.savepoints.clear()
+                txn.row_undo_log.clear()
+                txn.capture_row_undo = False
                 txn.touched_tables.clear()
                 txn.last_lsn = self._wal.abort(txn.xid)
                 self._wal.flush()
@@ -441,6 +452,7 @@ class TransactionManager:
                     self._bp.undo_depth(txn.xid) if self._bp is not None else 0
                 ),
                 undo_depth=len(txn.undo_log),
+                row_undo_depth=len(txn.row_undo_log),
                 deferred_fk_rows=frozenset(txn.deferred_fk_rows),
                 deferred_ref_checks=frozenset(txn.deferred_ref_checks),
                 constraint_modes=dict(txn.constraint_modes),
@@ -473,6 +485,12 @@ class TransactionManager:
                     undo()
                 except Exception:  # pragma: no cover
                     pass
+            while len(txn.row_undo_log) > target.row_undo_depth:
+                undo = txn.row_undo_log.pop()
+                try:
+                    undo()
+                except Exception:  # pragma: no cover
+                    _log.exception("事务 %s 的行级保存点 undo 失败", txn.xid)
             # 延迟约束队列和 SET CONSTRAINTS 覆盖也属于事务状态，必须回到
             # 保存点建立时的样子；仅回滚页/DDL 会让已撤销的检查或模式泄漏。
             txn.deferred_fk_rows = set(target.deferred_fk_rows)
@@ -488,6 +506,11 @@ class TransactionManager:
             txn.require_active()
             idx = self._find_savepoint(txn, name)
             del txn.savepoints[idx:]
+            if not txn.savepoints:
+                # 没有保存点了，就不再需要逐条行 undo；事务级 abort 仍由
+                # 可见性负责。这样之后的 DDL 也能回到物理页原像路径。
+                txn.capture_row_undo = False
+                txn.row_undo_log.clear()
 
     # -- 查询状态 -----------------------------------------------------------
 

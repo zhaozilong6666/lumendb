@@ -28,6 +28,7 @@ from ..errors import CorruptedPageError, RowTooLargeError, StorageError
 from .bufferpool import BufferPoolManager
 from .page import INVALID_PAGE_ID, PAGE_SIZE, HeapPage
 from .record import (
+    FLAG_ABORTED,
     FLAG_ROOT,
     DecodedRecord,
     RecordHeader,
@@ -167,6 +168,20 @@ class HeapFile:
             self._apply_and_log(txn, page, new_end, payload, old_body)
 
             return slot
+
+    def _record_row_undo(self, txn: Transaction, undo) -> None:
+        """保存点逻辑回滚：只在 ``capture_row_undo`` 打开时记录堆写逆操作。"""
+        if txn.capture_row_undo:
+            txn.row_undo_log.append(undo)
+
+    def _set_flags(
+        self, txn: Transaction, page: HeapPage, slot: int, flags: int
+    ) -> None:
+        """改记录头 flags（+22 处 1 字节），用于把版本标成 ABORTED。"""
+        rel = 22
+        base = self._abs_offset(page, slot, rel)
+        old = bytes(page.buf[base : base + 1])
+        self._apply_and_log(txn, page, base, bytes([flags & 0xFF]), old)
 
     def _set_xmax(self, txn: Transaction, page: HeapPage, slot: int, xmax: int) -> None:
         """给某个版本打上"被谁删除/更新"的标记（行内 +8 处的 8 字节）。"""
@@ -327,13 +342,29 @@ class HeapFile:
                 if slot is None:
                     continue
                 self.table.row_count_hint += 1
-                return (page.page_id, slot)
+                rid = (page.page_id, slot)
+                self._record_row_undo(
+                    txn, lambda rid=rid: self._undo_insert(txn, rid)
+                )
+                return rid
             finally:
                 self._release(page, dirty=True)
         raise StorageError(
             "连续多页都装不下这条记录，放弃插入",
             detail=f"payload={len(payload)} attempts=4",
         )
+
+    def _undo_insert(self, txn: Transaction, rid: RID) -> None:
+        """把保存点之后插入的版本标成 ABORTED；槽位不回收，留给 VACUUM。"""
+        got = self._read_rid(rid)
+        if got is None:
+            return
+        page, rec = got
+        try:
+            self._set_flags(txn, page, rid[1], rec.header.flags | FLAG_ABORTED)
+        finally:
+            self._release(page, dirty=True)
+        self.table.row_count_hint = max(0, self.table.row_count_hint - 1)
 
     def _latest_version_rid(self, root_rid: RID) -> RID:
         """不判可见性，直接拿链上最新的物理版本。
@@ -413,7 +444,52 @@ class HeapFile:
         finally:
             self._release(root_page, dirty=True)
 
+        self._record_row_undo(
+            txn,
+            lambda: self._undo_update(
+                txn,
+                new_rid,
+                old_rid,
+                root_rid,
+                old_header.xmax,
+                newest,
+            ),
+        )
         return new_rid
+
+    def _undo_update(
+        self,
+        txn: Transaction,
+        new_rid: RID,
+        old_rid: RID,
+        root_rid: RID,
+        old_xmax: int,
+        old_newest: RID,
+    ) -> None:
+        """撤销一次保存点后的 UPDATE：废弃新版本、清回旧版本 xmax、复位 newest。"""
+        got = self._read_rid(new_rid)
+        if got is not None:
+            page, rec = got
+            try:
+                self._set_flags(
+                    txn, page, new_rid[1], rec.header.flags | FLAG_ABORTED
+                )
+            finally:
+                self._release(page, dirty=True)
+        got = self._read_rid(old_rid)
+        if got is not None:
+            page, _rec = got
+            try:
+                self._set_xmax(txn, page, old_rid[1], old_xmax)
+            finally:
+                self._release(page, dirty=True)
+        got = self._read_rid(root_rid)
+        if got is not None:
+            page, _rec = got
+            try:
+                self._set_newest(txn, page, root_rid[1], old_newest)
+            finally:
+                self._release(page, dirty=True)
 
     def _raise_if_concurrent_write(
         self, txn: Transaction, newest: RID, target: RID, root_rid: RID
@@ -465,7 +541,22 @@ class HeapFile:
         finally:
             self._release(page, dirty=True)
         self.table.row_count_hint = max(0, self.table.row_count_hint - 1)
+        self._record_row_undo(
+            txn, lambda: self._undo_delete(txn, rid, rec.header.xmax)
+        )
         return 1
+
+    def _undo_delete(self, txn: Transaction, rid: RID, old_xmax: int) -> None:
+        """撤销一次保存点后的 DELETE：把旧版本的 xmax 清回原值。"""
+        got = self._read_rid(rid)
+        if got is None:
+            return
+        page, _rec = got
+        try:
+            self._set_xmax(txn, page, rid[1], old_xmax)
+        finally:
+            self._release(page, dirty=True)
+        self.table.row_count_hint += 1
 
     def vacuum_online(  # noqa: C901 - 版本链遍历与逐页回收集中在一个流程里
         self,

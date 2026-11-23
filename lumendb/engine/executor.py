@@ -232,9 +232,13 @@ class Executor:
     ) -> Result:
         self._txn = txn
         self._schema_statement = type(stmt) in _SCHEMA_CHANGING_STATEMENTS
+        if txn.capture_row_undo and self._schema_statement:
+            raise NotSupportedError(
+                "逻辑保存点事务内不支持 DDL/TRUNCATE",
+                detail="结构变更依赖页原像回滚，会和行级 undo 的 RID/槽位假设冲突",
+                hint="改用默认物理保存点（关闭 --logical-savepoints），或先提交/回滚整个事务",
+            )
         if self._read_only and type(stmt).__name__ not in _NON_WRITING_STATEMENTS:
-            from ..errors import NotSupportedError
-
             raise NotSupportedError(
                 "只读副本拒绝写入",
                 detail=f"语句 {type(stmt).__name__} 不是只读语句",
@@ -3123,6 +3127,12 @@ class Executor:
         并发模式下如果还有空闲的活跃事务，走保 RID 的 ``vacuum_online``：
         只回收对所有活跃快照都不可见的版本，槽位与索引项保持不变。
         """
+        if txn.capture_row_undo:
+            raise NotSupportedError(
+                "逻辑保存点事务内不能执行 VACUUM",
+                detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
+                hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时关闭 --logical-savepoints",
+            )
         tables = (
             [self._catalog.get_table(stmt.table)]
             if stmt.table

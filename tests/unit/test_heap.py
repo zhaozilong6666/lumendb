@@ -484,3 +484,66 @@ class TestTxnGuard:
         txns.abort(t)
         with pytest.raises(TransactionAbortedError):
             heap.insert(t, [1, "x", 1])
+
+
+class TestLogicalSavepointUndo:
+    def test_insert_update_delete_rollback_to_savepoint(self, env):
+        """并发 DML 的行级逻辑 undo：不靠整页原像，也能逐条撤回堆写。"""
+        heap, txns, bp, table = env
+        seed = txns.begin()
+        rids = [
+            heap.insert(seed, [1, "a", 10]),
+            heap.insert(seed, [2, "b", 20]),
+            heap.insert(seed, [3, "c", 30]),
+        ]
+        txns.commit(seed)
+
+        txn = txns.begin()
+        txn.capture_row_undo = True
+        txns.savepoint(txn, "s")
+        heap.insert(txn, [4, "d", 40])
+        heap.update(txn, rids[0], [1, "a2", 11])
+        heap.delete(txn, rids[1])
+        assert sorted(v[0] for _, v in heap.scan(txn)) == [1, 3, 4]
+        assert table.row_count_hint == 3
+
+        txns.rollback_to(txn, "s")
+        rows = sorted(heap.scan(txn), key=lambda item: item[1][0])
+        assert rows == [
+            (rids[0], [1, "a", 10]),
+            (rids[1], [2, "b", 20]),
+            (rids[2], [3, "c", 30]),
+        ]
+        assert table.row_count_hint == 3
+        txns.commit(txn)
+
+    def test_nested_savepoints_undo_in_order(self, env):
+        heap, txns, bp, table = env
+        seed = txns.begin()
+        rid = heap.insert(seed, [1, "a", 10])
+        other = heap.insert(seed, [2, "b", 20])
+        txns.commit(seed)
+
+        txn = txns.begin()
+        txn.capture_row_undo = True
+        txns.savepoint(txn, "a")
+        heap.insert(txn, [3, "c", 30])
+        txns.savepoint(txn, "b")
+        heap.update(txn, rid, [1, "a2", 11])
+        heap.delete(txn, other)
+
+        txns.rollback_to(txn, "b")
+        rows = sorted(heap.scan(txn), key=lambda item: item[1][0])
+        assert rows == [
+            (rid, [1, "a", 10]),
+            (other, [2, "b", 20]),
+            (rows[2][0], [3, "c", 30]),
+        ]
+        txns.rollback_to(txn, "a")
+        assert sorted(v[0] for _, v in heap.scan(txn)) == [1, 2]
+        assert table.row_count_hint == 2
+        txns.commit(txn)
+
+        reader = txns.begin()
+        assert sorted(v[0] for _, v in heap.scan(reader)) == [1, 2]
+        txns.commit(reader)

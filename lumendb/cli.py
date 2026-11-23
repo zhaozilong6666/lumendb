@@ -55,6 +55,7 @@ def _open_database(args: argparse.Namespace) -> Database:
         fence_path=getattr(args, "fence_path", None),
         node_id=getattr(args, "node_id", "primary"),
         concurrent_dml=bool(getattr(args, "concurrent_dml", False)),
+        logical_savepoints=bool(getattr(args, "logical_savepoints", False)),
     )
 
 
@@ -226,7 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--concurrent-dml",
             action="store_true",
-            help="开启并发 DML（opt-in；保存点会等独占并串行化，VACUUM 仍要求无活跃事务）",
+            help="开启并发 DML（opt-in；VACUUM 有活跃事务时转在线保 RID）",
+        )
+        p.add_argument(
+            "--logical-savepoints",
+            action="store_true",
+            help="保存点走行级逻辑 undo（实验，需配合 --concurrent-dml）",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

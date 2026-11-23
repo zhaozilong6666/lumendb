@@ -148,6 +148,7 @@ class Database:
         lease_path: str | Path | None = None,
         node_id: str = "primary",
         concurrent_dml: bool = False,
+        logical_savepoints: bool = False,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
@@ -158,6 +159,9 @@ class Database:
         if not concurrent_dml:
             concurrent_dml = os.environ.get("LUMEN_CONCURRENT_DML") == "1"
         self._concurrent_dml = concurrent_dml
+        #: 保存点走行级逻辑 undo（实验）：不拿全局写者锁，靠逐条堆写逆操作
+        #: 撤回。只覆盖 DML；事务内 DDL/TRUNCATE/VACUUM 会被拒绝。
+        self._logical_savepoints = bool(logical_savepoints and concurrent_dml)
         if fence_path is not None:
             # 共享 fencing marker：旧主库崩溃重启后重新打开数据库时，必须
             # 立即知道"别的节点已经被提升过"，否则裸 Database 打开不检查
@@ -421,6 +425,11 @@ class Database:
         """
         if not self._concurrent_dml or txn.physical_savepoint:
             return
+        if self._logical_savepoints:
+            # 行级逻辑 undo：保存点事务继续和别的写者并行，只记录自己的
+            # INSERT/UPDATE/DELETE 逆操作；ROLLBACK TO 逐条撤回。
+            txn.capture_row_undo = True
+            return
         self._write_lock.acquire()
         try:
             with self._readers_cv:
@@ -438,6 +447,9 @@ class Database:
 
     def _exit_savepoint_mode(self, txn: Transaction) -> None:
         """事务结束：恢复逻辑回滚并释放保存点模式占用的写者锁。"""
+        if getattr(txn, "capture_row_undo", False):
+            txn.capture_row_undo = False
+            txn.row_undo_log.clear()
         if not getattr(txn, "physical_savepoint", False):
             return
         txn.physical_savepoint = False

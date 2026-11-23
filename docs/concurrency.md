@@ -323,38 +323,60 @@ Step 4 的前置项在这条路径上落地：
   并发 DML 都要在这把全局锁上进/出一次，等于把语句重新串行）。现在读者计数用
   独立的 `_readers_lock`，`exclusive_guard` / `close()` 仍持 `_write_lock` 挡默认
   写者，再通过读者条件变量等在途读者退出。
-- **保存点**：逻辑回滚无法撤回"保存点之后的 DML"，所以并发模式下第一次
-  `SAVEPOINT` 会先置 `_no_readers`、排空在途语句，再拿 `_write_lock` 并把事务
-  切到物理回滚（`Transaction.physical_savepoint`）。已经有活跃事务不再报
+- **保存点（默认物理路径）**：逻辑回滚无法撤回"保存点之后的 DML"，所以并发模式
+  下第一次 `SAVEPOINT` 会先置 `_no_readers`、排空在途语句，再拿 `_write_lock` 并把
+  事务切到物理回滚（`Transaction.physical_savepoint`）。已经有活跃事务不再报
   `0A000`，但它们在保存点事务结束前不能进入下一条语句；保存点事务自己的后续
   语句走无 guard 的独占路径。正确性优先，代价仍是保存点事务存续期间写串行。
   写锁改成可跨线程释放的 `_CrossThreadRLock`：线协议语句跑在线程池，保存点可能
   在一个 worker 建、COMMIT 在另一个 worker 释放，`threading.RLock` 会报
   "cannot release a lock owned by another thread"。
+- **行级逻辑保存点（opt-in，`logical_savepoints=True` / `--logical-savepoints`）**：
+  保持 `concurrent_dml` 的并发写路径，第一次 `SAVEPOINT` 只置
+  `txn.capture_row_undo=True`，不拿 `_write_lock`、不排空读者。堆的
+  `INSERT/UPDATE/DELETE` 成功后各记一个闭包到 `txn.row_undo_log`：
+  INSERT 把新版本标 `FLAG_ABORTED` 并减 `row_count_hint`；UPDATE 废弃新版本、
+  把旧版本 `xmax` 清回旧值、根 `newest` 指回旧链头；DELETE 把被删版本 `xmax`
+  清回旧值并加回计数。`ROLLBACK TO SAVEPOINT` 先做原有页/目录 undo，再按保存点
+  记录的 `row_undo_depth` 逆序执行这些闭包；保存点事务存续期间其它写者可以正常
+  提交。索引不逐项 undo：索引项指向根 RID，回堆复核可见性与键值会跳过陈旧项，
+  后续 VACUUM/REINDEX 清理。逻辑保存点事务内拒绝 `DDL/TRUNCATE`（它们依赖页原像，
+  会和行 undo 的 RID/槽位假设冲突）与 `VACUUM`（物理回收会删掉回滚仍依赖的旧
+  版本）；事务结束统一清空 undo 栈并复位捕获标志。默认关闭，
+  物理保存点路径不变。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（11 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（17 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
-  活跃 DDL 时拒绝在线回收、热点行无丢失更新）；
+  活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
+  UPDATE/DELETE 回滚、回滚后继续写、主键/行复用、RELEASE 后恢复 DDL 路径、
+  DDL/TRUNCATE 与 VACUUM 拒绝）；
+- `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
+  逐条撤销、嵌套保存点按深度逆序撤销）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
+- `tests/crash/test_logical_savepoint_recovery.py`（3 例：逻辑保存点回滚后 COMMIT +
+  崩溃、回滚后在同一行继续写再崩溃、未 COMMIT 崩溃只保留事务前数据）；
 - `tests/crash/test_online_vacuum_recovery.py`（在线 VACUUM 的整页回收落盘后崩溃：
   恢复可重放或撤销，但可见行/索引扫描/后续离线 VACUUM 必须一致）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
   半回滚，校验行数/去重/索引不变量）、`sql_savepoint_concurrent`（A 未提交时
-  B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）
-  与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，快照看旧版本）。
+  B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）、
+  `sql_savepoint_logical`（A 在逻辑保存点内插入时 B 能直接提交、A 回滚后只看到
+  B 的行）与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，
+  快照看旧版本）。
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1416 passed**，门禁脚本 3 轮 PASS（9 项，前两项 pytest 探针固定
-  1 轮，已含 VACUUM 等待与在线回收探针）。
+  并发各 **1429 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
-- 保存点已经能并发使用：不再因为"有别的活跃事务"直接 `0A000`，而是排空在途
-  语句后独占写者锁。它仍然是"功能正确但并发度低"的兜底路径——保存点事务存续
-  期间其它写者排队。要恢复高并发保存点，仍需要行级逻辑 undo log。
+- 保存点已有两条路径：默认仍排空在途语句后独占写者锁；`--logical-savepoints`
+  改为行级逻辑 undo，保存点事务存续期间其它写者可提交。后者目前是 DML-only：
+  事务内 `DDL/TRUNCATE/VACUUM` 被拒绝，撤销的插入只标 `FLAG_ABORTED` 留待后续
+  回收，尚未成为默认保存点路径。
 - `VACUUM` 不再因为活跃事务失败：入口先等最多 5s；等不到空窗口就转“保 RID 的
   在线回收”（`HeapFile.vacuum_online`）。在线模式按 VACUUM 事务与所有活跃事务的
   快照逐版本判可见性，保留根记录、链头到最老可见版本的整条前缀链；只删对所有
@@ -810,9 +832,10 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1416 passed；门禁
-  脚本 3 轮 PASS（9 项，含保存点并发、VACUUM 等待与在线回收探针）；CI run
-  296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿。
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1429 passed；门禁
+  脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
+  CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；逻辑保存点提交后的
+  CI 运行另行记录。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
@@ -821,18 +844,19 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
   257/246/277 vs 353/193/187，受 fsync 抖动主导，2.7× 退化未复现；单线程并发
   198.4 vs 默认 277.4，固定开销约 28%，是“吞吐换并发能力”的代价。平台差异记录，
   不作为切默认门禁。
-- **保存点：部分过关。** 并发模式下第一次 `SAVEPOINT` 不再要求全库没有其它活跃
-  事务（不再 `0A000`）：它排空在途语句后独占写者锁，事务自己的后续语句继续执行，
-  其它写者排队到事务结束。功能可用、跨线程 COMMIT/ROLLBACK 已回归；但空闲保存点
-  事务仍会长期占住写者锁，切默认前要么接受"保存点即串行"，要么补行级逻辑 undo。
+- **保存点：默认路径部分过关，逻辑路径 opt-in。** 默认保存点仍排空在途语句后
+  独占写者锁；`--logical-savepoints` 已把堆 INSERT/UPDATE/DELETE 改为逐条 undo，
+  保存点事务存续期间其它写者可提交；它是 DML-only，事务内 DDL/TRUNCATE/VACUUM
+  会被拒绝。剩余边界是撤销的插入只标 `FLAG_ABORTED`、不物理回收根记录。
+  切默认前要么接受"默认保存点即串行"，要么把逻辑路径做成默认并补齐空间回收。
 - **VACUUM：在线 MVP 过关。** 活跃事务存在时不再报错：等 5s 后自动转保 RID
   在线回收，保留所有活跃快照需要的版本与根 RID，不重建索引。剩余是空间回收
   效率：根记录和空洞槽位不回收、文件不缩小；离线模式仍可做完整重排。
 - **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务
   才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
 
-所以下一步优先级是：保存点行级逻辑 undo → 自动提交 UPDATE 的隔离级别说明；
-VACUUM 在线回收已不再作为硬阻塞项。
+所以下一步优先级是：把逻辑保存点的空间回收/DDL 边界补完，决定它是否成为默认
+保存点路径 → 自动提交 UPDATE 的隔离级别说明；VACUUM 在线回收已不再作为硬阻塞项。
 
 ### 锁表的规模（已处理）
 

@@ -15,7 +15,7 @@ import traceback
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import TransactionError
+from lumendb.errors import NotSupportedError, TransactionError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 
@@ -367,3 +367,178 @@ def test_hot_row_increments_serialize_without_lost_updates(env):
     assert _rows(
         server, Session(database=db), "SELECT v FROM t WHERE id = 999999"
     ) == [(threads * per_thread,)]
+
+
+def test_logical_savepoint_does_not_block_other_writer(tmp_path):
+    """行级逻辑 undo：保存点事务存续期间，另一个写者仍能提交。"""
+    db = Database(tmp_path / "logical_sp", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    try:
+        first = Session(database=db)
+        _run(server, first, "BEGIN")
+        _run(server, first, "SAVEPOINT s")
+        _run(server, first, "INSERT INTO t VALUES (1, 10)")
+
+        second = Session(database=db)
+        _run(server, second, "INSERT INTO t VALUES (2, 20)")
+
+        _run(server, first, "ROLLBACK TO SAVEPOINT s")
+        assert _rows(server, Session(database=db), "SELECT id FROM t ORDER BY id") == [
+            (2,)
+        ]
+        _run(server, first, "INSERT INTO t VALUES (3, 30)")
+        _run(server, first, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT id FROM t ORDER BY id") == [
+            (2,),
+            (3,),
+        ]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_undoes_update_and_delete(tmp_path):
+    db = Database(tmp_path / "logical_sp_dml", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "UPDATE t SET v = 11 WHERE id = 1")
+        _run(server, session, "DELETE FROM t WHERE id = 2")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t ORDER BY id"
+        ) == [(1, 10), (2, 20)]
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t ORDER BY id"
+        ) == [(1, 10), (2, 20)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_can_write_again_after_rollback(tmp_path):
+    db = Database(tmp_path / "logical_sp_again", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "UPDATE t SET v = 11 WHERE id = 1")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        _run(server, session, "UPDATE t SET v = 12 WHERE id = 1")
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t"
+        ) == [(1, 12)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_release_restores_ddl_path(tmp_path):
+    db = Database(tmp_path / "logical_sp_release", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "INSERT INTO t VALUES (1, 10)")
+        _run(server, session, "RELEASE SAVEPOINT s")
+        # 所有保存点释放后回到普通事务：DDL 可以用物理页原像。
+        _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
+        _run(server, session, "INSERT INTO x VALUES (2)")
+        _run(server, session, "COMMIT")
+        assert "x" in [table.name for table in db.catalog.list_tables()]
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM x") == [(1,)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_rejects_ddl_and_truncate(tmp_path):
+    db = Database(tmp_path / "logical_sp_ddl", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
+            _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
+        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
+            _run(server, session, "TRUNCATE TABLE t")
+        # 被拒绝的结构变更不能污染事务；DML 仍可继续并正常回滚。
+        _run(server, session, "INSERT INTO t VALUES (1, 10)")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        _run(server, session, "COMMIT")
+        assert "x" not in [table.name for table in db.catalog.list_tables()]
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(0,)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_rejects_truncate_after_dml(tmp_path):
+    db = Database(tmp_path / "logical_sp_truncate", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "INSERT INTO t VALUES (3, 30)")
+        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
+            _run(server, session, "TRUNCATE TABLE t")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t ORDER BY id"
+        ) == [(1, 10), (2, 20)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_rejects_vacuum_with_row_undo(tmp_path):
+    db = Database(tmp_path / "logical_sp_vacuum", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "INSERT INTO t VALUES (1, 10)")
+        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不能执行 VACUUM"):
+            _run(server, session, "VACUUM")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        _run(server, session, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(0,)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_reuses_key_and_row_after_rollback(tmp_path):
+    db = Database(tmp_path / "logical_sp_reuse", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (2, 20)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "INSERT INTO t VALUES (1, 10)")
+        _run(server, session, "DELETE FROM t WHERE id = 2")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        # 被撤销的插入会留下 ABORTED 根记录；唯一键检查必须能跳过它。
+        _run(server, session, "INSERT INTO t VALUES (1, 11)")
+        # 被撤销的删除也必须能重新更新/再次删除。
+        _run(server, session, "UPDATE t SET v = 21 WHERE id = 2")
+        _run(server, session, "DELETE FROM t WHERE id = 2")
+        _run(server, session, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT id, v FROM t") == [(1, 11)]
+    finally:
+        db.close()
