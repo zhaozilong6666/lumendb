@@ -351,16 +351,24 @@ Step 4 的前置项在这条路径上落地：
   走 `ddl_guard`：拿独占门前与拿到门后各查一次活跃事务的行 undo，仍有则返回
   可重试的 `40001`，避免 `ALTER DROP COLUMN` 改行布局后行 undo 按新 schema
   解码旧版本而报列数不符；检查与拿门之间新产生的行 undo 由第二次检查兜住。
+  `ddl_guard` 还拒绝其它事务的未提交写入：shadow heap 只复制对 DDL 事务可见
+  的行，未提交行不会被复制，等它 COMMIT 就会落进已被目录替换掉的旧 heap，
+  查询静默少行。对 `ALTER TABLE*` / `TRUNCATE` 这类会改旧快照表定义或页链的
+  语句，还要求没有其它活跃事务——旧快照在结构切换后继续查询会读到空表或
+  新列布局。逻辑保存点的晚升级（保存点后尚无行 DML、DDL 触发物理保存点）
+  在拿到写者锁、排空在途读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（24 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（30 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
-  UPDATE/DELETE 回滚、回滚后继续写、主键/行复用、RELEASE 后恢复 DDL 路径、
-  无 DML 时 DDL/TRUNCATE 升级物理保存点、有 DML 后拒绝结构变更、TRUNCATE 升级后
-  回滚、VACUUM 拒绝、`Database.execute` 路径同样升级、其它会话 DDL 被行 undo
-  挡住并返回 40001）；
+  UPDATE/DELETE 回滚、回滚后继续写、主键/行复用、内层 RELEASE 保留外层 undo、
+  RELEASE 后恢复 DDL 路径、回滚到保存点后升级物理保存点、无 DML 时 DDL/TRUNCATE
+  升级物理保存点、有 DML 后拒绝结构变更、TRUNCATE 升级后回滚、VACUUM 拒绝、
+  `Database.execute` 路径同样升级、其它会话 DDL 被行 undo 挡住并返回 40001、
+  晚升级路径也检查其它行 undo、其它未提交写入挡住 DDL、活跃只读事务挡住
+  shadow 重写与 ADD COLUMN）；
 - `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
   逐条撤销、嵌套保存点按深度逆序撤销）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
@@ -379,7 +387,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1436 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1442 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -843,7 +851,12 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 并发模式连续重跑均未复现；先按“慢 runner 才暴露的并发窗口”记录，后续用固定
 线程时序做定向复现，确认是测试等待不足还是 B+ 树 merge/purge 漏摘。随后
 `31b6fd2` 的 run 45101946693 四矩阵全绿；随后 `dbcad2b` 的 run 45104750954 与
-`c3a0087`（DDL/TRUNCATE 安全升级）的 run 45109114642 均四矩阵全绿。
+`c3a0087`（DDL/TRUNCATE 安全升级）的 run 45109114642 均四矩阵全绿；
+`5105553`（跨会话 DDL 行 undo 门禁）的 run 45115443255 四矩阵全绿。
+`d6d8d54`（并发保存点默认逻辑 undo）的 run 45117937745 在 Windows 3.12/3.13
+与 Ubuntu 3.13 上成功，Ubuntu 3.12 长时间停在并发全量步骤；其后的
+`9f2f64d`（CLI 开关测试）run 45119005136 四矩阵全绿，因此以 `9f2f64d`
+作为 CI 基线。本轮新增的 DDL 活跃写/旧快照门禁提交待在 `9f2f64d` 之后验证。
 
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
@@ -852,11 +865,12 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1436 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1442 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
-  `c3a0087` 由 run **45109114642** 四矩阵全绿。
+  `c3a0087` 由 run **45109114642**、`5105553` 由 run **45115443255** 四矩阵全绿；
+  `9f2f64d`（覆盖 `d6d8d54` 的默认化改动）由 run **45119005136** 四矩阵全绿。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
@@ -865,12 +879,12 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
   257/246/277 vs 353/193/187，受 fsync 抖动主导，2.7× 退化未复现；单线程并发
   198.4 vs 默认 277.4，固定开销约 28%，是“吞吐换并发能力”的代价。平台差异记录，
   不作为切默认门禁。
-- **保存点：默认路径部分过关，逻辑路径 opt-in。** 默认保存点仍排空在途语句后
-  独占写者锁；并发模式下保存点默认把堆 INSERT/UPDATE/DELETE 改为逐条 undo，
-  保存点事务存续期间其它写者可提交。它是 DML-only：保存点后一旦有行 undo，
-  事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚未有行 DML 时 DDL/TRUNCATE 会先升级成
-  物理保存点。剩余边界是撤销的插入只标 `FLAG_ABORTED`、不物理回收根记录。
-  切默认前要么接受"默认保存点即串行"，要么把逻辑路径做成默认并补齐空间回收。
+- **保存点：并发模式默认逻辑路径，物理保存点可回退。** 并发模式下保存点默认把
+  堆 INSERT/UPDATE/DELETE 改为逐条 undo，保存点事务存续期间其它写者可提交；
+  `--physical-savepoints` / `logical_savepoints=False` 退回排空在途语句后独占写者锁。
+  它是 DML-only：保存点后一旦有行 undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；
+  尚未有行 DML 时 DDL/TRUNCATE 会先升级成物理保存点。剩余边界是撤销的插入只标
+  `FLAG_ABORTED`、不物理回收根记录；这不影响正确性，但空间会留到离线 VACUUM。
 - **VACUUM：在线 MVP 过关。** 活跃事务存在时不再报错：等 5s 后自动转保 RID
   在线回收，保留所有活跃快照需要的版本与根 RID，不重建索引。剩余是空间回收
   效率：根记录和空洞槽位不回收、文件不缩小；离线模式仍可做完整重排。
@@ -878,7 +892,7 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
   才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
 
 所以下一步优先级是：把逻辑保存点撤销插入的空间回收补完（根记录/空洞槽位），
-再决定它是否成为默认保存点路径 → 自动提交 UPDATE 的隔离级别说明；VACUUM 在线
+再推进 `concurrent_dml` 自身切默认的判据 → 自动提交 UPDATE 的隔离级别说明；VACUUM 在线
 回收与 DDL/TRUNCATE 升级已不再作为硬阻塞项。
 
 ### 锁表的规模（已处理）

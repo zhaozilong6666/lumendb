@@ -482,6 +482,48 @@ def test_logical_savepoint_release_restores_ddl_path(tmp_path):
         db.close()
 
 
+def test_logical_savepoint_release_inner_keeps_outer_undo(tmp_path):
+    """释放内层保存点不能丢掉外层保存点还需要回滚的行 undo。"""
+    db = Database(tmp_path / "logical_sp_release_inner", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT a")
+        _run(server, session, "INSERT INTO t VALUES (2, 20)")
+        _run(server, session, "SAVEPOINT b")
+        _run(server, session, "INSERT INTO t VALUES (3, 30)")
+        _run(server, session, "RELEASE SAVEPOINT b")
+        _run(server, session, "ROLLBACK TO SAVEPOINT a")
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t ORDER BY id"
+        ) == [(1, 10)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_upgrades_after_rollback_to_savepoint(tmp_path):
+    """行 undo 被 ROLLBACK TO 撤空后，同一事务仍可升级物理保存点做 DDL。"""
+    db = Database(tmp_path / "logical_sp_upgrade_after_rollback", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        _run(server, session, "INSERT INTO t VALUES (2, 2, 'b')")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        _run(server, session, "ALTER TABLE t DROP COLUMN pad")
+        _run(server, session, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
+    finally:
+        db.close()
+
+
 def test_logical_savepoint_without_dml_upgrades_for_ddl(tmp_path):
     db = Database(tmp_path / "logical_sp_ddl", concurrent_dml=True, logical_savepoints=True)
     server = PGWireServer(db)
@@ -562,6 +604,126 @@ def test_logical_savepoint_upgrade_via_database_exec(tmp_path):
         db.execute_one("COMMIT")
         assert "x" not in [table.name for table in db.catalog.list_tables()]
         assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+    finally:
+        db.close()
+
+
+def test_ddl_guard_blocks_other_uncommitted_writer(tmp_path):
+    """其它会话有未提交写时，DDL 不能改写 shadow heap。
+
+    shadow heap 只复制 DDL 事务可见的行；未提交行不会被复制。若此时允许
+    ALTER 替换目录，等那个事务 COMMIT，行就落在已被替换掉的旧 heap 里，
+    查询会静默少行。
+    """
+    db = Database(
+        tmp_path / "ddl_guard_uncommitted_writer",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+        db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        _run(server, a, "INSERT INTO t VALUES (2, 2, 'b')")
+        with pytest.raises(TransactionError, match="未提交写入"):
+            _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        _run(server, a, "COMMIT")
+        _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1), (2, 2)]
+    finally:
+        db.close()
+
+
+def test_ddl_guard_blocks_other_active_reader_for_shadow_rewrite(tmp_path):
+    """shadow heap 结构变更必须挡住活跃旧快照，不能让它之后读到空表。"""
+    db = Database(
+        tmp_path / "ddl_guard_active_reader",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+        db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1, "a")]
+        with pytest.raises(TransactionError, match="仍在活跃"):
+            _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        # DDL 被挡住后，旧快照仍然完整，而不是被切到新 heap 上读到空表。
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1, "a")]
+        _run(server, a, "COMMIT")
+        _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
+    finally:
+        db.close()
+
+
+def test_alter_add_column_blocks_active_reader(tmp_path):
+    """ALTER TABLE ADD/RENAME 也会改旧快照看到的表定义，必须挡住活跃读者。"""
+    db = Database(
+        tmp_path / "ddl_guard_active_reader_add",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+        db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1, "a")]
+        with pytest.raises(TransactionError, match="仍在活跃"):
+            _run(server, b, "ALTER TABLE t ADD COLUMN extra INT")
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 1, "a")]
+        _run(server, a, "COMMIT")
+        _run(server, b, "ALTER TABLE t ADD COLUMN extra INT")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [
+            (1, 1, "a", None)
+        ]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_upgrade_ddl_blocks_other_row_undo(tmp_path):
+    """保存点后无 DML 的 DDL 升级路径也必须检查别的会话行 undo。
+
+    S2 自己还没有行 DML，ALTER 会走 ``_maybe_upgrade_logical_savepoint``
+    拿物理保存点。如果只在普通 DDL 门前检查，S2 的升级路径会绕过门，
+    在 S1 还持有行 undo 时改掉行布局，S1 回滚时按新 schema 解码旧版本
+    就会报列数不符。
+    """
+    db = Database(
+        tmp_path / "logical_sp_upgrade_guard",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+        db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        _run(server, a, "SAVEPOINT s")
+        _run(server, a, "UPDATE t SET v = 2 WHERE id = 1")
+        _run(server, b, "BEGIN")
+        _run(server, b, "SAVEPOINT s2")
+        with pytest.raises(TransactionError, match="行 undo"):
+            _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        # 升级失败不能泄漏写者门：S1 还能正常回滚提交，B 也能重试。
+        assert _rows(server, a, "SELECT * FROM t") == [(1, 2, "a")]
+        _run(server, a, "ROLLBACK TO SAVEPOINT s")
+        _run(server, a, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1, "a")]
+        _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        _run(server, b, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
     finally:
         db.close()
 

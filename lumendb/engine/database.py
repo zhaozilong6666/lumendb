@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 from ..catalog.catalog import Catalog
 from ..catalog.store import CatalogStore
-from ..errors import NotSupportedError, StorageError, TransactionError
+from ..errors import NotSupportedError, SerializationError, StorageError, TransactionError
 from ..sql.ast import (
     Begin,
     Commit,
@@ -129,6 +129,20 @@ _STRUCTURAL_STATEMENTS = {
     "AlterTableAlterType",
     "AlterTableDropColumn",
 }
+
+
+def _blocks_active_readers(statement) -> bool:
+    """DDL 是否会让旧快照读到切换后的新结构。
+
+    ``ALTER TABLE`` 的任何子命令都会改目录里的表定义；旧快照事务在 DDL
+    之后继续查询时，可能按新列布局解码旧计划，或看到新列默认值，破坏
+    快照隔离。``TRUNCATE`` 更是直接换掉页链。``CREATE TABLE`` / 新建
+    索引不影响已有表的快照，不必为此挡住只读事务。
+    """
+    if statement is None:
+        return False
+    name = type(statement).__name__
+    return name == "Truncate" or name.startswith("AlterTable")
 
 
 class Database:
@@ -432,8 +446,21 @@ class Database:
             return
         self._acquire_physical_savepoint(txn)
 
-    def _acquire_physical_savepoint(self, txn: Transaction) -> None:
-        """把事务切到物理页原像回滚，并独占写者锁到事务结束。"""
+    def _acquire_physical_savepoint(
+        self,
+        txn: Transaction,
+        *,
+        guard_row_undo: bool = False,
+        block_active_readers: bool = False,
+    ) -> None:
+        """把事务切到物理页原像回滚，并独占写者锁到事务结束。
+
+        ``guard_row_undo=True`` 用于逻辑保存点的 late upgrade：拿到
+        ``_write_lock`` 并把在途读者排空后，再检查别的活跃事务是否仍持有
+        行 undo / 未提交写入 / 旧快照。此时 ``_no_readers`` 已经挡住新的
+        DML，检查通过后不会再产生新的行 undo；若检查失败，必须把刚拿的
+        门完整复位再抛错，不能让事务停在半升级状态。
+        """
         self._write_lock.acquire()
         try:
             with self._readers_cv:
@@ -442,7 +469,17 @@ class Database:
                 self._readers_cv.notify_all()
                 while self._readers:
                     self._readers_cv.wait()
+            # 在途 DML 已排空，新的 DML 又被 _no_readers 挡住；这份检查
+            # （行 undo + 其它未提交写入/旧快照）才是稳定的。放在设置
+            # physical_savepoint 之前，失败时事务仍保持逻辑保存点状态。
+            if guard_row_undo:
+                self._assert_no_ddl_blockers(
+                    txn, block_active_readers=block_active_readers
+                )
         except BaseException:
+            with self._readers_cv:
+                self._no_readers = False
+                self._readers_cv.notify_all()
             self._write_lock.release()
             raise
         txn.capture_row_undo = False
@@ -467,7 +504,8 @@ class Database:
 
         只有保存点之后还没有堆 DML（``row_undo_log`` 为空）才能升级：此时
         页原像从保存点开始，DDL 的页回滚不会和行 undo 的 RID/槽位假设冲突。
-        一旦已有行 undo，必须拒绝；调用方据此返回错误。
+        一旦已有行 undo，必须拒绝；升级拿门后还要检查别的活跃事务的行 undo、
+        未提交写入或旧快照，否则这条晚升级路径会绕过普通 ``ddl_guard``。
         """
         if not (
             self._concurrent_dml
@@ -482,7 +520,11 @@ class Database:
                 detail="页原像回滚会和行级 undo 的 RID/槽位假设冲突",
                 hint="先 ROLLBACK TO SAVEPOINT 或 COMMIT 整个事务，再执行结构变更",
             )
-        self._acquire_physical_savepoint(txn)
+        self._acquire_physical_savepoint(
+            txn,
+            guard_row_undo=True,
+            block_active_readers=_blocks_active_readers(statement),
+        )
         return True
 
     def _row_undo_holder(
@@ -505,24 +547,85 @@ class Database:
         """
         blocker = self._row_undo_holder(txn)
         if blocker is not None:
-            raise TransactionError(
+            raise SerializationError(
                 "逻辑保存点事务持有行 undo，DDL/TRUNCATE 暂不可执行",
                 detail=f"事务 {getattr(blocker, 'xid', '?')} 的保存点行 undo 尚未撤回",
                 hint="等该事务 COMMIT/ROLLBACK 后重试",
             )
 
+    def _other_writer_holder(
+        self, exclude: Transaction | None = None
+    ) -> Transaction | None:
+        """找另一个仍有未提交写入的活跃事务；没有则返回 None。
+
+        DDL 的 shadow heap 重写只复制对 DDL 事务可见的行。若别的会话已经
+        INSERT/UPDATE 但尚未 COMMIT，这些行不会被复制进新 heap；该会话
+        之后 COMMIT，数据就落在已经被目录替换掉的旧 heap 里，查询静默
+        少行。逻辑保存点门只覆盖 row undo，普通未提交写必须单独挡住。
+        """
+        for txn in self.txns.active_transactions():
+            if txn is exclude:
+                continue
+            if getattr(txn, "wrote", False):
+                return txn
+        return None
+
+    def _active_txn_holder(
+        self, exclude: Transaction | None = None
+    ) -> Transaction | None:
+        """找另一个仍活跃的事务；没有则返回 None。"""
+        for txn in self.txns.active_transactions():
+            if txn is not exclude:
+                return txn
+        return None
+
+    def _assert_no_ddl_blockers(
+        self,
+        txn: Transaction | None,
+        *,
+        block_active_readers: bool = False,
+    ) -> None:
+        """DDL/TRUNCATE 前拒绝行 undo 或其它未提交写入。
+
+        ``block_active_readers`` 用于 shadow heap 重写类结构变更：旧事务的
+        快照仍引用旧 heap，结构切换后它再查询会看到空结果或错误布局。
+        这类语句不仅要挡住写入者，也要挡住仍在活跃的只读事务。
+        """
+        self._assert_no_row_undo(txn)
+        blocker = self._other_writer_holder(txn)
+        if blocker is not None:
+            raise SerializationError(
+                "其它事务有未提交写入，DDL/TRUNCATE 暂不可执行",
+                detail=f"事务 {getattr(blocker, 'xid', '?')} 尚未 COMMIT/ROLLBACK",
+                hint="等该事务结束后重试",
+            )
+        if block_active_readers:
+            blocker = self._active_txn_holder(txn)
+            if blocker is not None:
+                raise SerializationError(
+                    "其它事务仍在活跃，DDL/TRUNCATE 暂不可执行",
+                    detail=f"事务 {getattr(blocker, 'xid', '?')} 的快照仍可能引用旧结构",
+                    hint="等该事务 COMMIT/ROLLBACK 后重试",
+                )
+
     @contextlib.contextmanager
-    def ddl_guard(self, txn: Transaction | None = None):
-        """DDL/TRUNCATE 的独占门：先拒绝行 undo，再与所有读者互斥。
+    def ddl_guard(self, txn: Transaction | None = None, statement=None):
+        """DDL/TRUNCATE 的独占门：先拒绝行 undo/未提交写，再与所有读者互斥。
 
         检查分两次：拿门前的检查挡住已经存在的保存点行 undo；拿到
         ``exclusive_guard`` 后再查一次，挡住"检查通过、拿门之前"新写入的
         行 undo。拿门后 ``_no_readers`` 会挡住新的 DML，因此第二次检查通过
-        后结构变更期间不会再有行 undo 产生。
+        后结构变更期间不会再有行 undo 产生。shadow heap 重写类语句还会
+        挡住仍在活跃的旧快照事务。
         """
-        self._assert_no_row_undo(txn)
+        block_active_readers = _blocks_active_readers(statement)
+        self._assert_no_ddl_blockers(
+            txn, block_active_readers=block_active_readers
+        )
         with self.exclusive_guard():
-            self._assert_no_row_undo(txn)
+            self._assert_no_ddl_blockers(
+                txn, block_active_readers=block_active_readers
+            )
             if self._closed:
                 raise StorageError(
                     "数据库已关闭",
@@ -602,7 +705,7 @@ class Database:
         # 持有行 undo；否则结构变更会改行布局，回滚时按新 schema 解码旧版本
         # 会直接报列数不符。这里用 ddl_guard 同时承担独占读者门。
         if self._concurrent_dml and type(statement) in _SCHEMA_CHANGING_STATEMENTS:
-            with self.ddl_guard(self._txn):
+            with self.ddl_guard(self._txn, statement):
                 return self._run_unlocked(statement, params)
 
         # VACUUM 要重排 RID/重建索引：先在独占门外等其它活跃事务退出，

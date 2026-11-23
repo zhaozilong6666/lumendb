@@ -443,7 +443,7 @@ class PGWireServer:
                 ):
                     # 结构变更必须先挡住逻辑保存点的行 undo，否则 ALTER 改
                     # 行布局后保存点回滚会按新 schema 解码旧版本而报错。
-                    guard = database.ddl_guard(session.txn)
+                    guard = database.ddl_guard(session.txn, statement)
                 else:
                     guard = (
                         database.read_guard()
@@ -484,7 +484,7 @@ class PGWireServer:
             database._concurrent_dml
             and type(statement) in _SCHEMA_CHANGING_STATEMENTS
         ):
-            guard = database.ddl_guard(None)
+            guard = database.ddl_guard(None, statement)
         else:
             guard = (
                 database.read_guard()

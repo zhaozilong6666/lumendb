@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1436 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1442 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
 - 并发 DML 实验模式已落地（`Database(concurrent_dml=True)`，默认关闭）：
   DML 走 `read_guard` + 行/键锁 + 页 latch，目录保存短锁，索引根页跨语句
@@ -14,6 +14,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
   `no_undo` 哨兵 + VACUUM 回收），DDL 仍物理可回滚；保存点事务在并发模式下
   默认走行级逻辑 undo，堆 INSERT/UPDATE/DELETE 改记逆操作闭包，保存点存续期间
   其它写者可提交；`--physical-savepoints` 退回排空在途语句后独占写者锁。
+  跨会话 DDL 会先拒绝仍有行 undo、未提交写入或旧快照的事务；逻辑保存点的
+  晚升级路径也走同一套检查，避免绕过 DDL 门。
   详见 `docs/concurrency.md`。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
@@ -355,7 +357,7 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 opt-in，默认模式尚未切换，卡在撤销插入的空间回收（根记录/空洞槽位）、`VACUUM`
 在线模式只保 RID 不回收
 根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1436 passed 与门禁脚本 3 轮
+的 READ COMMITTED 语义需发布说明。并发全量 1442 passed 与门禁脚本 3 轮
 （10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动
