@@ -58,6 +58,33 @@ class TestCliFence:
         finally:
             db.close()
 
+    def test_savepoint_mode_switches_reach_the_database(self, tmp_path):
+        """并发模式默认逻辑保存点；--physical-savepoints 显式退回。"""
+        default = _args(
+            "exec",
+            "--path", str(tmp_path / "db-default"),
+            "--concurrent-dml",
+            "SELECT 1",
+        )
+        db = _open_database(default)
+        try:
+            assert db._logical_savepoints is True
+        finally:
+            db.close()
+        physical = _args(
+            "exec",
+            "--path", str(tmp_path / "db-physical"),
+            "--concurrent-dml",
+            "--physical-savepoints",
+            "SELECT 1",
+        )
+        assert physical.logical_savepoints is False
+        db = _open_database(physical)
+        try:
+            assert db._logical_savepoints is False
+        finally:
+            db.close()
+
     def test_exec_refuses_to_write_when_another_node_is_promoted(self, tmp_path):
         path = tmp_path / "db"
         fence = tmp_path / "fence.json"
