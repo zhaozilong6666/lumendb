@@ -53,12 +53,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run tests (concurrent DML mode)
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-        env:
-          LUMEN_CONCURRENT_DML: "1"
-        run: python -m pytest tests -q
-
       - name: Check context pack
         run: python -m tools.context_pack check
 
@@ -68,3 +62,45 @@ jobs:
           python -m lumendb exec --path ./ci_data "INSERT INTO t VALUES (1), (2)"
           python -m lumendb exec --path ./ci_data "SELECT COUNT(*) FROM t"
           python -m lumendb exec --path ./ci_data "SELECT * FROM t ORDER BY a"
+
+  concurrent:
+    # 并发模式全量放到独立 job：原先挂在 Ubuntu 3.12 的默认 job 后面串行跑，
+    # 同一台 runner 要连跑两遍 1471 例，墙钟时间翻倍、看起来像卡住。独立 job
+    # 与四矩阵默认任务并行，反馈更快；不变量用例本身已在 pytest 内双模式参数化。
+    name: Concurrent DML on ubuntu-latest
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LUMEN_CONCURRENT_DML: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+
+      - name: Run tests (concurrent DML mode)
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests -q 2>&1 | tee pytest.log
+
+      - name: Publish pytest failure tail
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Pytest failure tail"
+            echo '```'
+            tail -n 200 pytest.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
