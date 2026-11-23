@@ -377,20 +377,33 @@ class TransactionManager:
                 self._prune_states()
                 self._active_cv.notify_all()
                 return
+            first_undo_error: Exception | None = None
+            undo_failures = 0
             try:
                 # 先撤销页级写入：它必须发生在 DDL 的 Catalog 对象 undo 之前，
                 # 这样 CatalogStore 的 root 回滚看到的是旧根页号，不会误判。
                 if self._bp is not None:
-                    self._bp.undo_xid(txn.xid)
+                    try:
+                        self._bp.undo_xid(txn.xid)
+                    except Exception as exc:  # pragma: no cover
+                        first_undo_error = exc
+                        undo_failures += 1
+                        _log.exception(
+                            "事务 %s 的页级 undo 失败，页可能停在半回滚状态",
+                            txn.xid,
+                        )
                 # DDL 修改的是内存里的 Catalog 对象；WAL 只能恢复页，不能替
                 # 调用方恢复已变异的 Python 对象，所以这里再逆序执行内存 undo。
+                # 即使前一个回调失败也继续跑完：尽量把能撤的撤掉，最后统一
+                # 抛错，不能静默把半回滚状态留给下一次 COMMIT。
                 while txn.undo_log:
                     undo = txn.undo_log.pop()
                     try:
                         undo()
-                    except Exception:  # pragma: no cover
-                        # 吞掉但要留痕：静默失败会让目录停在半回滚状态，
-                        # 事后只能靠恢复日志猜当时发生了什么。
+                    except Exception as exc:  # pragma: no cover
+                        if first_undo_error is None:
+                            first_undo_error = exc
+                        undo_failures += 1
                         _log.exception(
                             "事务 %s 的目录 undo 回调抛错，目录可能已偏离回滚前的状态",
                             txn.xid,
@@ -424,6 +437,19 @@ class TransactionManager:
                 self._prune_states()
                 self._active_cv.notify_all()
 
+            if first_undo_error is not None:
+                raise TransactionError(
+                    "事务 ABORT 的撤销回调失败",
+                    detail=(
+                        f"事务 {txn.xid} 有 {undo_failures} 个页/目录 undo 回调失败，"
+                        f"首个错误：{first_undo_error}"
+                    ),
+                    hint=(
+                        "事务已按 ABORTED 收尾并释放锁，但页/目录可能停在半回滚"
+                        "状态；请检查数据文件，必要时用备份恢复后重启做恢复"
+                    ),
+                ) from first_undo_error
+
     def abort_all(self) -> int:
         """回滚所有仍处于 ACTIVE 的事务；返回回滚数量。
 
@@ -436,8 +462,23 @@ class TransactionManager:
                 for txn in self._txns.values()
                 if txn.state is TxnState.ACTIVE
             ]
+        errors: list[Exception] = []
         for txn in pending:
-            self.abort(txn)
+            try:
+                self.abort(txn)
+            except Exception as exc:  # pragma: no cover
+                # 一个事务的 undo 失败不能阻止其它事务回滚：关闭/降级时
+                # 只要漏掉一个 ACTIVE，就会留下持有写锁的“幽灵事务”。
+                errors.append(exc)
+        if errors:
+            raise TransactionError(
+                "批量 ABORT 中有事务的撤销回调失败",
+                detail=(
+                    f"{len(errors)}/{len(pending)} 个事务未能干净回滚；"
+                    f"首个错误：{errors[0]}"
+                ),
+                hint="这些事务已落 ABORTED 并释放锁，但页/目录可能不一致，需检查数据文件",
+            ) from errors[0]
         return len(pending)
 
     # -- SAVEPOINT ---------------------------------------------------------

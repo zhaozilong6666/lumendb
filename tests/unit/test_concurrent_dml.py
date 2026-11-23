@@ -964,3 +964,87 @@ def test_rollback_to_reports_undo_failure_instead_of_swallowing(tmp_path):
         _run(server, session, "ROLLBACK")
     finally:
         db.close()
+
+
+def test_abort_reports_undo_failure_but_still_releases_the_transaction(tmp_path):
+    """ABORT 的目录 undo 失败时必须报错，但仍要落 ABORTED、释放锁。"""
+    db = Database(tmp_path / "abort_undo_failure", concurrent_dml=True)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    session = Session(database=db)
+    server = PGWireServer(db)
+    try:
+        _run(server, session, "BEGIN")
+        _run(server, session, "INSERT INTO t VALUES (1)")
+
+        def boom() -> None:
+            raise RuntimeError("模拟目录 undo 失败")
+
+        session.txn.undo_log.append(boom)
+        with pytest.raises(TransactionError) as exc:
+            db.txns.abort(session.txn)
+        assert "ABORT 的撤销回调失败" in str(exc.value)
+        assert db.txns.active_xids == []
+        # 锁已释放，新事务可以继续写
+        fresh = Session(database=db)
+        _run(server, fresh, "BEGIN")
+        _run(server, fresh, "INSERT INTO t VALUES (2)")
+        _run(server, fresh, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(1,)]
+    finally:
+        db.close()
+
+
+def test_abort_all_continues_after_one_transaction_fails(tmp_path):
+    """批量 ABORT 中一个 undo 抛错，不能把后面的 ACTIVE 事务留在锁上。"""
+    db = Database(tmp_path / "abort_all_failure", concurrent_dml=True)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    server = PGWireServer(db)
+    first = Session(database=db)
+    second = Session(database=db)
+    try:
+        _run(server, first, "BEGIN")
+        _run(server, first, "INSERT INTO t VALUES (1)")
+        _run(server, second, "BEGIN")
+        _run(server, second, "INSERT INTO t VALUES (2)")
+
+        def boom() -> None:
+            raise RuntimeError("模拟目录 undo 失败")
+
+        first.txn.undo_log.append(boom)
+        with pytest.raises(TransactionError) as exc:
+            db.txns.abort_all()
+        assert "批量 ABORT" in str(exc.value)
+        assert db.txns.active_xids == []
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(0,)]
+    finally:
+        db.close()
+
+
+def test_drop_view_index_and_reindex_block_active_reader(tmp_path):
+    """DROP VIEW/INDEX、REINDEX 也会让旧快照手里的对象或索引根失效。"""
+    db = Database(
+        tmp_path / "ddl_guard_drop_view_index_reindex",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("CREATE INDEX idx_v ON t (v)")
+        db.execute_one("CREATE VIEW vw AS SELECT * FROM t")
+        db.execute_one("INSERT INTO t VALUES (1, 1)")
+        server = PGWireServer(db)
+        reader = Session(database=db)
+        writer = Session(database=db)
+        _run(server, reader, "BEGIN")
+        assert _rows(server, reader, "SELECT * FROM vw") == [(1, 1)]
+        for sql in ("DROP VIEW vw", "DROP INDEX idx_v", "REINDEX TABLE t"):
+            with pytest.raises(TransactionError, match="仍在活跃"):
+                _run(server, writer, sql)
+            # 被挡住后旧快照仍然可读，索引和视图都没有被提前摘掉。
+            assert _rows(server, reader, "SELECT * FROM vw") == [(1, 1)]
+        _run(server, reader, "COMMIT")
+        for sql in ("DROP VIEW vw", "DROP INDEX idx_v", "REINDEX TABLE t"):
+            _run(server, writer, sql)
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
+    finally:
+        db.close()
