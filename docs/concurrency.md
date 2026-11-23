@@ -798,6 +798,14 @@ guard：`Vacuum` / `Truncate` / `AlterTableAlterType` / `AlterTableDropColumn`
 副本 / 基准备份重建。这正是第 4 层副本存在的意义：单机磁盘坏掉时，读一致
 性由副本兜底。
 
+`abort` 的页/目录 undo 回调**自己抛错**是另一类边界：此时不能再静默只记日志，
+否则事务看起来已回滚、实际页或 Catalog 只撤了一半。现在记录首个错误、尽量
+跑完剩余回调，事务仍落 `ABORTED` 并释放锁，然后抛 `TransactionError` 提醒
+"锁已放但页/目录可能不一致"；`abort_all` 会逐个收尾并汇总错误，避免一个事务
+失败把其它 `ACTIVE` 事务留在写锁上。回归见
+`test_abort_reports_undo_failure_but_still_releases_the_transaction` 与
+`test_abort_all_continues_after_one_transaction_fails`。
+
 ### 第 4 步：热点行更新改为“锁后重读”（2026-11-22）
 
 只把 `_lock_row` 的 `try_acquire` 换成 `acquire` 并不够。第一次实测反而更差
