@@ -937,3 +937,30 @@ def test_logical_savepoint_undoes_upsert_conflict_update(tmp_path):
         ) == [(1, 10)]
     finally:
         db.close()
+
+
+def test_rollback_to_reports_undo_failure_instead_of_swallowing(tmp_path):
+    """行 undo 抛错时必须把事务标成失败，不能静默继续让别人 COMMIT。"""
+    db = Database(
+        tmp_path / "logical_sp_undo_failure",
+        concurrent_dml=True,
+        logical_savepoints=True,
+    )
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT sp")
+
+        def boom() -> None:
+            raise RuntimeError("模拟行 undo 失败")
+
+        session.txn.row_undo_log.append(boom)
+        with pytest.raises(TransactionError) as exc:
+            _run(server, session, "ROLLBACK TO SAVEPOINT sp")
+        assert "撤销回调失败" in str(exc.value)
+        # 事务仍可显式回滚结束，不会把半回滚状态留给下一次 COMMIT
+        _run(server, session, "ROLLBACK")
+    finally:
+        db.close()

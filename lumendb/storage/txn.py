@@ -471,7 +471,12 @@ class TransactionManager:
         )
 
     def rollback_to(self, txn: Transaction, name: str) -> int:
-        """撤销到保存点，但保留该保存点和更早的保存点。"""
+        """撤销到保存点，但保留该保存点和更早的保存点。
+
+        任何一个 undo 回调失败都不能静默继续：那会把事务留在"只回滚了一半"
+        的状态，随后 COMMIT 可能把不一致写进库。这里尽量把剩余回调跑完，
+        然后抛 ``TransactionError`` 让调用方把事务标失败并要求 ROLLBACK。
+        """
         with self._lock:
             txn.require_active()
             idx = self._find_savepoint(txn, name)
@@ -479,18 +484,32 @@ class TransactionManager:
             pages = 0
             if self._bp is not None:
                 pages = self._bp.undo_to(txn.xid, target.page_depth)
+            first_error: Exception | None = None
             while len(txn.undo_log) > target.undo_depth:
                 undo = txn.undo_log.pop()
                 try:
                     undo()
-                except Exception:  # pragma: no cover
-                    pass
+                except Exception as exc:  # pragma: no cover
+                    if first_error is None:
+                        first_error = exc
+                    _log.exception("事务 %s 的保存点目录 undo 失败", txn.xid)
             while len(txn.row_undo_log) > target.row_undo_depth:
                 undo = txn.row_undo_log.pop()
                 try:
                     undo()
-                except Exception:  # pragma: no cover
+                except Exception as exc:  # pragma: no cover
+                    if first_error is None:
+                        first_error = exc
                     _log.exception("事务 %s 的行级保存点 undo 失败", txn.xid)
+            if first_error is not None:
+                raise TransactionError(
+                    "ROLLBACK TO SAVEPOINT 的撤销回调失败",
+                    detail=(
+                        f"事务 {txn.xid} 的行/目录 undo 只完成了一部分："
+                        f"{first_error}"
+                    ),
+                    hint="执行 ROLLBACK 结束事务，不要继续 COMMIT；需要继续时重新 BEGIN",
+                ) from first_error
             # 延迟约束队列和 SET CONSTRAINTS 覆盖也属于事务状态，必须回到
             # 保存点建立时的样子；仅回滚页/DDL 会让已撤销的检查或模式泄漏。
             txn.deferred_fk_rows = set(target.deferred_fk_rows)
