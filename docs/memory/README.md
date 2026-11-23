@@ -88,6 +88,9 @@ python -m tools.project_memory query "点查延迟为什么变慢"
 # 复查所有证据（--run-tests 会真的跑测试文件；--only-stale 只查有问题的）
 python -m tools.project_memory verify --run-tests
 
+# 门禁用只读校验：不改写账本，只有 failed 证据才返回 1
+python -m tools.project_memory verify --check
+
 # 把 git 提交灌成锚点记录（自动跳过已灌过的）
 python -m tools.project_memory ingest-git --rev-range "d21da96..HEAD"
 
@@ -119,8 +122,12 @@ BM25 在这个规模上更准也更便宜。等账本上千条、出现大量同
 | `file` | 文件存在 + 锚点字面串存在 | 抓"函数被改名/删除"导致的过期结论 |
 | `test` | 文件存在；`--run-tests` 时真的 `pytest` | 默认只查存在，避免每次 verify 都跑几分钟 |
 | `command` | 只记录，标记 `manual` | **不默认执行**外部命令：账本里的命令可能带副作用 |
+| `external` | 只记录，标记 `external` | CI 页面/规范 URL 离线打不开；可信度靠 `source` + 180 天新鲜度契约 |
 
-聚合状态：任一条 `failed` → `failed`；有 `unchecked`/`manual` → `partial`；全 `ok` → `ok`。
+聚合状态：任一条 `failed` → `failed`；有 `unchecked`/`manual`/`external` → `partial`；
+全 `ok` → `ok`。`--check` 只把 `failed` 当失败，其余按 partial 放行，避免
+"这台机器读不到 GitHub Actions"长期把门禁染红；真正的假证据（commit/文件/锚点
+消失）仍是 `failed`。
 
 ## 和"多写日志"的区别
 
