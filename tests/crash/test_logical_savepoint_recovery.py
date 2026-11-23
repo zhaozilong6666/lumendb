@@ -79,6 +79,31 @@ def test_logical_rollback_then_new_dml_survives_crash(tmp_path):
         db2.close()
 
 
+def test_upgraded_physical_savepoint_ddl_survives_crash(tmp_path):
+    """逻辑保存点遇到 DDL 会升级成物理页原像；回滚后的目录状态也要能恢复。"""
+    path = tmp_path / "logical_sp_upgrade_crash"
+    db, server = _open(path)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10)")
+
+    session = Session(database=db)
+    _run(server, session, "BEGIN")
+    _run(server, session, "SAVEPOINT s")
+    _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
+    _run(server, session, "INSERT INTO x VALUES (2)")
+    _run(server, session, "ROLLBACK TO SAVEPOINT s")
+    _run(server, session, "COMMIT")
+    _crash(db)
+
+    db2, server2 = _open(path)
+    try:
+        assert [table.name for table in db2.catalog.list_tables()] == ["t"]
+        assert _rows(server2, db2, "SELECT id, v FROM t ORDER BY id") == [(1, 10)]
+        assert _rows(server2, db2, "SELECT COUNT(*) FROM t") == [(1,)]
+    finally:
+        db2.close()
+
+
 def test_uncommitted_logical_rollback_crash_keeps_prior_data(tmp_path):
     path = tmp_path / "logical_sp_crash_loser"
     db, server = _open(path)

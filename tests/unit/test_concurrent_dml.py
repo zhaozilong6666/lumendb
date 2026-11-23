@@ -460,7 +460,7 @@ def test_logical_savepoint_release_restores_ddl_path(tmp_path):
         db.close()
 
 
-def test_logical_savepoint_rejects_ddl_and_truncate(tmp_path):
+def test_logical_savepoint_without_dml_upgrades_for_ddl(tmp_path):
     db = Database(tmp_path / "logical_sp_ddl", concurrent_dml=True, logical_savepoints=True)
     server = PGWireServer(db)
     db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -468,16 +468,78 @@ def test_logical_savepoint_rejects_ddl_and_truncate(tmp_path):
         session = Session(database=db)
         _run(server, session, "BEGIN")
         _run(server, session, "SAVEPOINT s")
-        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
-            _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
-        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
-            _run(server, session, "TRUNCATE TABLE t")
-        # 被拒绝的结构变更不能污染事务；DML 仍可继续并正常回滚。
+        # 保存点后还没有行 undo：DDL 可以把事务升级成物理保存点。
+        _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
+        _run(server, session, "INSERT INTO x VALUES (1)")
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        assert "x" not in [table.name for table in db.catalog.list_tables()]
+        _run(server, session, "COMMIT")
+        assert "x" not in [table.name for table in db.catalog.list_tables()]
+        assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(0,)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_rejects_ddl_after_dml(tmp_path):
+    db = Database(tmp_path / "logical_sp_ddl_after_dml", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
         _run(server, session, "INSERT INTO t VALUES (1, 10)")
+        with pytest.raises(NotSupportedError, match="逻辑保存点内有 DML 后不能再执行 DDL/TRUNCATE"):
+            _run(server, session, "CREATE TABLE x (id INT PRIMARY KEY)")
+        # 被拒绝的结构变更不能污染事务；行 undo 仍可正常回滚。
         _run(server, session, "ROLLBACK TO SAVEPOINT s")
         _run(server, session, "COMMIT")
         assert "x" not in [table.name for table in db.catalog.list_tables()]
         assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(0,)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_upgrades_then_truncate_rolls_back(tmp_path):
+    db = Database(tmp_path / "logical_sp_truncate", concurrent_dml=True, logical_savepoints=True)
+    server = PGWireServer(db)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20)")
+    try:
+        session = Session(database=db)
+        _run(server, session, "BEGIN")
+        _run(server, session, "SAVEPOINT s")
+        # 保存点后先 TRUNCATE 再 INSERT：升级成物理页原像后两者都能撤回。
+        _run(server, session, "TRUNCATE TABLE t")
+        _run(server, session, "INSERT INTO t VALUES (9, 90)")
+        # 已升级成物理保存点：其它会话被 _no_readers 挡在门外，本会话直读。
+        assert _run(server, session, "SELECT id FROM t")[0].rows == [(9,)]
+        _run(server, session, "ROLLBACK TO SAVEPOINT s")
+        assert _run(server, session, "SELECT id, v FROM t ORDER BY id")[0].rows == [
+            (1, 10),
+            (2, 20),
+        ]
+        _run(server, session, "COMMIT")
+        assert _rows(
+            server, Session(database=db), "SELECT id, v FROM t ORDER BY id"
+        ) == [(1, 10), (2, 20)]
+    finally:
+        db.close()
+
+
+def test_logical_savepoint_upgrade_via_database_exec(tmp_path):
+    """进程内 Database.execute 路径也要走同一套 DDL 升级逻辑。"""
+    db = Database(tmp_path / "logical_sp_exec", concurrent_dml=True, logical_savepoints=True)
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        db.execute_one("BEGIN")
+        db.execute_one("SAVEPOINT s")
+        db.execute_one("CREATE TABLE x (id INT PRIMARY KEY)")
+        db.execute_one("INSERT INTO x VALUES (1)")
+        db.execute_one("ROLLBACK TO SAVEPOINT s")
+        db.execute_one("COMMIT")
+        assert "x" not in [table.name for table in db.catalog.list_tables()]
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
     finally:
         db.close()
 
@@ -492,7 +554,7 @@ def test_logical_savepoint_rejects_truncate_after_dml(tmp_path):
         _run(server, session, "BEGIN")
         _run(server, session, "SAVEPOINT s")
         _run(server, session, "INSERT INTO t VALUES (3, 30)")
-        with pytest.raises(NotSupportedError, match="逻辑保存点事务内不支持 DDL/TRUNCATE"):
+        with pytest.raises(NotSupportedError, match="逻辑保存点内有 DML 后不能再执行 DDL/TRUNCATE"):
             _run(server, session, "TRUNCATE TABLE t")
         _run(server, session, "ROLLBACK TO SAVEPOINT s")
         _run(server, session, "COMMIT")

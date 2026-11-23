@@ -422,6 +422,12 @@ class PGWireServer:
                 if type(statement).__name__ not in _PURE_READ_STATEMENTS:
                     database.assert_writable()
                 return session.engine().run(statement, session.txn, params)
+            if database._maybe_upgrade_logical_savepoint(statement, session.txn):
+                if database._closed:
+                    raise StorageError("数据库已关闭")
+                if type(statement).__name__ not in _PURE_READ_STATEMENTS:
+                    database.assert_writable()
+                return session.engine().run(statement, session.txn, params)
             if isinstance(statement, Vacuum):
                 database.wait_for_vacuum_window(session.txn.xid)
             # [Review-Fix] 线协议会话不经过 Database._run，写围栏必须在这里

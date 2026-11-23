@@ -234,9 +234,9 @@ class Executor:
         self._schema_statement = type(stmt) in _SCHEMA_CHANGING_STATEMENTS
         if txn.capture_row_undo and self._schema_statement:
             raise NotSupportedError(
-                "逻辑保存点事务内不支持 DDL/TRUNCATE",
-                detail="结构变更依赖页原像回滚，会和行级 undo 的 RID/槽位假设冲突",
-                hint="改用默认物理保存点（关闭 --logical-savepoints），或先提交/回滚整个事务",
+                "逻辑保存点事务未升级，不能执行 DDL/TRUNCATE",
+                detail="结构变更依赖页原像回滚，绕过 Database 直接执行会破坏行 undo 的 RID/槽位假设",
+                hint="通过 Database/线协议执行以升级成物理保存点，或关闭 --logical-savepoints",
             )
         if self._read_only and type(stmt).__name__ not in _NON_WRITING_STATEMENTS:
             raise NotSupportedError(

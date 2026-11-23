@@ -34,7 +34,7 @@ from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager
 from ..storage.wal import WAL
 from ..storage.wal_segments import SegmentedWAL
-from .executor import Executor, Result
+from .executor import Executor, Result, _SCHEMA_CHANGING_STATEMENTS
 
 _log = logging.getLogger(__name__)
 
@@ -430,6 +430,10 @@ class Database:
             # INSERT/UPDATE/DELETE 逆操作；ROLLBACK TO 逐条撤回。
             txn.capture_row_undo = True
             return
+        self._acquire_physical_savepoint(txn)
+
+    def _acquire_physical_savepoint(self, txn: Transaction) -> None:
+        """把事务切到物理页原像回滚，并独占写者锁到事务结束。"""
         self._write_lock.acquire()
         try:
             with self._readers_cv:
@@ -441,9 +445,45 @@ class Database:
         except BaseException:
             self._write_lock.release()
             raise
+        txn.capture_row_undo = False
+        txn.row_undo_log.clear()
         txn.physical_savepoint = True
         self._savepoint_txn = txn
         self.bp.logical_abort = False
+
+    def _run_in_physical_savepoint(self, statement, params):
+        """保存点事务已独占写者锁：直接执行，跳过 read_guard 免得等自己。"""
+        if self._closed:
+            raise StorageError(
+                "数据库已关闭",
+                hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+            )
+        if not self._read_only:
+            self.assert_writable()
+        return self._run_unlocked(statement, params)
+
+    def _maybe_upgrade_logical_savepoint(self, statement, txn) -> bool:
+        """逻辑保存点遇到 DDL/TRUNCATE 时，按需升级成物理保存点。
+
+        只有保存点之后还没有堆 DML（``row_undo_log`` 为空）才能升级：此时
+        页原像从保存点开始，DDL 的页回滚不会和行 undo 的 RID/槽位假设冲突。
+        一旦已有行 undo，必须拒绝；调用方据此返回错误。
+        """
+        if not (
+            self._concurrent_dml
+            and txn is not None
+            and getattr(txn, "capture_row_undo", False)
+            and type(statement) in _SCHEMA_CHANGING_STATEMENTS
+        ):
+            return False
+        if txn.row_undo_log:
+            raise NotSupportedError(
+                "逻辑保存点内有 DML 后不能再执行 DDL/TRUNCATE",
+                detail="页原像回滚会和行级 undo 的 RID/槽位假设冲突",
+                hint="先 ROLLBACK TO SAVEPOINT 或 COMMIT 整个事务，再执行结构变更",
+            )
+        self._acquire_physical_savepoint(txn)
+        return True
 
     def _exit_savepoint_mode(self, txn: Transaction) -> None:
         """事务结束：恢复逻辑回滚并释放保存点模式占用的写者锁。"""
@@ -482,14 +522,10 @@ class Database:
             and self._txn is not None
             and getattr(self._txn, "physical_savepoint", False)
         ):
-            if self._closed:
-                raise StorageError(
-                    "数据库已关闭",
-                    hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
-                )
-            if not self._read_only:
-                self.assert_writable()
-            return self._run_unlocked(statement, params)
+            return self._run_in_physical_savepoint(statement, params)
+
+        if self._maybe_upgrade_logical_savepoint(statement, self._txn):
+            return self._run_in_physical_savepoint(statement, params)
 
         # 并发模式下第一次 SAVEPOINT：先拿写者锁、排空在途语句，再把事务
         # 切到物理回滚。必须在进 ``read_guard`` 之前做，否则当前语句自己
