@@ -847,10 +847,15 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞到
 `test_btree_split_crab.py::test_concurrent_reader_scan_during_delete_never_truncates`
-失败：`check_invariants()["entries"]` 为 1654，期望 1500，说明删除与读者扫描并发时
-仍有 154 个陈旧索引项没被摘掉。同提交在另外三个矩阵通过，VM/Windows 本地默认与
-并发模式连续重跑均未复现；先按“慢 runner 才暴露的并发窗口”记录，后续用固定
-线程时序做定向复现，确认是测试等待不足还是 B+ 树 merge/purge 漏摘。随后
+失败：`check_invariants()["entries"]` 为 1654，期望 1500。重新核对后不是 B+ 树
+merge/purge 漏摘，而是测试等待不足：旧实现 `w.join(timeout=180)`，慢 runner 上
+3000 键建树 + 1500 删除可能超过 3 分钟，180s 到点后 writer 还活着，测试就
+`stop.set()` 并检查不变量。1654 正好是“删除尚未做完”的剩余键数
+（`3000 - 1654 = 1346` 条已删，按计划还剩 154 条没删），而读者侧
+`min(counts) >= keep` 仍成立，因此失败只出在最终 entries 断言上。修法：把 join
+放宽到 600s，并在检查前 `assert not w.is_alive()`，让真正的超时以“writer 未完成”
+直接失败，而不是伪装成索引不变量错误。Windows 与 VM 各连续 10 轮通过；生产
+B+ 树删除算法未改。随后
 `31b6fd2` 的 run 45101946693 四矩阵全绿；随后 `dbcad2b` 的 run 45104750954 与
 `c3a0087`（DDL/TRUNCATE 安全升级）的 run 45109114642 均四矩阵全绿；
 `5105553`（跨会话 DDL 行 undo 门禁）的 run 45115443255 四矩阵全绿。
