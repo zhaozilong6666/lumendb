@@ -977,7 +977,12 @@ class Database:
             if self._txn is not None:
                 txn = self._txn
                 self._txn = None
-                self.txns.abort(txn)
+                try:
+                    self.txns.abort(txn)
+                except Exception:
+                    # abort 的 undo 失败现在会抛错（锁已释放、状态已落
+                    # ABORTED），但 close 必须继续关句柄；异常只留痕。
+                    _log.exception("关闭数据库时回滚当前事务失败，继续关闭")
                 # 保存点事务还握着写者锁并置了 _no_readers；同线程 close 是
                 # 可重入进来的，不在这里放门会留下永久 no_readers。
                 self._exit_savepoint_mode(txn)

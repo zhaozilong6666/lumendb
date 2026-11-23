@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1475 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1476 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
 - 质量门禁：`python scripts/gates.py` 跑全量测试、变异清单有效性、账本 drift
   与账本证据校验。证据校验用只读的 `verify --check`：`failed` 才红；
@@ -362,7 +362,7 @@ opt-in，默认模式尚未切换，卡在撤销插入的空间回收（根记�
 在线模式只保 RID 不回收
 根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留
 38 字节记录头，并对物理版本数设 250,000 硬上限，超限失败关闭）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1475 passed 与门禁脚本 3 轮
+的 READ COMMITTED 语义需发布说明。并发全量 1476 passed 与门禁脚本 3 轮
 （10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动

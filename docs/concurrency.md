@@ -360,7 +360,7 @@ Step 4 的前置项在这条路径上落地：
   读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（38 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（39 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
@@ -374,7 +374,8 @@ Step 4 的前置项在这条路径上落地：
   释放、`ON DELETE CASCADE` 删掉的子行随保存点回滚全部恢复、upsert 冲突
   `DO UPDATE` 的新值被撤销、行/目录 undo 抛错时 ROLLBACK TO 返回错误而不是
   静默继续、ABORT 的页/目录 undo 失败也抛错但仍落 ABORTED 并释放锁、批量
-  ABORT 中一个事务失败不影响其余事务收尾）；
+  ABORT 中一个事务失败不影响其余事务收尾、close 遇到当前事务 undo 失败仍
+  继续关闭句柄且可重复 close）；
 - `tests/unit/test_concurrency.py` 与 `tests/integration/test_cross_layer_invariants.py`
   的 `env` fixture 已参数化为默认/并发两模式，同一批写写冲突、唯一键回滚、外键
   并发、延迟约束、DDL 串行化、RI 可见性用例在同一个 pytest 进程里各跑两遍；
@@ -397,7 +398,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1475 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1476 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -891,7 +892,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1475 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1476 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

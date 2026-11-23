@@ -1048,3 +1048,22 @@ def test_drop_view_index_and_reindex_block_active_reader(tmp_path):
         assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
     finally:
         db.close()
+
+
+def test_close_still_closes_handles_when_current_txn_undo_fails(tmp_path):
+    """close 遇到 ABORT undo 失败也要把 WAL/磁盘句柄关掉，不能半开。"""
+    db = Database(tmp_path / "close_undo_failure", concurrent_dml=True)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    db.execute("BEGIN")
+    db.execute("INSERT INTO t VALUES (1)")
+
+    def boom() -> None:
+        raise RuntimeError("模拟目录 undo 失败")
+
+    db._txn.undo_log.append(boom)
+    try:
+        db.close()
+    finally:
+        assert db._closed is True
+    # 再关一次必须幂等，不重复释放
+    db.close()
