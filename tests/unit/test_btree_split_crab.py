@@ -489,12 +489,16 @@ def test_concurrent_reader_scan_during_delete_never_truncates(tmp_path) -> None:
         r.start()
     w = threading.Thread(target=writer)
     w.start()
-    w.join(timeout=180)
+    # 慢 runner 上 3000 键建树 + 1500 删除可能接近 3 分钟；必须等 writer
+    # 真正结束再取不变量。旧实现 180s 超时后直接 check_invariants，writer
+    # 还在删，就会看到 1654 > 1500 这种"删除没做完"的假失败。
+    w.join(timeout=600)
     stop.set()
     for r in readers:
         r.join(timeout=20)
 
     try:
+        assert not w.is_alive(), "writer 未在 600s 内完成"
         assert errors == [], f"读写并发出错: {errors[:3]}"
         assert counts, "读者一次都没扫完"
         # 物理删除只会让可见行数单调下降，任何一次扫描都不该少于最终行数。
