@@ -232,7 +232,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--logical-savepoints",
             action="store_true",
-            help="保存点走行级逻辑 undo（实验，需配合 --concurrent-dml）",
+            default=True,
+            help="保存点走行级逻辑 undo（并发模式下默认开启，需配合 --concurrent-dml）",
+        )
+        p.add_argument(
+            "--physical-savepoints",
+            dest="logical_savepoints",
+            action="store_false",
+            help="关闭逻辑保存点，回到独占写者锁的物理页原像路径",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

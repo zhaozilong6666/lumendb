@@ -6,15 +6,14 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1434 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1435 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
 - 并发 DML 实验模式已落地（`Database(concurrent_dml=True)`，默认关闭）：
   DML 走 `read_guard` + 行/键锁 + 页 latch，目录保存短锁，索引根页跨语句
   共享（`root_cell` + `Catalog.index_root_lock`），回滚走逻辑路径（WAL
-  `no_undo` 哨兵 + VACUUM 回收），DDL 仍物理可回滚；默认保存点事务不再因并发
-  活跃事务直接 `0A000`，改为排空在途语句后独占写者锁，跨线程 COMMIT/ROLLBACK
-  已回归。并发模式另开 `--logical-savepoints` 时，堆 INSERT/UPDATE/DELETE 改记
-  行级 undo 闭包，保存点事务存续期间其它写者可提交；该路径默认关闭。
+  `no_undo` 哨兵 + VACUUM 回收），DDL 仍物理可回滚；保存点事务在并发模式下
+  默认走行级逻辑 undo，堆 INSERT/UPDATE/DELETE 改记逆操作闭包，保存点存续期间
+  其它写者可提交；`--physical-savepoints` 退回排空在途语句后独占写者锁。
   详见 `docs/concurrency.md`。
 - 代价模型基础设施：`plan/cost.py` 已提供扫描/过滤/连接/投影/聚合/排序/
   集合/`LIMIT` 的基数与 CPU 估算，并已接入 `EXPLAIN` 的 `rows≈/cpu≈`
@@ -347,16 +346,16 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 时 apply 的原子性（现为降级路径，彻底解决要索引项 MVCC）；写并发已降到
 "行/键/DDL 三级锁"（`09376cb`），并新增 opt-in `concurrent_dml` 模式：DML
 不再拿 `_write_lock`，B+ 树插入/删除均已 crabbing，索引根页跨语句共享，回滚
-走逻辑路径（堆页/B+ 树页 `no_undo`，VACUUM 回收），默认保存点事务改为排空
-在途语句后独占写者锁（不再 `0A000`，但存续期间写者排队）；另开的
-`--logical-savepoints` 已把堆 DML 改为逐条行级 undo，保存点存续期间其它写者
-可提交；该路径是 DML-only，保存点后一旦有行 undo，事务内 DDL/TRUNCATE/VACUUM
-会被拒绝；尚无行 DML 时 DDL/TRUNCATE 先升级成物理保存点。撤销的插入只标
+走逻辑路径（堆页/B+ 树页 `no_undo`，VACUUM 回收），并发模式保存点默认走
+行级逻辑 undo，堆 DML 逐条记录逆操作，保存点存续期间其它写者可提交；
+`--physical-savepoints` 退回独占写者锁。逻辑路径是 DML-only，保存点后一旦有行
+undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCATE 先升级成
+物理保存点。撤销的插入只标
 `FLAG_ABORTED`、根记录不物理回收。`concurrent_dml` 仍保持
-opt-in，默认模式尚未切换，卡在保存点逻辑路径尚未成为默认、`VACUUM` 在线模式
-只保 RID 不回收
+opt-in，默认模式尚未切换，卡在撤销插入的空间回收（根记录/空洞槽位）、`VACUUM`
+在线模式只保 RID 不回收
 根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1434 passed 与门禁脚本 3 轮
+的 READ COMMITTED 语义需发布说明。并发全量 1435 passed 与门禁脚本 3 轮
 （10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动

@@ -148,7 +148,7 @@ class Database:
         lease_path: str | Path | None = None,
         node_id: str = "primary",
         concurrent_dml: bool = False,
-        logical_savepoints: bool = False,
+        logical_savepoints: bool = True,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)

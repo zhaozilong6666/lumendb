@@ -94,8 +94,8 @@ python -m lumendb serve --path ./mydb --port 5432
 # 需要时显式开启并发 DML（默认串行；保存点/VACUUM 门禁见 docs/concurrency.md）
 python -m lumendb serve --path ./mydb --port 5432 --concurrent-dml
 
-# 可选：并发模式下改用行级逻辑 undo 的保存点，保存点存续期间不独占写者锁
-python -m lumendb serve --path ./mydb --port 5432 --concurrent-dml --logical-savepoints
+# 并发模式下保存点默认走行级逻辑 undo；如需退回独占写者锁的物理路径：
+python -m lumendb serve --path ./mydb --port 5432 --concurrent-dml --physical-savepoints
 
 # 另开一个终端，用原生 psql 直连
 psql -h 127.0.0.1 -p 5432 -U lumendb -d lumendb
@@ -380,12 +380,12 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
   让 DML 不再拿全局写锁，不同行、不同唯一键、不同表可以同时写。自动提交
   UPDATE 对热点行会阻塞拿行锁、再读最新已提交版本重算；显式事务、唯一键、
   DDL、目录锁仍保持快速失败（`40001` 或 `0A000`），不引入"持语句锁等行锁"的环。
-  保存点默认仍会等所有在途语句退出后独占写者锁；并发模式另开
-  `--logical-savepoints` 后，第一次 `SAVEPOINT` 改为逐条记录 INSERT/UPDATE/DELETE
-  的行级 undo，保存点事务存续期间其它写者不再排队。该路径是 DML-only：保存点后
-  一旦有行 undo，事务内拒绝 `DDL/TRUNCATE`；尚无行 DML 时会先升级成物理保存点，
-  之后结构变更与 DML 都能整页撤回。其它会话的 `DDL/TRUNCATE` 若遇到仍在
-  行 undo 的保存点事务会返回可重试的 `40001`，避免改完行布局后回滚按新
+  保存点在并发模式下默认走行级逻辑 undo：第一次 `SAVEPOINT` 只逐条记录
+  INSERT/UPDATE/DELETE 的逆操作，保存点事务存续期间其它写者不再排队；
+  `--physical-savepoints` 可退回独占写者锁的物理页原像路径。逻辑路径是 DML-only：
+  保存点后一旦有行 undo，事务内拒绝 `DDL/TRUNCATE`；尚无行 DML 时会先升级成
+  物理保存点，之后结构变更与 DML 都能整页撤回。其它会话的 `DDL/TRUNCATE` 若遇到
+  仍在行 undo 的保存点事务会返回可重试的 `40001`，避免改完行布局后回滚按新
   schema 解码旧版本。有保存点时也拒绝 `VACUUM`（物理回收会删掉回滚仍依赖的旧版本）。
 - **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
   少了一套最容易出错的分支，代价是稀疏页要靠 `REINDEX table` 重建来回收。

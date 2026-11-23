@@ -38,6 +38,19 @@ def env(tmp_path):
     db.close()
 
 
+@pytest.fixture
+def physical_env(tmp_path):
+    """显式关闭逻辑保存点，专门守住独占写者锁的旧路径。"""
+    db = Database(
+        tmp_path / "db-physical", concurrent_dml=True, logical_savepoints=False
+    )
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    db.execute_one("CREATE INDEX idx_v ON t (v)")
+    server = PGWireServer(db)
+    yield db, server
+    db.close()
+
+
 def _run_threads(workers) -> list[str]:
     errors: list[str] = []
 
@@ -179,9 +192,9 @@ def test_concurrent_delete_and_readers(env):
     assert all(150 <= c <= 300 for c in seen_counts), seen_counts
 
 
-def test_savepoint_lock_can_be_released_by_another_thread(env):
+def test_savepoint_lock_can_be_released_by_another_thread(physical_env):
     """保存点可能在别的 worker 建；COMMIT 跨线程释放不能自锁/报 owner 错。"""
-    db, server = env
+    db, server = physical_env
     s = Session(database=db)
     ready = threading.Event()
     errors: list[str] = []
@@ -305,9 +318,9 @@ def test_vacuum_waits_for_active_transaction(env):
     assert _rows(server, Session(database=db), "SELECT COUNT(*) FROM t") == [(1,)]
 
 
-def test_close_with_savepoint_releases_the_gate(env):
+def test_close_with_savepoint_releases_the_gate(physical_env):
     """同线程 close 进到保存点事务：abort 后必须放门，不能留下 no_readers。"""
-    db, server = env
+    db, server = physical_env
     session = Session(database=db)
     _run(server, session, "BEGIN")
     _run(server, session, "SAVEPOINT s")
@@ -316,9 +329,9 @@ def test_close_with_savepoint_releases_the_gate(env):
     assert db._no_readers is False
 
 
-def test_savepoint_waits_for_exclusive_and_rolls_back(env):
+def test_savepoint_waits_for_exclusive_and_rolls_back(physical_env):
     """并发模式下保存点不再 0A000：排空在途语句后独占，回滚只撤保存点后写入。"""
-    db, server = env
+    db, server = physical_env
     a = Session(database=db)
     b = Session(database=db)
     _run(server, a, "BEGIN")
@@ -367,6 +380,15 @@ def test_hot_row_increments_serialize_without_lost_updates(env):
     assert _rows(
         server, Session(database=db), "SELECT v FROM t WHERE id = 999999"
     ) == [(threads * per_thread,)]
+
+
+def test_concurrent_dml_defaults_to_logical_savepoints(tmp_path):
+    """并发模式不显式传参时，保存点默认走行级逻辑 undo。"""
+    db = Database(tmp_path / "logical_sp_default", concurrent_dml=True)
+    try:
+        assert db._logical_savepoints is True
+    finally:
+        db.close()
 
 
 def test_logical_savepoint_does_not_block_other_writer(tmp_path):

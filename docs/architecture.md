@@ -147,7 +147,8 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 执行这个深度之后的目录对象 undo；更早的原像保留给后续事务级 abort。
 `RELEASE` 只丢弃保存点标记，不撤销任何写入。保存点是事务内状态，不写 WAL。
 
-并发模式另有 opt-in 的行级逻辑保存点（`logical_savepoints=True`）：第一次
+并发模式下行级逻辑保存点默认开启（`logical_savepoints=True`；显式
+`--physical-savepoints` 或 `logical_savepoints=False` 可关闭）：第一次
 `SAVEPOINT` 只打开 `txn.capture_row_undo`，不拿全局写者锁；堆的 INSERT/UPDATE/
 DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在页/目录 undo
 之后按保存点记下的深度逆序执行闭包，直接修版本链的 `xmax/newest/flags`，而不是

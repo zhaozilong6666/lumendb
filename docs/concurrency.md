@@ -331,7 +331,8 @@ Step 4 的前置项在这条路径上落地：
   写锁改成可跨线程释放的 `_CrossThreadRLock`：线协议语句跑在线程池，保存点可能
   在一个 worker 建、COMMIT 在另一个 worker 释放，`threading.RLock` 会报
   "cannot release a lock owned by another thread"。
-- **行级逻辑保存点（opt-in，`logical_savepoints=True` / `--logical-savepoints`）**：
+- **行级逻辑保存点（并发模式默认，`logical_savepoints=True` / 默认开启；
+  `--physical-savepoints` 或 `logical_savepoints=False` 关闭）**：
   保持 `concurrent_dml` 的并发写路径，第一次 `SAVEPOINT` 只置
   `txn.capture_row_undo=True`，不拿 `_write_lock`、不排空读者。堆的
   `INSERT/UPDATE/DELETE` 成功后各记一个闭包到 `txn.row_undo_log`：
@@ -345,13 +346,14 @@ Step 4 的前置项在这条路径上落地：
   改回页原像，之后的结构变更和 DML 都能整页撤回；如果已经有行 undo，则拒绝，
   因为页原像会和行 undo 的 RID/槽位假设冲突（实测 `SAVEPOINT→TRUNCATE→INSERT→
   ROLLBACK` 会误标原行）。`VACUUM` 不升级，始终拒绝。事务结束统一清空 undo 栈
-  并复位捕获标志。默认关闭，物理保存点路径不变。别的会话执行 DDL/TRUNCATE 时
+  并复位捕获标志。并发模式下默认开启；显式 `logical_savepoints=False` 或
+  `--physical-savepoints` 退回物理保存点。别的会话执行 DDL/TRUNCATE 时
   走 `ddl_guard`：拿独占门前与拿到门后各查一次活跃事务的行 undo，仍有则返回
   可重试的 `40001`，避免 `ALTER DROP COLUMN` 改行布局后行 undo 按新 schema
   解码旧版本而报列数不符；检查与拿门之间新产生的行 undo 由第二次检查兜住。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（23 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（24 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
@@ -377,15 +379,15 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1434 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1435 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
-- 保存点已有两条路径：默认仍排空在途语句后独占写者锁；`--logical-savepoints`
-  改为行级逻辑 undo，保存点事务存续期间其它写者可提交。后者是 DML-only：
-  保存点后一旦有行 undo，事务内 `DDL/TRUNCATE/VACUUM` 会被拒绝；尚无行 DML 时
-  `DDL/TRUNCATE` 会先升级成物理保存点。撤销的插入只标 `FLAG_ABORTED` 留待后续
-  回收，尚未成为默认保存点路径。
+- 保存点已有两条路径：并发模式默认走行级逻辑 undo，保存点事务存续期间其它
+  写者可提交；`--physical-savepoints` 退回排空在途语句后独占写者锁。逻辑路径是
+  DML-only：保存点后一旦有行 undo，事务内 `DDL/TRUNCATE/VACUUM` 会被拒绝；
+  尚无行 DML 时 `DDL/TRUNCATE` 会先升级成物理保存点。撤销的插入只标
+  `FLAG_ABORTED` 留待后续回收。
 - `VACUUM` 不再因为活跃事务失败：入口先等最多 5s；等不到空窗口就转“保 RID 的
   在线回收”（`HeapFile.vacuum_online`）。在线模式按 VACUUM 事务与所有活跃事务的
   快照逐版本判可见性，保留根记录、链头到最老可见版本的整条前缀链；只删对所有
@@ -850,7 +852,7 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1434 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1435 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
@@ -864,7 +866,7 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
   198.4 vs 默认 277.4，固定开销约 28%，是“吞吐换并发能力”的代价。平台差异记录，
   不作为切默认门禁。
 - **保存点：默认路径部分过关，逻辑路径 opt-in。** 默认保存点仍排空在途语句后
-  独占写者锁；`--logical-savepoints` 已把堆 INSERT/UPDATE/DELETE 改为逐条 undo，
+  独占写者锁；并发模式下保存点默认把堆 INSERT/UPDATE/DELETE 改为逐条 undo，
   保存点事务存续期间其它写者可提交。它是 DML-only：保存点后一旦有行 undo，
   事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚未有行 DML 时 DDL/TRUNCATE 会先升级成
   物理保存点。剩余边界是撤销的插入只标 `FLAG_ABORTED`、不物理回收根记录。

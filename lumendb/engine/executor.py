@@ -236,7 +236,7 @@ class Executor:
             raise NotSupportedError(
                 "逻辑保存点事务未升级，不能执行 DDL/TRUNCATE",
                 detail="结构变更依赖页原像回滚，绕过 Database 直接执行会破坏行 undo 的 RID/槽位假设",
-                hint="通过 Database/线协议执行以升级成物理保存点，或关闭 --logical-savepoints",
+                hint="通过 Database/线协议执行以升级成物理保存点，或改用 --physical-savepoints",
             )
         if self._read_only and type(stmt).__name__ not in _NON_WRITING_STATEMENTS:
             raise NotSupportedError(
@@ -3131,7 +3131,7 @@ class Executor:
             raise NotSupportedError(
                 "逻辑保存点事务内不能执行 VACUUM",
                 detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
-                hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时关闭 --logical-savepoints",
+                hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时改用 --physical-savepoints",
             )
         tables = (
             [self._catalog.get_table(stmt.table)]
