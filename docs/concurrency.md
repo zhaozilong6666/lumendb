@@ -825,6 +825,14 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 `test_promote_with_quorum_steps_down_on_lease_loss` 的固定 `sleep(0.3)` 都改成
 轮询到条件成立；`test_lease.py` + `test_write_fence.py` 默认/并发各 5 轮通过。
 
+run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞到
+`test_btree_split_crab.py::test_concurrent_reader_scan_during_delete_never_truncates`
+失败：`check_invariants()["entries"]` 为 1654，期望 1500，说明删除与读者扫描并发时
+仍有 154 个陈旧索引项没被摘掉。同提交在另外三个矩阵通过，VM/Windows 本地默认与
+并发模式连续重跑均未复现；先按“慢 runner 才暴露的并发窗口”记录，后续用固定
+线程时序做定向复现，确认是测试等待不足还是 B+ 树 merge/purge 漏摘。随后
+`31b6fd2` 的 run 45101946693 四矩阵全绿。
+
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
 仍是快照隔离 + 冲突即 40001。`concurrent_dml` 因此仍保持 opt-in，不切默认：下一步
@@ -834,8 +842,8 @@ run 286（`a9785a3`）Ubuntu 3.12 又撞到 `test_promote_with_quorum_starts_lea
 
 - **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1429 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
-  CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；逻辑保存点提交后的
-  CI 运行另行记录。
+  CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
+  `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs
