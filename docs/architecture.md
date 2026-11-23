@@ -154,9 +154,11 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 恢复整页。该模式是 DML-only：保存点后一旦有行 undo，事务内 `DDL/TRUNCATE`
 会被拒绝（结构变更的页原像回滚会和行 undo 的 RID/槽位假设冲突）；如果还没有
 行 DML，遇到 `DDL/TRUNCATE` 会先把事务升级成物理保存点，拿写者锁、排空读者、
-改回页原像，之后的结构变更与 DML 都能整页撤回。有保存点时也拒绝 `VACUUM`，
-避免物理回收删掉回滚仍依赖的旧版本。所有保存点 `RELEASE` 后关闭行捕获，DDL
-恢复物理路径。
+改回页原像，之后的结构变更与 DML 都能整页撤回。其它会话的 `DDL/TRUNCATE`
+在执行前会检查活跃事务的行 undo；仍有则返回 `40001`，因为 `ALTER DROP COLUMN`
+改行布局后，行 undo 再按新 schema 解码旧版本会报列数不符。有保存点时也拒绝
+`VACUUM`，避免物理回收删掉回滚仍依赖的旧版本。所有保存点 `RELEASE` 后关闭
+行捕获，DDL 恢复物理路径。
 
 ### 2.6 回收（VACUUM）
 

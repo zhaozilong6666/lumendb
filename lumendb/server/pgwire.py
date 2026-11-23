@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 from ..datatypes import DataType
 from ..engine.database import Database, _STRUCTURAL_STATEMENTS
-from ..engine.executor import ColumnMeta, Result
+from ..engine.executor import ColumnMeta, Result, _SCHEMA_CHANGING_STATEMENTS
 from ..errors import (
     ClientDisconnected,
     LumenError,
@@ -437,18 +437,26 @@ class PGWireServer:
                 # 之后仍可能有一条 INSERT 把页写到已关闭的句柄上。
                 # 结构性语句（VACUUM/TRUNCATE/shadow heap 重写）还要与在途
                 # 只读语句互斥：它们不拿写者锁，会扫到重排中的页。
-                guard = (
-                    database.read_guard()
-                    if (
-                        database._concurrent_dml
-                        and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+                if (
+                    database._concurrent_dml
+                    and type(statement) in _SCHEMA_CHANGING_STATEMENTS
+                ):
+                    # 结构变更必须先挡住逻辑保存点的行 undo，否则 ALTER 改
+                    # 行布局后保存点回滚会按新 schema 解码旧版本而报错。
+                    guard = database.ddl_guard(session.txn)
+                else:
+                    guard = (
+                        database.read_guard()
+                        if (
+                            database._concurrent_dml
+                            and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+                        )
+                        else (
+                            database.exclusive_guard()
+                            if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                            else database._write_lock
+                        )
                     )
-                    else (
-                        database.exclusive_guard()
-                        if type(statement).__name__ in _STRUCTURAL_STATEMENTS
-                        else database._write_lock
-                    )
-                )
                 with guard:
                     database.assert_writable()
                     return session.engine().run(statement, session.txn, params)
@@ -472,18 +480,24 @@ class PGWireServer:
 
         if isinstance(statement, Vacuum):
             database.wait_for_vacuum_window(None)
-        guard = (
-            database.read_guard()
-            if (
-                database._concurrent_dml
-                and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+        if (
+            database._concurrent_dml
+            and type(statement) in _SCHEMA_CHANGING_STATEMENTS
+        ):
+            guard = database.ddl_guard(None)
+        else:
+            guard = (
+                database.read_guard()
+                if (
+                    database._concurrent_dml
+                    and type(statement).__name__ not in _STRUCTURAL_STATEMENTS
+                )
+                else (
+                    database.exclusive_guard()
+                    if type(statement).__name__ in _STRUCTURAL_STATEMENTS
+                    else database._write_lock
+                )
             )
-            else (
-                database.exclusive_guard()
-                if type(statement).__name__ in _STRUCTURAL_STATEMENTS
-                else database._write_lock
-            )
-        )
         with guard:
             if database._closed:
                 raise StorageError("数据库已关闭")

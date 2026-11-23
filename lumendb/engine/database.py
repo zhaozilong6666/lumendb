@@ -485,6 +485,53 @@ class Database:
         self._acquire_physical_savepoint(txn)
         return True
 
+    def _row_undo_holder(
+        self, exclude: Transaction | None = None
+    ) -> Transaction | None:
+        """找一个仍持有行 undo 的活跃事务；没有则返回 None。"""
+        for txn in self.txns.active_transactions():
+            if txn is exclude:
+                continue
+            if getattr(txn, "capture_row_undo", False) and txn.row_undo_log:
+                return txn
+        return None
+
+    def _assert_no_row_undo(self, txn: Transaction | None) -> None:
+        """DDL 前拒绝仍有行 undo 的活跃事务。
+
+        ALTER DROP COLUMN / ALTER TYPE 会改行布局，逻辑保存点的行 undo 之后
+        再按新 schema 解码旧版本会直接报列数不符。这里宁可让 DDL 返回可重试
+        的 40001，也不允许它在别的保存点事务未撤回时改结构。
+        """
+        blocker = self._row_undo_holder(txn)
+        if blocker is not None:
+            raise TransactionError(
+                "逻辑保存点事务持有行 undo，DDL/TRUNCATE 暂不可执行",
+                detail=f"事务 {getattr(blocker, 'xid', '?')} 的保存点行 undo 尚未撤回",
+                hint="等该事务 COMMIT/ROLLBACK 后重试",
+            )
+
+    @contextlib.contextmanager
+    def ddl_guard(self, txn: Transaction | None = None):
+        """DDL/TRUNCATE 的独占门：先拒绝行 undo，再与所有读者互斥。
+
+        检查分两次：拿门前的检查挡住已经存在的保存点行 undo；拿到
+        ``exclusive_guard`` 后再查一次，挡住"检查通过、拿门之前"新写入的
+        行 undo。拿门后 ``_no_readers`` 会挡住新的 DML，因此第二次检查通过
+        后结构变更期间不会再有行 undo 产生。
+        """
+        self._assert_no_row_undo(txn)
+        with self.exclusive_guard():
+            self._assert_no_row_undo(txn)
+            if self._closed:
+                raise StorageError(
+                    "数据库已关闭",
+                    hint="这是并发降级（step_down/close）后的预期错误，请重试或换节点",
+                )
+            if not self._read_only:
+                self.assert_writable()
+            yield
+
     def _exit_savepoint_mode(self, txn: Transaction) -> None:
         """事务结束：恢复逻辑回滚并释放保存点模式占用的写者锁。"""
         if getattr(txn, "capture_row_undo", False):
@@ -550,6 +597,13 @@ class Database:
                 # 保存点还没登记成功就失败了：不能把库一直锁在独占模式。
                 self._exit_savepoint_mode(self._txn)
                 raise
+
+        # 并发写模式下，DDL/TRUNCATE 必须先确认没有别的逻辑保存点事务仍
+        # 持有行 undo；否则结构变更会改行布局，回滚时按新 schema 解码旧版本
+        # 会直接报列数不符。这里用 ddl_guard 同时承担独占读者门。
+        if self._concurrent_dml and type(statement) in _SCHEMA_CHANGING_STATEMENTS:
+            with self.ddl_guard(self._txn):
+                return self._run_unlocked(statement, params)
 
         # VACUUM 要重排 RID/重建索引：先在独占门外等其它活跃事务退出，
         # 再走结构性写的 exclusive_guard。默认模式没有并发活跃事务，不额外等。

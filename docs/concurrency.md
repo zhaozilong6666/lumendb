@@ -345,16 +345,20 @@ Step 4 的前置项在这条路径上落地：
   改回页原像，之后的结构变更和 DML 都能整页撤回；如果已经有行 undo，则拒绝，
   因为页原像会和行 undo 的 RID/槽位假设冲突（实测 `SAVEPOINT→TRUNCATE→INSERT→
   ROLLBACK` 会误标原行）。`VACUUM` 不升级，始终拒绝。事务结束统一清空 undo 栈
-  并复位捕获标志。默认关闭，物理保存点路径不变。
+  并复位捕获标志。默认关闭，物理保存点路径不变。别的会话执行 DDL/TRUNCATE 时
+  走 `ddl_guard`：拿独占门前与拿到门后各查一次活跃事务的行 undo，仍有则返回
+  可重试的 `40001`，避免 `ALTER DROP COLUMN` 改行布局后行 undo 按新 schema
+  解码旧版本而报列数不符；检查与拿门之间新产生的行 undo 由第二次检查兜住。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（22 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（23 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
   UPDATE/DELETE 回滚、回滚后继续写、主键/行复用、RELEASE 后恢复 DDL 路径、
   无 DML 时 DDL/TRUNCATE 升级物理保存点、有 DML 后拒绝结构变更、TRUNCATE 升级后
-  回滚、VACUUM 拒绝、`Database.execute` 路径同样升级）；
+  回滚、VACUUM 拒绝、`Database.execute` 路径同样升级、其它会话 DDL 被行 undo
+  挡住并返回 40001）；
 - `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
   逐条撤销、嵌套保存点按深度逆序撤销）；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
@@ -373,7 +377,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1433 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1434 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -836,7 +840,8 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 仍有 154 个陈旧索引项没被摘掉。同提交在另外三个矩阵通过，VM/Windows 本地默认与
 并发模式连续重跑均未复现；先按“慢 runner 才暴露的并发窗口”记录，后续用固定
 线程时序做定向复现，确认是测试等待不足还是 B+ 树 merge/purge 漏摘。随后
-`31b6fd2` 的 run 45101946693 四矩阵全绿。
+`31b6fd2` 的 run 45101946693 四矩阵全绿；随后 `dbcad2b` 的 run 45104750954 与
+`c3a0087`（DDL/TRUNCATE 安全升级）的 run 45109114642 均四矩阵全绿。
 
 **边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
 色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
@@ -845,10 +850,11 @@ run 45026772513（`88b1be8`，仅 docs 改动）Ubuntu 3.12 的并发全量撞�
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1433 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1434 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
-  `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）。
+  `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
+  `c3a0087` 由 run **45109114642** 四矩阵全绿。
 - **热点行写：过关。** Linux 4 线程 122.0 vs 默认 116.1 ops/s；Windows 8 线程
   28.0 vs 默认 29.2 ops/s，二者均 0 次 `40001`，最终值等于总自增次数。
 - **短事务插入：不再作为阻塞项。** Linux 8 线程 × 200 行：并发 694.7–730.1 vs

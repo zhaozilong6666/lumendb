@@ -544,6 +544,37 @@ def test_logical_savepoint_upgrade_via_database_exec(tmp_path):
         db.close()
 
 
+def test_logical_savepoint_blocks_other_session_ddl(tmp_path):
+    """别的会话不能在逻辑保存点持有行 undo 时改行布局。
+
+    ALTER DROP COLUMN 走 shadow heap 改 schema；若此时允许执行，保存点
+    ROLLBACK 会拿旧记录按新列数解码，直接报 CorruptedPageError。DDL 必须
+    返回可重试的 40001，等保存点事务结束再改。
+    """
+    db = Database(
+        tmp_path / "logical_sp_ddl_guard", concurrent_dml=True, logical_savepoints=True
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+        db.execute_one("INSERT INTO t VALUES (1, 1, 'a')")
+        server = PGWireServer(db)
+        a = Session(database=db)
+        b = Session(database=db)
+        _run(server, a, "BEGIN")
+        _run(server, a, "SAVEPOINT s")
+        _run(server, a, "UPDATE t SET v = 2 WHERE id = 1")
+        with pytest.raises(TransactionError, match="行 undo"):
+            _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        _run(server, a, "ROLLBACK TO SAVEPOINT s")
+        _run(server, a, "COMMIT")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1, "a")]
+        # 保存点事务结束后，同一个结构变更可以正常执行。
+        _run(server, b, "ALTER TABLE t DROP COLUMN pad")
+        assert _rows(server, Session(database=db), "SELECT * FROM t") == [(1, 1)]
+    finally:
+        db.close()
+
+
 def test_logical_savepoint_rejects_truncate_after_dml(tmp_path):
     db = Database(tmp_path / "logical_sp_truncate", concurrent_dml=True, logical_savepoints=True)
     server = PGWireServer(db)

@@ -384,8 +384,9 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
   `--logical-savepoints` 后，第一次 `SAVEPOINT` 改为逐条记录 INSERT/UPDATE/DELETE
   的行级 undo，保存点事务存续期间其它写者不再排队。该路径是 DML-only：保存点后
   一旦有行 undo，事务内拒绝 `DDL/TRUNCATE`；尚无行 DML 时会先升级成物理保存点，
-  之后结构变更与 DML 都能整页撤回。有保存点时也拒绝 `VACUUM`（物理回收会删掉
-  回滚仍依赖的旧版本）。
+  之后结构变更与 DML 都能整页撤回。其它会话的 `DDL/TRUNCATE` 若遇到仍在
+  行 undo 的保存点事务会返回可重试的 `40001`，避免改完行布局后回滚按新
+  schema 解码旧版本。有保存点时也拒绝 `VACUUM`（物理回收会删掉回滚仍依赖的旧版本）。
 - **索引不做借位与合并**：删除走惰性标记，空节点从父节点摘除并修复叶子链。
   少了一套最容易出错的分支，代价是稀疏页要靠 `REINDEX table` 重建来回收。
 - **`VACUUM` 有离线/在线两模式**：没有活跃事务时重排堆页、改变 RID 并重建索引；
