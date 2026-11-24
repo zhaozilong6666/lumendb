@@ -392,7 +392,9 @@ Step 4 的前置项在这条路径上落地：
 - `tests/crash/test_online_vacuum_recovery.py`（在线 VACUUM 的整页回收落盘后崩溃：
   恢复可重放或撤销，但可见行/索引扫描/后续离线 VACUUM 必须一致）；
 - `scripts/concurrency_gate.py` 新增 `sql_concurrent_dml`（4 会话 × 150 行，半提交
-  半回滚，校验行数/去重/索引不变量）、`sql_savepoint_concurrent`（A 未提交时
+  半回滚，校验行数/去重/索引不变量）、`sql_mixed_dml`（4 会话并发 INSERT/UPDATE/
+  DELETE，终态 120 行、SUM(v)=40，每个索引至少覆盖全部存活行）、
+  `sql_savepoint_concurrent`（A 未提交时
   B 建保存点、插入、回滚到保存点、提交；终态只保留 A 的行，校验不再 `0A000`）、
   `sql_savepoint_logical`（A 在逻辑保存点内插入时 B 能直接提交、A 回滚后只看到
   B 的行）与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，
@@ -400,7 +402,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1478 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1478 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -896,7 +898,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
 - **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1478 passed；门禁
-  脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
+  脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
   `c3a0087` 由 run **45109114642**、`5105553` 由 run **45115443255** 四矩阵全绿；

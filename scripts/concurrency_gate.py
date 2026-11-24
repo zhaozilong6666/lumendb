@@ -5,19 +5,23 @@
     python scripts/concurrency_gate.py --rounds 5
     python scripts/concurrency_gate.py --quick        # 只跑 1 轮 + 单测
 
-它检查四件事（每一项都对应一个实测过的真实故障）：
+它检查十一项（每一项都对应一个实测过的真实故障）：
 
 1. ``btree_page_latch``    同一片叶双线程并发插入：不丢行、不乱序（页 latch）。
 2. ``btree_split_chain``   叶/内部页分裂 + 删除 + 并发读者：键序、叶子链、条目数。
 3. ``heap_insert_race``    2 线程 × 300 行绕过写锁直接 ``HeapFile.insert``：
    RID 不重复分配、行数不丢。
-4. ``btree_delete_race``   4 线程乱序删除 + 1 并发读者（120 字节 TEXT 键造
+4. ``btree_insert_crab``   多线程插入造多层树：不丢键、根/内部页分裂链完整。
+5. ``btree_delete_race``   4 线程乱序删除 + 1 并发读者（120 字节 TEXT 键造
    depth>=2 的树）：读者不截断、不重复；删完叶子链不断、树能完全塌陷。
-5. ``sql_concurrent_dml``  4 个线协议会话并发跑 SQL DML（半数回滚）：
+6. ``sql_concurrent_dml``  4 个线协议会话并发跑 SQL DML（半数回滚）：
    提交行数/去重数正确，索引不变量成立。走 ``concurrent_dml=True`` 路径。
-6. ``sql_savepoint_concurrent`` 别的会话活跃时建保存点：等待独占而非 ``0A000``。
-7. ``sql_vacuum_window``  别的会话活跃时自动提交 VACUUM：在独占门外等它结束。
-8. ``sql_vacuum_online``  等不到空窗口时转保 RID 在线回收：活跃快照仍看旧版本。
+7. ``sql_mixed_dml``       4 会话并发 INSERT/UPDATE/DELETE：终态行数、
+   SUM(v)、每个索引至少覆盖全部存活行。
+8. ``sql_savepoint_concurrent`` 别的会话活跃时建保存点：等待独占而非 ``0A000``。
+9. ``sql_savepoint_logical`` 逻辑保存点事务存续时另一个写者仍能提交。
+10. ``sql_vacuum_window`` 别的会话活跃时自动提交 VACUUM：在独占门外等它结束。
+11. ``sql_vacuum_online`` 等不到空窗口时转保 RID 在线回收：活跃快照仍看旧版本。
 
 输出是机器可读的 ``GATE <name> rounds=.. ok=.. status=PASS|FAIL``，退出码非 0
 表示有门禁未通过。所有临时库都建在系统临时目录，跑完即删，不碰工作树。
@@ -149,6 +153,66 @@ def _probe_sql_concurrent_dml(db: Database) -> dict:
         "distinct": distinct,
         "expected": (writers // 2) * per_writer,
         "entries": entries,
+        "invariants": invariants,
+    }
+
+
+def _probe_sql_mixed_dml(db: Database) -> dict:
+    """4 会话并发混合 INSERT/UPDATE/DELETE：各自行不相交，终态可精确对账。
+
+    每条会话插入 40 行（v=0）、把偶数 id 更新为 v=1、删掉 4 的倍数。
+    期望剩 30 行/会话，共 120 行；剩余偶数 10 行/会话 v=1，SUM(v)=40。
+    这个探针把 UPDATE/DELETE 的并发路径也纳入门禁，而不只是 INSERT。
+    """
+    server = PGWireServer(db)
+    per_writer = 40
+    writers = 4
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def run_sql(session: Session, sql: str):
+        return [server._run_statement(session, stmt) for stmt in parse_sql(sql)]
+
+    def worker(wid: int) -> None:
+        try:
+            session = Session(database=db)
+            run_sql(session, "BEGIN")
+            base = wid * per_writer
+            for i in range(base, base + per_writer):
+                run_sql(session, f"INSERT INTO t VALUES ({i}, 0, 'm{i}')")
+            for i in range(base, base + per_writer, 2):
+                run_sql(session, f"UPDATE t SET v = v + 1 WHERE id = {i}")
+            for i in range(base, base + per_writer, 4):
+                run_sql(session, f"DELETE FROM t WHERE id = {i}")
+            run_sql(session, "COMMIT")
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(f"w{wid}: {type(exc).__name__}: {exc}")
+
+    workers = [threading.Thread(target=worker, args=(w,), daemon=True)
+               for w in range(writers)]
+    for th in workers:
+        th.start()
+    for th in workers:
+        th.join(timeout=120)
+
+    session = Session(database=db)
+    count, total = run_sql(session, "SELECT COUNT(*), SUM(v) FROM t")[0].rows[0]
+    distinct = run_sql(session, "SELECT COUNT(DISTINCT id) FROM t")[0].rows[0][0]
+    table = db.catalog.get_table("t")
+    invariants = {}
+    for idx in table.indexes.values():
+        tree = db.executor._tree_for(table, idx)
+        invariants[idx.name] = tree.check_invariants()
+    expected = writers * (per_writer * 3 // 4)
+    expected_sum = writers * (per_writer // 4)
+    return {
+        "errors": errors[:3],
+        "count": count,
+        "distinct": distinct,
+        "sum": total,
+        "expected": expected,
+        "expected_sum": expected_sum,
         "invariants": invariants,
     }
 
@@ -512,6 +576,21 @@ def _probe_failed(name: str, detail: dict) -> bool:
             return True
         return any(entries < detail["expected"]
                    for entries in detail["entries"].values())
+    if name == "sql_mixed_dml":
+        if detail["errors"]:
+            return True
+        if detail["count"] != detail["expected"]:
+            return True
+        if detail["distinct"] != detail["expected"]:
+            return True
+        if detail["sum"] != detail["expected_sum"]:
+            return True
+        # 索引项因为 UPDATE 不摘旧项会多于行数；只要求每个索引至少覆盖所有
+        # 存活行，且结构自检（depth/entries 非负）没有崩塌。
+        return any(
+            inv["entries"] < detail["expected"]
+            for inv in detail["invariants"].values()
+        )
     if name == "sql_savepoint_concurrent":
         return (
             detail["final"] != detail["expected"]
@@ -564,6 +643,13 @@ def _build_sql_dml(tmp: pathlib.Path):
     return db, _probe_sql_concurrent_dml(db)
 
 
+def _build_mixed_dml(tmp: pathlib.Path):
+    db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
+    db.execute("CREATE INDEX idx_v ON t (v)")
+    return db, _probe_sql_mixed_dml(db)
+
+
 def _build_savepoint(tmp: pathlib.Path):
     db = Database(tmp, checkpoint_wal_bytes=0, concurrent_dml=True)
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(16))")
@@ -613,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
                         ("btree_insert_crab", _build_insert_crab),
                         ("btree_delete_race", _build_btree),
                         ("sql_concurrent_dml", _build_sql_dml),
+                        ("sql_mixed_dml", _build_mixed_dml),
                         ("sql_savepoint_concurrent", _build_savepoint),
                         ("sql_savepoint_logical", _build_savepoint_logical),
                         ("sql_vacuum_window", _build_vacuum),
