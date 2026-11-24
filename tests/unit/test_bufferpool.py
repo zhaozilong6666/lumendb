@@ -241,6 +241,50 @@ class TestWalRule:
         assert wal.durable_lsn >= lsn
         assert dm.read_page(victim.page_id) == bytes(victim.buf)
 
+    def test_clean_barrier_flushes_pages_dirtied_during_flush(self, env, monkeypatch):
+        """屏障内必须看到空脏页集合；flush 期间新标脏的页由下一轮补上。"""
+        bp, dm, wal = env
+        first = bp.new_page(HeapPage)
+        first.init_heap(first.page_id)
+        bp.unpin(first.page_id, dirty=True)
+        original = bp.flush_page
+        added = {"done": False}
+
+        def flush_then_dirty(page_id):
+            original(page_id)
+            if not added["done"]:
+                added["done"] = True
+                late = bp.new_page(HeapPage)
+                late.init_heap(late.page_id)
+                bp.unpin(late.page_id, dirty=True)
+
+        monkeypatch.setattr(bp, "flush_page", flush_then_dirty)
+        with bp.clean_barrier():
+            assert not bp._dirty
+            assert added["done"]
+
+    def test_flush_all_repeats_until_dirty_set_is_empty(self, env, monkeypatch):
+        """flush 期间新标脏的页也必须落盘，否则 checkpoint 会漏页。"""
+        bp, dm, wal = env
+        first = bp.new_page(HeapPage)
+        first.init_heap(first.page_id)
+        bp.unpin(first.page_id, dirty=True)
+        original = bp.flush_page
+        added = {"done": False}
+
+        def flush_then_dirty(page_id):
+            original(page_id)
+            if not added["done"]:
+                added["done"] = True
+                late = bp.new_page(HeapPage)
+                late.init_heap(late.page_id)
+                bp.unpin(late.page_id, dirty=True)
+
+        monkeypatch.setattr(bp, "flush_page", flush_then_dirty)
+        flushed = bp.flush_all()
+        assert flushed >= 2
+        assert not bp._dirty
+
     def test_mark_dirty_bumps_page_version(self, env):
         """绕过 log_page_update 的直接写也要让解码缓存/刷盘版本失效。"""
         bp, dm, wal = env

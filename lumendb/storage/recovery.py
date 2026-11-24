@@ -176,9 +176,15 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def checkpoint(self) -> int:
-        """把所有脏页落盘，然后写一条 checkpoint 日志并记录到元数据页。"""
-        self._bp.flush_all()
-        lsn = self._wal.checkpoint(self._txns.active_xids)
+        """把所有脏页落盘，然后写一条 checkpoint 日志并记录到元数据页。
+
+        并发 DML 不拿 ``Database._write_lock``，所以 flush 与 checkpoint 之间
+        仍可能有写者标脏。这里用 ``clean_barrier`` 把 CHECKPOINT 记录追加放在
+        “脏页集合为空且 ``_lock`` 在手”的临界区内，消除“记录早于 checkpoint、
+        页却没落盘”的漏页窗口。
+        """
+        with self._bp.clean_barrier():
+            lsn = self._wal.checkpoint(self._txns.active_xids)
         self._wal.flush()
         self._disk.meta.checkpoint_lsn = lsn
         self._disk._persist_meta()

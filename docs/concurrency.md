@@ -136,6 +136,13 @@ pageLSN 并改字节；断言脏标记没被清掉，第二次 flush 写入的�
 从主库取 FREE 页镜像时也持主库页 latch 拷贝；副本读线程与 applier 交错时
 不会看到半页内容。`BufferPoolManager.mark_dirty` 同时推进页版本，覆盖复制
 应用、目录页这种绕过 `log_page_update` 的直接写路径。
+
+`flush_all` 还改成循环到 `_dirty` 为空再 fsync：并发写者可能在两轮之间把页
+重新标脏，单轮快照会漏掉它们。`Recovery.checkpoint` 进一步用
+`BufferPool.clean_barrier()` 把“CHECKPOINT 记录追加”放进
+“脏页集合为空且 `_lock` 在手”的临界区；写者要标脏必须先拿 `_lock`，因此
+不会出现“WAL 记录早于 checkpoint_lsn、页却还没落盘”的漏页。屏障内只追加
+记录，不 fsync、不写页。
 ### 为什么索引页 latch 暂不做（架构判断，不是遗漏）
 
 堆表的 latch 可以"一页一锁、自包含"：一次 insert 只碰一页。B+ 树不行 ——
@@ -434,7 +441,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1486 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1488 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -954,7 +961,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1486 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1488 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

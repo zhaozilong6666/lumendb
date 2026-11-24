@@ -352,13 +352,51 @@ class BufferPoolManager:
             self.unpin(page_id)
 
     def flush_all(self) -> int:
-        """刷掉所有脏页并 fsync 数据文件，返回开始时的脏页数。"""
-        with self._lock:
-            dirty = list(self._dirty)
-        for page_id in dirty:
-            self.flush_page(page_id)
+        """刷掉所有脏页并 fsync 数据文件，返回实际刷过的页次数。
+
+        并发写者可能在两轮之间把页重新标脏；checkpoint 必须等脏页集合真正
+        空掉再推进 checkpoint_lsn，否则“WAL 记录早于 checkpoint、页却还没
+        落盘”的页会在恢复时被跳过。这里循环到 ``_dirty`` 为空：每轮开始
+        时短暂持 ``_lock`` 取快照，flush 本身不持全局锁。
+
+        ``flush_page`` 在写盘期间发现版本变了会把脏标记留下，所以本轮写完
+        仍可能有余项，下一轮自然收敛；返回的是所有轮次实际 flush 的次数。
+        """
+        flushed = 0
+        while True:
+            with self._lock:
+                dirty = list(self._dirty)
+            if not dirty:
+                break
+            for page_id in dirty:
+                self.flush_page(page_id)
+                flushed += 1
         self._disk.sync()
-        return len(dirty)
+        return flushed
+
+    @contextlib.contextmanager
+    def clean_barrier(self):
+        """把脏页刷空，并在 ``_lock`` 内保持"没有脏页"直到退出。
+
+        checkpoint 需要在"所有页都干净"的点上写 CHECKPOINT 记录：否则并发
+        写者可能在 flush 与 checkpoint 之间标脏一页，而它的 WAL 记录 LSN 又
+        早于 checkpoint_lsn，恢复时会被跳过。这里循环 flush 直到 ``_dirty``
+        为空，然后拿着 ``_lock`` 让调用方追加 CHECKPOINT 记录——写者要标脏
+        必须先拿 ``_lock``，所以屏障内不会出现新的 dirty 页。
+
+        调用方只应在屏障内做"追加 CHECKPOINT 记录"这种短操作，不要做 fsync
+        或页写；``flush_all`` 的 fsync 在进入屏障前已经完成。
+        """
+        while True:
+            self.flush_all()
+            self._lock.acquire()
+            if not self._dirty:
+                break
+            self._lock.release()
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def _apply_wal_rule(self, page: Page) -> None:
         """淘汰路径的 WAL 规则执行点（flush_page 用自己抓到的快照 LSN）。"""
