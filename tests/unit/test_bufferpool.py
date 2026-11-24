@@ -241,6 +241,15 @@ class TestWalRule:
         assert wal.durable_lsn >= lsn
         assert dm.read_page(victim.page_id) == bytes(victim.buf)
 
+    def test_mark_dirty_bumps_page_version(self, env):
+        """绕过 log_page_update 的直接写也要让解码缓存/刷盘版本失效。"""
+        bp, dm, wal = env
+        page = bp.new_page(HeapPage)
+        page.init_heap(page.page_id)
+        before = bp.page_version(page.page_id)
+        bp.mark_dirty(page)
+        assert bp.page_version(page.page_id) > before
+
     def test_log_page_update_marks_dirty_and_sets_lsn(self, env):
         bp, dm, wal = env
         page = bp.new_page(HeapPage)

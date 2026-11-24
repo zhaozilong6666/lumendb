@@ -178,8 +178,16 @@ class BufferPoolManager:
                 self._dirty.add(page_id)
 
     def mark_dirty(self, page: Page) -> None:
+        """标脏并推进页版本。
+
+        ``log_page_update`` 已经为日志路径推进过版本；但复制应用、目录页
+        直接改字节这类路径会绕过它直接 ``mark_dirty``。版本不推进的话，
+        B+ 树内部页解码缓存会继续命中旧条目，刷盘线程也可能把“快照后又被
+        改过”的页误判成未变。
+        """
         with self._lock:
             self._dirty.add(page.page_id)
+            self._bump_version(page.page_id)
 
     # -- 日志与脏页 ---------------------------------------------------------
 

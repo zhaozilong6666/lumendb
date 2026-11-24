@@ -614,10 +614,12 @@ class Replica:
         self.db.disk.ensure_page(page_id)
         page = self.db.bp.fetch_page(page_id)
         try:
-            if page.page_lsn < record.lsn:
-                page.buf[:] = image
-                page.page_lsn = record.lsn
-                self.db.bp.mark_dirty(page)
+            # 与读路径共用页 latch：副本在读线程扫描同一页时不能看到半页镜像。
+            with page.latch:
+                if page.page_lsn < record.lsn:
+                    page.buf[:] = image
+                    page.page_lsn = record.lsn
+                    self.db.bp.mark_dirty(page)
         finally:
             self.db.bp.unpin(page_id)
 
@@ -626,22 +628,28 @@ class Replica:
         self.db.disk.ensure_page(page_id)
         page = self.db.bp.fetch_page(page_id)
         try:
-            # 新页的“分配 + 初始化”不是一条独立 WAL 记录：主库只把后续
-            # 页内 diff 写进 WAL。副本看到 FREE 页时，先向主库取一次完整
-            # 页镜像（在真实网络实现里就是一个 PAGE_IMAGE 请求），再应用
-            # 当前 diff。已有页则只按 pageLSN 应用 diff。
-            if page.page_type == PageType.FREE and primary is not None:
-                primary_page = primary.bp.fetch_page(page_id)
-                try:
-                    page.buf[:] = primary_page.buf
-                    page.page_lsn = primary_page.page_lsn
-                finally:
-                    primary.bp.unpin(page_id)
-                self.db.bp.mark_dirty(page)
-            if page.page_lsn < record.lsn:
-                page.buf[offset : offset + len(new)] = new
-                page.page_lsn = record.lsn
-                self.db.bp.mark_dirty(page)
+            # 同 _apply_page_image：整段“改字节 + 盖 pageLSN + 标脏”在页 latch
+            # 内完成，reader 不会读到页码与偏移已经变了、内容只改了一半的页。
+            with page.latch:
+                # 新页的“分配 + 初始化”不是一条独立 WAL 记录：主库只把后续
+                # 页内 diff 写进 WAL。副本看到 FREE 页时，先向主库取一次完整
+                # 页镜像（在真实网络实现里就是一个 PAGE_IMAGE 请求），再应用
+                # 当前 diff。已有页则只按 pageLSN 应用 diff。
+                if page.page_type == PageType.FREE and primary is not None:
+                    primary_page = primary.bp.fetch_page(page_id)
+                    try:
+                        with primary_page.latch:
+                            image = bytes(primary_page.buf)
+                            image_lsn = primary_page.page_lsn
+                    finally:
+                        primary.bp.unpin(page_id)
+                    page.buf[:] = image
+                    page.page_lsn = image_lsn
+                    self.db.bp.mark_dirty(page)
+                if page.page_lsn < record.lsn:
+                    page.buf[offset : offset + len(new)] = new
+                    page.page_lsn = record.lsn
+                    self.db.bp.mark_dirty(page)
         finally:
             self.db.bp.unpin(page_id)
 
