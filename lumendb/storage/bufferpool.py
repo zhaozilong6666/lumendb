@@ -309,37 +309,51 @@ class BufferPoolManager:
         return len(touched)
 
     def flush_page(self, page_id: int) -> None:
-        """把单个脏页写回磁盘（先刷 WAL）。"""
+        """把单个脏页写回磁盘（先刷 WAL）。
+
+        不能拿着 ``_lock`` 直接写 ``page.buf``：写者持有页 latch 时可能刚把
+        pageLSN 推进到新 LSN、还没改字节，这时磁盘若写入旧内容，崩溃恢复会
+        因为 pageLSN 已变而跳过 redo，静默丢掉这次修改。这里先短暂拿
+        ``_lock`` pin 页并记下版本，随后按「页 latch → 拷贝」拿一致快照，
+        释放 latch 后再写盘；写完只在版本未变时清脏标记，写者若在写盘期间
+        改过页，脏标记会保留到下一次 flush。
+        """
         with self._lock:
             page = self._frames.get(page_id)
             if page is None:
+                # 页已被淘汰（淘汰时写过），只是脏标记残留。
+                self._dirty.discard(page_id)
                 return
             if page_id not in self._dirty:
                 return
-            self._apply_wal_rule(page)
-            self._disk.write_page(page_id, page.buf)
-            self._dirty.discard(page_id)
-            self.stats.page_writes += 1
+            # 临时 pin，防止拿到 page 引用后立刻被淘汰/复用。
+            self._pins[page_id] = self._pins.get(page_id, 0) + 1
+            version = self._page_versions.get(page_id, 0)
+        try:
+            with page.latch:
+                data = bytes(page.buf)
+                page_lsn = page.page_lsn
+            if page_lsn > 0:
+                self._wal.flush_upto(page_lsn)
+            self._disk.write_page(page_id, data)
+            with self._lock:
+                if self._page_versions.get(page_id, 0) == version:
+                    self._dirty.discard(page_id)
+                self.stats.page_writes += 1
+        finally:
+            self.unpin(page_id)
 
     def flush_all(self) -> int:
-        """刷掉所有脏页并 fsync 数据文件，返回刷掉的页数。"""
+        """刷掉所有脏页并 fsync 数据文件，返回开始时的脏页数。"""
         with self._lock:
             dirty = list(self._dirty)
-            for page_id in dirty:
-                page = self._frames.get(page_id)
-                if page is None:
-                    # 页已不在池里（被淘汰时写过），只是脏标记残留
-                    self._dirty.discard(page_id)
-                    continue
-                self._apply_wal_rule(page)
-                self._disk.write_page(page_id, page.buf)
-                self._dirty.discard(page_id)
-                self.stats.page_writes += 1
-            self._disk.sync()
-            return len(dirty)
+        for page_id in dirty:
+            self.flush_page(page_id)
+        self._disk.sync()
+        return len(dirty)
 
     def _apply_wal_rule(self, page: Page) -> None:
-        """WAL 规则的唯一执行点。"""
+        """淘汰路径的 WAL 规则执行点（flush_page 用自己抓到的快照 LSN）。"""
         if page.page_lsn > 0:
             before = self._wal.durable_lsn
             self._wal.flush_upto(page.page_lsn)
@@ -379,8 +393,10 @@ class BufferPoolManager:
     # -- 生命周期 -----------------------------------------------------------
 
     def close(self) -> None:
+        # flush_all 会短暂 pin 页并在页 latch 下取快照；不要在持有全局
+        # _lock 时调用，否则与「页 latch → _lock」的写者形成 ABBA。
+        self.flush_all()
         with self._lock:
-            self.flush_all()
             self._frames.clear()
             self._pins.clear()
             self._dirty.clear()

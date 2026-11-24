@@ -6,6 +6,8 @@
 3. 缓冲池不会把"同一个页"缓存成两份。
 """
 
+import threading
+
 import pytest
 
 from lumendb.errors import StorageError
@@ -178,6 +180,48 @@ class TestWalRule:
         assert wal.durable_lsn >= lsn  # 先刷了日志
         assert dm.read_page(page.page_id) == bytes(page.buf)
         bp.unpin(page.page_id)
+
+    def test_flush_does_not_clear_dirty_flag_if_page_changes_after_snapshot(
+        self, env, monkeypatch
+    ):
+        """刷盘快照取完后写者又改页：脏标记必须保留，下次 flush 写新内容。"""
+        bp, dm, wal = env
+        page = bp.new_page(HeapPage)
+        page.init_heap(page.page_id)
+        bp.log_page_update(1, page, 40, b"", b"old")
+        pid = page.page_id
+
+        original = dm.write_page
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_write(page_id, data):
+            if page_id == pid:
+                entered.set()
+                assert release.wait(5)
+            original(page_id, data)
+
+        monkeypatch.setattr(dm, "write_page", slow_write)
+        flusher = threading.Thread(target=lambda: bp.flush_page(pid))
+        flusher.start()
+        assert entered.wait(5)
+
+        # flush 已取完快照、还没清脏标记；此时写者推进 pageLSN 并改字节。
+        with page.latch:
+            old = bytes(page.buf[40:43])
+            bp.log_page_update(1, page, 40, old, b"new")
+            page.buf[40:43] = b"new"
+            bp.mark_dirty(page)
+        release.set()
+        flusher.join(5)
+        assert not flusher.is_alive()
+        assert bp.is_dirty(pid), "快照后的写者修改不能被 flush 清掉"
+
+        monkeypatch.setattr(dm, "write_page", original)
+        bp.flush_page(pid)
+        assert dm.read_page(pid) == bytes(page.buf)
+        assert not bp.is_dirty(pid)
+        bp.unpin(pid)
 
     def test_eviction_also_respects_wal_rule(self, env):
         bp, dm, wal = env
