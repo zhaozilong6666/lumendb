@@ -170,6 +170,35 @@ latch 内取原始记录再解码；`_set_flags` / `_set_xmax` / `_set_newest` �
 
 B+ 树 `_commit_page` 把“读旧页 → 算 diff → 记日志 → 写页”整段收进页 latch；
 `_init_page` 的整页初始化也在 latch 内，避免刷盘线程看到只改一半的页。
+
+
+#### 文件句柄的 seek/write 也必须原子（2026-11-24）
+
+上面所有页 latch 都假设「磁盘上的页内容就是缓存里那一页」。这个假设此前
+并不成立：`DiskManager` 只有一个共享文件句柄，`write_page` 的
+`seek(page_id * PAGE_SIZE)` 与紧随其后的 `write(data)` 没有进程内互斥。
+BufferPool 刷盘线程按设计不持 `_lock`、也不持页 latch（它写的是快照），
+于是两个刷盘线程可能各自 seek 后交错 write，把一页写到另一页的偏移。
+
+实测现场：`benchmarks/concurrency_throughput.py --threads 8 --rows 1000`
+的 `hot_update` 间歇性让 8 个 worker 同时抛
+`CorruptedPageError('记录头被截断')`。抓到的损坏页 277 里
+`page_id=100`、`type=3`（B+ 树叶），即一页 B+ 树内容被写到了堆页 277 的
+偏移；堆页链把 B+ 树叶当堆页解码，`get_record` 的槽位偏移越界，返回空
+字节。同一轮基准还会出现 `COUNT(*)` 从 8001 掉到 6630、热点 `v` 读成 0，
+都是同一类“页写到错误偏移”的下游表现。
+
+修法：`DiskManager` 增加 `threading.RLock` 作为进程内 IO 锁，所有
+`seek/write/read/flush/fsync` 组合都在这把锁内完成；它与跨进程的 FileLock
+是两层不同的保护。`allocate_page`、`_persist_meta`、`ensure_page`、
+`write_page_bytes` 也一并纳入，避免“分配新页的写”和“刷旧页的写”互相
+移动文件偏移。
+
+回归：`tests/unit/test_pager.py::TestConcurrentIo::test_write_page_serializes_file_position`
+用一个可阻塞的 `seek` 句柄把线程 A 卡在 seek 与 write 之间，线程 B 再调用
+`write_page`；旧实现 B 能进入 seek（`other_entered=True`），新实现 B 必须等
+A 的 IO 锁。测试同时校验两页的页内 `page_id` 没有被写到对方偏移。
+
 ### 为什么索引页 latch 暂不做（架构判断，不是遗漏）
 
 堆表的 latch 可以"一页一锁、自包含"：一次 insert 只碰一页。B+ 树不行 ——
@@ -468,7 +497,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1491 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1492 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -988,7 +1017,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1491 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1492 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

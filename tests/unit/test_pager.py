@@ -1,6 +1,8 @@
 """磁盘管理器的单元测试。"""
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -123,3 +125,83 @@ class TestContextManager:
         with DiskManager(db_path) as dm:
             dm.allocate_page()
         assert dm._fh.closed
+
+
+class TestConcurrentIo:
+    def test_write_page_serializes_file_position(self, db_path):
+        """刷盘线程并发写不同页时，seek/write 必须原子。
+
+        回归：DiskManager 只有一个共享文件句柄；若 write_page 不持进程内
+        IO 锁，线程 A seek 到页 A 后、write 前，线程 B 可能 seek 到页 B，
+        A 随后把页 A 写到页 B 的偏移。现场表现为堆页链里出现页号字段
+        与目标页号不符的 B+ 树页，读取时抛 ``记录头被截断``。
+        """
+        dm = DiskManager(db_path)
+        page_a = dm.allocate_page()
+        page_b = dm.allocate_page()
+        real = dm._fh
+
+        class BlockingHandle:
+            def __init__(self, inner, blocked_page):
+                self.inner = inner
+                self.blocked_offset = blocked_page * PAGE_SIZE
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.other_entered = threading.Event()
+                self.pos = 0
+
+            def seek(self, pos):
+                if pos == self.blocked_offset:
+                    self.entered.set()
+                    self.release.wait(timeout=2)
+                elif not self.release.is_set():
+                    # 页 A 还卡在 seek/write 之间，另一个线程已经进来了。
+                    self.other_entered.set()
+                self.pos = pos
+
+            def write(self, data):
+                self.inner.seek(self.pos)
+                self.inner.write(data)
+
+            def flush(self):
+                self.inner.flush()
+
+            @property
+            def closed(self):
+                return self.inner.closed
+
+        proxy = BlockingHandle(real, page_a)
+        dm._fh = proxy
+
+        def payload(pid: int) -> bytes:
+            buf = bytearray(PAGE_SIZE)
+            import struct
+
+            struct.pack_into("<H", buf, 0, PageType.HEAP)
+            struct.pack_into("<I", buf, 16, pid)
+            struct.pack_into("<I", buf, 32, pid)
+            return bytes(buf)
+
+        def write_page(pid: int) -> None:
+            dm.write_page(pid, payload(pid))
+
+        first = threading.Thread(target=write_page, args=(page_a,))
+        first.start()
+        assert proxy.entered.wait(timeout=2)
+        second = threading.Thread(target=write_page, args=(page_b,))
+        second.start()
+        time.sleep(0.05)
+        proxy.release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        assert not proxy.other_entered.is_set()
+
+        dm._fh = real
+        for pid in (page_a, page_b):
+            import struct
+
+            raw = dm.read_page(pid)
+            assert struct.unpack_from("<H", raw, 0)[0] == PageType.HEAP
+            assert struct.unpack_from("<I", raw, 16)[0] == pid
+            assert struct.unpack_from("<I", raw, 32)[0] == pid
+        dm.close()

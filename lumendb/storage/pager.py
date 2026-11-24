@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import struct
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +117,11 @@ class DiskManager:
         # 先拿独占锁再碰数据文件：两个进程同时打开同一目录会互相覆盖脏页。
         self._lock = FileLock(self.path.with_name(self.path.name + ".lock"))
         self._lock.acquire()
+        #: 同一个文件句柄的 seek/write 必须原子。BufferPool 的刷盘线程会在
+        #: 不持缓冲池全局锁的情况下并发写不同页；两个线程各自 seek 后交错
+        #: write，会把一页写到另一页的偏移（页内 page_id 与目标页号不符）。
+        #: 这是进程内 IO 串行锁，与跨进程的 FileLock 是两件事。
+        self._io_lock = threading.RLock()
 
         try:
             existed = self.path.exists() and self.path.stat().st_size > 0
@@ -145,10 +151,11 @@ class DiskManager:
         raw = bytearray(PAGE_SIZE)
         meta = MetaPage(0)
         meta.init_meta()
-        self._fh.seek(0)
-        self._fh.write(meta.buf)
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        with self._io_lock:
+            self._fh.seek(0)
+            self._fh.write(meta.buf)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
         self._size = PAGE_SIZE
 
     # -- 属性 ---------------------------------------------------------------
@@ -167,14 +174,15 @@ class DiskManager:
         故意用"读-改-写"而不是直接覆盖整页：``catalog_root`` 属于目录层，
         由 CatalogStore 通过 Buffer Pool 自己维护，这里不能把它盖回旧值。
         """
-        raw = self.read_page(0)
-        buf = bytearray(raw)
-        struct.pack_into("<I", buf, META_OFF_NEXT_PAGE, self._meta.next_page_id)
-        struct.pack_into("<Q", buf, META_OFF_NEXT_XID, self._meta.next_xid)
-        struct.pack_into("<Q", buf, META_OFF_CHECKPOINT_LSN, self._meta.checkpoint_lsn)
-        self._fh.seek(0)
-        self._fh.write(buf)
-        self._fh.flush()
+        with self._io_lock:
+            raw = self.read_page(0)
+            buf = bytearray(raw)
+            struct.pack_into("<I", buf, META_OFF_NEXT_PAGE, self._meta.next_page_id)
+            struct.pack_into("<Q", buf, META_OFF_NEXT_XID, self._meta.next_xid)
+            struct.pack_into("<Q", buf, META_OFF_CHECKPOINT_LSN, self._meta.checkpoint_lsn)
+            self._fh.seek(0)
+            self._fh.write(buf)
+            self._fh.flush()
 
     # -- 页 I/O -------------------------------------------------------------
 
@@ -184,18 +192,19 @@ class DiskManager:
         立即落盘而不是延后，是为了让崩溃后的页号分配保持单调——
         否则恢复时可能把两批数据分配到同一个页号。
         """
-        pid = self.num_pages
-        buf = bytearray(PAGE_SIZE)
-        struct.pack_into("<H", buf, 0, PageType.FREE)
-        struct.pack_into("<I", buf, 16, pid)
+        with self._io_lock:
+            pid = self.num_pages
+            buf = bytearray(PAGE_SIZE)
+            struct.pack_into("<H", buf, 0, PageType.FREE)
+            struct.pack_into("<I", buf, 16, pid)
 
-        self._fh.seek(pid * PAGE_SIZE)
-        self._fh.write(buf)
-        self._fh.flush()
+            self._fh.seek(pid * PAGE_SIZE)
+            self._fh.write(buf)
+            self._fh.flush()
 
-        self._meta.next_page_id = pid + 1
-        self._persist_meta()
-        return pid
+            self._meta.next_page_id = pid + 1
+            self._persist_meta()
+            return pid
 
     def ensure_page(self, page_id: int) -> None:
         """把文件扩展到至少包含 ``page_id``；用于副本应用主库 WAL。
@@ -206,61 +215,67 @@ class DiskManager:
         """
         if page_id < 0:
             raise StorageError("页号不能为负数")
-        current = self.num_pages
-        if page_id < current:
-            return
-        for pid in range(current, page_id + 1):
-            buf = bytearray(PAGE_SIZE)
-            struct.pack_into("<H", buf, 0, PageType.FREE)
-            struct.pack_into("<I", buf, 16, pid)
-            self._fh.seek(pid * PAGE_SIZE)
-            self._fh.write(buf)
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
-        if self._meta.next_page_id <= page_id:
-            self._meta.next_page_id = page_id + 1
-            self._persist_meta()
+        with self._io_lock:
+            current = self.num_pages
+            if page_id < current:
+                return
+            for pid in range(current, page_id + 1):
+                buf = bytearray(PAGE_SIZE)
+                struct.pack_into("<H", buf, 0, PageType.FREE)
+                struct.pack_into("<I", buf, 16, pid)
+                self._fh.seek(pid * PAGE_SIZE)
+                self._fh.write(buf)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            if self._meta.next_page_id <= page_id:
+                self._meta.next_page_id = page_id + 1
+                self._persist_meta()
 
     def read_page(self, page_id: int) -> bytes:
-        if page_id < 0 or page_id >= self.num_pages:
-            raise PageNotFoundError(
-                f"页 {page_id} 不存在",
-                detail=f"文件共 {self.num_pages} 页",
-            )
-        self._fh.seek(page_id * PAGE_SIZE)
-        data = self._fh.read(PAGE_SIZE)
-        if len(data) != PAGE_SIZE:
-            raise PageNotFoundError(
-                f"页 {page_id} 读取不完整",
-                detail=f"读到 {len(data)} 字节，期望 {PAGE_SIZE}",
-            )
-        return data
+        with self._io_lock:
+            if page_id < 0 or page_id >= self.num_pages:
+                raise PageNotFoundError(
+                    f"页 {page_id} 不存在",
+                    detail=f"文件共 {self.num_pages} 页",
+                )
+            self._fh.seek(page_id * PAGE_SIZE)
+            data = self._fh.read(PAGE_SIZE)
+            if len(data) != PAGE_SIZE:
+                raise PageNotFoundError(
+                    f"页 {page_id} 读取不完整",
+                    detail=f"读到 {len(data)} 字节，期望 {PAGE_SIZE}",
+                )
+            return data
 
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         if len(data) != PAGE_SIZE:
             raise StorageError(f"写入长度必须是 {PAGE_SIZE}，收到 {len(data)}")
-        if page_id < 0 or page_id >= self.num_pages:
-            raise PageNotFoundError(f"页 {page_id} 未分配，不能写入")
-        self._fh.seek(page_id * PAGE_SIZE)
-        self._fh.write(data)
+        with self._io_lock:
+            if page_id < 0 or page_id >= self.num_pages:
+                raise PageNotFoundError(f"页 {page_id} 未分配，不能写入")
+            self._fh.seek(page_id * PAGE_SIZE)
+            self._fh.write(data)
 
     def sync(self) -> None:
         """把文件缓冲与元数据刷到磁盘（fsync，不是 fflush）。"""
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        with self._io_lock:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
 
     def snapshot_bytes(self) -> bytes:
         """读取当前数据文件的完整快照。
 
         调用方负责保证没有并发写；``Database.snapshot`` 会用写锁做这件事。
         """
-        self._fh.flush()
-        return self.path.read_bytes()
+        with self._io_lock:
+            self._fh.flush()
+            return self.path.read_bytes()
 
     def copy_to(self, target: str | Path) -> None:
         """在调用方持锁时把数据文件复制到 target，不把整库读进内存。"""
-        self._fh.flush()
-        shutil.copyfile(self.path, Path(target))
+        with self._io_lock:
+            self._fh.flush()
+            shutil.copyfile(self.path, Path(target))
 
     def write_page_bytes(self, page_id: int, data: bytes) -> None:
         """把一页原始字节写回数据文件；用于增量基准备份的页级恢复。
@@ -269,16 +284,17 @@ class DiskManager:
         """
         if len(data) != PAGE_SIZE:
             raise ValueError(f"页大小必须是 {PAGE_SIZE}，收到 {len(data)}")
-        with self._lock:
+        with self._io_lock:
             self._fh.seek(page_id * PAGE_SIZE)
             self._fh.write(data)
             self._fh.flush()
 
     def close(self) -> None:
         if not self._fh.closed:
-            self._persist_meta()
-            self._fh.flush()
-            self._fh.close()
+            with self._io_lock:
+                self._persist_meta()
+                self._fh.flush()
+                self._fh.close()
         self._lock.release()
 
     def __enter__(self) -> "DiskManager":
