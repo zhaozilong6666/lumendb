@@ -147,6 +147,11 @@ pageLSN 并改字节；断言脏标记没被清掉，第二次 flush 写入的�
 `tests/crash/test_checkpoint_concurrent_recovery.py::test_checkpoint_does_not_skip_page_dirtied_during_flush`
 把写者卡在 `flush_all` 返回之后、CHECKPOINT 记录写入之前提交；旧实现恢复后
 读到 v=2（更新被跳过），屏障实现读到 v=1（redo 或已刷页覆盖）。
+
+目录页也补了同一套页 latch：`CatalogStore.load` 在 `page.latch` 内读整页字节
+与 next 指针；`CatalogStore.save` 的“写整页 chunk + 改 next/prev + 记日志 +
+标脏”以及元数据页根指针写入/undo 全部在页 latch 内完成。此前目录 save 的
+`page.buf[...] = chunk` 在 `log_page_update` 之外，读者可能拼到半页目录。
 ### 为什么索引页 latch 暂不做（架构判断，不是遗漏）
 
 堆表的 latch 可以"一页一锁、自包含"：一次 insert 只碰一页。B+ 树不行 ——

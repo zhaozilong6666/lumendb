@@ -39,8 +39,9 @@ class CatalogStore:
         # 走 Buffer Pool 而不是直接读磁盘，是为了让未落盘的目录更新也能被看到。
         meta = self._bp.fetch_page(0)
         try:
-            root = meta.get_u32(META_OFF_CATALOG_ROOT)
-            next_page_id = meta.get_u32(8)
+            with meta.latch:
+                root = meta.get_u32(META_OFF_CATALOG_ROOT)
+                next_page_id = meta.get_u32(8)
         finally:
             self._bp.unpin(0)
 
@@ -53,13 +54,14 @@ class CatalogStore:
         while page_id != INVALID_PAGE_ID:
             page = self._bp.fetch_page(page_id)
             try:
-                if page.page_type != PageType.CATALOG:
-                    raise CatalogError(
-                        f"页 {page_id} 不是目录页（类型 {page.page_type}）",
-                        hint="数据文件可能已损坏",
-                    )
-                parts.append(bytes(page.buf[32:PAGE_SIZE]))
-                nxt = page.next_page
+                with page.latch:
+                    if page.page_type != PageType.CATALOG:
+                        raise CatalogError(
+                            f"页 {page_id} 不是目录页（类型 {page.page_type}）",
+                            hint="数据文件可能已损坏",
+                        )
+                    parts.append(bytes(page.buf[32:PAGE_SIZE]))
+                    nxt = page.next_page
             finally:
                 self._bp.unpin(page_id)
             page_id = nxt
@@ -95,25 +97,31 @@ class CatalogStore:
             pages.append(page)
         try:
             for i, (page, chunk) in enumerate(zip(pages, chunks)):
-                page.buf[32 : 32 + len(chunk)] = chunk
-                if i + 1 < len(pages):
-                    page.next_page = pages[i + 1].page_id
-                self._bp.log_page_update(
-                    txn.xid, page, 0, bytes(PAGE_SIZE), bytes(page.buf)
-                )
-                self._bp.mark_dirty(page)
+                # 目录页一旦把根指针指过来就会被读者看到；整页内容 + 页头
+                # 链接 + 记日志必须在页 latch 内完成，否则读者可能拼到半页。
+                with page.latch:
+                    page.buf[32 : 32 + len(chunk)] = chunk
+                    if i + 1 < len(pages):
+                        page.next_page = pages[i + 1].page_id
+                    self._bp.log_page_update(
+                        txn.xid, page, 0, bytes(PAGE_SIZE), bytes(page.buf)
+                    )
+                    self._bp.mark_dirty(page)
 
             # 先把根页号写进元数据页（同一个事务、同一条 WAL）
             meta = self._bp.fetch_page(0)
             try:
-                old = bytes(meta.buf[META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4])
-                old_root = struct.unpack("<I", old)[0]
-                new = struct.pack("<I", pages[0].page_id)
-                self._bp.log_page_update(
-                    txn.xid, meta, META_OFF_CATALOG_ROOT, old, new
-                )
-                meta.buf[META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4] = new
-                self._bp.mark_dirty(meta)
+                with meta.latch:
+                    old = bytes(
+                        meta.buf[META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4]
+                    )
+                    old_root = struct.unpack("<I", old)[0]
+                    new = struct.pack("<I", pages[0].page_id)
+                    self._bp.log_page_update(
+                        txn.xid, meta, META_OFF_CATALOG_ROOT, old, new
+                    )
+                    meta.buf[META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4] = new
+                    self._bp.mark_dirty(meta)
             finally:
                 self._bp.unpin(0, dirty=True)
         finally:
@@ -125,22 +133,23 @@ class CatalogStore:
             # 主动指回旧链；否则关闭/重启后目录加载到未提交的新链。
             meta_page = self._bp.fetch_page(0)
             try:
-                current = meta_page.get_u32(META_OFF_CATALOG_ROOT)
-                if current != pages[0].page_id:
-                    return
-                old_bytes = struct.pack("<I", old_root)
-                self._bp.log_page_update(
-                    txn.xid,
-                    meta_page,
-                    META_OFF_CATALOG_ROOT,
-                    struct.pack("<I", current),
-                    old_bytes,
-                    clr=True,
-                )
-                meta_page.buf[
-                    META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4
-                ] = old_bytes
-                self._bp.mark_dirty(meta_page)
+                with meta_page.latch:
+                    current = meta_page.get_u32(META_OFF_CATALOG_ROOT)
+                    if current != pages[0].page_id:
+                        return
+                    old_bytes = struct.pack("<I", old_root)
+                    self._bp.log_page_update(
+                        txn.xid,
+                        meta_page,
+                        META_OFF_CATALOG_ROOT,
+                        struct.pack("<I", current),
+                        old_bytes,
+                        clr=True,
+                    )
+                    meta_page.buf[
+                        META_OFF_CATALOG_ROOT : META_OFF_CATALOG_ROOT + 4
+                    ] = old_bytes
+                    self._bp.mark_dirty(meta_page)
             finally:
                 self._bp.unpin(0, dirty=True)
 
