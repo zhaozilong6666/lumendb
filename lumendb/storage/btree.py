@@ -188,14 +188,17 @@ class BPlusTree:
             self._root_cell.root_page = page_id
 
     def _init_page(self, page: Page, page_type: PageType) -> None:
-        page.buf[:] = bytes(PAGE_SIZE)
-        page.page_type = page_type
-        page.set_u16(2, 0)
-        page.next_page = INVALID_PAGE_ID
-        page.prev_page = INVALID_PAGE_ID
-        page.set_u32(16, page.page_id)
-        page.page_lsn = 0
-        self._bp.mark_dirty(page)
+        # 新页尚未发布，但刷盘线程已经能看见 dirty 标记；初始化必须在页
+        # latch 内整体完成，避免写入只改了一半的空页。
+        with page.latch:
+            page.buf[:] = bytes(PAGE_SIZE)
+            page.page_type = page_type
+            page.set_u16(2, 0)
+            page.next_page = INVALID_PAGE_ID
+            page.prev_page = INVALID_PAGE_ID
+            page.set_u32(16, page.page_id)
+            page.page_lsn = 0
+            self._bp.mark_dirty(page)
 
     def _init_leaf(self, page: Page) -> None:
         self._init_page(page, PageType.BTREE_LEAF)
@@ -602,25 +605,23 @@ class BPlusTree:
         零区也写进 WAL。多条记录仍按 pageLSN 顺序重放，恢复/复制语义
         不变。
         """
-        old = bytes(page.buf)
         newb = bytes(new_buf)
-        if old == newb:
-            return
-        ranges = _diff_ranges(old, newb)
-        if len(ranges) > 32:
-            # 变化过于零碎时退回单区间，避免一条插入产生几十条日志。
-            first = next(
-                i for i, (a, b) in enumerate(zip(old, newb)) if a != b
-            )
-            last = PAGE_SIZE
-            while last > first and old[last - 1] == newb[last - 1]:
-                last -= 1
-            ranges = [(first, last)]
-        # 读旧值 → 写日志 → 写页三步在同一页 latch 内完成（与 HeapFile 的
-        # `_apply_and_log` 同款语义）：页内容的读-改-写必须原子，否则两个写者
-        # 交错时后者的 before image 已含前者的改动，WAL 重放会算错。这是
-        # Step 4 的前半段；分裂/合并的多页原子性仍需 crabbing（见 `_split_leaf`）。
+        # 读旧值 → 算 diff → 写日志 → 写页整段都在页 latch 内：即使调用方
+        # 忘了先 latch，也不会拿一份过期的 before image 记 WAL。
         with page.latch:
+            old = bytes(page.buf)
+            if old == newb:
+                return
+            ranges = _diff_ranges(old, newb)
+            if len(ranges) > 32:
+                # 变化过于零碎时退回单区间，避免一条插入产生几十条日志。
+                first = next(
+                    i for i, (a, b) in enumerate(zip(old, newb)) if a != b
+                )
+                last = PAGE_SIZE
+                while last > first and old[last - 1] == newb[last - 1]:
+                    last -= 1
+                ranges = [(first, last)]
             for first, last in ranges:
                 self._bp.log_page_update(
                     txn.xid, page, first, old[first:last], newb[first:last]

@@ -83,11 +83,13 @@ class HeapFile:
         page = self._bp.new_page(HeapPage)
         # 新页的"初始化"本身必须是一条能重放的日志：否则崩溃恢复后这一页
         # 仍是磁盘上的空页（page_type=FREE），而后续的行插入日志只覆盖了
-        # 页头里的几个计数器，页类型永远补不回来。
-        old_init = bytes(page.buf)
-        page.init_heap(page.page_id)
-        self._bp.log_page_update(txn.xid, page, 0, old_init, bytes(page.buf))
-        self._bp.mark_dirty(page)
+        # 页头里的几个计数器，页类型永远补不回来。初始化与整页镜像日志
+        # 在页 latch 内完成，避免刷盘线程看到只改了一半的页头。
+        with page.latch:
+            old_init = bytes(page.buf)
+            page.init_heap(page.page_id)
+            self._bp.log_page_update(txn.xid, page, 0, old_init, bytes(page.buf))
+            self._bp.mark_dirty(page)
 
         last_id = self.table.last_page
         if last_id == INVALID_PAGE_ID:
@@ -185,15 +187,23 @@ class HeapFile:
     ) -> None:
         """改记录头 flags（+22 处 1 字节），用于把版本标成 ABORTED。"""
         rel = 22
-        base = self._abs_offset(page, slot, rel)
-        old = bytes(page.buf[base : base + 1])
-        self._apply_and_log(txn, page, base, bytes([flags & 0xFF]), old)
+        with page.latch:
+            base = self._abs_offset(page, slot, rel)
+            old = bytes(page.buf[base : base + 1])
+            self._apply_and_log(txn, page, base, bytes([flags & 0xFF]), old)
 
     def _set_xmax(self, txn: Transaction, page: HeapPage, slot: int, xmax: int) -> None:
         """给某个版本打上"被谁删除/更新"的标记（行内 +8 处的 8 字节）。"""
         off = 8
-        old = struct.pack("<Q", _record_u64(page, slot, off))
-        self._apply_and_log(txn, page, self._abs_offset(page, slot, off), struct.pack("<Q", xmax), old)
+        with page.latch:
+            old = struct.pack("<Q", _record_u64(page, slot, off))
+            self._apply_and_log(
+                txn,
+                page,
+                self._abs_offset(page, slot, off),
+                struct.pack("<Q", xmax),
+                old,
+            )
 
     def _abs_offset(self, page: HeapPage, slot: int, rel: int) -> int:
         entry_off = 32 + 4 * slot
@@ -205,10 +215,11 @@ class HeapFile:
     ) -> None:
         """更新根记录的 newest 指针（+30 处 u32 page_id + u16 slot）。"""
         rel_newest = 30
-        base = self._abs_offset(page, slot, rel_newest)
-        old = bytes(page.buf[base : base + 6])
-        new = struct.pack("<IH", newest[0], newest[1])
-        self._apply_and_log(txn, page, base, new, old)
+        with page.latch:
+            base = self._abs_offset(page, slot, rel_newest)
+            old = bytes(page.buf[base : base + 6])
+            new = struct.pack("<IH", newest[0], newest[1])
+            self._apply_and_log(txn, page, base, new, old)
 
     # ------------------------------------------------------------------
     # 读
@@ -218,6 +229,9 @@ class HeapFile:
         raw = page.get_record(slot)
         if raw is None:
             return None
+        return self._decode_raw(raw)
+
+    def _decode_raw(self, raw: bytes) -> DecodedRecord:
         return decode_record(self.table.columns, raw, allow_missing=True)
 
     def _read_rid(self, rid: RID) -> Optional[Tuple[HeapPage, DecodedRecord]]:
@@ -231,11 +245,16 @@ class HeapFile:
             page = self._fetch(page_id)
         except StorageError:
             return None
-        rec = self._decode(page, slot)
-        if rec is None:
+        try:
+            with page.latch:
+                raw = page.get_record(slot)
+        except BaseException:
+            self._release(page)
+            raise
+        if raw is None:
             self._release(page)
             return None
-        return page, rec
+        return page, self._decode_raw(raw)
 
     def _visible(self, txn: Transaction, rec: DecodedRecord, *, ri: bool = False) -> bool:
         h = rec.header
@@ -316,11 +335,22 @@ class HeapFile:
         page_id = self.table.root_page
         while page_id != INVALID_PAGE_ID:
             page = self._fetch(page_id)
-            next_id = page.next_page
             try:
-                for slot in range(page.nslots):
-                    rec = self._decode(page, slot)
-                    if rec is None or not self._visible(txn, rec, ri=ri):
+                # 先把这一页的 (slot, 记录) 在 latch 内整页解码成快照，再在
+                # latch 外做可见性判断与 yield：写者不会把 slot 目录改到一半，
+                # 调用方也不会因为拿着页 latch 做业务逻辑而堵住写者。
+                with page.latch:
+                    next_id = page.next_page
+                    # 只在 latch 内拷贝每条记录的原始字节；解码、可见性判断、
+                    # yield 都放到 latch 外，避免长扫描把写者饿死。
+                    raws = [
+                        page.get_record(slot) for slot in range(page.nslots)
+                    ]
+                for slot, raw in enumerate(raws):
+                    if raw is None:
+                        continue
+                    rec = self._decode_raw(raw)
+                    if not self._visible(txn, rec, ri=ri):
                         continue
                     root = self.resolve_root((page_id, slot), rec.header)
                     yield root, rec.values

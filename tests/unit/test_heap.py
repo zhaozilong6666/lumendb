@@ -8,6 +8,8 @@
 * 跨页之后，扫描仍然连续且不重复。
 """
 
+import threading
+
 import pytest
 
 from lumendb.catalog.schema import Column, TableDef
@@ -158,6 +160,49 @@ class TestCrossPage:
             page_id = prv
 
         assert forward == list(reversed(backward))
+
+
+def test_scan_stays_page_consistent_under_concurrent_updates(env):
+    """扫描一页时写者不能把 slot 目录改到一半：每页在 latch 内整体解码。"""
+    heap, txns, bp, table = env
+    setup = txns.begin()
+    rids = [heap.insert(setup, [i, f"n{i}", 0]) for i in range(40)]
+    txns.commit(setup)
+
+    stop = threading.Event()
+    errors: list[str] = []
+    start = threading.Barrier(6)
+
+    def writer(offset: int) -> None:
+        start.wait(timeout=10)
+        n = 0
+        while not stop.is_set():
+            for rid in rids[offset::4]:
+                txn = txns.begin()
+                heap.update(txn, rid, [rid[1], f"v{n}", n])
+                txns.commit(txn)
+                n += 1
+
+    def reader() -> None:
+        start.wait(timeout=10)
+        while not stop.is_set():
+            txn = txns.begin()
+            rows = list(heap.scan(txn))
+            txns.commit(txn)
+            if len(rows) != 40:
+                errors.append(f"scan 看到 {len(rows)} 行，期望 40")
+
+    workers = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+    workers += [threading.Thread(target=reader) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    import time
+
+    time.sleep(0.25)
+    stop.set()
+    for worker in workers:
+        worker.join(10)
+    assert errors == []
 
 
 class TestUpdateAndSnapshot:
