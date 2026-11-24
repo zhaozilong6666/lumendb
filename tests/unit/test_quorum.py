@@ -1285,6 +1285,45 @@ def test_push_entries_to_peers_advances_a_real_replica(tmp_path):
         primary.close()
 
 
+def test_one_peer_timeout_does_not_starve_later_peers(tmp_path, monkeypatch):
+    """n1 超时后本轮仍要推到 n2；否则一个慢 peer 会永久饿住后面的副本。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    follower_a = Replica.bootstrap(primary, tmp_path / "follower-a")
+    follower_b = Replica.bootstrap(primary, tmp_path / "follower-b")
+    nodes = _cluster(tmp_path, count=3)
+    try:
+        follower_a.attach_quorum(nodes[1])
+        follower_b.attach_quorum(nodes[2])
+        leader.promote()
+        leader.attach_quorum(nodes[0])
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        nodes[0].timeout = 5.0
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+
+        original = QuorumClient.append_entries
+
+        def flaky(host, port, *args, **kwargs):
+            if port == nodes[1].port:
+                raise TimeoutError("injected peer timeout")
+            return original(host, port, *args, **kwargs)
+
+        monkeypatch.setattr(QuorumClient, "append_entries", staticmethod(flaky))
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed.get("n2", 0) > 0
+        assert "n1" not in pushed
+        assert "n1" in leader._push_backoff
+        assert follower_a.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+        assert follower_b.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+    finally:
+        _stop(nodes)
+        leader.db.close()
+        follower_a.db.close()
+        follower_b.db.close()
+        primary.close()
+
+
 def test_push_stops_when_a_peer_reports_a_higher_term(tmp_path):
     primary = _make_primary(tmp_path)
     primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
