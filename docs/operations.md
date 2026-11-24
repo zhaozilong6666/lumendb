@@ -88,7 +88,10 @@ peer 的已知前缀，不会自动截断 leader 的尾巴。长期落后仍应�
 `rebase_from_server` 追上。推送成功后 peer 的新 `match_lsn` 会立刻计入
 `quorum_commit_lsn`（不用等下一轮心跳），同步复制的屏障随之提前结束；
 `quorum.status()` 里的 `peer_matches` / `peer_match_terms` 可以诊断每个
-peer 的复制滞后。
+peer 的复制滞后。单个 peer 的 socket 超时或断连（`OSError` /
+`StorageError`）按该 peer 的失败处理：写进 `last_push_rejections`、退避
+2 秒、继续推后面的 peer，不会中断整轮，也不会把裸 `TimeoutError` 抛给
+直接调用方。此时该 peer 不在 `pushed` 里，下一轮心跳会自动重试。
 
 `promote_with_quorum(heartbeat_interval=...)` 启动的 `HeartbeatLoop` 会自动
 把 `push_entries_to_peers` 挂在每轮心跳之后；每轮最多连续推

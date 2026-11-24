@@ -880,21 +880,37 @@ class Replica:
                 continue
             entries = [_record_to_json(record) for record in records]
             entry_terms = [node.state.term_at(record.lsn) for record in records]
-            response = QuorumClient.append_entries(
-                host,
-                port,
-                int(node.state.term),
-                node.node_id,
-                prev_lsn,
-                prev_term,
-                entries,
-                commit_lsn=int(node.quorum_commit_lsn),
-                entry_terms=entry_terms,
-                rebuild_host=rebuild_from[0] if rebuild_from else None,
-                rebuild_port=rebuild_from[1] if rebuild_from else None,
-                timeout=node.timeout,
-                token=node.token,
-            )
+            try:
+                response = QuorumClient.append_entries(
+                    host,
+                    port,
+                    int(node.state.term),
+                    node.node_id,
+                    prev_lsn,
+                    prev_term,
+                    entries,
+                    commit_lsn=int(node.quorum_commit_lsn),
+                    entry_terms=entry_terms,
+                    rebuild_host=rebuild_from[0] if rebuild_from else None,
+                    rebuild_port=rebuild_from[1] if rebuild_from else None,
+                    timeout=node.timeout,
+                    token=node.token,
+                )
+            except (OSError, StorageError) as exc:
+                # 单个 peer 超时/断连不能中断整轮推送：否则它后面的 peer
+                # 永远轮不到，且直接调用方（非心跳线程）会收到裸 TimeoutError。
+                # 当作一次拒绝记下来并退避，下一轮再试。
+                reason = f"append_entries 传输失败: {type(exc).__name__}: {exc}"
+                if self.last_push_rejections.get(peer_id) != reason:
+                    _log.warning(
+                        "append_entries 发往 %s 失败: %s (prev_lsn=%s)",
+                        peer_id,
+                        exc,
+                        prev_lsn,
+                    )
+                self.last_push_rejections[peer_id] = reason
+                self._push_backoff[peer_id] = time.monotonic() + 2.0
+                continue
             if max(0, int(response.get("term", 0))) > int(node.state.term):
                 # 有 peer 已进入更高任期：本节点已经过期，不再把同一批
                 # 旧任期的条目推给其他 peer；任期推进交给下一轮心跳。

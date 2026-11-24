@@ -1457,6 +1457,9 @@ def test_push_backoff_skips_peer_without_applier_and_recovers(tmp_path):
         # match_lsn，leader 需要再收一轮心跳刷新 last_matches。
         follower.attach_quorum(nodes[1])
         leader._push_backoff["n1"] = 0
+        # Windows CI 慢盘上 follower apply 一批可能超过默认 1s；这里验的是
+        # “修复后退避能恢复”，不是传输延迟，给客户端留足超时。
+        nodes[0].timeout = 5.0
         nodes[0].heartbeat_round(leader.db.wal.last_lsn)
         pushed = leader.push_entries_to_peers(nodes[0])
         assert pushed.get("n1", 0) > 0
@@ -1467,4 +1470,30 @@ def test_push_backoff_skips_peer_without_applier_and_recovers(tmp_path):
         _stop(nodes)
         leader.db.close()
         follower.db.close()
+        primary.close()
+
+
+def test_push_entries_transport_timeout_backs_off_instead_of_raising(tmp_path, monkeypatch):
+    """单个 peer 超时只记拒绝并退避，不能把整轮推送和调用方一起拖垮。"""
+    primary = _make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    leader = Replica.bootstrap(primary, tmp_path / "leader")
+    nodes = _cluster(tmp_path, count=2)
+    try:
+        leader.promote()
+        leader.attach_quorum(nodes[0])
+        leader.execute_one("INSERT INTO t VALUES (1, 'one')")
+        nodes[0].heartbeat_round(leader.db.wal.last_lsn)
+
+        def timeout(*_args, **_kwargs):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(QuorumClient, "append_entries", timeout)
+        pushed = leader.push_entries_to_peers(nodes[0])
+        assert pushed == {}
+        assert "传输失败" in leader.last_push_rejections.get("n1", "")
+        assert "n1" in leader._push_backoff
+    finally:
+        _stop(nodes)
+        leader.db.close()
         primary.close()
