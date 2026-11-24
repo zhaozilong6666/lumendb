@@ -17,6 +17,7 @@ import pytest
 from lumendb.engine.database import Database
 from lumendb.errors import DuplicateKeyError, NotSupportedError, TransactionError
 from lumendb.server.pgwire import PGWireServer, Session
+from lumendb.storage.heap import HeapFile
 from lumendb.sql.parser import parse_sql
 
 
@@ -1067,3 +1068,32 @@ def test_close_still_closes_handles_when_current_txn_undo_fails(tmp_path):
         assert db._closed is True
     # 再关一次必须幂等，不重复释放
     db.close()
+
+
+def test_online_vacuum_reclaims_indexed_dead_root_without_blocking_reinsert(tmp_path):
+    """整条死链连根回收后，陈旧索引项回堆为空，同主键重插不能误报重复。"""
+    db = Database(tmp_path / "vacuum_dead_root_index", concurrent_dml=True)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (1, 10), (2, 20)")
+    db.execute_one("DELETE FROM t WHERE id = 2")
+    reader = Session(database=db)
+    server = PGWireServer(db)
+    try:
+        _run(server, reader, "BEGIN")
+        vac = db.txns.begin()
+        table = db.catalog.get_table("t")
+        kept, dead, _pages = HeapFile(db.bp, table, db.txns).vacuum_online(
+            vac, db.txns.active_transactions()
+        )
+        db.txns.commit(vac)
+        assert (kept, dead) == (1, 1)
+        _run(server, reader, "COMMIT")
+
+        writer = Session(database=db)
+        _run(server, writer, "INSERT INTO t VALUES (2, 20)")
+        assert _rows(server, writer, "SELECT id, v FROM t ORDER BY id") == [
+            (1, 10),
+            (2, 20),
+        ]
+    finally:
+        db.close()

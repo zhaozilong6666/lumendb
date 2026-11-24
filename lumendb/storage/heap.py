@@ -287,8 +287,21 @@ class HeapFile:
     def get(
         self, txn: Transaction, root_rid: RID, *, ri: bool = False
     ) -> Optional[list[Any]]:
-        """按根 RID 取当前快照下可见的那一版。索引查找最终都会走到这里。"""
-        newest = self.newest_rid(root_rid)
+        """按根 RID 取当前快照下可见的那一版。索引查找最终都会走到这里。
+
+        根记录可能已经被在线 VACUUM 回收（整条版本链对所有快照都不可见），
+        而索引项仍是陈旧的 RID。这里把"根不存在"当成行不存在返回 ``None``，
+        与 ``find_version`` 的半途缺失语义一致；真正的页损坏仍由
+        ``_read_rid`` 抛 ``CorruptedPageError``，不会被吞掉。
+        """
+        got = self._read_rid(root_rid)
+        if got is None:
+            return None
+        page, rec = got
+        try:
+            newest = rec.header.newest_rid or root_rid
+        finally:
+            self._release(page)
         found = self.find_version(txn, newest, ri=ri)
         return found[1].values if found else None
 
@@ -632,9 +645,6 @@ class HeapFile:
         for rid, header in headers.items():
             if not header.is_root:
                 continue
-            # 根 RID 是索引入口：即使整行对所有人都不可见也保留，
-            # 否则索引会指向一个不存在的槽位。
-            keep.add(rid)
             cur = header.newest_rid or rid
             chain: list[RID] = []
             seen: set[RID] = set()
@@ -643,12 +653,19 @@ class HeapFile:
                 seen.add(cur)
                 cur = headers[cur].prev_rid
             if not chain:
+                # 版本链断在根上：保守保留，避免把可能仍被索引引用的槽位删掉。
+                keep.add(rid)
                 continue
-            keep.add(chain[0])
-            deepest = 0
+            deepest = -1
             for i, version_rid in enumerate(chain):
                 if visible(headers[version_rid]):
                     deepest = i
+            if deepest < 0:
+                # 整条链对所有快照都不可见：行已经彻底死亡，根记录也不再
+                # 是任何活版本的入口。索引里的陈旧 RID 由 heap.get() 当成
+                # 缺失行返回 None，扫描/唯一性检查都会跳过，可以连根回收。
+                continue
+            keep.add(rid)
             keep.update(chain[: deepest + 1])
 
         # 可见但不在任何根链上的孤儿版本（历史遗留）也保留，避免在线

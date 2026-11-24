@@ -360,7 +360,7 @@ Step 4 的前置项在这条路径上落地：
   读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（39 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（40 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
@@ -375,13 +375,15 @@ Step 4 的前置项在这条路径上落地：
   `DO UPDATE` 的新值被撤销、行/目录 undo 抛错时 ROLLBACK TO 返回错误而不是
   静默继续、ABORT 的页/目录 undo 失败也抛错但仍落 ABORTED 并释放锁、批量
   ABORT 中一个事务失败不影响其余事务收尾、close 遇到当前事务 undo 失败仍
-  继续关闭句柄且可重复 close）；
+  继续关闭句柄且可重复 close、在线 VACUUM 连根回收死链后陈旧索引项回堆为空且
+  同主键重插不误报重复）；
 - `tests/unit/test_concurrency.py` 与 `tests/integration/test_cross_layer_invariants.py`
   的 `env` fixture 已参数化为默认/并发两模式，同一批写写冲突、唯一键回滚、外键
   并发、延迟约束、DDL 串行化、RI 可见性用例在同一个 pytest 进程里各跑两遍；
   CI 仍保留 Linux 3.12 的 `LUMEN_CONCURRENT_DML=1` 全量任务作为整库兜底；
 - `tests/unit/test_heap.py::TestLogicalSavepointUndo`（2 例：INSERT/UPDATE/DELETE
-  逐条撤销、嵌套保存点按深度逆序撤销）；
+  逐条撤销、嵌套保存点按深度逆序撤销）；`test_vacuum_online_reclaims_fully_dead_root_records`
+  验证无快照需要时整条死链连根回收；
 - `tests/crash/test_concurrent_dml_recovery.py`（崩溃后 loser 的 `no_undo` 记录不参与
   undo，已提交行完整、VACUUM 回收逻辑垃圾）；
 - `tests/crash/test_logical_savepoint_recovery.py`（4 例：逻辑保存点回滚后 COMMIT +
@@ -398,7 +400,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1476 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
+  并发各 **1478 passed**，门禁脚本 3 轮 PASS（10 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -409,13 +411,14 @@ Step 4 的前置项在这条路径上落地：
   `FLAG_ABORTED` 留待后续回收。
 - `VACUUM` 不再因为活跃事务失败：入口先等最多 5s；等不到空窗口就转“保 RID 的
   在线回收”（`HeapFile.vacuum_online`）。在线模式按 VACUUM 事务与所有活跃事务的
-  快照逐版本判可见性，保留根记录、链头到最老可见版本的整条前缀链；只删对所有
-  快照都不可见的版本，槽位不重排、索引不重建。持有 DDL 目录锁/物理 undo 的活跃
+  快照逐版本判可见性，保留仍有可见版本的行的根记录、链头到最老可见版本的整条前缀链；
+  整条链对所有快照都不可见的行连根记录一起回收，只删对所有快照都不可见的
+  版本，槽位不重排、索引不重建。持有 DDL 目录锁/物理 undo 的活跃
   事务仍会让 VACUUM 按原门禁报错——DDL abort 的页原像不能和在线整页日志交错。
   内存模型只保留每个版本的 38 字节 `RecordHeader`（用 `decode_header` 直读，
   不物化列值），并对物理版本数设 250,000 的硬上限；超限直接失败关闭、提示改用
   离线 VACUUM，避免“在线”把大表整表解码进内存。
-  剩余边界是根记录/空洞槽位不回收，文件不缩小；离线模式（无活跃事务）仍重排
+  剩余边界是 tombstone 槽位目录不回收、文件不缩小；离线模式（无活跃事务）仍重排
   RID 并重建索引。
 
 **实测（2026-11-21，Windows / Python 3.13，单机）**
@@ -892,7 +895,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1476 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1478 passed；门禁
   脚本 3 轮 PASS（10 项，含保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
@@ -910,15 +913,18 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
   堆 INSERT/UPDATE/DELETE 改为逐条 undo，保存点事务存续期间其它写者可提交；
   `--physical-savepoints` / `logical_savepoints=False` 退回排空在途语句后独占写者锁。
   它是 DML-only：保存点后一旦有行 undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；
-  尚未有行 DML 时 DDL/TRUNCATE 会先升级成物理保存点。剩余边界是撤销的插入只标
-  `FLAG_ABORTED`、不物理回收根记录；这不影响正确性，但空间会留到离线 VACUUM。
+  尚未有行 DML 时 DDL/TRUNCATE 会先升级成物理保存点。撤销的插入先标
+  `FLAG_ABORTED`；若后续没有快照还能看见它，在线 VACUUM 会把整条死链连根回收，
+  否则留到离线 VACUUM。
 - **VACUUM：在线 MVP 过关。** 活跃事务存在时不再报错：等 5s 后自动转保 RID
   在线回收，保留所有活跃快照需要的版本与根 RID，不重建索引。剩余是空间回收
-  效率：根记录和空洞槽位不回收、文件不缩小；离线模式仍可做完整重排。
+  效率：整条死链的根记录已能回收，但 tombstone 槽位目录不回收、文件不缩小；
+  离线模式仍可做完整重排。
 - **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务
   才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
 
-所以下一步优先级是：把逻辑保存点撤销插入的空间回收补完（根记录/空洞槽位），
+所以下一步优先级是：补完 tombstone 槽位目录与文件收缩（整条死链的根记录
+已能在线回收），
 再推进 `concurrent_dml` 自身切默认的判据 → 自动提交 UPDATE 的隔离级别说明；VACUUM 在线
 回收与 DDL/TRUNCATE 升级已不再作为硬阻塞项。
 
@@ -932,7 +938,8 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 ## 3. 已知的取舍（写在这里，避免下一轮再讨论一遍）
 
 - **`VACUUM` 有离线/在线两模式**：没有活跃事务时重排 RID、重建索引；有活跃
-  事务时走保 RID 在线回收，只删对所有人不可见的版本，根记录与空洞槽位不回收。
+  事务时走保 RID 在线回收，只删对所有人不可见的版本；整条链都不可见的行连根记录回收，但 tombstone
+  槽位目录与文件大小不回收。
 - **witness 节点不参与 durability**：不存数据的投票节点**不计入**"多数派真正持有"
   的提交水位。水位由 `match_lsn`（真正 apply 到）算出，`last_lsn`（听到过）只
   用于投票安全性比较；心跳与投票响应都带两个字段、`campaign()` 与 `heartbeat_round`

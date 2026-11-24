@@ -573,3 +573,26 @@ class TestLogicalSavepointUndo:
         reader = txns.begin()
         assert sorted(v[0] for _, v in heap.scan(reader)) == [1, 2]
         txns.commit(reader)
+
+
+def test_vacuum_online_reclaims_fully_dead_root_records(env):
+    """没有活跃快照需要时，整条版本链都不可见的行可以连根记录一起回收。"""
+    heap, txns, bp, table = env
+    txn = txns.begin()
+    r1 = heap.insert(txn, [1, "a", 10])
+    r2 = heap.insert(txn, [2, "b", 20])
+    txns.commit(txn)
+
+    txn = txns.begin()
+    heap.delete(txn, r1)
+    heap.delete(txn, r2)
+    txns.commit(txn)
+
+    vac = txns.begin()
+    kept, dead, pages = heap.vacuum_online(vac)
+    assert (kept, dead, pages) == (0, 2, 1)
+    assert list(heap.scan(vac)) == []
+    # 槽位不重排，但根记录体已经没了；再插入同主键不会撞陈旧根。
+    rid = heap.insert(vac, [1, "a-new", 11])
+    assert heap.get(vac, rid) == [1, "a-new", 11]
+    txns.commit(vac)
