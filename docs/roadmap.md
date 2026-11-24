@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1480 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1483 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。
 - 质量门禁：`python scripts/gates.py` 跑全量测试、变异清单有效性、账本 drift
   与账本证据校验。证据校验用只读的 `verify --check`：`failed` 才红；
@@ -357,12 +357,12 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 `--physical-savepoints` 退回独占写者锁。逻辑路径是 DML-only，保存点后一旦有行
 undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCATE 先升级成
 物理保存点。撤销的插入只标
-`FLAG_ABORTED`、根记录不物理回收。`concurrent_dml` 仍保持
-opt-in，默认模式尚未切换，卡在撤销插入的空间回收（根记录/空洞槽位）、`VACUUM`
-在线模式只保 RID 不回收
-根记录/空洞槽位（有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留
-38 字节记录头，并对物理版本数设 250,000 硬上限，超限失败关闭）、自动提交 UPDATE
-的 READ COMMITTED 语义需发布说明。并发全量 1480 passed 与门禁脚本 3 轮
+`FLAG_ABORTED`。`concurrent_dml` 仍保持 opt-in，默认模式尚未切换，卡在
+tombstone 槽位目录不回收/文件不缩小（整条死链的根记录已能在
+线回收），以及 `VACUUM` 在线模式只保 RID、不重排（有活跃事务时等 5s 后自动转
+在线，不再报错；版本索引只保留 38 字节记录头，物理版本数默认上限 250,000，
+可由 Database/CLI 配置，超限失败关闭）。自动提交 UPDATE 的 READ COMMITTED
+色彩与显式事务的快照隔离已写成契约并由测试钉住。并发全量 1483 passed 与门禁脚本 3 轮
 （11 项，含混合 INSERT/UPDATE/DELETE 与保存点、VACUUM 探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动

@@ -14,7 +14,6 @@ from lumendb.catalog.schema import Column, TableDef
 from lumendb.datatypes import DataType, TypeSpec
 from lumendb.errors import RowTooLargeError, StorageError, TransactionAbortedError
 from lumendb.storage.bufferpool import BufferPoolManager
-from lumendb.storage import heap as heap_module
 from lumendb.storage.heap import HeapFile
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.txn import TransactionManager
@@ -478,7 +477,7 @@ class TestVacuum:
         txns.commit(vac)
 
     def test_vacuum_online_refuses_to_build_version_index_above_cap(
-        self, env, monkeypatch
+        self, env
     ):
         """超过版本上限时必须失败关闭，不能先删掉一部分再报错。"""
         heap, txns, bp, table = env
@@ -490,10 +489,9 @@ class TestVacuum:
             heap.update(txn, rid, [1, "a", age])
             txns.commit(txn)
 
-        monkeypatch.setattr(heap_module, "VACUUM_ONLINE_MAX_VERSIONS", 2)
         vac = txns.begin()
         with pytest.raises(StorageError) as exc:
-            heap.vacuum_online(vac)
+            heap.vacuum_online(vac, max_versions=2)
         assert "版本数超过上限" in str(exc.value)
         txns.abort(vac)
 

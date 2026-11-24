@@ -402,7 +402,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1480 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1483 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -418,7 +418,9 @@ Step 4 的前置项在这条路径上落地：
   版本，槽位不重排、索引不重建。持有 DDL 目录锁/物理 undo 的活跃
   事务仍会让 VACUUM 按原门禁报错——DDL abort 的页原像不能和在线整页日志交错。
   内存模型只保留每个版本的 38 字节 `RecordHeader`（用 `decode_header` 直读，
-  不物化列值），并对物理版本数设 250,000 的硬上限；超限直接失败关闭、提示改用
+  不物化列值），并对物理版本数设上限（默认 250,000，可由
+  `Database(vacuum_online_max_versions=...)` 或 CLI
+  `--vacuum-online-max-versions` 调整）；超限直接失败关闭、提示改用
   离线 VACUUM，避免“在线”把大表整表解码进内存。
   剩余边界是 tombstone 槽位目录不回收、文件不缩小；离线模式（无活跃事务）仍重排
   RID 并重建索引。
@@ -890,14 +892,29 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 `9f2f64d`（CLI 开关测试）run 45119005136 四矩阵全绿。
 `7f7f5e9`（DDL 活跃写/旧快照门禁 + 保存点晚升级）的 run 45166209530 四矩阵全绿。
 
-**边界写清楚**：这条路径让并发 UPDATE 的目标选择与 SET 求值带上了 READ COMMITTED
-色彩（能看到语句开始后别的自动提交事务写下的行），不是严格的可重复快照；显式事务
-仍是快照隔离 + 冲突即 40001。`concurrent_dml` 因此仍保持 opt-in，不切默认：下一步
-要先把显式事务的等待/重读语义与保存点、VACUUM 水位一起定下来。
+**隔离级别契约（2026-11-24 固化）**：
+
+- **默认模式（`concurrent_dml=False`）**：单写者 + `_write_lock` 串行所有写语句，
+  事务之间没有写冲突；读仍是语句快照。它是"事实上的串行写 + 快照读"，
+  不承诺 PostgreSQL 的 READ COMMITTED 语义。
+- **`concurrent_dml=True` 的自动提交 UPDATE**：行锁等待后重读最新已提交版本
+  （`txn.statement_scoped` → `latest=True`），所以 `SET v=v+1` 不会覆盖别人
+  刚提交的增量；这是 READ COMMITTED 色彩，不是可重复快照。
+- **`concurrent_dml=True` 的显式事务**：事务快照固定在 `BEGIN`，UPDATE 命中
+  并发修改仍 first-updater-wins，返回可重试的 `40001`；即快照隔离，不是
+  READ COMMITTED。显式事务里的 SELECT 也不会看到 `BEGIN` 后别人提交的行。
+- **保存点/VACUUM**：保存点撤自己的行 undo；在线 VACUUM 按所有活跃快照的
+  可见性保留版本，不改变上述隔离级别。
+
+这三条由 `test_autocommit_update_waits_for_holder_then_rereads_latest` 与
+`test_explicit_transaction_update_stays_snapshot_isolation` 钉住。`concurrent_dml`
+仍保持 opt-in，不切默认：不是正确性没底，而是默认模式在单写者/短事务吞吐上
+更好，且显式事务的快照隔离语义与 PostgreSQL READ COMMITTED 不同，静默切换会
+改变用户可见行为。
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1480 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1483 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
@@ -922,8 +939,9 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
   在线回收，保留所有活跃快照需要的版本与根 RID，不重建索引。剩余是空间回收
   效率：整条死链的根记录已能回收，但 tombstone 槽位目录不回收、文件不缩小；
   离线模式仍可做完整重排。
-- **隔离级别：需要发布说明。** 自动提交 UPDATE 是 READ COMMITTED 色彩，显式事务
-  才是快照隔离；这跟“默认模式”原来的单写者语义不同，不能静默切换。
+- **隔离级别：说明已固化（2026-11-24）。** 自动提交 UPDATE 是 READ COMMITTED
+  色彩，显式事务仍是快照隔离 + `40001`；测试已钉住两条路径。是否切换仍是
+  产品决策，不是因为语义没写清。
 
 所以下一步优先级是：补完 tombstone 槽位目录与文件收缩（整条死链的根记录
 已能在线回收），

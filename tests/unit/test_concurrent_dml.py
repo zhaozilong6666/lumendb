@@ -10,12 +10,18 @@
 from __future__ import annotations
 
 import threading
+import time
 import traceback
 
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.errors import DuplicateKeyError, NotSupportedError, TransactionError
+from lumendb.errors import (
+    DuplicateKeyError,
+    NotSupportedError,
+    SerializationError,
+    TransactionError,
+)
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.storage.heap import HeapFile
 from lumendb.sql.parser import parse_sql
@@ -381,6 +387,64 @@ def test_hot_row_increments_serialize_without_lost_updates(env):
     assert _rows(
         server, Session(database=db), "SELECT v FROM t WHERE id = 999999"
     ) == [(threads * per_thread,)]
+
+
+def test_autocommit_update_waits_for_holder_then_rereads_latest(env):
+    """自动提交 UPDATE 在行锁上等待后重读最新已提交版本，不能拿旧快照覆盖。"""
+    db, server = env
+    _run(server, Session(database=db), "INSERT INTO t VALUES (1, 0, 'rc')")
+    holder = Session(database=db)
+    _run(server, holder, "BEGIN")
+    _run(server, holder, "UPDATE t SET v = v + 1 WHERE id = 1")
+
+    started = threading.Event()
+    errors: list[str] = []
+
+    def waiter():
+        started.set()
+        try:
+            _run(server, Session(database=db), "UPDATE t SET v = v + 1 WHERE id = 1")
+        except Exception:
+            errors.append(traceback.format_exc())
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert started.wait(5)
+    # 让 waiter 先到行锁上排队，再提交 holder；若 waiter 没等待就会提前失败。
+    time.sleep(0.3)
+    _run(server, holder, "COMMIT")
+    thread.join(5)
+    assert not thread.is_alive()
+    assert errors == [], errors[0]
+    assert _rows(server, Session(database=db), "SELECT v FROM t WHERE id = 1") == [
+        (2,)
+    ]
+
+
+def test_explicit_transaction_update_stays_snapshot_isolation(env):
+    """显式事务不享受自动提交 UPDATE 的"锁后重读最新"：旧快照写同一行应 40001。
+
+    自动提交 UPDATE 是 READ COMMITTED 色彩（锁后重读最新已提交版本）；
+    显式事务仍是快照隔离 + first-updater-wins。这条差异必须由测试钉住，
+    否则以后有人把 ``latest`` 无脑设成 ``self._concurrent_dml`` 会静默改变
+    显式事务的隔离级别。
+    """
+    db, server = env
+    _run(server, Session(database=db), "INSERT INTO t VALUES (1, 0, 'iso')")
+    a = Session(database=db)
+    b = Session(database=db)
+    _run(server, a, "BEGIN")
+    _run(server, a, "UPDATE t SET v = v + 1 WHERE id = 1")
+    _run(server, b, "BEGIN")
+    # b 的快照仍停在 a 修改前：SELECT 看到 0，UPDATE 必须拒绝而不是覆盖 a。
+    assert _rows(server, b, "SELECT v FROM t WHERE id = 1") == [(0,)]
+    with pytest.raises(SerializationError):
+        _run(server, b, "UPDATE t SET v = v + 1 WHERE id = 1")
+    _run(server, b, "ROLLBACK")
+    _run(server, a, "COMMIT")
+    assert _rows(server, Session(database=db), "SELECT v FROM t WHERE id = 1") == [
+        (1,)
+    ]
 
 
 def test_concurrent_dml_defaults_to_logical_savepoints(tmp_path):

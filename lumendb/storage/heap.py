@@ -581,6 +581,8 @@ class HeapFile:
         self,
         txn: Transaction,
         active_txns: Sequence[Transaction] = (),
+        *,
+        max_versions: int = VACUUM_ONLINE_MAX_VERSIONS,
     ) -> tuple[int, int, int]:
         """保 RID 的在线回收：不重排槽位、不重建索引，保留活跃快照要的版本。
 
@@ -596,6 +598,9 @@ class HeapFile:
         """
         txn.require_active()
         txn.wrote = True
+        cap = int(max_versions)
+        if cap <= 0:
+            raise ValueError("max_versions 必须是正整数")
 
         # 只保留每个版本的 RecordHeader，不保留 DecodedRecord 里的值。
         # 在线 VACUUM 的决策只需要 xmin/xmax/flags 与版本链指针；把整行
@@ -612,12 +617,12 @@ class HeapFile:
                     raw = page.get_record(slot)
                     if raw is None:
                         continue
-                    if len(headers) >= VACUUM_ONLINE_MAX_VERSIONS:
+                    if len(headers) >= cap:
                         raise StorageError(
                             "在线 VACUUM 的版本数超过上限",
                             detail=(
                                 f"表 {self.table.name} 超过 "
-                                f"{VACUUM_ONLINE_MAX_VERSIONS} 个物理版本；"
+                                f"{cap} 个物理版本；"
                                 "在线模式只保留 header 元数据，但仍需一次性"
                                 "建立版本链索引"
                             ),

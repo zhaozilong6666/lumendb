@@ -56,6 +56,9 @@ def _open_database(args: argparse.Namespace) -> Database:
         node_id=getattr(args, "node_id", "primary"),
         concurrent_dml=bool(getattr(args, "concurrent_dml", False)),
         logical_savepoints=bool(getattr(args, "logical_savepoints", False)),
+        vacuum_online_max_versions=int(
+            getattr(args, "vacuum_online_max_versions", 250_000)
+        ),
     )
 
 
@@ -240,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
             dest="logical_savepoints",
             action="store_false",
             help="关闭逻辑保存点，回到独占写者锁的物理页原像路径",
+        )
+        p.add_argument(
+            "--vacuum-online-max-versions",
+            type=int,
+            default=250_000,
+            help="在线 VACUUM 允许的物理版本上限（默认 250000，超限失败关闭）",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

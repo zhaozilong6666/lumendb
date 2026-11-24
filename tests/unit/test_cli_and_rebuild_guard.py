@@ -43,6 +43,26 @@ class TestCliFence:
             args = _args(command[0], *command[1:], "--fence-path", str(tmp_path / "f.json"))
             assert args.fence_path == tmp_path / "f.json"
 
+    def test_vacuum_online_cap_reaches_database_and_executors(self, tmp_path):
+        """在线 VACUUM 版本上限可从 CLI/构造参数配置，执行器必须拿到。"""
+        args = _args(
+            "exec",
+            "--path", str(tmp_path / "db-cap"),
+            "--concurrent-dml",
+            "--vacuum-online-max-versions", "2",
+            "SELECT 1",
+        )
+        assert args.vacuum_online_max_versions == 2
+        db = _open_database(args)
+        try:
+            assert db._vacuum_online_max_versions == 2
+            assert db.executor._vacuum_online_max_versions == 2
+            assert db.make_executor()._vacuum_online_max_versions == 2
+        finally:
+            db.close()
+        with pytest.raises(ValueError, match="正整数"):
+            Database(tmp_path / "db-bad", vacuum_online_max_versions=0)
+
     def test_concurrent_dml_switch_reaches_the_database(self, tmp_path):
         """CLI 也能开并发 DML，不用只靠环境变量。"""
         args = _args(

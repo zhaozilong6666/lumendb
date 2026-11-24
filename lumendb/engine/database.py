@@ -168,10 +168,17 @@ class Database:
         node_id: str = "primary",
         concurrent_dml: bool = False,
         logical_savepoints: bool = True,
+        vacuum_online_max_versions: int = 250_000,
     ) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        version_cap = int(vacuum_online_max_versions)
+        if version_cap <= 0:
+            raise ValueError("vacuum_online_max_versions 必须是正整数")
+        #: 在线 VACUUM 一次性建立版本链索引的物理版本上限。默认 250,000；
+        #: 超限失败关闭，提示改用离线 VACUUM。产品可按内存预算调低/调高。
+        self._vacuum_online_max_versions = version_cap
         #: 写并发模式：DML 不拿 ``_write_lock``，改由行/键锁 + 页 latch +
         #: ``read_guard`` 与 DDL/close 互斥。默认关闭；环境变量可让全套测试
         #: 用同一条路径跑一遍（CI 门禁用）。
@@ -284,6 +291,7 @@ class Database:
             self.locks,
             read_only=self._read_only,
             concurrent_dml=self._concurrent_dml,
+            vacuum_online_max_versions=self._vacuum_online_max_versions,
         )
 
         self._txn: Optional[Transaction] = None
@@ -320,6 +328,7 @@ class Database:
             self.locks,
             read_only=self._read_only,
             concurrent_dml=self._concurrent_dml,
+            vacuum_online_max_versions=self._vacuum_online_max_versions,
         )
 
     def assert_writable(self) -> None:

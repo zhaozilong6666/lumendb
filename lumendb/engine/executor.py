@@ -75,7 +75,7 @@ from ..sql.ast import (
 )
 from ..storage.btree import BPlusTree, KeyCodec
 from ..storage.bufferpool import BufferPoolManager
-from ..storage.heap import HeapFile
+from ..storage.heap import HeapFile, VACUUM_ONLINE_MAX_VERSIONS
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.record import RID
 from ..storage.recovery import RecoveryManager
@@ -182,6 +182,7 @@ class Executor:
         locks: Optional[LockManager] = None,
         read_only: bool = False,
         concurrent_dml: bool = False,
+        vacuum_online_max_versions: int = VACUUM_ONLINE_MAX_VERSIONS,
     ) -> None:
         self._bp = buffer_pool
         self._catalog = catalog
@@ -190,6 +191,8 @@ class Executor:
         self._locks = locks if locks is not None else LockManager()
         #: 写并发模式：DML 不拿数据库写者锁，由行/键锁 + 页 latch 保护。
         self._concurrent_dml = concurrent_dml
+        #: 在线 VACUUM 的物理版本上限；由 Database 下传，便于按内存预算配置。
+        self._vacuum_online_max_versions = max(1, int(vacuum_online_max_versions))
         #: 当前语句是否是 DDL/schema 变更（目录锁要持有到事务结束、页回滚
         #: 必须走物理路径）。run() 每条语句都重设。
         self._schema_statement = False
@@ -3154,7 +3157,11 @@ class Executor:
             self._snapshot_table_state(table, txn)
             heap = HeapFile(self._bp, table, self._txns)
             if online:
-                k, d, p = heap.vacuum_online(txn, active_others)
+                k, d, p = heap.vacuum_online(
+                    txn,
+                    active_others,
+                    max_versions=self._vacuum_online_max_versions,
+                )
                 online_tables += 1
             else:
                 k, d, p = heap.vacuum(txn)
