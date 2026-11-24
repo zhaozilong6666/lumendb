@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from lumendb.engine.database import _FairRLock
 from lumendb.errors import DeadlockError
 from lumendb.storage.lock import LockManager, LockMode, LockTimeoutError, row_resource
 
@@ -182,3 +183,45 @@ class TestReleaseAllScalesWithHeldLocks:
         assert locks.try_acquire(3, resource, LockMode.EXCLUSIVE)
         assert locks.held_count(3) == 1
         assert locks.holders(resource) == {3: LockMode.EXCLUSIVE}
+
+
+def test_fair_statement_lock_puts_queued_writer_before_later_readers():
+    """写者先排队，后来的读者不能插队；否则 COUNT 风暴会把 INSERT 饿死。"""
+    lock = _FairRLock()
+    lock.acquire()
+    order: list[str] = []
+
+    def writer() -> None:
+        with lock:
+            order.append("writer")
+
+    def reader(name: str) -> None:
+        with lock:
+            order.append(name)
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    for _ in range(100):
+        if lock.waiters >= 1:
+            break
+        time.sleep(0.001)
+    assert lock.waiters >= 1
+
+    reader_threads = [
+        threading.Thread(target=reader, args=(f"r{i}",)) for i in range(3)
+    ]
+    for thread in reader_threads:
+        thread.start()
+    for _ in range(100):
+        if lock.waiters >= 4:
+            break
+        time.sleep(0.001)
+    assert lock.waiters >= 4
+
+    lock.release()
+    writer_thread.join(5)
+    for thread in reader_threads:
+        thread.join(5)
+    assert not writer_thread.is_alive()
+    assert all(not thread.is_alive() for thread in reader_threads)
+    assert order[0] == "writer", order

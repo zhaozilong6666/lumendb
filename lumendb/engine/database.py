@@ -10,6 +10,7 @@ import logging
 import contextlib
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -37,6 +38,76 @@ from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result, _SCHEMA_CHANGING_STATEMENTS
 
 _log = logging.getLogger(__name__)
+
+
+class _FairRLock:
+    """FIFO 重入锁，避免读语句风暴把写语句饿死。
+
+    ``threading.RLock`` 不保证公平：多个只读线程释放后立刻重新竞争，等待中
+    的写线程可能长期拿不到锁（实测 400 行 INSERT + 3 个 COUNT 读者要 477s）。
+    这里给每个非重入等待者排一个 ticket，释放时唤醒所有等待者、只让队首进入；
+    新来的读者排到写者后面，写者不会被无限插队。跨线程释放语义与
+    ``_CrossThreadRLock`` 一致（保存点事务需要）。
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._owner: Optional[int] = None
+        self._depth = 0
+        self._waiters: deque[object] = deque()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        with self._condition:
+            if self._owner == me:
+                self._depth += 1
+                return True
+            if not blocking:
+                return False
+            ticket = object()
+            self._waiters.append(ticket)
+            try:
+                deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+                while self._owner is not None or self._waiters[0] is not ticket:
+                    if deadline is None:
+                        self._condition.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._waiters.remove(ticket)
+                            self._condition.notify_all()
+                            return False
+                        self._condition.wait(remaining)
+            except BaseException:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                self._condition.notify_all()
+                raise
+            self._waiters.popleft()
+            self._owner = me
+            self._depth = 1
+            return True
+
+    def release(self) -> None:
+        with self._condition:
+            if self._depth <= 0:
+                raise RuntimeError("release unlocked lock")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._condition.notify_all()
+
+    def __enter__(self) -> "_FairRLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+    @property
+    def waiters(self) -> int:
+        with self._condition:
+            return len(self._waiters)
 
 
 class _CrossThreadRLock:
@@ -227,7 +298,7 @@ class Database:
         #: close()/snapshot() 仍然只拿 ``_write_lock``，所以"备份时读可以继续"
         #: 的语义不变。要真正支持并发语句，必须把 Executor 的语句状态改成
         #: 按调用传递的上下文（见 docs/concurrency.md 的路线）。
-        self._statement_lock = threading.RLock()
+        self._statement_lock = _FairRLock()
         self.disk = DiskManager(self.path / "lumendb.data")
         # 兼容旧库：如果已有单文件 WAL，继续用它；新库默认使用分段 WAL，
         # 这样 checkpoint 后可以回收旧段。
