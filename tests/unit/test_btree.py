@@ -6,6 +6,8 @@
 """
 
 import random
+import threading
+import traceback
 
 import pytest
 
@@ -196,6 +198,51 @@ class TestDelete:
         assert list(tree.scan_all(txn)) == []
         assert tree.check_invariants()["entries"] == 0
         txns.commit(txn)
+
+    def test_root_collapse_does_not_drop_concurrent_inserts(self, env):
+        """删除触发根塌陷时，另一个线程插入的新键不能落在已不可达的旧页。"""
+        bp, txns = env
+        tree = make_tree(bp)
+        txn = txns.begin()
+        for i in range(500):
+            tree.insert(txn, (f"old{i:04d}",), (1, i))
+        txns.commit(txn)
+
+        barrier = threading.Barrier(2)
+        errors: list[str] = []
+
+        def run(fn):
+            try:
+                t = txns.begin()
+                barrier.wait(timeout=10)
+                fn(t)
+                txns.commit(t)
+            except BaseException:
+                errors.append(traceback.format_exc())
+
+        def delete_old(t):
+            for i in range(500):
+                tree.delete(t, (f"old{i:04d}",), (1, i))
+
+        def insert_new(t):
+            for i in range(500):
+                tree.insert(t, (f"new{i:04d}",), (2, i))
+
+        threads = [
+            threading.Thread(target=run, args=(delete_old,)),
+            threading.Thread(target=run, args=(insert_new,)),
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(30)
+        assert errors == [], errors[0]
+
+        reader = txns.begin()
+        keys = [k[0] for k, _ in tree.scan_all(reader)]
+        assert keys == [f"new{i:04d}" for i in range(500)]
+        assert tree.check_invariants()["entries"] == 500
+        txns.commit(reader)
 
     def test_delete_key_removes_all(self, env):
         bp, txns = env

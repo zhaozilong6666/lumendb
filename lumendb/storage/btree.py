@@ -1398,7 +1398,8 @@ class BPlusTree:
 
     def _collapse_root_locked(self, txn: Transaction) -> None:
         while self.root_page != INVALID_PAGE_ID:
-            root = self._bp.fetch_page(self.root_page)
+            root_id = self.root_page
+            root = self._bp.fetch_page(root_id)
             try:
                 if self._is_leaf(root):
                     return
@@ -1411,21 +1412,26 @@ class BPlusTree:
                     return
                 if len(children) > 1:
                     return
-                # 把唯一孩子的整页内容复制到根页：父指针不用改，树高减一
+                # 直接把根指针下移到唯一孩子，而不是把孩子的页内容复制
+                # 到旧根页。复制路径有一个真实的并发窗口：另一个插入线程
+                # 可能已经在下探时选中了 child_id，等复制完才拿到 child 的
+                # latch 并写进去；这次写入落在已经不再是根的旧页上，静默
+                # 丢失。下移根指针后，child_id 无论何时写入都仍是根，插入
+                # 不会丢；旧根页保留为不可达页，不回收（避免复用后被仍在
+                # 旧路径上的线程写坏）。
                 child_id = children[0]
                 child = self._bp.fetch_page(child_id)
                 try:
-                    new_buf = bytearray(child.buf)
-                    struct.pack_into("<I", new_buf, 16, self.root_page)
                     if self._is_leaf(child):
                         # 整棵树只剩这一个叶子：它必须自成一条空链
-                        struct.pack_into("<I", new_buf, 8, INVALID_PAGE_ID)
-                        struct.pack_into("<I", new_buf, 12, INVALID_PAGE_ID)
-                    self._commit_page(txn, root, new_buf)
+                        self._clear_links(txn, child)
+                    self.root_page = child_id
                 finally:
-                    self._bp.unpin(child_id)
+                    self._bp.unpin(child_id, dirty=True)
             finally:
-                self._bp.unpin(self.root_page, dirty=True)
+                # 必须按 fetch 时的页号 unpin：下移根指针后 self.root_page
+                # 已经变成孩子页，拿它去 unpin 会把旧根的 pin 泄漏。
+                self._bp.unpin(root_id, dirty=True)
 
     # ------------------------------------------------------------------
     # 扫描
