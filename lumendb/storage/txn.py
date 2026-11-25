@@ -297,6 +297,10 @@ class TransactionManager:
                 self._commit_queue = []
             durable = self._wal.flush()
             with self._lock:
+                # 一次 fsync 失败只属于那一批提交；后续 flush 成功必须清掉
+                # 旧错误，否则后到的 follower 即使自己的 COMMIT 已 durable，
+                # 也会被历史错误惊醒并报“提交失败”。
+                self._commit_error = None
                 committed_any = False
                 remaining: list[tuple[Transaction, int]] = []
                 for pending, target in batch:

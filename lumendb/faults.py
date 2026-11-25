@@ -60,7 +60,8 @@ POINTS = frozenset(
 _lock = threading.Lock()
 _hits: dict[str, int] = {}
 _specs: dict[str, "_Spec"] = {}
-_enabled = True
+#: 嵌套 ``disabled()`` 的深度；只有最外层退出才重新放行。
+_disable_depth = 0
 
 
 @dataclass
@@ -109,20 +110,22 @@ def disarm(point: Optional[str] = None) -> None:
 
 
 def _armed() -> bool:
-    return _enabled and bool(_specs)
+    return _disable_depth == 0 and bool(_specs)
 
 
 class disabled:
-    """上下文管理器：临时关掉所有注入点（测试收尾用）。"""
+    """上下文管理器：临时关掉所有注入点（测试收尾用）。
+
+    支持嵌套：内层退出不能把外层的关闭状态提前恢复。
+    """
 
     def __enter__(self) -> None:
-        global _enabled
-        self._previous = _enabled
-        _enabled = False
+        global _disable_depth
+        _disable_depth += 1
 
     def __exit__(self, *exc) -> None:
-        global _enabled
-        _enabled = self._previous
+        global _disable_depth
+        _disable_depth = max(0, _disable_depth - 1)
 
 
 def _error(kind: str) -> BaseException:
@@ -131,25 +134,37 @@ def _error(kind: str) -> BaseException:
     return OSError(5, "injected I/O error")
 
 
-def triggered(point: str) -> bool:
-    """该点本次是否应该报错（不抛异常，供调用方决定怎么报错）。"""
+def _fire(point: str, kinds: frozenset[str] | None = None) -> Optional[str]:
+    """命中时返回错误种类；未命中/点未挂/类型不匹配返回 None。
+
+    ``kinds`` 用于区分“会完整写失败”的 io/diskfull 与“只写半页”的 torn：
+    同一注入点被不同语义的调用方轮询时，不能重复计数，也不能让 torn
+    在普通 ``check()`` 里提前抛成完整失败。
+    """
     if not _armed():
-        return False
+        return None
     with _lock:
         spec = _specs.get(point)
         if spec is None:
-            return False
+            return None
+        if kinds is not None and spec.kind not in kinds:
+            return None
         _hits[point] = _hits.get(point, 0) + 1
         count = _hits[point]
         with spec.lock:
             if spec.every is not None:
                 if count != spec.every:
-                    return False
+                    return None
             elif spec.probability is not None:
                 if random.random() >= spec.probability:
-                    return False
+                    return None
             spec.fired += 1
-            return True
+            return spec.kind
+
+
+def triggered(point: str) -> bool:
+    """该点本次是否应该报完整 I/O 失败（不抛异常，供调用方决定怎么报错）。"""
+    return _fire(point, frozenset({"io", "diskfull"})) is not None
 
 
 def check(point: str) -> None:
@@ -158,23 +173,18 @@ def check(point: str) -> None:
     调用点必须把这里的异常当成**普通 I/O 失败**处理——也就是说，任何"已提交"
     的判定必须发生在 fsync 成功之后。注入测试就是在验证这一点。
     """
-    if not triggered(point):
-        return
-    with _lock:
-        kind = _specs[point].kind if point in _specs else "io"
-    raise _error(kind)
+    kind = _fire(point, frozenset({"io", "diskfull"}))
+    if kind is not None:
+        raise _error(kind)
 
 
 def torn_after(point: str, size: int) -> Optional[int]:
     """页写注入用：返回"只写前多少个字节"，None 表示完整写。
 
-    只有 ``kind == "torn"`` 时生效；调用方据此截断写入长度。
+    只有 ``kind == torn`` 时生效；普通 io/diskfull 不会在这里计数，交给
+    ``check()``。调用方据此截断写入长度并报错。
     """
-    if not triggered(point):
-        return None
-    with _lock:
-        spec = _specs.get(point)
-    if spec is None or spec.kind != "torn":
+    if _fire(point, frozenset({"torn"})) is None:
         return None
     return max(0, size // 2)
 

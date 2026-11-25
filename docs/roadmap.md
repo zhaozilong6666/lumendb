@@ -6,8 +6,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1501 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
-  用例也全绿）。
+- 全量测试：1515 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+  用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
+  [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
   34.40s → 0.81s（23.3 → 987.8 ops/s），并发 49.97s → 0.82s（16.0 → 976.1
   ops/s），最终 `final_rows=8001`、`hot_value=800`。
@@ -366,7 +367,7 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 峰值后不缩盘）；以及 `VACUUM` 在线模式只保 RID、不重排（有活跃事务时等 5s 后自动转
 在线，不再报错；版本索引只保留 38 字节记录头，物理版本数默认上限 250,000，
 可由 Database/CLI 配置，超限失败关闭）。自动提交 UPDATE 的 READ COMMITTED
-色彩与显式事务的快照隔离已写成契约并由测试钉住。并发全量 1501 passed 与门禁脚本 3 轮
+色彩与显式事务的快照隔离已写成契约并由测试钉住。并发全量 1515 passed 与门禁脚本 3 轮
 （11 项，含混合 INSERT/UPDATE/DELETE 与保存点、VACUUM 探针）已本地跑通，
 Windows 插入
 退化复测未复现（受 fsync 抖动

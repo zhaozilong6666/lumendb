@@ -204,6 +204,49 @@ class SegmentedWAL(WAL):
         self._current_path = None
         self._current_size = 0
 
+    def _rollback_failed_flush(
+        self, start_path: Path | None, start_size: int, pending: list
+    ) -> None:
+        """fsync 失败后把文件截回持久边界，并把整批记录放回 pending。
+
+        只把 pending 放回去不够：失败前可能已经把半批写进文件，重试会追加
+        重复记录。这里的顺序是「先截文件、再放 pending」，保证重试从上一个
+        已持久化边界开始。若失败发生在段轮转之后，新段整段删除，再回到旧段
+        的 start_size 截断。
+        """
+        with self._lock:
+            self._pending[0:0] = pending
+        try:
+            if self._fh is not None and self._current_path == start_path:
+                self._fh.seek(start_size)
+                self._fh.truncate()
+                self._current_size = start_size
+                return
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+            if self._current_path is not None:
+                try:
+                    self._current_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._current_path = None
+            self._current_size = 0
+            if start_path is not None:
+                with open(start_path, "r+b") as fh:
+                    fh.seek(start_size)
+                    fh.truncate()
+                self._fh = open(start_path, "ab")
+                self._current_path = start_path
+                self._current_size = start_size
+        except OSError:
+            # 回滚文件失败时，至少 pending 已保住；恢复端对重复 LSN 的
+            # redo 是幂等的，最坏情况是日志多一段可重放记录。
+            pass
+
     def flush(self) -> int:
         """把 pending 记录写盘并 fsync，返回已持久化的最后 LSN。
 
@@ -211,7 +254,6 @@ class SegmentedWAL(WAL):
         ``_flush_lock`` 下进行，不再长期占着追加锁。这样提交线程在 leader
         刷盘期间仍能追加 COMMIT 记录，落到下一轮同一批 flush 里。
         """
-        _fault_check("wal_segment.fsync")
         with self._flush_lock:
             with self._lock:
                 if not self._pending:
@@ -221,6 +263,8 @@ class SegmentedWAL(WAL):
                 pending = self._pending
                 self._pending = []
                 last_written = self._size
+                start_path = self._current_path
+                start_size = self._current_size
             try:
                 for lsn, data in pending:
                     if (
@@ -236,13 +280,12 @@ class SegmentedWAL(WAL):
                     last_written = lsn
                 assert self._fh is not None
                 self._fh.flush()
+                _fault_check("wal_segment.fsync")
                 os.fsync(self._fh.fileno())
             except BaseException:
-                # 写失败时把这一批放回队首，避免 pending 凭空消失；文件里
-                # 可能已有半批记录，重试的重复记录由恢复端按 LSN 去重语义
-                # 处理（与旧实现 flush 失败后 pending 未清空的行为一致）。
-                with self._lock:
-                    self._pending[0:0] = pending
+                # 写失败时把这一批放回队首，避免 pending 凭空消失；同时把
+                # 文件截回上一个持久边界，避免重试追加重复记录。
+                self._rollback_failed_flush(start_path, start_size, pending)
                 raise
             with self._lock:
                 self._size = last_written

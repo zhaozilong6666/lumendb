@@ -315,14 +315,31 @@ class WAL:
         这是"WAL 规则"的执行点：Buffer Pool 在写任何脏页之前必须调用它。
         多个调用者可以安全并发；只有真正有 pending 的调用会做一次 ``fsync``，
         这使后到的提交可以搭上前一次刷盘的顺风车。
+
+        失败时不能清掉 pending：fsync 报错意味着持久性未知，调用方会中止
+        事务；如果这里把 pending 丢了，之后即使磁盘恢复也无法再把它写出去。
+        同时把文件截回上一个已持久化的边界，避免重试时把半条/重复记录留在
+        日志里。
         """
-        _fault_check("wal.fsync")
         with self._lock:
             if self._pending:
-                self._fh.write(self._pending)
+                pending = bytes(self._pending)
                 self._pending.clear()
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
+                try:
+                    self._fh.write(pending)
+                    self._fh.flush()
+                    _fault_check("wal.fsync")
+                    os.fsync(self._fh.fileno())
+                except BaseException:
+                    self._pending[0:0] = pending
+                    try:
+                        self._fh.seek(self._size)
+                        self._fh.truncate()
+                    except OSError:
+                        # 截断也失败时保留 pending 仍是正确方向：下次 flush
+                        # 会重新写，恢复端对重复 LSN 的 redo 是幂等的。
+                        pass
+                    raise
                 self._size = self._next_lsn - 1
             else:
                 # 即使没有新日志，也可能需要把之前的写刷下去

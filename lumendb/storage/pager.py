@@ -16,6 +16,7 @@ from typing import Optional
 
 from ..errors import CorruptedPageError, PageNotFoundError, StorageError
 from ..faults import check as _fault_check
+from ..faults import torn_after as _fault_torn
 from .filelock import DataDirLockedError, FileLock
 from .page import INVALID_PAGE_ID, MAGIC, PAGE_SIZE, Page, PageType
 
@@ -252,18 +253,26 @@ class DiskManager:
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         if len(data) != PAGE_SIZE:
             raise StorageError(f"写入长度必须是 {PAGE_SIZE}，收到 {len(data)}")
-        _fault_check("disk.write_page")
         with self._io_lock:
             if page_id < 0 or page_id >= self.num_pages:
                 raise PageNotFoundError(f"页 {page_id} 未分配，不能写入")
+            cut = _fault_torn("disk.write_page", len(data))
+            if cut is not None:
+                # torn write：前半页新内容、后半页旧内容，然后明确报错。
+                # 不能在这里写完整页再抛——那样测试不到恢复/校验路径。
+                self._fh.seek(page_id * PAGE_SIZE)
+                self._fh.write(data[:cut])
+                self._fh.flush()
+                raise OSError(5, "injected torn page write")
+            _fault_check("disk.write_page")
             self._fh.seek(page_id * PAGE_SIZE)
             self._fh.write(data)
 
     def sync(self) -> None:
         """把文件缓冲与元数据刷到磁盘（fsync，不是 fflush）。"""
-        _fault_check("disk.sync")
         with self._io_lock:
             self._fh.flush()
+            _fault_check("disk.sync")
             os.fsync(self._fh.fileno())
 
     def snapshot_bytes(self) -> bytes:

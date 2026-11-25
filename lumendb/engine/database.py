@@ -32,7 +32,7 @@ from ..storage.bufferpool import BufferPoolManager
 from ..storage.lock import LockManager
 from ..storage.pager import DiskManager
 from ..storage.recovery import RecoveryManager
-from ..storage.txn import Transaction, TransactionManager
+from ..storage.txn import Transaction, TransactionManager, TxnState
 from ..storage.wal import WAL
 from ..storage.wal_segments import SegmentedWAL
 from .executor import Executor, Result, _SCHEMA_CHANGING_STATEMENTS
@@ -857,12 +857,13 @@ class Database:
             try:
                 self.txns.commit(txn)
             except BaseException:
-                # WAL 写 COMMIT 记录失败（磁盘满 / IO 错误）：事务既没持久化，
-                # 就不该留下改过的页和写者锁——单写者模型下那把锁一泄漏，
-                # 之后每个写事务都会拿到 40001，数据库等于永久只读。
-                # 反过来，COMMIT 记录已经落盘的情况（例如同步复制屏障超时）
-                # 不能 undo：事务事实上已提交，调用方拿到的是"结果未知"。
-                if not getattr(txn, "commit_record_written", False):
+                # 只有 COMMITTED 才说明 WAL 已 fsync 成功（或至少提交点已跨过）。
+                # `commit_record_written` 只表示 COMMIT 记录进了内存 buffer：
+                # fsync 失败时它既没有持久化、事务也仍是 ACTIVE；此时必须走
+                # abort 撤销页写并追加 ABORT 记录，否则它会一直持有 undo，
+                # 后续事务改同一页后，再回滚就会把后来的提交一起覆盖。
+                # 同步复制屏障失败时 txn.state 已是 COMMITTED，不能 undo。
+                if txn.state is not TxnState.COMMITTED:
                     self.txns.abort(txn)
                 self._exit_savepoint_mode(txn)
                 raise
@@ -925,9 +926,10 @@ class Database:
         try:
             self.txns.commit(txn)
         except BaseException:
-            # 同上：自动提交路径的 COMMIT 记录写失败时，也要把事务回滚掉，
-            # 否则页上已改的数据和写者锁都会留在原地。
-            if not getattr(txn, "commit_record_written", False):
+            # 同上：用事务状态而不是“COMMIT 记录已写”来判断。记录进 buffer
+            # 不等于 fsync 成功；未 COMMITTED 就必须撤销，避免半提交事务
+            # 的 undo 在后续提交之后才执行、把别人的页改动覆盖掉。
+            if txn.state is not TxnState.COMMITTED:
                 self.txns.abort(txn)
             raise
         self._maybe_checkpoint()
