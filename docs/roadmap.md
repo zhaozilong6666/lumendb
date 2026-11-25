@@ -361,18 +361,19 @@ heartbeat RPC / quorum 续租已做 MVP；投票比较已升级为
 `--physical-savepoints` 退回独占写者锁。逻辑路径是 DML-only，保存点后一旦有行
 undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCATE 先升级成
 物理保存点。撤销的插入只标
-`FLAG_ABORTED`。`concurrent_dml` 仍保持 opt-in，默认模式尚未切换，卡在
-文件不缩小（整页死链已能在线回收：索引陈旧项按 key+RID 清掉、空页重置后
-移到链尾复用，反复维护不再每次长一页目录；但页号仍按文件尾部单调分配，
-峰值后不缩盘）；以及 `VACUUM` 在线模式只保 RID、不重排（有活跃事务时等 5s 后自动转
-在线，不再报错；版本索引只保留 38 字节记录头，物理版本数默认上限 250,000，
-可由 Database/CLI 配置，超限失败关闭）。自动提交 UPDATE 的 READ COMMITTED
-色彩与显式事务的快照隔离已写成契约并由测试钉住。并发全量 1517 passed 与门禁脚本 3 轮
-（11 项，含混合 INSERT/UPDATE/DELETE 与保存点、VACUUM 探针）已本地跑通，
-Windows 插入
-退化复测未复现（受 fsync 抖动
-主导）。HeapPage/目录页锁纪律还缺逐路径审计清单，因此第 4 层仍只能标
-"MVP 验收"，不能标"生产就绪"。
+`FLAG_ABORTED`。`concurrent_dml` 仍保持 opt-in：不是正确性没底，而是显式事务
+仍是快照隔离（不是 PostgreSQL READ COMMITTED），静默切换会改变用户可见语义；
+默认串行短事务吞吐也更好。文件不缩盘仍是能力边界：整页死链已能在线回收（索引
+陈旧项按 key+RID 清掉、空页重置后移到链尾复用，反复维护不再每次长一页目录；
+但页号仍按文件尾部单调分配，峰值后不缩盘）。`VACUUM` 在线模式只保 RID、不重排
+（有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
+物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
+UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
+2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
+`affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写。并发全量 1517 passed、
+门禁脚本 3 轮（11 项，含混合 INSERT/UPDATE/DELETE 与保存点、VACUUM 探针）、
+8×1000+8×100 基准顺序 20 轮/低切换 10 轮/四进程 20 轮均 `8001/800`。HeapPage/目录页
+锁纪律还缺逐路径审计清单，因此第 4 层仍只能标 "MVP 验收"，不能标 "生产就绪"。
 
 ## 明确不做
 
