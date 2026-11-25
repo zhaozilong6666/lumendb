@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Iterator
 
 from ..errors import StorageError
+from ..faults import check as _fault_check
+from ..faults import torn_after as _fault_torn
 from .page import PAGE_SIZE
 
 
@@ -263,6 +265,7 @@ class WAL:
     # -- 追加 ---------------------------------------------------------------
 
     def append(self, xid: int, rtype: int, payload: bytes = b"") -> int:
+        _fault_check("wal.append")
         with self._lock:
             lsn = self._next_lsn
             rec = LogRecord(lsn, xid, int(rtype), payload)
@@ -313,6 +316,7 @@ class WAL:
         多个调用者可以安全并发；只有真正有 pending 的调用会做一次 ``fsync``，
         这使后到的提交可以搭上前一次刷盘的顺风车。
         """
+        _fault_check("wal.fsync")
         with self._lock:
             if self._pending:
                 self._fh.write(self._pending)

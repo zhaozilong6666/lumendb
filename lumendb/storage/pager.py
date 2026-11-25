@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..errors import CorruptedPageError, PageNotFoundError, StorageError
+from ..faults import check as _fault_check
 from .filelock import DataDirLockedError, FileLock
 from .page import INVALID_PAGE_ID, MAGIC, PAGE_SIZE, Page, PageType
 
@@ -192,6 +193,7 @@ class DiskManager:
         立即落盘而不是延后，是为了让崩溃后的页号分配保持单调——
         否则恢复时可能把两批数据分配到同一个页号。
         """
+        _fault_check("disk.allocate_page")
         with self._io_lock:
             pid = self.num_pages
             buf = bytearray(PAGE_SIZE)
@@ -250,6 +252,7 @@ class DiskManager:
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         if len(data) != PAGE_SIZE:
             raise StorageError(f"写入长度必须是 {PAGE_SIZE}，收到 {len(data)}")
+        _fault_check("disk.write_page")
         with self._io_lock:
             if page_id < 0 or page_id >= self.num_pages:
                 raise PageNotFoundError(f"页 {page_id} 未分配，不能写入")
@@ -258,6 +261,7 @@ class DiskManager:
 
     def sync(self) -> None:
         """把文件缓冲与元数据刷到磁盘（fsync，不是 fflush）。"""
+        _fault_check("disk.sync")
         with self._io_lock:
             self._fh.flush()
             os.fsync(self._fh.fileno())

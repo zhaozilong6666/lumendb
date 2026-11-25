@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 from ..errors import StorageError
+from ..faults import check as _fault_check
 from .wal import HEADER_SIZE, LogRecord, WAL, WALCorruptionError
 
 _SEGMENT_RE = re.compile(r"^wal-(\d{20})\.log$")
@@ -175,6 +176,7 @@ class SegmentedWAL(WAL):
     # -- 追加与刷盘 ---------------------------------------------------------
 
     def append(self, xid: int, rtype: int, payload: bytes = b"") -> int:
+        _fault_check("wal_segment.append")
         with self._lock:
             lsn = self._next_lsn
             record = LogRecord(lsn, xid, int(rtype), payload)
@@ -209,6 +211,7 @@ class SegmentedWAL(WAL):
         ``_flush_lock`` 下进行，不再长期占着追加锁。这样提交线程在 leader
         刷盘期间仍能追加 COMMIT 记录，落到下一轮同一批 flush 里。
         """
+        _fault_check("wal_segment.fsync")
         with self._flush_lock:
             with self._lock:
                 if not self._pending:
