@@ -3927,7 +3927,18 @@ class Executor:
         latest = self._concurrent_dml and txn.statement_scoped
         # 必须先物化目标行：更新会向堆里追加新版本，边扫边写会让扫描器
         # 不断看到刚写进去的新版本（root RID 不变），从而反复更新同一行。
-        targets = list(heap.scan(txn, ri=latest))
+        # 同一个 root RID 只能作为一次 UPDATE 目标。并发更新时，旧版本页
+        # 与新版本页不是同一份快照：ri=True 的扫描可能先看到旧页（xmax 尚未
+        # 写），再看到新页（xmin 已提交），把同一逻辑行的两个物理版本都算
+        # 成可见。若不去重，SET v=v+1 会对同一行执行两次，热点基准出现
+        # “800 次更新最后 v=801”。
+        targets = []
+        seen_roots: set[RID] = set()
+        for rid, values in heap.scan(txn, ri=latest):
+            if rid in seen_roots:
+                continue
+            seen_roots.add(rid)
+            targets.append((rid, values))
         for rid, old_values in targets:
             old_tuple = tuple(old_values)
             if source_table is None:

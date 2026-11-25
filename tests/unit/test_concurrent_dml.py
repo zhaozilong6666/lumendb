@@ -1161,3 +1161,32 @@ def test_online_vacuum_reclaims_indexed_dead_root_without_blocking_reinsert(tmp_
         ]
     finally:
         db.close()
+
+
+def test_update_collapses_duplicate_root_rids_from_ri_scan(env, monkeypatch):
+    """ri=True 的多页快照可能同时看到同一 root 的旧版和新版。
+
+    回归：8 线程做 800 次 ``UPDATE ... SET v=v+1`` 时，偶尔有一次扫描把同一个
+    逻辑行的两个物理版本都算成可见；UPDATE 目标列表因此出现重复 root RID，
+    同一条语句对同一行加了两次，最终 ``v=801``。唯一正确语义是每个 root
+    RID 只更新一次。
+    """
+    db, server = env
+    writer = Session(database=db)
+    _run(server, writer, "INSERT INTO t VALUES (1, 0, 'x')")
+
+    original_scan = HeapFile.scan
+
+    def duplicate_scan(self, txn, *, ri=False):
+        rows = list(original_scan(self, txn, ri=ri))
+        yield from rows
+        if rows:
+            yield rows[0]
+
+    monkeypatch.setattr(HeapFile, "scan", duplicate_scan)
+    try:
+        result = _run(server, writer, "UPDATE t SET v = v + 1 WHERE id = 1")[0]
+    finally:
+        monkeypatch.setattr(HeapFile, "scan", original_scan)
+    assert result.affected == 1
+    assert _rows(server, writer, "SELECT v FROM t WHERE id = 1") == [(1,)]

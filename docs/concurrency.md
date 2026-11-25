@@ -497,7 +497,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1492 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1493 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -950,6 +950,26 @@ first-updater-wins 仍会发现链头已变，于是继续报冲突。等待只�
 并发门禁 6 项 × 3 轮全 PASS，GitHub Actions run **279**（Python 3.12 / 3.13 ×
 Linux / Windows 四矩阵）全绿。
 
+**2026-11-25 补充：同一 root RID 的重复扫描必须折叠。**
+
+`ri=True` 的扫描按页取快照，不是一个跨页的原子快照：更新中的一行可能旧页
+先被拷到（旧版本 `xmax` 还没写），新页稍后被拷到（新版本 `xmin` 已提交），
+于是同一逻辑行的两个物理版本都通过“已提交即可见”的判断，`heap.scan` 产出
+两个相同的 root RID。UPDATE 的目标列表若不去重，一条 `SET v=v+1` 会同时对
+同一行执行两次。实测 8 线程 ×100 次热点自增，偶尔出现 `affected=801`、
+最终 `v=801`，而正确值是 800。
+
+修法：`_update` 物化目标时用 `seen_roots` 按 root RID 去重；每个逻辑行只
+作为一次 UPDATE 目标。`DELETE` 早就有 `deleted_rids/processing` 去重，不受
+影响。回归
+`tests/unit/test_concurrent_dml.py::test_update_collapses_duplicate_root_rids_from_ri_scan`
+用 monkeypatch 让 `HeapFile.scan` 故意返回重复 root；旧实现 `affected=2`、
+`v=2`，新实现 `affected=1`、`v=1`。
+
+基准脚本也补了 worker 超时检查：`_run_threads` 原先 `join(timeout=300)` 后
+不检查 `is_alive()`，慢机器上剩余 worker 还没写完，主线程就开始 COUNT/读，
+会把“尚未写完”误报成丢行；现在超时会进入 `errors` 并让基准显式失败。
+
 前一个 docs 提交 `4fbb6df` 的 CI #278 失败与本次改动无关：Windows 3.13 上
 `test_quorum.py` 两条时间敏感用例偶发（看门狗心跳重置竞态、`append_entries`
 连接超时），同树在 run 279 重跑即绿。已作为 flake 记进账本，后续单独硬化。
@@ -1017,7 +1037,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1492 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1493 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

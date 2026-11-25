@@ -71,8 +71,12 @@ def _run_threads(threads: int, fn) -> list[str]:
         worker.start()
     started = time.perf_counter()
     start.wait(timeout=30)
-    for worker in workers:
+    for index, worker in enumerate(workers):
         worker.join(timeout=300)
+        if worker.is_alive():
+            # 之前这里直接返回：慢机器上还有 worker 在写，主线程就开始
+            # COUNT/热点读，基准会把“尚未写完”误报成丢行。超时必须显式失败。
+            errors.append(f"worker {index}: 未在 300s 内结束")
     return errors, time.perf_counter() - started
 
 
