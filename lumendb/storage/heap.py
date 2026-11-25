@@ -303,6 +303,16 @@ class HeapFile:
             visited += 1
         return None
 
+    def _newest_for_root(self, root_rid: RID) -> Optional[RID]:
+        got = self._read_rid(root_rid)
+        if got is None:
+            return None
+        page, rec = got
+        try:
+            return rec.header.newest_rid or root_rid
+        finally:
+            self._release(page)
+
     def get(
         self, txn: Transaction, root_rid: RID, *, ri: bool = False
     ) -> Optional[list[Any]]:
@@ -312,17 +322,26 @@ class HeapFile:
         而索引项仍是陈旧的 RID。这里把"根不存在"当成行不存在返回 ``None``，
         与 ``find_version`` 的半途缺失语义一致；真正的页损坏仍由
         ``_read_rid`` 抛 ``CorruptedPageError``，不会被吞掉。
+
+        并发热点更新还有一个瞬时窗口：读完根记录的 ``newest`` 指针后、真正
+        沿链回溯前，另一个事务可能已经提交新版本，把旧 ``newest`` 的 xmax
+        打成已提交。此时从旧指针出发会一路看到"全部已被更新"，返回 ``None``，
+        但新版本其实已经在根上。``ri=True`` 的自动提交 UPDATE 会因此把一次
+        自增误判成"行不存在"，热点基准最终少 1。这里在找不到版本时重读
+        ``newest``；指针前进了就重试，稳定不变才认定行确实不可见。
         """
-        got = self._read_rid(root_rid)
-        if got is None:
+        newest = self._newest_for_root(root_rid)
+        if newest is None:
             return None
-        page, rec = got
-        try:
-            newest = rec.header.newest_rid or root_rid
-        finally:
-            self._release(page)
-        found = self.find_version(txn, newest, ri=ri)
-        return found[1].values if found else None
+        for _ in range(6):
+            found = self.find_version(txn, newest, ri=ri)
+            if found is not None:
+                return found[1].values
+            latest = self._newest_for_root(root_rid)
+            if latest is None or latest == newest:
+                return None
+            newest = latest
+        return None
 
     def scan(
         self, txn: Transaction, *, ri: bool = False

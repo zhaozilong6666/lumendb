@@ -497,7 +497,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1494 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1495 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   HeapPage / 目录页的锁纪律还缺
   一份逐路径审计清单——现有并发回归覆盖插入/删除/扫描/回滚，但不等于审计完成。
@@ -994,6 +994,40 @@ Linux / Windows 四矩阵）全绿。
 等值 UPDATE 都必须仍然成功。索引项缺失/陈旧时仍以堆里的当前版本为准，不能
 仅凭索引判定行存在。
 
+**2026-11-25 补充：`ri=True` 读到旧 `newest` 指针时必须重试。**
+
+索引下推把热点更新从 41ms/次降到 1ms/次后，8×100 次热点自增仍偶发
+`hot_value=799`，且有一次返回 `affected=0`，没有报错、没有重试。抓现场：
+`HeapFile.get(root, ri=True)` 返回 `None`，但根记录存在、`newest` 指针也
+非空；把整条链 dump 出来，所有版本的 `xmin`/`xmax` 都是 `COMMITTED`，没有
+可回退的可见版本。
+
+根因是 `get` 的读法与并发提交之间的窗口：
+
+1. 读者先读根记录的 `newest`，拿到版本 n；
+2. 在读者沿 `prev` 回溯前，写者提交了 n+1：它把 n 的 `xmax` 打成已提交，
+   再把根 `newest` 指向 n+1；
+3. 读者仍从 n 出发，看到 n “已被更新”，沿 `prev` 继续回溯；链上每一版都
+   已被更后面的版本标成 `xmax` 已提交，最终返回 `None`；
+4. 自动提交 UPDATE 把“读不到”当成“行不存在”，直接 `affected=0`，这一次
+   自增就被静默吞掉。
+
+修法：`HeapFile.get` 在 `find_version` 返回空时**重读根 `newest`**；指针
+前进了就重试（最多 6 次），指针稳定不变才认定这一行对所有可见性都不可见
+（例如并发 DELETE 已提交，或 VACUUM 已回收整条链）。这样不会把“写者刚提交、
+读指针还没跟上”误判成行删除。
+
+复现负载：8 线程 ×100 次热点自增，30 轮共 24000 次。修复前多轮出现
+1–2 次 `affected=0`、最终 `v=798/799`；修复后 30 轮全部 `v=800`。完整基准
+连跑 5 轮均为 `final_rows=8001`、`hot_value=800`，热点吞吐 962–1154 ops/s。
+基准本身也加了
+自检：`COUNT` 或热点值不符就抛错并 dump 页链、`last_page`、
+`row_count_hint`、直接 `HeapFile.scan` 计数，不再只打印数字后静默通过。
+
+回归 `test_heap_get_retries_when_root_newest_advances` 用 monkeypatch 让
+`_newest_for_root` 第一次返回旧根、第二次返回真实链头：旧实现只查一次会返回
+`None`，新实现必须重试并读回最新版本。
+
 前一个 docs 提交 `4fbb6df` 的 CI #278 失败与本次改动无关：Windows 3.13 上
 `test_quorum.py` 两条时间敏感用例偶发（看门狗心跳重置竞态、`append_entries`
 连接超时），同树在 run 279 重跑即绿。已作为 flake 记进账本，后续单独硬化。
@@ -1061,7 +1095,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1494 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1495 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

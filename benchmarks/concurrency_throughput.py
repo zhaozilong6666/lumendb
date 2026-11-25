@@ -28,10 +28,84 @@ from lumendb.engine.database import Database
 from lumendb.errors import SerializationError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
+from lumendb.storage.heap import HeapFile
+from lumendb.storage.page import INVALID_PAGE_ID
 
 
 def _run(server: PGWireServer, session: Session, sql: str):
     return [server._run_statement(session, statement) for statement in parse_sql(sql)]
+
+
+def _diagnose_heap(database: Database) -> dict:
+    """COUNT 对不上时保存页链现场，避免只看到“少了 1300 行”却不知道哪页断。"""
+    table = database.catalog.get_table("bench")
+    diag: dict = {
+        "root_page": table.root_page,
+        "last_page": table.last_page,
+        "row_count_hint": table.row_count_hint,
+        "disk_pages": database.disk.num_pages,
+    }
+    pages: list[dict] = []
+    seen: set[int] = set()
+    page_id = table.root_page
+    try:
+        while page_id != INVALID_PAGE_ID:
+            if page_id in seen:
+                diag["cycle_at"] = page_id
+                break
+            seen.add(page_id)
+            current = page_id
+            page = database.bp.fetch_page(current)
+            try:
+                pages.append(
+                    {
+                        "page": current,
+                        "type": page.page_type,
+                        "page_id": page.page_id,
+                        "nslots": page.nslots,
+                        "next": page.next_page,
+                    }
+                )
+                page_id = page.next_page
+            finally:
+                database.bp.unpin(current)
+    except Exception as exc:  # noqa: BLE001 - 诊断路径要把异常本身带回去
+        diag["chain_error"] = repr(exc)
+    diag["chain"] = pages
+
+    txn = database.txns.begin(read_only=True)
+    try:
+        diag["direct_scan_count"] = sum(
+            1 for _ in HeapFile(database.bp, table, database.txns).scan(txn)
+        )
+    except Exception as exc:  # noqa: BLE001
+        diag["scan_error"] = repr(exc)
+    finally:
+        database.txns.commit(txn)
+    return diag
+
+
+def _check_result(
+    database: Database,
+    count: int,
+    hot_value: int,
+    threads: int,
+    rows: int,
+    updates: int,
+) -> None:
+    """基准不只打印数字：计数或热点值不符就失败，并带上页链现场。"""
+    expected_rows = threads * rows + 1
+    if count != expected_rows:
+        diag = _diagnose_heap(database)
+        raise RuntimeError(
+            f"COUNT 不一致：期望 {expected_rows}，实际 {count}；"
+            + json.dumps(diag, ensure_ascii=False)
+        )
+    expected_hot = threads * updates
+    if hot_value != expected_hot:
+        raise RuntimeError(
+            f"热点值不一致：期望 {expected_hot}，实际 {hot_value}"
+        )
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -154,13 +228,18 @@ def bench_mode(concurrent: bool, threads: int, rows: int, updates: int) -> dict:
         hot_value = _run(
             server, Session(database=database), "SELECT v FROM bench WHERE id = 999999"
         )[0].rows[0][0]
+        final_rows = int(count[0][0])
+        final_hot = int(hot_value)
+        _check_result(
+            database, final_rows, final_hot, threads, rows, updates
+        )
         return {
             "mode": "concurrent_dml" if concurrent else "default_write_lock",
             "threads": threads,
             "insert": insert,
             "hot_update": hot,
-            "hot_value": hot_value,
-            "final_rows": count[0][0],
+            "hot_value": final_hot,
+            "final_rows": final_rows,
         }
     finally:
         server.shutdown()

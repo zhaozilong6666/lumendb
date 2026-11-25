@@ -389,6 +389,34 @@ def test_hot_row_increments_serialize_without_lost_updates(env):
     ) == [(threads * per_thread,)]
 
 
+def test_heap_get_retries_when_root_newest_advances(env, monkeypatch):
+    """读完 newest 后新版本才提交：旧指针会一路全不可见，必须重读根指针。"""
+    db, server = env
+    _run(server, Session(database=db), "INSERT INTO t VALUES (1, 0, 'x')")
+    _run(server, Session(database=db), "UPDATE t SET v = 1 WHERE id = 1")
+    table = db.catalog.get_table("t")
+    heap = HeapFile(db.bp, table, db.txns)
+    txn = db.txns.begin(read_only=True)
+    try:
+        root = db.executor._tree_for(table, table.indexes["t_pkey"]).lookup(txn, [1])[0]
+        actual_newest = heap._newest_for_root(root)
+        assert actual_newest != root
+        calls = 0
+
+        def stale_then_actual(rid):
+            nonlocal calls
+            calls += 1
+            return root if calls == 1 else actual_newest
+
+        monkeypatch.setattr(heap, "_newest_for_root", stale_then_actual)
+        # 旧指针 root 的 xmax 已提交，从它出发找不到可见版本；get 必须重读
+        # newest 并重试，不能把一次自增静默吞成 affected=0。
+        assert heap.get(txn, root, ri=True) == [1, 1, "x"]
+        assert calls == 2
+    finally:
+        db.txns.commit(txn)
+
+
 def test_autocommit_update_waits_for_holder_then_rereads_latest(env):
     """自动提交 UPDATE 在行锁上等待后重读最新已提交版本，不能拿旧快照覆盖。"""
     db, server = env
