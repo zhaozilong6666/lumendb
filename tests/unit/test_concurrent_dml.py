@@ -1185,8 +1185,47 @@ def test_update_collapses_duplicate_root_rids_from_ri_scan(env, monkeypatch):
 
     monkeypatch.setattr(HeapFile, "scan", duplicate_scan)
     try:
-        result = _run(server, writer, "UPDATE t SET v = v + 1 WHERE id = 1")[0]
+        result = _run(server, writer, "UPDATE t SET v = v + 1 WHERE pad = 'x'")[0]
     finally:
         monkeypatch.setattr(HeapFile, "scan", original_scan)
     assert result.affected == 1
     assert _rows(server, writer, "SELECT v FROM t WHERE id = 1") == [(1,)]
+
+
+def test_single_column_equality_dml_uses_index_instead_of_scan(env, monkeypatch):
+    """UPDATE/DELETE 的单列等值条件必须走索引，不能每次全表扫。
+
+    热点行更新原先每次扫 8000 行，8×100 次基准要 34 秒；走索引后同一组
+    更新 0.8 秒。这里把 ``HeapFile.scan`` 直接改成抛错，任何回退到全扫的
+    实现都会立刻失败。
+    """
+    db, server = env
+    writer = Session(database=db)
+    _run(
+        server,
+        writer,
+        "INSERT INTO t VALUES "
+        + ", ".join(f"({i}, {i % 4}, 'p{i}')" for i in range(24)),
+    )
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("单列等值 DML 不应回退到全表扫描")
+
+    original_scan = HeapFile.scan
+    monkeypatch.setattr(HeapFile, "scan", no_scan)
+    try:
+        updated = _run(server, writer, "UPDATE t SET v = 9 WHERE id = 10")[0]
+        deleted = _run(server, writer, "DELETE FROM t WHERE id = 11")[0]
+        updated_by_value = _run(server, writer, "UPDATE t SET pad = 'z' WHERE v = 3")[0]
+        stale = _run(server, writer, "UPDATE t SET v = 7 WHERE id = 11")[0]
+        stale_delete = _run(server, writer, "DELETE FROM t WHERE id = 11")[0]
+    finally:
+        monkeypatch.setattr(HeapFile, "scan", original_scan)
+    assert updated.affected == 1
+    assert deleted.affected == 1
+    assert updated_by_value.affected == 5
+    # 删除不摘索引项，等 VACUUM 回收；陈旧索引项回堆为空必须当成无目标。
+    assert stale.affected == 0
+    assert stale_delete.affected == 0
+    assert _rows(server, writer, "SELECT v FROM t WHERE id = 10") == [(9,)]
+    assert _rows(server, writer, "SELECT id FROM t WHERE id = 11") == []

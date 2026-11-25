@@ -48,6 +48,8 @@ from ..sql.ast import (
     AlterTableRenameConstraint,
     AlterTableRenameTable,
     AlterTableValidateConstraint,
+    BinaryOp,
+    ColumnRef,
     CreateIndex,
     CreateTable,
     CreateTableAs,
@@ -61,6 +63,7 @@ from ..sql.ast import (
     Explain,
     ForeignKeySpec,
     Insert,
+    Literal,
     Query,
     Reindex,
     SetConstraints,
@@ -3869,6 +3872,61 @@ class Executor:
         """ON CONFLICT DO NOTHING 的前置检查：任一唯一索引上已有同样的键。"""
         return self._find_unique_conflict(table, values, txn) is not None
 
+    def _indexed_dml_targets(
+        self,
+        table: TableDef,
+        where: Optional[Expr],
+        txn: Transaction,
+        heap: HeapFile,
+        *,
+        ri: bool,
+    ) -> Optional[list[tuple[RID, list[Any]]]]:
+        """把单列 ``col = 常量`` 的 DML 目标改走索引，避免全表扫描。
+
+        返回 ``None`` 表示这条 WHERE 不适合索引下推（调用方继续全扫）；
+        返回列表（可能为空）表示已经用索引物化完目标，调用方不要再扫堆。
+        ``UPDATE/DELETE`` 仍会在物化后重新执行 ``where_fn``，所以这里只负责
+        缩小候选集合，不改变谓词语义。
+        """
+        if not isinstance(where, BinaryOp) or where.op != "=":
+            return None
+        left, right = where.left, where.right
+        if isinstance(right, ColumnRef) and isinstance(left, Literal):
+            left, right = right, left
+        if not isinstance(left, ColumnRef) or not isinstance(right, Literal):
+            return None
+        if left.table is not None and left.table.lower() != table.name:
+            return None
+        column_name = left.name.lower()
+        if not table.has_column(column_name):
+            return None
+        column = table.column(column_name)
+        index = table.index_for_columns((column_name,))
+        if index is None:
+            return None
+        if right.value is None:
+            return None
+        try:
+            key_value = column.type.coerce(right.value)
+        except (TypeError, ValueError):
+            return None
+
+        targets: list[tuple[RID, list[Any]]] = []
+        seen_roots: set[RID] = set()
+        for rid in self._tree_for(table, index).lookup(txn, [key_value]):
+            if rid in seen_roots:
+                continue
+            seen_roots.add(rid)
+            values = heap.get(txn, rid, ri=ri)
+            if values is None:
+                continue
+            # 索引项可能陈旧（DELETE/UPDATE 不立即摘项，等 VACUUM 回收）：
+            # 以堆里的当前版本复核键，避免把已经改走键的行当成命中。
+            if self._key_for(table, index, values) != [key_value]:
+                continue
+            targets.append((rid, values))
+        return targets
+
     def _update(self, stmt: Update, txn: Transaction) -> Result:
         table = self._catalog.get_table(stmt.table)
         self._snapshot_table_state(table, txn)
@@ -3932,13 +3990,26 @@ class Executor:
         # 写），再看到新页（xmin 已提交），把同一逻辑行的两个物理版本都算
         # 成可见。若不去重，SET v=v+1 会对同一行执行两次，热点基准出现
         # “800 次更新最后 v=801”。
-        targets = []
-        seen_roots: set[RID] = set()
-        for rid, values in heap.scan(txn, ri=latest):
-            if rid in seen_roots:
-                continue
-            seen_roots.add(rid)
-            targets.append((rid, values))
+        #
+        # 单列等值条件优先走索引：UPDATE ... WHERE id = ? 若仍全表扫描，
+        # 热点行更新会被 8000 行的堆扫描拖成几十毫秒，行锁争用会被放大。
+        indexed = (
+            self._indexed_dml_targets(
+                table, stmt.where, txn, heap, ri=latest
+            )
+            if source_table is None
+            else None
+        )
+        if indexed is not None:
+            targets = indexed
+        else:
+            targets = []
+            seen_roots: set[RID] = set()
+            for rid, values in heap.scan(txn, ri=latest):
+                if rid in seen_roots:
+                    continue
+                seen_roots.add(rid)
+                targets.append((rid, values))
         for rid, old_values in targets:
             old_tuple = tuple(old_values)
             if source_table is None:
@@ -4046,7 +4117,13 @@ class Executor:
         deferred: dict[
             tuple[str, RID], tuple[TableDef, RID, list[Any], list[Any]]
         ] = {}
-        for rid, values in heap.scan(txn):
+        indexed = (
+            self._indexed_dml_targets(table, stmt.where, txn, heap, ri=False)
+            if source_table is None
+            else None
+        )
+        targets = indexed if indexed is not None else list(heap.scan(txn))
+        for rid, values in targets:
             old_tuple = tuple(values)
             if source_table is None:
                 ctx = EvalContext(old_tuple)
