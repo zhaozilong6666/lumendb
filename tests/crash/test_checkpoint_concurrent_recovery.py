@@ -19,6 +19,57 @@ def _crash(db: Database) -> None:
     db.disk.close()
 
 
+def test_checkpoint_does_not_deadlock_with_commit_holding_txn_lock(tmp_path, monkeypatch):
+    """checkpoint 在 BufferPool 锁内不能再取 TransactionManager 锁。
+
+    提交路径是 TM 锁 → BP 锁（``_mark_committed`` → ``clear_undo``），
+    checkpoint 的 ``clean_barrier`` 却先拿 BP 锁。如果它在屏障里再调用
+    会拿 TM 锁的 ``active_xids``，两边就形成 ABBA 死锁：8 线程基准实测
+    卡在 ``flush_page`` 的 checkpoint 与 ``active_xids`` 两处。
+    """
+    db = Database(tmp_path / "db", concurrent_dml=True)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+    db.execute_one("INSERT INTO t VALUES (0, 0)")
+
+    tm_locked = threading.Event()
+    release_tm = threading.Event()
+    reached_wal_checkpoint = threading.Event()
+    checkpoint_done = threading.Event()
+
+    original_wal_checkpoint = db.wal.checkpoint
+
+    def observed_wal_checkpoint(active_xids):
+        # 能走到这里，说明屏障里没有因为 active_xids 去抢 TM 锁。
+        reached_wal_checkpoint.set()
+        return original_wal_checkpoint(active_xids)
+
+    monkeypatch.setattr(db.wal, "checkpoint", observed_wal_checkpoint)
+
+    def hold_tm_lock() -> None:
+        with db.txns._lock:
+            tm_locked.set()
+            assert release_tm.wait(10)
+
+    def run_checkpoint() -> None:
+        db.checkpoint()
+        checkpoint_done.set()
+
+    holder = threading.Thread(target=hold_tm_lock, daemon=True)
+    checker = threading.Thread(target=run_checkpoint, daemon=True)
+    holder.start()
+    assert tm_locked.wait(10)
+    checker.start()
+    try:
+        # 修复前 checkpoint 会停在屏障里的 active_xids，到不了 WAL 追加点。
+        assert reached_wal_checkpoint.wait(2), "checkpoint 在 BP 锁内抢 TM 锁：ABBA 死锁"
+    finally:
+        release_tm.set()
+        holder.join(10)
+        checker.join(10)
+        assert checkpoint_done.is_set()
+        db.close()
+
+
 def test_checkpoint_does_not_skip_page_dirtied_during_flush(tmp_path, monkeypatch):
     path = tmp_path / "db"
     db = Database(path, concurrent_dml=True)

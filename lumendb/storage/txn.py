@@ -583,6 +583,21 @@ class TransactionManager:
         with self._lock:
             return sorted(self._active)
 
+    def active_xids_for_checkpoint(self) -> list[int]:
+        """checkpoint 在 BufferPool._lock 内取活跃集合的专用入口。
+
+        不能在这里拿 ``self._lock``：提交路径是「TM 锁 → BufferPool 锁」
+        （``_mark_committed`` 里 ``clear_undo``），而 checkpoint 的
+        ``clean_barrier`` 已经持有 BufferPool 锁；再反过来要 TM 锁就是
+        ABBA 死锁（实测 8 线程基准卡在 flush_page / active_xids 两处）。
+
+        这里只读 ``_active``。调用方已持有 BufferPool 锁，任何事务即使刚
+        BEGIN 也还不能写页；因此快照之后才加入 ``_active`` 的事务不会在
+        checkpoint 记录之前留下脏页。GIL 下 ``list(set)`` 是原子的，读到
+        BEGIN 前或后的集合都安全：多一个活跃事务只是让恢复更保守。
+        """
+        return list(self._active)
+
     @property
     def active_first_lsn(self) -> int | None:
         """最老的活跃事务 BEGIN LSN；没有活跃事务时返回 None。"""

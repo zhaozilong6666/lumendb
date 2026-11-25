@@ -184,7 +184,11 @@ class RecoveryManager:
         页却没落盘”的漏页窗口。
         """
         with self._bp.clean_barrier():
-            lsn = self._wal.checkpoint(self._txns.active_xids)
+            # 这里已经持有 BufferPool._lock，不能再拿 TransactionManager 锁：
+            # 提交路径是 TM 锁 → BP 锁（_mark_committed 的 clear_undo），
+            # 反过来取就是 ABBA 死锁。active_xids_for_checkpoint 只读集合，
+            # 且此时新事务即使 BEGIN 也写不了页，不会在 checkpoint 前留脏页。
+            lsn = self._wal.checkpoint(self._txns.active_xids_for_checkpoint())
         self._wal.flush()
         self._disk.meta.checkpoint_lsn = lsn
         self._disk._persist_meta()
