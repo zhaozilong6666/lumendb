@@ -417,6 +417,38 @@ def test_heap_get_retries_when_root_newest_advances(env, monkeypatch):
         db.txns.commit(txn)
 
 
+def test_indexed_update_keeps_rid_when_initial_get_is_transiently_none(env, monkeypatch):
+    """索引物化发生在行锁之前，版本链头未提交时 get 可能返回 None。
+
+    回归：16×200 热点更新里偶发 affected=0，最终 v 少 1。根因不是索引没有
+    命中，而是 ``_indexed_dml_targets`` 在拿行锁前用 ``ri=True`` 读到了
+    另一个事务刚写、尚未 COMMIT 的链头；整条旧链的 xmax 又都已提交，于是
+    所有版本都不可见，目标被丢掉。保留 RID、等锁后用 fresh 值复核即可。
+    """
+    db, server = env
+    writer = Session(database=db)
+    _run(server, writer, "INSERT INTO t VALUES (1, 0, 'x')")
+
+    original_get = HeapFile.get
+    calls = 0
+
+    def transiently_none(self, txn, root_rid, *, ri=False):
+        nonlocal calls
+        if ri:
+            calls += 1
+            if calls == 1:
+                return None
+        return original_get(self, txn, root_rid, ri=ri)
+
+    monkeypatch.setattr(HeapFile, "get", transiently_none)
+    try:
+        result = _run(server, writer, "UPDATE t SET v = v + 1 WHERE id = 1")[0]
+    finally:
+        monkeypatch.setattr(HeapFile, "get", original_get)
+    assert result.affected == 1
+    assert _rows(server, writer, "SELECT v FROM t WHERE id = 1") == [(1,)]
+
+
 def test_autocommit_update_waits_for_holder_then_rereads_latest(env):
     """自动提交 UPDATE 在行锁上等待后重读最新已提交版本，不能拿旧快照覆盖。"""
     db, server = env

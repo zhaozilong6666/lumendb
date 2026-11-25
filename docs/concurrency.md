@@ -509,7 +509,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1515 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1517 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -1048,6 +1048,35 @@ Linux / Windows 四矩阵）全绿。
 `_newest_for_root` 第一次返回旧根、第二次返回真实链头：旧实现只查一次会返回
 `None`，新实现必须重试并读回最新版本。
 
+**2026-11-25 再修正：真正吞掉自增的是“行锁前物化目标 + 链头未提交”。**
+
+上面的“整条链都已 COMMITTED”只是第一次抓现场时的误判；后续把 `get` 内部
+逐版本可见性打出来，稳定复现到的是：
+
+1. `_indexed_dml_targets` 在 `_update` **拿行锁之前**用 `ri=True` 读堆，目的是
+   先缩小目标集；
+2. 此时另一个并发 UPDATE 刚把新版本写进链头并把根 `newest` 指过去，但它的
+   事务还没 COMMIT（`xmin` 仍是 `ACTIVE`）；
+3. 链头不可见；旧版本的 `xmax` 又都指向各自后继（后继多已 COMMIT），所以
+   沿 `prev` 回溯整条链都不可见，`find_version` 返回 `None`；
+4. `get` 重读 `newest`，指针没变（同一个未提交链头），重试 6/64 次都没用；
+5. 目标被丢掉，`affected=0`，这次自增静默消失。
+
+修法不是等更久，而是**不把“现在读不到”当成“行不存在”**：
+`_indexed_dml_targets(..., ri=True)` 遇到 `heap.get` 返回 `None` 时保留
+`(rid, None)`；`_update` 等行锁后用 `fresh=heap.get(..., ri=True)` 重新判
+WHERE/赋值，`fresh` 仍为 `None` 才跳过。显式快照事务（`ri=False`）保持原语义。
+
+确定性回归
+`tests/unit/test_concurrent_dml.py::test_indexed_update_keeps_rid_when_initial_get_is_transiently_none`
+把第一次 `ri=True` 的 `get` 改成返回 `None`；旧实现 `affected=0`，新实现必须
+在锁后读回并完成一次自增。
+
+实测：8×1000 插入 + 8×100 热点连续 20 轮、低切换间隔 10 轮、四进程并发
+5 轮（共 20 个进程）全部 `final_rows=8001`、`hot_value=800`；16×200 低切换
+间隔 10 轮全部 `v=3200`、`zeros=0`、`retries=0`。此前同样的 16×200 负载
+每轮几乎必现 1–2 次 `affected=0`。
+
 前一个 docs 提交 `4fbb6df` 的 CI #278 失败与本次改动无关：Windows 3.13 上
 `test_quorum.py` 两条时间敏感用例偶发（看门狗心跳重置竞态、`append_entries`
 连接超时），同树在 run 279 重跑即绿。已作为 flake 记进账本，后续单独硬化。
@@ -1115,7 +1144,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1515 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1517 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

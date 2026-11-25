@@ -76,6 +76,11 @@ class BufferPoolManager:
         self._frames: "OrderedDict[int, Page]" = OrderedDict()
         self._pins: dict[int, int] = {}
         self._dirty: set[int] = set()
+        #: 正在把页写向磁盘的 flush_page 数量。clean_barrier 必须在
+        #: ``_lock`` 内等到它归零，再做最后一次 fsync，否则一个晚到的
+        #: 页写可能落在 checkpoint 之后、却没被 fsync 覆盖。
+        self._inflight_writes = 0
+        self._write_cv = threading.Condition(self._lock)
         # xid -> [(page_id, offset, before_image)]，用于显式 ROLLBACK 的页级撤销
         self._undo: dict[int, list[tuple[int, int, bytes]]] = {}
         # 新分配、尚未写入 WAL 的页；第一次更新时先记一条完整页镜像。
@@ -337,6 +342,7 @@ class BufferPoolManager:
             # 临时 pin，防止拿到 page 引用后立刻被淘汰/复用。
             self._pins[page_id] = self._pins.get(page_id, 0) + 1
             version = self._page_versions.get(page_id, 0)
+            self._inflight_writes += 1
         try:
             with page.latch:
                 data = bytes(page.buf)
@@ -349,6 +355,9 @@ class BufferPoolManager:
                     self._dirty.discard(page_id)
                 self.stats.page_writes += 1
         finally:
+            with self._lock:
+                self._inflight_writes -= 1
+                self._write_cv.notify_all()
             self.unpin(page_id)
 
     def flush_all(self) -> int:
@@ -381,16 +390,23 @@ class BufferPoolManager:
         checkpoint 需要在"所有页都干净"的点上写 CHECKPOINT 记录：否则并发
         写者可能在 flush 与 checkpoint 之间标脏一页，而它的 WAL 记录 LSN 又
         早于 checkpoint_lsn，恢复时会被跳过。这里循环 flush 直到 ``_dirty``
-        为空，然后拿着 ``_lock`` 让调用方追加 CHECKPOINT 记录——写者要标脏
-        必须先拿 ``_lock``，所以屏障内不会出现新的 dirty 页。
+        为空，再等所有在飞的 ``flush_page`` 写盘完成，持着 ``_lock`` 做最后
+        一次 ``disk.sync``，让调用方追加 CHECKPOINT——写者要标脏必须先拿
+        ``_lock``，所以屏障内不会出现新的 dirty 页或新的页写。
 
-        调用方只应在屏障内做"追加 CHECKPOINT 记录"这种短操作，不要做 fsync
-        或页写；``flush_all`` 的 fsync 在进入屏障前已经完成。
+        调用方只应在屏障内做"追加 CHECKPOINT 记录"这种短操作，不要做页写；
+        数据页的 fsync 已由屏障在进入前加锁完成。
         """
         while True:
             self.flush_all()
             self._lock.acquire()
+            # flush_all 的 fsync 发生在锁外；等待所有已经在飞的页写
+            # 完成，再持着 _lock 做最后一次 fsync。这样从这次 fsync
+            # 到 yield 结束，不会有 flush_page 或 _evict 再写盘。
+            while self._inflight_writes:
+                self._write_cv.wait()
             if not self._dirty:
+                self._disk.sync()
                 break
             self._lock.release()
         try:
@@ -430,8 +446,13 @@ class BufferPoolManager:
         page = self._frames.pop(page_id)
         self._pins.pop(page_id, None)
         if page_id in self._dirty:
-            self._apply_wal_rule(page)
-            self._disk.write_page(page_id, page.buf)
+            # pin=0 且已从 frames 移除，理论上没有写者；仍先拷贝一致快照，
+            # 避免 disk.write_page 在异步写文件时读到正在变化的 bytearray。
+            data = bytes(page.buf)
+            page_lsn = page.page_lsn
+            if page_lsn > 0:
+                self._apply_wal_rule(page)
+            self._disk.write_page(page_id, data)
             self._dirty.discard(page_id)
             self.stats.page_writes += 1
         self.stats.evictions += 1

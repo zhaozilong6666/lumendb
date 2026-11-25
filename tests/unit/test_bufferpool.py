@@ -285,6 +285,38 @@ class TestWalRule:
         assert flushed >= 2
         assert not bp._dirty
 
+    def test_clean_barrier_waits_for_inflight_page_writes(self, env):
+        """checkpoint 的最终 fsync 不能漏掉一个已经在飞的 flush_page。
+
+        旧实现里 flush_all 在锁外 fsync；如果另一个线程随后才把脏页写盘，
+        checkpoint 可能在这个写盘前推进 checkpoint_lsn，崩溃恢复就会跳过
+        该页的 redo（历史 COUNT=7486 / 页链尾部丢失的窗口之一）。
+        """
+        bp, dm, wal = env
+        entered = threading.Event()
+
+        def run_barrier():
+            with bp.clean_barrier():
+                entered.set()
+
+        # 模拟一个已经开始、尚未完成的页写。
+        with bp._lock:
+            bp._inflight_writes += 1
+        thread = threading.Thread(target=run_barrier)
+        thread.start()
+        try:
+            assert not entered.wait(0.2), "屏障没有等待在飞的页写"
+            with bp._lock:
+                bp._inflight_writes -= 1
+                bp._write_cv.notify_all()
+            assert entered.wait(2)
+        finally:
+            with bp._lock:
+                if bp._inflight_writes:
+                    bp._inflight_writes -= 1
+                    bp._write_cv.notify_all()
+            thread.join(5)
+
     def test_mark_dirty_bumps_page_version(self, env):
         """绕过 log_page_update 的直接写也要让解码缓存/刷盘版本失效。"""
         bp, dm, wal = env

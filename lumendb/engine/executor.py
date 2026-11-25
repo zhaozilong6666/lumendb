@@ -3885,7 +3885,7 @@ class Executor:
         heap: HeapFile,
         *,
         ri: bool,
-    ) -> Optional[list[tuple[RID, list[Any]]]]:
+    ) -> Optional[list[tuple[RID, Optional[list[Any]]]]]:
         """把单列 ``col = 常量`` 的 DML 目标改走索引，避免全表扫描。
 
         返回 ``None`` 表示这条 WHERE 不适合索引下推（调用方继续全扫）；
@@ -3916,7 +3916,7 @@ class Executor:
         except (TypeError, ValueError):
             return None
 
-        targets: list[tuple[RID, list[Any]]] = []
+        targets: list[tuple[RID, Optional[list[Any]]]] = []
         seen_roots: set[RID] = set()
         for rid in self._tree_for(table, index).lookup(txn, [key_value]):
             if rid in seen_roots:
@@ -3924,6 +3924,14 @@ class Executor:
             seen_roots.add(rid)
             values = heap.get(txn, rid, ri=ri)
             if values is None:
+                # 自动提交 UPDATE 的 ri=True 目标物化发生在行锁之前：此刻
+                # 版本链头可能正被另一个事务改写（xmin 尚未 COMMIT），
+                # get 会返回 None。不能据此把目标丢掉——否则 _update 拿到
+                # 空列表、affected=0，热点自增直接少一次（实测 800→799）。
+                # 保留 RID 作为“待复核目标”，_update 会在等行锁后用 fresh
+                # 值再判可见性和完整 WHERE；显式快照事务保持原语义跳过。
+                if ri:
+                    targets.append((rid, None))
                 continue
             # 索引项可能陈旧（DELETE/UPDATE 不立即摘项，等 VACUUM 回收）：
             # 以堆里的当前版本复核键，避免把已经改走键的行当成命中。
@@ -4016,20 +4024,23 @@ class Executor:
                 seen_roots.add(rid)
                 targets.append((rid, values))
         for rid, old_values in targets:
-            old_tuple = tuple(old_values)
-            if source_table is None:
-                ctx = EvalContext(old_tuple)
-                if where_fn is not None and not _truthy(where_fn(ctx)):
-                    continue
-            else:
-                ctx = None
-                for source_values in source_rows:
-                    candidate = EvalContext(old_tuple + tuple(source_values))
-                    if where_fn is None or _truthy(where_fn(candidate)):
-                        ctx = candidate
-                        break
-                if ctx is None:
-                    continue
+            # 索引物化时若版本链头正被并发写者改到一半，old_values 会是
+            # None。此时不做预过滤，等行锁后拿到 fresh 值再判 WHERE。
+            old_tuple = tuple(old_values) if old_values is not None else None
+            ctx = None
+            if old_tuple is not None:
+                if source_table is None:
+                    ctx = EvalContext(old_tuple)
+                    if where_fn is not None and not _truthy(where_fn(ctx)):
+                        continue
+                else:
+                    for source_values in source_rows:
+                        candidate = EvalContext(old_tuple + tuple(source_values))
+                        if where_fn is None or _truthy(where_fn(candidate)):
+                            ctx = candidate
+                            break
+                    if ctx is None:
+                        continue
             if latest:
                 # 先等到这一行的写锁，再从版本链头取最新已提交版本重算。
                 self._lock_row(table, rid, txn, wait=True)
@@ -4050,6 +4061,8 @@ class Executor:
                             break
                     if ctx is None:
                         continue
+            elif old_tuple is None:  # pragma: no cover - 非 latest 不会产生空目标
+                continue
             assert ctx is not None
             new_values = list(old_tuple)
             for index, fn in assignment_fns:
