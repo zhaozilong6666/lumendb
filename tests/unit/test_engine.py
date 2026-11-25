@@ -5111,3 +5111,34 @@ class TestErrorQuality:
     def test_keyword_as_name_rejected(self, db):
         with pytest.raises(Exception):
             db.execute_one("SELECT FROM")
+
+
+def test_repeated_online_vacuum_reuses_pages_without_file_growth(tmp_path, monkeypatch):
+    """反复插入-删除-在线 VACUUM 不应每次新建目录页链，空页要能复用。"""
+    db = Database(tmp_path / "reclaim", concurrent_dml=True)
+    try:
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(1000))"
+        )
+        db.execute_one("CREATE INDEX idx_v ON t (v)")
+        monkeypatch.setattr(
+            db.txns, "wait_until_no_others", lambda *args, **kwargs: False
+        )
+        pad = "x" * 900
+        baseline = None
+        for cycle in range(3):
+            for i in range(18):
+                db.execute_one(f"INSERT INTO t VALUES ({i}, {i}, '{pad}')")
+            db.execute_one("DELETE FROM t")
+            idle = db.txns.begin()
+            db.execute_one("VACUUM")
+            db.txns.abort(idle)
+            if baseline is None:
+                baseline = db.disk.num_pages
+            else:
+                assert db.disk.num_pages == baseline
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(0,)]
+        db.execute_one("INSERT INTO t VALUES (100, 1, 'z')")
+        assert db.execute_one("SELECT COUNT(*) FROM t").rows == [(1,)]
+    finally:
+        db.close()

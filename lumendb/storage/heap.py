@@ -25,6 +25,7 @@ from typing import Any, Iterator, Optional, Sequence, Tuple
 
 from ..catalog.schema import TableDef
 from ..errors import CorruptedPageError, RowTooLargeError, StorageError
+from .btree import BPlusTree, KeyCodec
 from .bufferpool import BufferPoolManager
 from .page import INVALID_PAGE_ID, PAGE_SIZE, HeapPage
 from .record import (
@@ -728,8 +729,12 @@ class HeapFile:
             if rid not in keep and visible(header):
                 keep.add(rid)
 
+        # 先驱逐指向“不再保留的物理版本”的索引项。必须在重置/复用页之前
+        # 完成；否则同一页槽位被新行复用后，旧键的索引项会命中新行。
+        stale_index_entries = self._purge_stale_index_entries(txn, keep)
+
         dead = 0
-        compacted = 0
+        rewritten: set[int] = set()
         for pid in page_ids:
             page = self._fetch(pid)
             dirty = False
@@ -750,10 +755,13 @@ class HeapFile:
                         page.compact()
                         self._log_page_image(txn, page, old)
                         dead += removed
-                        compacted += 1
+                        rewritten.add(pid)
                         dirty = True
             finally:
                 self._release(page, dirty=dirty)
+
+        # 空页的旧槽位目录/版本链已经被整页重置，计进“重写页数”。
+        rewritten.update(self._reclaim_empty_pages(txn, page_ids, keep))
 
         live_roots: set[RID] = set()
         for rid, header in headers.items():
@@ -762,7 +770,10 @@ class HeapFile:
             ):
                 live_roots.add(self.resolve_root(rid, header))
         self.table.row_count_hint = len(live_roots)
-        return len(live_roots), dead, compacted
+        # ``stale_index_entries`` 目前只用于保证页复用安全；调用方不需要
+        # 这个计数，保留局部变量让日志/调试能看到实际清理量。
+        del stale_index_entries
+        return len(live_roots), dead, len(rewritten)
 
     def vacuum(self, txn: Transaction) -> tuple[int, int, int]:
         """回收死版本，并把存活行重排成"每行只剩一条根元组"。
@@ -861,6 +872,143 @@ class HeapFile:
                 return index
             index += 1
         return index
+
+    def _reclaim_empty_pages(
+        self, txn: Transaction, page_ids: Sequence[int], keep: set[RID]
+    ) -> set[int]:
+        """把没有任何保留版本的页重置后移到链尾，供后续插入复用；返回页号集合。
+
+        只处理 ``keep`` 里没有任何 RID 的页：这些页上的根记录也已经被
+        回收，索引项由 :meth:`_purge_stale_index_entries` 先清空。页号保持
+        不变（索引项已清空，不会再有旧 RID 命中新行），但槽位目录和版本链
+        一起归零，等于把整页空间交还给 ``_find_page_with_space``。
+
+        必须在 ``exclusive_guard`` 下执行；链指针的改写在 ``_shape_lock``
+        内完成，页内容仍按页 latch + 整页 WAL 落盘。
+        """
+        empty = [
+            pid
+            for pid in page_ids
+            if not any(rid[0] == pid for rid in keep)
+        ]
+        if not empty:
+            return set()
+        reclaimed: set[int] = set()
+        with self._shape_lock:
+            for pid in empty:
+                page = self._fetch(pid)
+                try:
+                    with page.latch:
+                        next_id = page.next_page
+                        prev_id = page.prev_page
+                    if prev_id == INVALID_PAGE_ID and next_id == INVALID_PAGE_ID:
+                        # 唯一的一页：保留为根页，只清空槽位。
+                        old = bytes(page.buf)
+                        page.init_heap(pid)
+                        self._log_page_image(txn, page, old)
+                        reclaimed.add(pid)
+                        continue
+
+                    # 先摘链：更新前驱/后继与目录里的根/尾指针。
+                    if prev_id == INVALID_PAGE_ID:
+                        self.table.root_page = next_id
+                        nxt = self._fetch(next_id)
+                        try:
+                            self._apply_and_log(
+                                txn,
+                                nxt,
+                                12,
+                                struct.pack("<I", INVALID_PAGE_ID),
+                                bytes(nxt.buf[12:16]),
+                            )
+                        finally:
+                            self._release(nxt, dirty=True)
+                    else:
+                        prv = self._fetch(prev_id)
+                        try:
+                            self._apply_and_log(
+                                txn,
+                                prv,
+                                8,
+                                struct.pack("<I", next_id),
+                                bytes(prv.buf[8:12]),
+                            )
+                        finally:
+                            self._release(prv, dirty=True)
+                    if next_id != INVALID_PAGE_ID:
+                        nxt = self._fetch(next_id)
+                        try:
+                            self._apply_and_log(
+                                txn,
+                                nxt,
+                                12,
+                                struct.pack("<I", prev_id),
+                                bytes(nxt.buf[12:16]),
+                            )
+                        finally:
+                            self._release(nxt, dirty=True)
+                    elif prev_id != INVALID_PAGE_ID:
+                        self.table.last_page = prev_id
+
+                    # 重置该页，再挂到当前链尾。
+                    old = bytes(page.buf)
+                    page.init_heap(pid)
+                    tail_id = self.table.last_page
+                    if tail_id != INVALID_PAGE_ID and tail_id != pid:
+                        tail = self._fetch(tail_id)
+                        try:
+                            self._apply_and_log(
+                                txn,
+                                tail,
+                                8,
+                                struct.pack("<I", pid),
+                                bytes(tail.buf[8:12]),
+                            )
+                        finally:
+                            self._release(tail, dirty=True)
+                        page.prev_page = tail_id
+                    self.table.last_page = pid
+                    self._log_page_image(txn, page, old)
+                    reclaimed.add(pid)
+                finally:
+                    self._release(page, dirty=True)
+        return reclaimed
+
+    def _purge_stale_index_entries(
+        self, txn: Transaction, keep: set[RID]
+    ) -> int:
+        """清掉指向已回收 RID 的索引项，返回实际删除的条目数。
+
+        在线 VACUUM 此前只回收堆页里的死版本，索引项故意保留给活跃快照和
+        尚未重排的 RID 使用；但这些 RID 一旦对所有快照都不可见、记录体也被
+        回收，索引项就只剩两类作用：让查询多回表一次，以及让唯一索引的
+        陈旧命中越积越多。这里在 ``exclusive_guard`` 之后把 ``keep`` 之外的
+        条目按 ``(key, rid)`` 精确删除；删除按完整键 + RID 定位，不会误删
+        同键的其它活版本。
+
+        只在页级回收之前调用：页面稍后会被重置复用，不能再留着任何指向
+        旧槽位的索引项，否则新行可能“继承”旧键的索引命中。
+        """
+        removed = 0
+        for idx in self.table.indexes.values():
+            specs = [self.table.column(c).type for c in idx.columns]
+            tree = BPlusTree(
+                self._bp,
+                KeyCodec(specs),
+                idx.root_page,
+                name=idx.name,
+                root_cell=idx,
+            )
+            stale: list[tuple[tuple, RID]] = []
+            for full_key, rid in tree.scan_all(txn):
+                if rid in keep:
+                    continue
+                # scan_all 的键末尾带 RID 两列；B+ 树 delete 只接收索引列值。
+                stale.append((tuple(full_key[:-2]), rid))
+            for values, rid in stale:
+                if tree.delete(txn, list(values), rid):
+                    removed += 1
+        return removed
 
     def _log_page_image(self, txn: Transaction, page: HeapPage, old: bytes) -> None:
         """整页重写也要进 WAL：否则恢复后看到的是旧内容，行就凭空复活了。"""

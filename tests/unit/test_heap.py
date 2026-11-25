@@ -12,10 +12,11 @@ import threading
 
 import pytest
 
-from lumendb.catalog.schema import Column, TableDef
+from lumendb.catalog.schema import Column, IndexDef, TableDef
 from lumendb.datatypes import DataType, TypeSpec
 from lumendb.errors import RowTooLargeError, StorageError, TransactionAbortedError
 from lumendb.storage.bufferpool import BufferPoolManager
+from lumendb.storage.btree import BPlusTree, KeyCodec
 from lumendb.storage.heap import HeapFile
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.txn import TransactionManager
@@ -639,3 +640,127 @@ def test_vacuum_online_reclaims_fully_dead_root_records(env):
     rid = heap.insert(vac, [1, "a-new", 11])
     assert heap.get(vac, rid) == [1, "a-new", 11]
     txns.commit(vac)
+
+
+def test_vacuum_online_purges_stale_index_entries(env):
+    """死版本的索引项必须按 (key, rid) 精确摘除，不能留给页复用。"""
+    heap, txns, bp, table = env
+    idx = IndexDef(name="idx_age", table=table.name, columns=("age",))
+    table.indexes[idx.name] = idx
+    tree = BPlusTree(
+        bp,
+        KeyCodec([table.column("age").type]),
+        idx.root_page,
+        name=idx.name,
+        root_cell=idx,
+    )
+
+    txn = txns.begin()
+    r1 = heap.insert(txn, [1, "a", 10])
+    r2 = heap.insert(txn, [2, "b", 20])
+    tree.insert(txn, [10], r1)
+    tree.insert(txn, [20], r2)
+    txns.commit(txn)
+
+    txn = txns.begin()
+    heap.delete(txn, r1)
+    new_r2 = heap.update(txn, r2, [2, "b", 42])
+    tree.insert(txn, [42], new_r2)
+    txns.commit(txn)
+
+    vac = txns.begin()
+    # 根记录 r2 是逻辑行的长期句柄，必须保留；死的是 r1 根 + 旧版本。
+    assert heap.vacuum_online(vac) == (1, 1, 1)
+    txns.commit(vac)
+
+    reader = txns.begin()
+    entries = list(tree.scan_all(reader))
+    # r1 已连根回收，指向它的索引项必须消失；r2 的根仍然保留。
+    assert all(rid != r1 for _, rid in entries)
+    assert any(rid == new_r2 for _, rid in entries)
+    assert any(rid == r2 for _, rid in entries)
+    txns.commit(reader)
+
+
+def test_vacuum_online_reclaims_empty_page_and_reuses_it(env):
+    """整页死链回收后，页移到链尾复用；旧索引项不能命中新行。"""
+    heap, txns, bp, table = env
+    idx = IndexDef(name="idx_age", table=table.name, columns=("age",))
+    table.indexes[idx.name] = idx
+    tree = BPlusTree(
+        bp,
+        KeyCodec([table.column("age").type]),
+        idx.root_page,
+        name=idx.name,
+        root_cell=idx,
+    )
+
+    txn = txns.begin()
+    rids = []
+    for i in range(18):
+        rid = heap.insert(txn, [i, "x" * 900, i])
+        rids.append(rid)
+        tree.insert(txn, [i], rid)
+    txns.commit(txn)
+
+    page_of = {}
+    txn = txns.begin()
+    for rid in rids:
+        page, _rec = heap._read_rid(rid)
+        try:
+            page_of.setdefault(page.page_id, []).append(rid)
+        finally:
+            bp.unpin(page.page_id)
+    txns.commit(txn)
+    assert len(page_of) >= 3
+    target = next(pid for pid, rows in page_of.items() if len(rows) >= 2)
+
+    txn = txns.begin()
+    for rid in page_of[target]:
+        heap.delete(txn, rid)
+    txns.commit(txn)
+
+    vac = txns.begin()
+    kept, dead, pages = heap.vacuum_online(vac)
+    txns.commit(vac)
+    assert kept == len(rids) - len(page_of[target])
+    assert dead == len(page_of[target])
+    assert pages >= 1
+    assert table.last_page == target
+
+    reader = txns.begin()
+    assert all(rid[0] != target for _key, rid in tree.scan_all(reader))
+    new_rid = heap.insert(reader, [99, "y" * 100, 99])
+    tree.insert(reader, [99], new_rid)
+    txns.commit(reader)
+    assert new_rid[0] == target
+    reader = txns.begin()
+    assert heap.get(reader, new_rid) == [99, "y" * 100, 99]
+    txns.commit(reader)
+
+
+def test_vacuum_online_all_dead_multipage_keeps_chain_walkable(env):
+    """所有页都死时，链仍保持单链且可继续插入，不出现指针环。"""
+    heap, txns, bp, table = env
+    txn = txns.begin()
+    rids = [heap.insert(txn, [i, "z" * 900, i]) for i in range(18)]
+    txns.commit(txn)
+
+    txn = txns.begin()
+    for rid in rids:
+        heap.delete(txn, rid)
+    txns.commit(txn)
+
+    vac = txns.begin()
+    kept, dead, pages = heap.vacuum_online(vac)
+    assert kept == 0
+    assert dead == len(rids)
+    assert pages >= 2
+    assert list(heap.scan(vac)) == []
+    txns.commit(vac)
+
+    # 链没有断：新插入能落到被重置的尾页，扫描也只看到新行。
+    txn = txns.begin()
+    new_rid = heap.insert(txn, [100, "n" * 100, 1])
+    assert list(heap.scan(txn)) == [(new_rid, [100, "n" * 100, 1])]
+    txns.commit(txn)

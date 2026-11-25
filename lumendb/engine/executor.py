@@ -3154,6 +3154,7 @@ class Executor:
             and bool(active_others)
             and all(not t.catalog_hold and not t.undo_log for t in active_others)
         )
+        before = self._catalog_structure_fingerprint()
         kept = dead = pages = 0
         online_tables = 0
         for table in tables:
@@ -3172,7 +3173,11 @@ class Executor:
             kept += k
             dead += d
             pages += p
-        self._persist_catalog(txn)
+        # 在线 VACUUM 可能只清死版本/索引陈旧项，不动 root_page/last_page/
+        # 索引根；这时不必每次重写整份目录（否则每次 VACUUM 都会新建一条
+        # 目录页链，文件随维护次数增长）。离线 VACUUM 会换 RID 和根页，
+        # 指纹变化后仍会落盘。
+        self._persist_if_structure_changed(before, txn)
         suffix = ", online" if online_tables else ""
         return Result(
             affected=dead,

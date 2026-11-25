@@ -98,3 +98,70 @@ def test_crashed_online_vacuum_keeps_visible_rows(tmp_path, monkeypatch):
         assert _count(db2, "SELECT COUNT(*) FROM t") == [(20,)]
     finally:
         db2.close()
+
+
+def test_crashed_online_vacuum_page_reclaim_keeps_chain_and_rows(tmp_path):
+    """整页回收把空页移到链尾后崩溃：恢复不能丢可见行或把索引指到旧槽位。"""
+    path = tmp_path / "db-reclaim"
+    db = Database(path, concurrent_dml=True)
+    db.execute_one(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT, pad VARCHAR(1000))"
+    )
+    pad = "x" * 900
+    for i in range(18):
+        db.execute_one(f"INSERT INTO t VALUES ({i}, {i}, '{pad}')")
+    db.execute_one("CREATE INDEX idx_v ON t (v)")
+    table = db.catalog.get_table("t")
+    heap = HeapFile(db.bp, table, db.txns)
+
+    reader = db.txns.begin()
+    page_of: dict[int, list[int]] = {}
+    for rid, values in heap.scan(reader):
+        page, _rec = heap._read_rid(rid)
+        try:
+            page_of.setdefault(page.page_id, []).append(values[0])
+        finally:
+            db.bp.unpin(page.page_id)
+    db.txns.commit(reader)
+    assert len(page_of) >= 3
+    target_page = next(pid for pid, ids in page_of.items() if len(ids) >= 2)
+    target_ids = page_of[target_page]
+    for row_id in target_ids:
+        db.execute_one(f"DELETE FROM t WHERE id = {row_id}")
+
+    # 删除提交后再开空闲快照，它不需要被删行，在线 VACUUM 可以整页回收。
+    idle = db.txns.begin()
+    vac = db.txns.begin()
+    heap.vacuum_online(vac, db.txns.active_transactions())
+    db.catalog.mark_dirty()
+    db.catalog.persist(vac)
+    db.txns.commit(vac)
+    assert table.last_page == target_page
+
+    # 重置后的页应立即能复用；旧键的索引项不得把新行当成命中。
+    new_row = db.execute_one(
+        f"INSERT INTO t VALUES (99, 99, '{'y' * 100}')"
+    )
+    assert new_row.affected == 1
+    assert db.execute_one("SELECT COUNT(*) FROM t").rows[0][0] == (
+        18 - len(target_ids) + 1
+    )
+    db.txns.abort(idle)
+
+    db.bp.flush_all()
+    db.wal.flush()
+    db.wal.close()
+    db.disk.close()
+
+    db2 = Database(path, concurrent_dml=True)
+    try:
+        table2 = db2.catalog.get_table("t")
+        heap2 = HeapFile(db2.bp, table2, db2.txns)
+        count = db2.execute_one("SELECT COUNT(*) FROM t").rows[0][0]
+        assert count == 18 - len(target_ids) + 1
+        scan_count = db2.execute_one("SELECT COUNT(*) FROM t WHERE v >= 0").rows[0][0]
+        assert scan_count == count
+        tree = db2.executor._tree_for(table2, table2.indexes["idx_v"])
+        assert tree.check_invariants()["entries"] == count
+    finally:
+        db2.close()
