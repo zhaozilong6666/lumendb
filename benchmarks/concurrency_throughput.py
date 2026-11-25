@@ -29,7 +29,7 @@ from lumendb.errors import SerializationError
 from lumendb.server.pgwire import PGWireServer, Session
 from lumendb.sql.parser import parse_sql
 from lumendb.storage.heap import HeapFile
-from lumendb.storage.page import INVALID_PAGE_ID
+from lumendb.storage.page import INVALID_PAGE_ID, HeapPage
 
 
 def _run(server: PGWireServer, session: Session, sql: str):
@@ -55,7 +55,7 @@ def _diagnose_heap(database: Database) -> dict:
                 break
             seen.add(page_id)
             current = page_id
-            page = database.bp.fetch_page(current)
+            page = database.bp.fetch_page(current, HeapPage)
             try:
                 pages.append(
                     {
