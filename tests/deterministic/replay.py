@@ -11,6 +11,7 @@ import pathlib
 import sys
 import tempfile
 
+from .scenario_ddl import run_ddl_case
 from .scenario_row_lock import run_row_case
 from .scenario_split import run_case
 
@@ -28,31 +29,37 @@ def _run_row(seed: int, root: pathlib.Path) -> str:
     return f"row initial={detail['initial']} final={detail['final']}"
 
 
+def _run_ddl(seed: int, root: pathlib.Path) -> str:
+    trace, detail = run_ddl_case(seed, root / f"ddl-{seed}")
+    return f"ddl rows={detail['rows']}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LumenDB 确定性重放")
     parser.add_argument("--seeds", type=int, default=10, help="跑 0..N-1 个种子")
     parser.add_argument("--seed", type=int, default=None, help="只跑一个种子")
     parser.add_argument(
         "--scenario",
-        choices=["split", "row", "all"],
+        choices=["split", "row", "ddl", "all"],
         default="all",
-        help="split=叶分裂结构窗口；row=两个事务写同一行",
+        help="split=叶分裂结构窗口；row=两个事务写同一行；ddl=未提交写挡住并发 DDL",
     )
     args = parser.parse_args(argv)
 
     seeds = [args.seed] if args.seed is not None else list(range(args.seeds))
-    scenarios = ["split", "row"] if args.scenario == "all" else [args.scenario]
+    scenarios = ["split", "row", "ddl"] if args.scenario == "all" else [args.scenario]
     failures = 0
     for seed in seeds:
         with tempfile.TemporaryDirectory(prefix=f"lumendb_replay_{seed}_") as td:
             root = pathlib.Path(td)
             for scenario in scenarios:
                 try:
-                    detail = (
-                        _run_split(seed, root)
-                        if scenario == "split"
-                        else _run_row(seed, root)
-                    )
+                    if scenario == "split":
+                        detail = _run_split(seed, root)
+                    elif scenario == "row":
+                        detail = _run_row(seed, root)
+                    else:
+                        detail = _run_ddl(seed, root)
                 except BaseException as exc:  # noqa: BLE001
                     failures += 1
                     print(f"[seed {seed}][{scenario}] FAIL: {type(exc).__name__}: {exc}")

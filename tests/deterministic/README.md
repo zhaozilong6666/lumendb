@@ -1,4 +1,4 @@
-# 确定性重放（② 骨架的第一块）
+# 确定性重放（② 骨架的前三块）
 
 这不是概率性并发压测。它把真实引擎里的关键交错点变成可命名的闸门，用固定
 种子决定参数，用事件轨迹断言因果顺序；失败时按同一 seed 重跑会走到同一个点。
@@ -25,6 +25,18 @@
 3. 断言 B 的 `acquire.end` 在 A 的 `COMMIT` 之前没有发生；
 4. 放行 A 提交，B 唤醒后锁后重读，最终值是两次增量，不是 40001。
 
+## 场景三：未提交写挡住并发 DDL
+
+`scenario_ddl.py` 固定：
+
+1. A 显式事务已插入一行，停在 `COMMIT` 前；
+2. B 在 A 提交前尝试 `ALTER TABLE ... ADD COLUMN`；
+3. 断言 DDL 被 40001 拒绝，而不是悄悄重写只复制可见行的 shadow heap；
+4. 放行 A 提交，B 重试 DDL 成功；
+5. 最终两行都在，且都能按新列形状读出。
+
+若门失效，第一版 DDL 会成功，未提交行之后落到已被替换的旧 heap，查询静默少行。
+
 ## 运行
 
 ```bash
@@ -32,11 +44,12 @@ python -m pytest tests/unit/test_deterministic_replay.py -q
 python -m tests.deterministic.replay --seeds 10
 python -m tests.deterministic.replay --seed 3   # 单种子复现
 python -m tests.deterministic.replay --seed 3 --scenario row
+python -m tests.deterministic.replay --seed 3 --scenario ddl
 python -m tests.deterministic.replay --seed 3 --scenario split
 ```
 
 ## 边界
 
-这是 ② 的第二块基础设施，不是 Cherry 评审里“三个场景各 1000 个种子”的全部。
-目前覆盖“B+ 树分裂结构窗口”和“两个事务写同一行”；并发 DDL、副本 apply 中途
-换主还没接，`fsync` / `page.fetch` 也还只有结构窗口这一处闸门。
+这是 ② 的第三块基础设施，不是 Cherry 评审里“三个场景各 1000 个种子”的全部。
+目前覆盖“B+ 树分裂结构窗口”“两个事务写同一行”“未提交写挡住并发 DDL”；
+副本 apply 中途换主还没接，`fsync` / `page.fetch` 也还只有结构窗口这一处闸门。

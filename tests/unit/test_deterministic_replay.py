@@ -10,6 +10,7 @@ import pathlib
 
 import pytest
 
+from tests.deterministic.scenario_ddl import run_ddl_case
 from tests.deterministic.scenario_row_lock import run_row_case
 from tests.deterministic.scenario_split import run_case
 
@@ -30,3 +31,10 @@ def test_row_lock_wait_is_deterministic(tmp_path: pathlib.Path, seed: int) -> No
     assert detail["final"] == detail["initial"] + 2
     assert trace.count("lock.acquire.start", thread="writer-b") >= 1
     assert trace.count("lock.acquire.end", thread="writer-b") >= 1
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_concurrent_ddl_is_rejected_before_uncommitted_commit(tmp_path: pathlib.Path, seed: int) -> None:
+    trace, detail = run_ddl_case(seed, tmp_path / f"ddl-seed-{seed}")
+    assert detail["rows"] == [(1, 1, None), (seed + 2, seed + 2, None)]
+    assert trace.count("B.ddl.rejected") == 1
