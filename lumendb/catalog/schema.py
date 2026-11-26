@@ -265,6 +265,8 @@ class TableDef:
     column_stats: dict[str, ColumnStats] = field(default_factory=dict)
     #: ANALYZE 时的可见行数；0 是合法空表，配合 column_stats 判断“分析过没有”。
     stats_rows: int = -1
+    #: ANALYZE 实际参与列统计的样本行数；0 表示全量扫描。
+    stats_sample_rows: int = 0
     indexes: dict[str, IndexDef] = field(default_factory=dict)
     checks: dict[str, CheckDef] = field(default_factory=dict)
     foreign_keys: dict[str, ForeignKeyDef] = field(default_factory=dict)
@@ -330,6 +332,7 @@ class TableDef:
             "row_count_hint": self.row_count_hint,
             "column_stats": {k: v.to_json() for k, v in self.column_stats.items()},
             "stats_rows": self.stats_rows,
+            "stats_sample_rows": self.stats_sample_rows,
             "indexes": {k: v.to_json() for k, v in self.indexes.items()},
             "checks": {k: v.to_json() for k, v in self.checks.items()},
             "foreign_keys": {
@@ -350,6 +353,7 @@ class TableDef:
                 for k, v in data.get("column_stats", {}).items()
             },
             stats_rows=int(data.get("stats_rows", -1)),
+            stats_sample_rows=int(data.get("stats_sample_rows", 0)),
             indexes={
                 k: IndexDef.from_json(v) for k, v in data.get("indexes", {}).items()
             },

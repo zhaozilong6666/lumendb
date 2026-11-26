@@ -403,8 +403,10 @@ SHOW VIEWS  [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
 SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数、创建时间；只读
 SHOW COLUMNS FROM table [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列名/类型/可空/主键/默认值；带版本或时间时读历史 schema
-SHOW STATISTICS [FROM table];
-                         -- 表/列/行数/n_distinct/null_frac/min/max/桶数；只读
+SHOW STATISTICS [FROM table] [AT CATALOG VERSION n | AT TIME '...'];
+                         -- 表/列/行数/n_distinct/null_frac/min/max/桶数/sample_rows；只读
+                         -- sample_rows=0 表示全量统计，>0 表示抽样统计
+                         -- AT 读取该目录版本的列统计，不代表旧数据页当前内容
 CHECKPOINT;
 ANALYZE [TABLE] table [SAMPLE n];
                          -- 扫描可见行；SAMPLE n 只保留 n 行做列统计（近似），

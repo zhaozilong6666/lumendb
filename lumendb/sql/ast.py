@@ -695,6 +695,8 @@ class ShowColumns(Statement):
 @dataclass
 class ShowStatistics(Statement):
     table: Optional[str] = None
+    catalog_version: Optional[int] = None
+    catalog_time: Optional[str] = None
 
 
 @dataclass

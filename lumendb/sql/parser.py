@@ -308,7 +308,12 @@ class Parser:
                 table = None
                 if self._match_kw("FROM") or self._match_word("FROM"):
                     table = self._parse_ident("表名")
-                return ShowStatistics(table=table)
+                version, timestamp = self._parse_show_history()
+                return ShowStatistics(
+                    table=table,
+                    catalog_version=version,
+                    catalog_time=timestamp,
+                )
             raise self._error(
                 "SHOW 之后期望 TABLES、VIEWS、COLUMNS、STATISTICS 或 CATALOG VERSIONS"
             )

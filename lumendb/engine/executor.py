@@ -3139,6 +3139,7 @@ class Executor:
             total_rows += exact_rows
             table.row_count_hint = exact_rows
             table.stats_rows = exact_rows
+            table.stats_sample_rows = len(rows) if stmt.sample is not None else 0
             table.column_stats = {}
             for index, column in enumerate(table.columns):
                 nulls = 0
@@ -3493,10 +3494,34 @@ class Executor:
         )
 
     def _show_statistics(self, stmt: ShowStatistics) -> Result:
-        if stmt.table is None:
-            tables = sorted(self._catalog.list_tables(), key=lambda t: t.name)
+        has_history = stmt.catalog_version is not None or stmt.catalog_time is not None
+        version = self._history_version(stmt.catalog_version, stmt.catalog_time)
+        notice = ""
+        if not has_history:
+            if stmt.table is None:
+                tables = sorted(self._catalog.list_tables(), key=lambda t: t.name)
+            else:
+                tables = [self._catalog.get_table(stmt.table)]
+        elif version is None:
+            if stmt.table is not None:
+                raise TableNotFoundError(
+                    f"表 {stmt.table!r} 在 {stmt.catalog_time!r} 及之前不存在",
+                    hint="用 SHOW CATALOG VERSIONS 查 created_at",
+                )
+            tables = []
+            notice = f"{stmt.catalog_time!r} 早于第一个 catalog 版本，没有统计"
         else:
-            tables = [self._catalog.get_table(stmt.table)]
+            if stmt.table is None:
+                tables = self._catalog.tables_at(version)
+            else:
+                found = self._catalog.table_at(version, stmt.table)
+                if found is None:
+                    raise TableNotFoundError(
+                        f"表 {stmt.table!r} 在 catalog 版本 {version} 不存在",
+                        hint="用 SHOW TABLES AT CATALOG VERSION n 查该版本的表",
+                    )
+                tables = [found]
+            notice = f"按目录版本 {version} 读取列统计；不代表旧数据页的当前内容"
         rows = []
         for table in tables:
             for column in table.columns:
@@ -3511,6 +3536,7 @@ class Executor:
                         "" if stats is None or stats.min_value is None else str(stats.min_value),
                         "" if stats is None or stats.max_value is None else str(stats.max_value),
                         len(stats.histogram) if stats is not None else 0,
+                        table.stats_sample_rows,
                     )
                 )
         return Result(
@@ -3523,9 +3549,11 @@ class Executor:
                 ColumnMeta("min", TypeSpec(DataType.TEXT)),
                 ColumnMeta("max", TypeSpec(DataType.TEXT)),
                 ColumnMeta("buckets", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("sample_rows", TypeSpec(DataType.BIGINT)),
             ],
             rows=rows,
             tag=f"STATISTICS {len(rows)}",
+            notice=notice,
         )
 
     def _show_columns(self, stmt: ShowColumns) -> Result:

@@ -205,3 +205,32 @@ def test_show_tables_and_views_can_target_history(tmp_path, monkeypatch):
     with pytest.raises(BinderError):
         db.execute_one("SHOW TABLES AT CATALOG VERSION 99")
     db.close()
+
+
+def test_show_statistics_can_target_history(tmp_path, monkeypatch):
+    from lumendb.errors import BinderError
+
+    _fixed_catalog_clock(monkeypatch)
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    for value in range(10):
+        db.execute_one(f"INSERT INTO t VALUES ({value})")
+    db.execute_one("ANALYZE t")
+    first = db.catalog.catalog_version
+    db.execute_one("ALTER TABLE t ADD COLUMN z TEXT")
+    second = db.catalog.catalog_version
+    current = db.execute_one("SHOW STATISTICS FROM t")
+    assert [row[1] for row in current.rows] == ["id", "z"]
+    old = db.execute_one(f"SHOW STATISTICS FROM t AT CATALOG VERSION {first}")
+    assert [row[1] for row in old.rows] == ["id"]
+    assert old.rows[0][2:] == (10, 10, 0.0, "0.0", "9.0", 16, 0)
+    assert "目录版本 1" in old.notice
+    assert db.execute_one(
+        "SHOW STATISTICS AT TIME '1970-01-01T00:00:00+00:00'"
+    ).rows == []
+    with pytest.raises(BinderError):
+        db.execute_one("SHOW STATISTICS FROM t AT CATALOG VERSION 99")
+    db.execute_one("CREATE TABLE u (id INT)")
+    with pytest.raises(TableNotFoundError):
+        db.execute_one(f"SHOW STATISTICS FROM u AT CATALOG VERSION {first}")
+    db.close()

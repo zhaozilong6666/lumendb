@@ -626,7 +626,8 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 实际行数，并为每一列记录 `n_distinct` 与 `null_frac`，随目录 JSON 持久化。
 `SAMPLE n` 用固定种子的蓄水池抽样只保留 n 行参与列统计，行数仍精确计数；
 此时 `n_distinct`、`min/max` 和直方图都是近似值，`SHOW STATISTICS` 的
-`rows` 仍是总行数而不是样本行数。等值谓词
+`rows` 仍是总行数，`sample_rows` 记录实际参与统计的样本行数（0 表示全量）。
+等值谓词
 （`col = 常量`）不再固定使用 0.1，而是优先用
 `(1 - null_frac) / n_distinct`；没有 ANALYZE 统计时仍回退默认选择率。
 
@@ -638,7 +639,10 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 比较，不做数值转换（`'090' < '1'`）。
 
 `SHOW STATISTICS [FROM t]` 把这些列统计暴露成只读目录视图（行数、n_distinct、
-null_frac、min/max、桶数），不复制 PostgreSQL 的 `pg_statistic` 二进制布局。
+null_frac、min/max、桶数、sample_rows），不复制 PostgreSQL 的
+`pg_statistic` 二进制布局。加 `AT CATALOG VERSION n` / `AT TIME '...'`
+可读取历史版本的列统计（列集合与统计值都来自该版本目录快照）；数据页本身
+不会回到过去，notice 会明确这一点。
 
 这些估算目前只用于观测，不改变执行顺序。索引选择仍是两条规则：
 

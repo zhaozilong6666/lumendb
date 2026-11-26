@@ -123,10 +123,11 @@ def test_show_statistics_exposes_analyzed_catalog(tmp_path):
             "min",
             "max",
             "buckets",
+            "sample_rows",
         ]
         rows = {row[1]: row for row in result.rows}
-        assert rows["id"][2:] == (20, 20, 0.0, "0.0", "19.0", 16)
-        assert rows["s"][2:] == (20, 20, 0.0, "00", "19", 16)
+        assert rows["id"][2:] == (20, 20, 0.0, "0.0", "19.0", 16, 0)
+        assert rows["s"][2:] == (20, 20, 0.0, "00", "19", 16, 0)
         assert result.tag == "STATISTICS 2"
     finally:
         db.close()
@@ -146,6 +147,7 @@ def test_analyze_sample_bounds_memory_and_stays_approximate(tmp_path):
     id_stats = table.column_stats["id"]
     assert id_stats.n_distinct <= 10
     assert sum(bucket[2] for bucket in id_stats.histogram) == 10
+    assert db.execute_one("SHOW STATISTICS FROM t").rows[0][-1] == 10
     with pytest.raises(BinderError):
         db.execute_one("ANALYZE t SAMPLE 0")
     db.close()
