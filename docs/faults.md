@@ -50,6 +50,9 @@ faults.disarm()                          # 全部撤掉
 - 分段 WAL 失败同理；若失败跨段轮转，删除未完成的新段并回到旧段边界。
 - `torn` 必须真的只写前半页：`test_torn_page_write_writes_prefix_then_reports_error`
   直接检查数据文件字节，后半页保持旧内容。
+- checkpoint 屏障内的最终 `fsync` 失败必须放掉 `BufferPool._lock`：否则一次
+  可重试的 I/O 错误会变成永久死锁。`test_clean_barrier_releases_lock_when_final_sync_fails`
+  用第二个线程抢锁来验证失败路径确实还锁。
 
 ## 边界
 

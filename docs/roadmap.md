@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1517 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1554 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -370,7 +370,8 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
-`affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写。并发全量 1517 passed、
+`affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
+会泄漏 BufferPool 锁。并发全量 1554 passed、
 门禁脚本 3 轮（11 项，含混合 INSERT/UPDATE/DELETE 与保存点、VACUUM 探针）、
 8×1000+8×100 基准顺序 20 轮/低切换 10 轮/四进程 20 轮均 `8001/800`。HeapPage/目录页
 锁纪律还缺逐路径审计清单，因此第 4 层仍只能标 "MVP 验收"，不能标 "生产就绪"。

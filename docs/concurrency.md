@@ -509,7 +509,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1517 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1554 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -1088,6 +1088,16 @@ WAL 尾已经是 41k，0.15s 同步屏障必然超时。这是测试的等待条
 实现的问题；已改为等水位 >= leader 自己的 `state.last_lsn`，并断言目标 >0。
 目标用例连续跑 20 次、`test_sync_replication.py` 13 例均通过。
 
+**2026-11-25 再补：checkpoint 最终 fsync 失败不能泄漏 BufferPool 锁。**
+`clean_barrier` 先 `flush_all`（锁外 fsync），再拿 `_lock` 等完在飞页写、
+做最后一次 `disk.sync`。旧实现把这次 `disk.sync` 放在 `try/finally` 之外：
+一旦它抛 EIO，`_lock` 就被当前线程永久持有，后续任何取页或刷盘都会挂死。
+故障注入 `disk.sync@2`（第一次放行、第二次在屏障内失败）能稳定复现。
+修法是用 `hold_lock` 标记：只有真正拿到“空脏页 + 最终 fsync 成功”的干净点
+才把锁交给 `yield` 临界区；任何异常路径都在 `finally` 放锁。正常路径行为不变。
+回归 `test_clean_barrier_releases_lock_when_final_sync_fails` 从另一个线程抢锁，
+旧实现失败、新实现通过。
+
 并发全量本地还碰到 `test_write_fence.py::TestLeasePathOnOpen::
 test_lease_expiry_after_open_blocks_the_next_write` 的时间敏感失败：租约 TTL
 只有 0.15s，而 Windows 慢盘上“打开 Database + CREATE TABLE”本身就可能超过
@@ -1144,7 +1154,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1517 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1554 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

@@ -10,6 +10,7 @@ import threading
 
 import pytest
 
+from lumendb import faults
 from lumendb.errors import StorageError
 from lumendb.storage.bufferpool import BufferPoolManager
 from lumendb.storage.page import INVALID_PAGE_ID, PAGE_SIZE, HeapPage, Page
@@ -316,6 +317,39 @@ class TestWalRule:
                     bp._inflight_writes -= 1
                     bp._write_cv.notify_all()
             thread.join(5)
+
+    def test_clean_barrier_releases_lock_when_final_sync_fails(self, env):
+        """屏障最后 fsync 抛错时必须放锁，不能把 checkpoint 失败变成死锁。
+
+        旧实现 ``self._disk.sync()`` 在 ``try/finally`` 之外：注入失败后
+        ``BufferPool._lock`` 被测试线程永久持有，下一次取页/刷盘直接挂死。
+        这里从另一线程抢锁，确认失败路径把锁还回来了。
+        """
+        bp, dm, wal = env
+        faults.arm("disk.sync@2")  # 第一次 flush_all 的 sync 放行，第二次屏障内 sync 失败
+        try:
+            with pytest.raises(OSError):
+                with bp.clean_barrier():
+                    pass
+        finally:
+            faults.disarm()
+
+        acquired = threading.Event()
+
+        def take_lock():
+            with bp._lock:
+                acquired.set()
+
+        thread = threading.Thread(target=take_lock)
+        thread.start()
+        try:
+            assert acquired.wait(0.3), "clean_barrier 失败后没有释放 BufferPool._lock"
+        finally:
+            # 旧实现会把锁留给当前线程；先把当前线程持有的锁放掉，避免
+            # 夹具 close() 挂死，再让抢锁线程退出。
+            if bp._lock._is_owned():
+                bp._lock.release()
+            thread.join(2)
 
     def test_mark_dirty_bumps_page_version(self, env):
         """绕过 log_page_update 的直接写也要让解码缓存/刷盘版本失效。"""

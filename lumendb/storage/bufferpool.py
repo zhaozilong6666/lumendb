@@ -397,22 +397,32 @@ class BufferPoolManager:
         调用方只应在屏障内做"追加 CHECKPOINT 记录"这种短操作，不要做页写；
         数据页的 fsync 已由屏障在进入前加锁完成。
         """
+        hold_lock = False
         while True:
             self.flush_all()
             self._lock.acquire()
-            # flush_all 的 fsync 发生在锁外；等待所有已经在飞的页写
-            # 完成，再持着 _lock 做最后一次 fsync。这样从这次 fsync
-            # 到 yield 结束，不会有 flush_page 或 _evict 再写盘。
-            while self._inflight_writes:
-                self._write_cv.wait()
-            if not self._dirty:
-                self._disk.sync()
-                break
-            self._lock.release()
+            try:
+                # flush_all 的 fsync 发生在锁外；等待所有已经在飞的页写
+                # 完成，再持着 _lock 做最后一次 fsync。这样从这次 fsync
+                # 到 yield 结束，不会有 flush_page 或 _evict 再写盘。
+                while self._inflight_writes:
+                    self._write_cv.wait()
+                if not self._dirty:
+                    self._disk.sync()
+                    hold_lock = True
+                    break
+            finally:
+                # 这一轮没拿到"干净点"（包括最后 fsync 抛错）时必须放锁；
+                # 否则 checkpoint 失败会把 BufferPool._lock 永久泄漏，
+                # 后续任何取页/刷盘都会挂死。只有 break 成功才把锁交给下面
+                # 的 yield 临界区。
+                if not hold_lock:
+                    self._lock.release()
         try:
             yield
         finally:
-            self._lock.release()
+            if hold_lock:
+                self._lock.release()
 
     def _apply_wal_rule(self, page: Page) -> None:
         """淘汰路径的 WAL 规则执行点（flush_page 用自己抓到的快照 LSN）。"""
