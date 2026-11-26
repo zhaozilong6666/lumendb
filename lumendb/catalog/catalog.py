@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+from datetime import datetime, timezone
 import threading
 from dataclasses import replace
 from typing import Optional
@@ -97,6 +98,8 @@ class Catalog:
         self.catalog_version = 0
         #: 上一个 schema 版本的目录根页；用于版本链回溯。
         self._previous_root = 0
+        #: 当前 schema 版本的创建时间（UTC ISO-8601），用于按时间定位目录版本。
+        self.catalog_created_at = ""
         #: 最近一次落盘的 schema_version，用来识别“这次 persist 是否改形状”。
         self._last_schema_version = 0
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
@@ -165,6 +168,7 @@ class Catalog:
                 )
             self.catalog_version = int(data.get("catalog_version", 1))
             self._previous_root = int(data.get("previous_root", 0))
+            self.catalog_created_at = str(data.get("created_at", ""))
             for tdata in data.get("tables", []):
                 table = TableDef.from_json(tdata)
                 self.tables[table.name] = table
@@ -195,13 +199,18 @@ class Catalog:
             self.catalog_version += 1
             before_version = self.catalog_version - 1
             before_previous = self._previous_root
+            before_created = self.catalog_created_at
+            self.catalog_created_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
 
             def undo_version() -> None:
                 # 回滚/失败的 DDL 不能留下一个“从未提交过”的 catalog 版本号。
                 # schema_version 不回滚（它只负责失效计划缓存），所以这里
-                # 只恢复版本序号和上一版根页。
+                # 只恢复版本序号、上一版根页和创建时间。
                 self.catalog_version = before_version
                 self._previous_root = before_previous
+                self.catalog_created_at = before_created
 
             # 在写盘之前登记：save 中途 EIO 时事务 abort 也要把版本号退回去。
             txn.undo_log.append(undo_version)
@@ -211,6 +220,7 @@ class Catalog:
                 "version": CATALOG_VERSION,
                 "catalog_version": self.catalog_version,
                 "previous_root": history_root,
+                "created_at": self.catalog_created_at,
                 "tables": [t.to_json() for t in self.tables.values()],
                 "views": [
                     {
@@ -257,6 +267,7 @@ class Catalog:
             result.append(
                 {
                     "catalog_version": int(data.get("catalog_version", 1)),
+                    "created_at": str(data.get("created_at", "")),
                     "root_page": root,
                     "tables": [
                         {
@@ -307,6 +318,19 @@ class Catalog:
                     "dependencies": sorted(vdata.get("dependencies", [])),
                 }
             return None
+        return None
+
+    @_locked
+    def version_at_or_before(self, timestamp: str) -> Optional[int]:
+        """返回 ``timestamp`` 当时或之前最近的 catalog 版本号。
+
+        时间只用于**目录**定位，不代表数据页可回到该时刻；数据时间旅行还需要
+        版本保留水位和按提交时间过滤的可见性。
+        """
+        for snapshot in self.history():
+            created = snapshot.get("created_at", "")
+            if created and created <= timestamp:
+                return int(snapshot["catalog_version"])
         return None
 
     @_locked

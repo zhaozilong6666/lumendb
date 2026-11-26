@@ -398,7 +398,7 @@ RELEASE [SAVEPOINT] name;       -- 释放保存点及其之后建立的保存点
 EXPLAIN <query>;          -- 计划树每行带 rows≈ / cpu≈ / confidence 估算
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
-SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数；只读
+SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数、创建时间；只读
 SHOW COLUMNS FROM table [AT CATALOG VERSION n];
                          -- 列名/类型/可空/主键/默认值；带版本时读历史 schema
 SHOW STATISTICS [FROM table];

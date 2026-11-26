@@ -3486,6 +3486,7 @@ class Executor:
                 ", ".join(table["name"] for table in item["tables"]),
                 ", ".join(view["name"] for view in item["views"]),
                 len(item["tables"]) + len(item["views"]),
+                item.get("created_at", ""),
             )
             for item in history
         ]
@@ -3495,6 +3496,7 @@ class Executor:
                 ColumnMeta("tables", TypeSpec(DataType.TEXT)),
                 ColumnMeta("views", TypeSpec(DataType.TEXT)),
                 ColumnMeta("objects", TypeSpec(DataType.INT)),
+                ColumnMeta("created_at", TypeSpec(DataType.TEXT)),
             ],
             rows=rows,
             tag=f"CATALOG VERSIONS {len(rows)}",

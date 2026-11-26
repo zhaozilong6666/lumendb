@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1617 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1618 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -396,8 +396,11 @@ election-watchdog 改由内部 `ServiceRegistry` 管理，启动按注册顺序�
 2026-11-26 C 版本化 catalog 第一切片：目录 JSON 增加 `catalog_version` 与
 `previous_root`，只有 schema 形状变化才递增；`Catalog.history()` /
 `table_at()` 可回溯旧列，`SHOW CATALOG VERSIONS` 暴露版本链；回滚 DDL 恢复
-版本号。普通 DML 的页根更新不再伪造新 schema 版本。并发 DDL 仍是单写者，
-但历史链已经为 `AS OF SYSTEM TIME` 提供了索引骨架。
+版本号。普通 DML 的页根更新不再伪造新 schema 版本。
+每个 schema 版本写入 UTC `created_at`，`Catalog.version_at_or_before(ts)` 可按
+时间定位最近目录版本，`SHOW CATALOG VERSIONS` 增加第五列 `created_at`。
+这只定位目录，不保证数据页可回到该时刻；并发 DDL 仍是单写者，但历史链已经为
+`AS OF SYSTEM TIME` 提供了索引骨架。全量基线 1618。
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
 会泄漏 BufferPool 锁。并发全量全绿、

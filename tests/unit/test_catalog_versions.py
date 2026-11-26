@@ -116,3 +116,21 @@ def test_show_columns_can_target_historical_catalog_version(tmp_path):
     with pytest.raises(TableNotFoundError):
         db.execute_one("SHOW COLUMNS FROM t AT CATALOG VERSION 99")
     db.close()
+
+
+def test_catalog_versions_carry_created_at_and_time_lookup(tmp_path):
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    first = db.catalog.catalog_created_at
+    assert first
+    db.execute_one("ALTER TABLE t ADD COLUMN v INT")
+    second = db.catalog.catalog_created_at
+    assert second
+    history = db.catalog.history()
+    assert [item["created_at"] for item in history][:2] == [second, first]
+    result = db.execute_one("SHOW CATALOG VERSIONS")
+    assert result.columns[4].name == "created_at"
+    assert result.rows[0][4] == second
+    assert db.catalog.version_at_or_before("2099-01-01T00:00:00+00:00") == 2
+    assert db.catalog.version_at_or_before("1970-01-01T00:00:00+00:00") is None
+    db.close()
