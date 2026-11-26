@@ -46,6 +46,20 @@ def _print_result(result, *, show_tag: bool = True) -> None:
         print(result.tag)
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """自审计入口：委托给 lumendb.audit（只认子进程退出码）。"""
+    from .audit import main as audit_main
+
+    argv: list[str] = []
+    if args.fast:
+        argv.append("--fast")
+    if args.full:
+        argv.append("--full")
+    if args.out is not None:
+        argv.extend(["--out", str(args.out)])
+    return audit_main(argv)
+
+
 def _open_database(args: argparse.Namespace) -> Database:
     """按命令行参数打开数据库（三个子命令共用同一套 fence/只读语义）。"""
     return Database(
@@ -204,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("shell", cmd_shell, "进入交互式 shell"),
         ("exec", cmd_exec, "执行一条或多条 SQL"),
         ("serve", cmd_serve, "启动 PostgreSQL 协议服务端"),
+        ("audit", cmd_audit, "自审计：测试/变异/账本/线程泄漏"),
     ):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--path", type=Path, default=Path("lumendb_data"), help="数据目录")
@@ -255,6 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "serve":
             p.add_argument("--host", default="127.0.0.1")
             p.add_argument("--port", type=int, default=5432)
+        if name == "audit":
+            p.add_argument("--fast", action="store_true", help="跳过全量测试")
+            p.add_argument("--full", action="store_true", help="追加真跑变异（分钟级）")
+            p.add_argument("--out", type=Path, default=None, help="把报告写到文件")
         p.set_defaults(handler=handler)
 
     # 重新加入集群：不与上面三个共用 --fence-path / --node-id / --read-only
