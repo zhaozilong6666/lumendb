@@ -415,7 +415,7 @@ def test_drift_command_flags_stale_and_skips_milestone(tmp_path, capsys):
 
     from tools.project_memory import main
 
-    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "drift"]) == 0
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "drift"]) == 1
     out = capsys.readouterr().out
     assert "roadmap.md:2" in out and "1285" in out, "活文档里的旧测试数应被揪出"
     assert "959" not in out, "milestone 冻结快照不该被当漂移"

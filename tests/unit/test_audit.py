@@ -46,6 +46,8 @@ def test_plan_covers_the_four_checks(tmp_path: Path):
     assert "线程泄漏不变量" in names
     assert "变异清单有效性" in names
     assert "账本漂移" in names
+    verify_cmd = [cmd for name, cmd, _note in steps if name == "账本证据"]
+    assert verify_cmd and "--check" in verify_cmd[0], "审计必须只读校验账本，不能改写 verify 时间戳"
 
 
 def test_fast_skips_the_full_suite(tmp_path: Path):

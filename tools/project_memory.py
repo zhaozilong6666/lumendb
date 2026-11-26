@@ -1119,12 +1119,14 @@ def cmd_roadmap(args: argparse.Namespace) -> int:
 
 
 def cmd_drift(args: argparse.Namespace) -> int:
-    """文档漂移对账：把活文档里写的 ``N passed`` 测试数拿去和账本最新一次
+    """文档漂移对账：把**当前基线**里的 ``N passed`` 测试数拿去和账本最新一次
     测试结果对比，揪出"更新了账本却忘了改文档"的旧数字。
 
-    只扫 README 和 ``docs/`` 下的活文档；文件名含 ``milestone`` 的是冻结的
-    历史快照（如外键里程碑里写的 959 passed），本来就不该跟着最新数字走，
-    跳过。改完文档后重跑本命令应归零——这是防幻觉最实用的一道程序闸。
+    只扫 README 与 ``docs/roadmap.md`` 的当前基线，不扫 ``docs/concurrency.md``
+    等叙事文档里的历史测试数——那些数字是当时的事实，本来就不该跟着最新
+    基线走。文件名含 ``milestone`` 的冻结快照同样跳过。
+
+    有漂移时返回 1，这样它不只是打印警告，而是能真正挡住 ``audit``/``gates``。
     """
     ledger = Ledger(Path(args.ledger), Path(args.root))
     root = Path(args.root)
@@ -1134,7 +1136,7 @@ def cmd_drift(args: argparse.Namespace) -> int:
         return 0
     want = int(_TEST_RUN_RE.search(latest.claim).group(1))
 
-    docs = [root / "README.md"] + sorted((root / "docs").glob("*.md"))
+    docs = [root / "README.md", root / "docs" / "roadmap.md"]
     drift: list[tuple[str, int, int]] = []
     for p in docs:
         if not p.exists() or "milestone" in p.name:
@@ -1151,7 +1153,7 @@ def cmd_drift(args: argparse.Namespace) -> int:
     print(f"文档测试数漂移（账本最新 {want} passed，改完重跑本命令应归零）：")
     for doc, lineno, got in drift:
         print(f"  {doc}:{lineno}  写 {got} passed")
-    return 0
+    return 1
 
 
 def cmd_plan(args: argparse.Namespace) -> int:

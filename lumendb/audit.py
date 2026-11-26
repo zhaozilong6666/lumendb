@@ -122,8 +122,8 @@ def plan_steps(
         steps.append(
             (
                 "账本证据",
-                [python, str(memory), "verify"],
-                "每条事实的锚点可复核（含不可复核的 CI 类条目）",
+                [python, str(memory), "verify", "--check"],
+                "每条事实的锚点可复核（只读，不改写账本；含不可复核的 CI 类条目）",
             )
         )
     return steps
