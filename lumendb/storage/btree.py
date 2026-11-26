@@ -1215,10 +1215,23 @@ class BPlusTree:
         if self.root_page == INVALID_PAGE_ID:
             return False
         key = tuple(values) + (rid[0], rid[1])
-        deleted, root_empty = self._delete_recursive(txn, self.root_page, key)
-        if deleted and root_empty:
-            self._collapse_root(txn)
-        return deleted
+        # 并发插入可能刚把这片叶子分裂、父分隔键还没更新：第一次下探会按
+        # 旧路由落到左半，返回“没找到”。这不是键真的不存在，而是 B-link
+        # 的瞬态。短重试从当前根重新定位；实测 500 删 + 500 插时约 1/30
+        # 概率命中，修复前会静默留下 old0019 这类残键。
+        for attempt in range(8):
+            if self.root_page == INVALID_PAGE_ID:
+                return False
+            deleted, root_empty = self._delete_recursive(
+                txn, self.root_page, key
+            )
+            if deleted:
+                if root_empty:
+                    self._collapse_root(txn)
+                return True
+            if attempt < 7:
+                time.sleep(0.001)
+        return False
 
     def delete_key(self, txn: Transaction, values: Sequence[Any]) -> int:
         rids = self.lookup(txn, values)
