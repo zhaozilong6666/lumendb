@@ -26,7 +26,11 @@ def _cluster(tmp_path, count: int = 3):
         node = QuorumNode(
             f"n{i}",
             state_path=tmp_path / f"n{i}.vote.json",
-            timeout=1.0,
+            # 1 秒是单机空载的余量，不是 CI 的余量：四个矩阵任务与并发
+            # DML 同时抢 runner 时，heartbeat_round 的一次 RPC 就可能超过
+            # 1 秒，2026-11-26 CI #367 的续租首轮就是这样假失败的。这里
+            # 留 5 秒；真正停掉的节点是连接拒绝，不会把失败用例拖满超时。
+            timeout=5.0,
         ).start()
         nodes.append(node)
     peers = {
