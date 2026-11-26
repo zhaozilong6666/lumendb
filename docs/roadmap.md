@@ -409,6 +409,16 @@ election-watchdog 改由内部 `ServiceRegistry` 管理，启动按注册顺序�
 从历史目录重建当时的表/视图清单。这只定位目录，不保证数据页可回到该时刻；
 并发 DDL 仍是单写者，但历史链已经为 `AS OF SYSTEM TIME` 提供了索引骨架。
 全量基线 1620。
+
+2026-11-26 C 历史统计与样本可见性：`SHOW STATISTICS [FROM t]` 增加
+`AT CATALOG VERSION n` / `AT TIME`，读取该目录版本的列集合与统计快照；
+输出增加 `sample_rows`（0=全量，>0=抽样参与行数），抽样统计不再只能靠
+notice 判断。全量基线 1622。
+
+2026-11-26 ① AS OF SYSTEM TIME 只完成设计边界，见
+[`docs/as-of-system-time.md`](as-of-system-time.md)：目录 `AT TIME` 不是数据
+时间旅行；必须先有持久提交账本、历史可见性和 VACUUM 保留水位。下一步从
+P0 提交账本开始，未实现前不宣称 `AS OF`。
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
 会泄漏 BufferPool 锁。并发全量全绿、
