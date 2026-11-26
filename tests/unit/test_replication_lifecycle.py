@@ -17,6 +17,7 @@ import time
 import pytest
 
 from lumendb.engine.database import Database
+from lumendb.services import ServiceRegistry
 from lumendb.replication import (
     Lease,
     MonitorState,
@@ -244,6 +245,7 @@ class TestStepDownWaitsForInflightWrites:
         replica._lock = threading.RLock()
         replica._lease_keeper = None
         replica._heartbeat = None
+        replica._services = ServiceRegistry("test")
         replica._step_down_listeners = []
         replica.db = db
 

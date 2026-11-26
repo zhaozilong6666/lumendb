@@ -37,6 +37,7 @@ from ..storage.wal import LogType, decode_page_image, decode_page_update
 from ._atomic import atomic_replace
 from .fence import PromotionFence
 from .lease import Lease, LeaseFence, LeaseKeeper
+from ..services import ServiceRegistry
 from .quorum import HeartbeatLoop, QuorumCommitBarrier
 
 _log = logging.getLogger(__name__)
@@ -116,6 +117,8 @@ class Replica:
         self._snapshot_depth = 0
         self._lease_keeper: LeaseKeeper | None = None
         self._heartbeat: HeartbeatLoop | None = None
+        #: 后台任务骨架：停止顺序（心跳先于续租）、幂等停止、错误上报都交给它。
+        self._services = ServiceRegistry("replica")
         #: 本副本对应的仲裁节点；用来把复制进度（match_lsn）报给 leader。
         self._quorum_node = None
         #: 同步复制的提交屏障（未开启时为 None）。
@@ -1060,15 +1063,18 @@ class Replica:
         return db
 
     def _stop_background(self) -> None:
-        """先停心跳、再停续租。"""
-        heartbeat = self._heartbeat
+        """停掉全部后台任务：**反向注册序**（心跳先于续租），幂等。
+
+        顺序不能靠手写：反了会让被废黜的主库继续以 leader 身份发心跳
+        （这是真实发生过的 bug）。注册表保证"后注册的先停"。
+        """
+        self._services.clear()
         self._heartbeat = None
-        if heartbeat is not None:
-            heartbeat.stop()
-        keeper = self._lease_keeper
         self._lease_keeper = None
-        if keeper is not None:
-            keeper.stop()
+
+    def services_status(self) -> dict:
+        """后台任务快照（运维/测试用）：谁在跑、谁报过错。"""
+        return self._services.status()
 
     def rebase_from_server(
         self,
@@ -1343,7 +1349,9 @@ class Replica:
                     lease_loss_callback=lease_loss_callback,
                     lease_loss_stepdown=lease_loss_stepdown,
                     term_of=term_of,
-                ).start()
+                )
+                self._services.register("lease-keeper", self._lease_keeper)
+                self._services.start_all()
 
         if heartbeat_interval is not None:
             callback = on_higher_term
@@ -1356,7 +1364,9 @@ class Replica:
                 on_higher_term=callback,
                 push_entries=self.push_entries_to_peers,
                 max_batches_per_round=push_max_batches_per_round,
-            ).start()
+            )
+            self._services.register("heartbeat", self._heartbeat)
+            self._services.start_all()
 
         if sync_replication:
             # 装上提交屏障：本地 COMMIT fsync 之后还要等多数派水位追平，
