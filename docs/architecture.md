@@ -148,7 +148,7 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 `catalog_version`，不会伪造 schema 版本。旧链从不覆盖，`Catalog.history()`
 可沿 `previous_root` 回溯历史表定义，`Catalog.table_at(version, name)` 读出
 当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；每个版本还记录
-UTC `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时刻之前的最近版本。
+UTC 微秒级 `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时刻之前的最近版本。
 `SHOW CATALOG VERSIONS` 暴露版本、表名、视图名、对象数和创建时间，
 `SHOW COLUMNS FROM t AT CATALOG VERSION n` 或 `AT TIME '…'` 直接读出历史列定义；
 时间会先经 `version_at_or_before` 解析到目录版本，再取该版本的 `TableDef`。回滚的 DDL 通过

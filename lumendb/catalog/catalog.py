@@ -89,6 +89,11 @@ def _locked(method):
     return wrapper
 
 
+def _utc_now_iso() -> str:
+    """目录版本时间戳；用微秒避免同一秒内多次 DDL 无法按时间区分。"""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
 class Catalog:
     def __init__(self, store: CatalogStore) -> None:
         self._store = store
@@ -200,9 +205,7 @@ class Catalog:
             before_version = self.catalog_version - 1
             before_previous = self._previous_root
             before_created = self.catalog_created_at
-            self.catalog_created_at = datetime.now(timezone.utc).isoformat(
-                timespec="seconds"
-            )
+            self.catalog_created_at = _utc_now_iso()
 
             def undo_version() -> None:
                 # 回滚/失败的 DDL 不能留下一个“从未提交过”的 catalog 版本号。

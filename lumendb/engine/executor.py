@@ -3419,7 +3419,7 @@ class Executor:
             )
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        normalized = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+        normalized = moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
         return self._catalog.version_at_or_before(normalized)
 
     def _history_version(self, catalog_version: Optional[int], catalog_time: Optional[str]) -> Optional[int]:

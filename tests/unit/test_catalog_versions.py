@@ -136,15 +136,22 @@ def test_catalog_versions_carry_created_at_and_time_lookup(tmp_path):
     db.close()
 
 
-def test_show_columns_at_time_resolves_catalog_version(tmp_path):
-    import time
+def _fixed_catalog_clock(monkeypatch):
+    from lumendb.catalog import catalog as catalog_module
 
+    stamps = iter(
+        f"2026-11-26T00:00:0{index}.000001+00:00" for index in range(10)
+    )
+    monkeypatch.setattr(catalog_module, "_utc_now_iso", lambda: next(stamps))
+
+
+def test_show_columns_at_time_resolves_catalog_version(tmp_path, monkeypatch):
     from lumendb.errors import BinderError
 
+    _fixed_catalog_clock(monkeypatch)
     db = Database(tmp_path)
     db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
     first = db.catalog.catalog_created_at
-    time.sleep(1.05)
     db.execute_one("ALTER TABLE t ADD COLUMN v INT")
     second = db.catalog.catalog_created_at
     assert first != second
@@ -164,28 +171,26 @@ def test_show_columns_at_time_resolves_catalog_version(tmp_path):
     db.close()
 
 
-def test_show_tables_and_views_can_target_history(tmp_path):
-    import time
-
+def test_show_tables_and_views_can_target_history(tmp_path, monkeypatch):
     from lumendb.errors import BinderError
 
+    _fixed_catalog_clock(monkeypatch)
     db = Database(tmp_path)
     db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
     db.execute_one("CREATE VIEW v AS SELECT id FROM t")
     view_version = db.catalog.catalog_version
-    first = db.catalog.catalog_created_at
-    time.sleep(1.05)
+    view_time = db.catalog.catalog_created_at
     db.execute_one("ALTER TABLE t ADD COLUMN z INT")
     db.execute_one("DROP VIEW v")
     second = db.catalog.catalog_created_at
-    assert first != second
+    assert view_time != second
     assert db.execute_one("SHOW TABLES").rows == [("t", 2, 0)]
     assert db.execute_one("SHOW VIEWS").rows == []
     assert db.execute_one(
-        f"SHOW TABLES AT TIME '{first}'"
+        f"SHOW TABLES AT TIME '{view_time}'"
     ).rows == [("t", 1, 0)]
     assert db.execute_one(
-        f"SHOW VIEWS AT TIME '{first}'"
+        f"SHOW VIEWS AT TIME '{view_time}'"
     ).rows == [("v", "SELECT id FROM t")]
     assert db.execute_one("SHOW TABLES AT CATALOG VERSION 1").rows == [("t", 1, 0)]
     assert db.execute_one(
