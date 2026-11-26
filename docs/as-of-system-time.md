@@ -1,6 +1,8 @@
 # AS OF SYSTEM TIME 设计（未实现）
 
-本文是 ① 的设计边界，不是已交付能力。当前只有目录版本链：
+本文是 ① 的设计边界，不是已交付能力。P0 的第一块只读提交账本已经落地：
+`SHOW COMMIT LOG` 暴露当前 WAL 窗口的 `xid / commit_lsn`，但它还不是完整
+历史，也没有驱动任何 `AS OF` 读。当前只有目录版本链：
 `SHOW ... AT CATALOG VERSION n` / `AT TIME '...'` 能读历史 **schema 与列统计**，
 但数据页仍只有当前版本；VACUUM 也会回收旧行版本。因此不能把
 `SHOW ... AT TIME` 当成 `AS OF SYSTEM TIME`。

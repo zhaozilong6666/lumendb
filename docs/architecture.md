@@ -66,6 +66,12 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 为 `COMMITTED`；因此“已提交”仍然等于“崩溃后可见”。单提交路径语义不变，
 并发提交测试会断言刷盘次数少于提交次数。
 
+`TransactionManager` 同时维护 `xid -> COMMIT LSN` 的提交账本：只有 COMMIT
+记录持久化、事务真正标记 `COMMITTED` 后才登记，成功恢复时从 WAL 的 COMMIT
+记录重建。`SHOW COMMIT LOG` 暴露当前窗口（xid、commit_lsn，按 LSN 升序），
+用于验证提交顺序与崩溃前后一致性。checkpoint 会截断 WAL，截断前的持久提交
+尚未进入这个账本——它还不是 `AS OF SYSTEM TIME` 所需的完整历史。
+
 ### 2.4 恢复
 
 启动时：

@@ -75,6 +75,7 @@ from ..sql.ast import (
     Truncate,
     ShowCatalogVersions,
     ShowColumns,
+    ShowCommitLog,
     ShowStatistics,
     ShowTables,
     ShowViews,
@@ -114,6 +115,7 @@ _NON_WRITING_STATEMENTS = frozenset(
         "ShowViews",
         "ShowCatalogVersions",
         "ShowColumns",
+        "ShowCommitLog",
         "ShowStatistics",
         "SetConstraints",
         "Checkpoint",
@@ -351,6 +353,8 @@ class Executor:
                 return self._show_views(stmt)
             if isinstance(stmt, ShowCatalogVersions):
                 return self._show_catalog_versions()
+            if isinstance(stmt, ShowCommitLog):
+                return self._show_commit_log(stmt)
             if isinstance(stmt, ShowColumns):
                 return self._show_columns(stmt)
             if isinstance(stmt, ShowStatistics):
@@ -3554,6 +3558,25 @@ class Executor:
             rows=rows,
             tag=f"STATISTICS {len(rows)}",
             notice=notice,
+        )
+
+    def _show_commit_log(self, stmt: ShowCommitLog) -> Result:
+        from ..errors import BinderError
+
+        if stmt.limit is not None and stmt.limit < 0:
+            raise BinderError(
+                "SHOW COMMIT LOG LIMIT 必须是非负整数",
+                hint="LIMIT 0 返回空结果；省略 LIMIT 查看全部",
+            )
+        rows = self._txns.commit_log(stmt.limit)
+        return Result(
+            columns=[
+                ColumnMeta("xid", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("commit_lsn", TypeSpec(DataType.BIGINT)),
+            ],
+            rows=rows,
+            tag=f"COMMITS {len(rows)}",
+            notice="进程内新增提交 + 启动时从当前 WAL 窗口重建；更早的持久提交历史尚未保留",
         )
 
     def _show_columns(self, stmt: ShowColumns) -> Result:

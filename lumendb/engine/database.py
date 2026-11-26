@@ -197,6 +197,7 @@ _PURE_READ_STATEMENTS = {
     "ShowCatalogVersions",
     "ShowColumns",
     "ShowStatistics",
+    "ShowCommitLog",
 }
 
 #: 会重排/重写堆页的语句：VACUUM 重排 RID 并重建索引，TRUNCATE 清空页链，
@@ -359,6 +360,7 @@ class Database:
             self.disk, self.wal, self.bp, self.txns
         )
         self.recovery_report = self.recovery.recover()
+        self.txns.install_commit_lsns(self.recovery_report.commit_lsns)
 
         self.catalog = Catalog(CatalogStore(self.bp))
         self.catalog.load()

@@ -686,6 +686,11 @@ class ShowCatalogVersions(Statement):
 
 
 @dataclass
+class ShowCommitLog(Statement):
+    limit: Optional[int] = None
+
+
+@dataclass
 class ShowColumns(Statement):
     table: str
     catalog_version: Optional[int] = None

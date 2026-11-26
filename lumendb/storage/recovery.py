@@ -43,6 +43,8 @@ class RecoveryReport:
     undo_applied: int = 0
     losers: list[int] = field(default_factory=list)
     committed: list[int] = field(default_factory=list)
+    #: 当前 WAL 窗口内每个已提交事务的 COMMIT 记录 LSN。
+    commit_lsns: dict[int, int] = field(default_factory=dict)
     checkpoint_lsn: int = 0
 
     def summary(self) -> str:
@@ -77,6 +79,8 @@ class RecoveryManager:
             return report
 
         # ---- analysis -------------------------------------------------
+        start_lsn = self._disk.meta.checkpoint_lsn
+        report.checkpoint_lsn = start_lsn
         states: dict[int, str] = {}
         max_xid = 0
         for rec in records:
@@ -85,6 +89,8 @@ class RecoveryManager:
                 states[rec.xid] = "active"
             elif rec.rtype == LogType.COMMIT:
                 states[rec.xid] = "committed"
+                if rec.lsn > start_lsn:
+                    report.commit_lsns[rec.xid] = rec.lsn
             elif rec.rtype == LogType.ABORT:
                 states[rec.xid] = "aborted"
 
@@ -93,9 +99,6 @@ class RecoveryManager:
         aborted = {xid for xid, st in states.items() if st == "aborted"}
         report.losers = sorted(losers)
         report.committed = sorted(committed)
-
-        start_lsn = self._disk.meta.checkpoint_lsn
-        report.checkpoint_lsn = start_lsn
 
         # ---- redo -----------------------------------------------------
         for rec in records:
@@ -201,6 +204,11 @@ class RecoveryManager:
         truncate = getattr(self._wal, "truncate_before", None)
         if truncate is not None:
             truncate(safe_lsn)
+        prune = getattr(self._txns, "prune_commit_log_before", None)
+        if prune is not None:
+            # 与重开恢复一致：以 checkpoint LSN 为界，而不是可能更早的
+            # active_start；旧提交已经随 checkpoint 固化，不应留在当前窗口。
+            prune(lsn)
         return lsn
 
 

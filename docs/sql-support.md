@@ -401,6 +401,9 @@ SHOW TABLES [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
 SHOW VIEWS  [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列出表/视图；带版本或时间时读历史目录，不读旧数据页
 SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数、创建时间；只读
+SHOW COMMIT LOG [LIMIT n];
+                         -- 当前 WAL 窗口内已提交事务的 xid 与 COMMIT LSN；只读
+                         -- LIMIT 0 返回空；更早的持久提交历史尚未保留
 SHOW COLUMNS FROM table [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列名/类型/可空/主键/默认值；带版本或时间时读历史 schema
 SHOW STATISTICS [FROM table] [AT CATALOG VERSION n | AT TIME '...'];

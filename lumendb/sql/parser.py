@@ -62,6 +62,7 @@ from .ast import (
     SetConstraints,
     ShowCatalogVersions,
     ShowColumns,
+    ShowCommitLog,
     ShowStatistics,
     ShowTables,
     ShowViews,
@@ -292,6 +293,13 @@ class Parser:
                 if not self._match_word("VERSIONS"):
                     raise self._error("SHOW CATALOG 之后期望 VERSIONS")
                 return ShowCatalogVersions()
+            if self._match_word("COMMIT"):
+                if not self._match_word("LOG"):
+                    raise self._error("SHOW COMMIT 之后期望 LOG")
+                limit = None
+                if self._match_kw("LIMIT") or self._match_word("LIMIT"):
+                    limit = self._expect_int()
+                return ShowCommitLog(limit=limit)
             if self._match_word("COLUMNS"):
                 if not self._match_kw("FROM") and not self._match_word("FROM"):
                     raise self._error("SHOW COLUMNS 之后期望 FROM")

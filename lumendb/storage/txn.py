@@ -159,6 +159,10 @@ class TransactionManager:
         self._commit_barrier = commit_barrier
         self._lock = threading.RLock()
         self._states: dict[int, TxnState] = {}
+        #: 已提交事务的 COMMIT 记录 LSN。只保留当前 WAL 窗口（进程内新增 +
+        #: 启动恢复时从 WAL 重建）；checkpoint 截断前的更早提交不在这里。
+        self._commit_lsns: dict[int, int] = {}
+        self._commit_order: list[tuple[int, int]] = []
         self._active: set[int] = set()
         #: 活跃事务集合变化时唤醒等待者。VACUUM 用它等一个"没有别的活跃
         #: 事务"的窗口，避免空闲显式事务把维护操作直接拒掉。
@@ -323,6 +327,11 @@ class TransactionManager:
 
     def _mark_committed(self, txn: Transaction) -> None:
         txn.state = TxnState.COMMITTED
+        if txn.commit_record_written and int(txn.last_lsn) > 0:
+            lsn = int(txn.last_lsn)
+            if txn.xid not in self._commit_lsns:
+                self._commit_lsns[txn.xid] = lsn
+                self._commit_order.append((txn.xid, lsn))
         self._states[txn.xid] = TxnState.COMMITTED
         self._active.discard(txn.xid)
         self._active_starts.pop(txn.xid, None)
@@ -337,6 +346,32 @@ class TransactionManager:
         self._release_locks(txn.xid)
         self._prune_states()
         self._active_cv.notify_all()
+
+    def install_commit_lsns(self, entries: dict[int, int]) -> None:
+        """恢复时装入 WAL 窗口内的提交 LSN 账本（按 LSN 排序，去重）。"""
+        for xid, lsn in sorted(entries.items(), key=lambda item: item[1]):
+            if xid in self._commit_lsns:
+                continue
+            self._commit_lsns[xid] = int(lsn)
+            self._commit_order.append((xid, int(lsn)))
+
+    def prune_commit_log_before(self, lsn: int) -> None:
+        """checkpoint 截断 WAL 后，丢掉已经不在 WAL 窗口里的提交记录。"""
+        with self._lock:
+            self._commit_order = [
+                (xid, commit_lsn)
+                for xid, commit_lsn in self._commit_order
+                if commit_lsn >= lsn
+            ]
+            self._commit_lsns = dict(self._commit_order)
+
+    def commit_log(self, limit: Optional[int] = None) -> list[tuple[int, int]]:
+        """返回 ``(xid, commit_lsn)``，按提交 LSN 升序；limit 取最近 N 条。"""
+        with self._lock:
+            entries = self._commit_order
+            if limit is not None and limit >= 0:
+                entries = entries[-limit:] if limit else []
+            return list(entries)
 
     def _release_locks(self, xid: int) -> None:
         """事务结束时释放它持有的全部锁（写者锁在这里被交出）。"""
