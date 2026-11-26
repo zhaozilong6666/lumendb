@@ -240,6 +240,17 @@ def test_cli_add_with_evidence_round_trips(tmp_path, capsys):
     assert fact.evidence[1]["anchor"] == "量级参考"
 
 
+def test_verify_treats_cleaned_tmp_log_as_manual(tmp_path, capsys):
+    """临时日志被 /tmp 清理不代表事实失效，但也不能算已验证。"""
+    from tools.project_memory import main
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("m", "跑过一次全量", evidence=[{"type": "file", "value": "/tmp/never-existed.log", "anchor": ""}]))
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "verify", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "manual" in out
+
+
 def test_verify_check_skips_superseded_history(tmp_path, capsys):
     """被取代的旧记录可以带失效证据，但不该永久挡住只读审计。"""
     from tools.project_memory import main

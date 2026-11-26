@@ -521,7 +521,11 @@ def verify_fact(
                     status, detail = "failed", "commit 不存在（可能被 rebase/删分支）"
             elif kind == "file":
                 path = root / value
-                if not path.exists():
+                if not path.exists() and value.startswith(("/tmp/", "/var/tmp/")):
+                    # /tmp 会在换环境/重启后清空，不能把“日志被清理”当成
+                    # 事实被推翻；这类证据降级为 manual，要求用 command 复现。
+                    status, detail = "manual", f"临时路径文件已清理：{value}"
+                elif not path.exists():
                     status, detail = "failed", f"文件不存在：{value}"
                 elif anchor:
                     text = path.read_text(encoding="utf-8", errors="replace")

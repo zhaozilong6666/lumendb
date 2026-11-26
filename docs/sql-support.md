@@ -399,6 +399,7 @@ EXPLAIN <query>;          -- 计划树每行带 rows≈ / cpu≈ / confidence �
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
 CHECKPOINT;
+ANALYZE [TABLE] table;   -- 扫描可见行，记录列级 n_distinct / null_frac
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
 VACUUM [FULL] [table];  -- 回收死版本；无活跃事务时重排堆页并重建索引，
                          -- 有活跃事务时转保 RID 在线回收；不带表名处理所有表
@@ -421,7 +422,8 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | `ON CONFLICT` 约束目标 | 支持 `DO NOTHING` / `DO UPDATE SET` / `DO UPDATE ... WHERE` / `excluded.col`；列组合或 `ON CONSTRAINT name` 必须映射到一个唯一索引 |
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
-| autovacuum / 后台触发 | 不做后台自动触发，只能显式执行 `VACUUM` |
+| autovacuum / 后台触发 | 不做后台自动触发，只能显式执行 `VACUUM`；`ANALYZE` 也需显式执行 |
+| 统计直方图 / 范围分位 | `ANALYZE` 只记录 `n_distinct`、`null_frac` 与行数，没有直方图；范围谓词仍是固定选择率 |
 | 缩小数据文件 / 回收根记录 | 离线 `VACUUM` 回收页内空间但文件不缩；在线模式保 RID，不回收根记录与空洞槽位 |
 
 ## 已知的行为细节

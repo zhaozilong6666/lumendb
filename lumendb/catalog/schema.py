@@ -173,12 +173,41 @@ class ForeignKeyDef:
 
 
 @dataclass
+class ColumnStats:
+    """一列的 ANALYZE 结果；只存估算需要的字段。"""
+
+    n_distinct: int = 0
+    null_frac: float = 0.0
+
+    @property
+    def equality_selectivity(self) -> float:
+        # 空表/全 NULL 没有可用等值选择率，交给调用方回退默认值。
+        if self.n_distinct <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (1.0 - self.null_frac) / self.n_distinct))
+
+    def to_json(self) -> dict:
+        return {"n_distinct": int(self.n_distinct), "null_frac": float(self.null_frac)}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "ColumnStats":
+        return cls(
+            n_distinct=int(data.get("n_distinct", 0)),
+            null_frac=float(data.get("null_frac", 0.0)),
+        )
+
+
+@dataclass
 class TableDef:
     name: str
     columns: list[Column]
     root_page: int = INVALID_PAGE_ID
     last_page: int = INVALID_PAGE_ID
     row_count_hint: int = 0
+    #: ANALYZE 产生的列统计；空表示尚未分析，仅能使用行数 hint。
+    column_stats: dict[str, ColumnStats] = field(default_factory=dict)
+    #: ANALYZE 时的可见行数；0 是合法空表，配合 column_stats 判断“分析过没有”。
+    stats_rows: int = -1
     indexes: dict[str, IndexDef] = field(default_factory=dict)
     checks: dict[str, CheckDef] = field(default_factory=dict)
     foreign_keys: dict[str, ForeignKeyDef] = field(default_factory=dict)
@@ -242,6 +271,8 @@ class TableDef:
             "root_page": self.root_page,
             "last_page": self.last_page,
             "row_count_hint": self.row_count_hint,
+            "column_stats": {k: v.to_json() for k, v in self.column_stats.items()},
+            "stats_rows": self.stats_rows,
             "indexes": {k: v.to_json() for k, v in self.indexes.items()},
             "checks": {k: v.to_json() for k, v in self.checks.items()},
             "foreign_keys": {
@@ -257,6 +288,11 @@ class TableDef:
             root_page=data.get("root_page", INVALID_PAGE_ID),
             last_page=data.get("last_page", INVALID_PAGE_ID),
             row_count_hint=data.get("row_count_hint", 0),
+            column_stats={
+                k: ColumnStats.from_json(v)
+                for k, v in data.get("column_stats", {}).items()
+            },
+            stats_rows=int(data.get("stats_rows", -1)),
             indexes={
                 k: IndexDef.from_json(v) for k, v in data.get("indexes", {}).items()
             },

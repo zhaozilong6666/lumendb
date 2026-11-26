@@ -38,6 +38,8 @@ class CostEstimate:
     confidence: str = "default"
     #: ``nested_loop`` / ``hash`` / ``scan`` / ``filter``，用于可读输出。
     algorithm: str = "scan"
+    #: EXPLAIN 里展示“为什么选这个访问路径/放弃别的路径”的一句话。
+    reason: str = ""
 
     @property
     def total(self) -> float:
@@ -49,7 +51,9 @@ def _positive(value: float) -> float:
     return max(float(value), MIN_ROWS)
 
 
-def scan_estimate(row_count_hint: int, *, indexed: bool = False) -> CostEstimate:
+def scan_estimate(
+    row_count_hint: int, *, indexed: bool = False, reason: str = ""
+) -> CostEstimate:
     """基表扫描估算。
 
     ``row_count_hint`` 由堆表在插入/删除时维护，0 是合法的空表，因此统一
@@ -57,7 +61,13 @@ def scan_estimate(row_count_hint: int, *, indexed: bool = False) -> CostEstimate
     """
     rows = _positive(row_count_hint)
     cpu = rows * (0.2 if indexed else 1.0)
-    return CostEstimate(rows=rows, cpu=cpu, confidence="stats", algorithm="scan")
+    return CostEstimate(
+        rows=rows,
+        cpu=cpu,
+        confidence="stats",
+        algorithm="scan",
+        reason=reason,
+    )
 
 
 def unknown_estimate(*, confidence: str = "default") -> CostEstimate:
@@ -66,7 +76,10 @@ def unknown_estimate(*, confidence: str = "default") -> CostEstimate:
 
 
 def filter_estimate(
-    child: CostEstimate, selectivity: float = OTHER_SELECTIVITY
+    child: CostEstimate,
+    selectivity: float = OTHER_SELECTIVITY,
+    *,
+    reason: str = "",
 ) -> CostEstimate:
     """过滤估算；选择率限制在 ``[MIN_SELECTIVITY, 1]``。"""
     selectivity = min(max(float(selectivity), MIN_SELECTIVITY), 1.0)
@@ -76,6 +89,7 @@ def filter_estimate(
         cpu=child.cpu + rows,
         confidence=child.confidence,
         algorithm="filter",
+        reason=reason,
     )
 
 

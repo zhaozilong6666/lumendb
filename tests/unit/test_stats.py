@@ -1,0 +1,64 @@
+"""ANALYZE 与统计驱动估算：D 子系统的第一块。"""
+
+from __future__ import annotations
+
+from lumendb.engine.database import Database
+
+
+def _plan(db: Database, sql: str) -> str:
+    return "\n".join(row[0] for row in db.execute_one("EXPLAIN " + sql).rows)
+
+
+def test_analyze_computes_column_stats_and_persists(tmp_path):
+    db = Database(tmp_path / "stats")
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, code INT, pad VARCHAR(16))")
+    for i in range(12):
+        db.execute_one(f"INSERT INTO t VALUES ({i}, {i % 4}, 'p{i}')")
+    result = db.execute_one("ANALYZE t")
+    assert "3 column(s)" in result.tag
+    table = db.catalog.get_table("t")
+    assert table.stats_rows == 12
+    assert table.column_stats["code"].n_distinct == 4
+    assert table.column_stats["code"].null_frac == 0.0
+    db.close()
+
+    reopened = Database(tmp_path / "stats")
+    try:
+        table = reopened.catalog.get_table("t")
+        assert table.stats_rows == 12
+        assert table.column_stats["code"].n_distinct == 4
+        assert table.column_stats["id"].n_distinct == 12
+    finally:
+        reopened.close()
+
+
+def test_analyze_changes_equality_estimate(tmp_path):
+    db = Database(tmp_path / "estimate")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, code INT)")
+        for i in range(100):
+            db.execute_one(f"INSERT INTO t VALUES ({i}, {i % 4})")
+        before = _plan(db, "SELECT id FROM t WHERE code = 1")
+        assert "rows≈10" in before, before
+        db.execute_one("ANALYZE t")
+        after = _plan(db, "SELECT id FROM t WHERE code = 1")
+        assert "rows≈25" in after, after
+        assert "reason=顺序扫描基表" in after
+    finally:
+        db.close()
+
+
+def test_explain_reports_index_choice_reason(tmp_path):
+    db = Database(tmp_path / "access_reason")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, code INT)")
+        for i in range(12):
+            db.execute_one(f"INSERT INTO t VALUES ({i}, {i % 4})")
+        db.execute_one("ANALYZE t")
+        db.execute_one("CREATE INDEX ix_code ON t (code)")
+        plan = _plan(db, "SELECT id FROM t WHERE code = 1")
+        assert "IndexScan" in plan
+        assert "reason=等值谓词命中索引" in plan
+        assert "SeqScan≈12" in plan and "IndexScan≈3" in plan
+    finally:
+        db.close()

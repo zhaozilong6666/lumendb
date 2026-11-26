@@ -684,6 +684,13 @@ class Checkpoint(Statement):
 
 
 @dataclass
+class Analyze(Statement):
+    """``ANALYZE [table]``：扫描表并记录列级 n_distinct / null_frac。"""
+
+    table: Optional[str] = None
+
+
+@dataclass
 class Reindex(Statement):
     """``REINDEX table``：按堆表当前内容重建该表所有索引。"""
 

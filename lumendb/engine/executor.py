@@ -18,6 +18,7 @@ from ..catalog.catalog import Catalog
 from ..catalog.schema import (
     CheckDef,
     Column,
+    ColumnStats,
     ForeignKeyDef,
     IndexDef,
     TableDef,
@@ -48,6 +49,7 @@ from ..sql.ast import (
     AlterTableRenameConstraint,
     AlterTableRenameTable,
     AlterTableValidateConstraint,
+    Analyze,
     BinaryOp,
     ColumnRef,
     CreateIndex,
@@ -325,6 +327,8 @@ class Executor:
                 return self._create_index(stmt, txn)
             if isinstance(stmt, DropIndex):
                 return self._drop_index(stmt, txn)
+            if isinstance(stmt, Analyze):
+                return self._analyze(stmt, txn)
             if isinstance(stmt, Reindex):
                 return self._reindex(stmt, txn)
             if isinstance(stmt, Vacuum):
@@ -3085,6 +3089,51 @@ class Executor:
         if self._catalog_structure_fingerprint() != before:
             self._persist_catalog(txn)
 
+    def _analyze(self, stmt: Analyze, txn: Transaction) -> Result:
+        """扫描表并记录列级统计；统计是优化器输入，不改变查询结果。"""
+        tables = (
+            [self._catalog.get_table(stmt.table)]
+            if stmt.table
+            else self._catalog.list_tables()
+        )
+        total_rows = 0
+        analyzed_columns = 0
+        for table in tables:
+            heap = HeapFile(self._bp, table, self._txns)
+            rows = [values for _rid, values in heap.scan(txn)]
+            total_rows += len(rows)
+            table.row_count_hint = len(rows)
+            table.stats_rows = len(rows)
+            table.column_stats = {}
+            for index, column in enumerate(table.columns):
+                nulls = 0
+                distinct = set()
+                for values in rows:
+                    value = values[index]
+                    if value is None:
+                        nulls += 1
+                        continue
+                    try:
+                        distinct.add(value)
+                    except TypeError:
+                        distinct.add(repr(value))
+                n_distinct = len(distinct)
+                null_frac = (nulls / len(rows)) if rows else 0.0
+                table.column_stats[column.name] = ColumnStats(
+                    n_distinct=n_distinct,
+                    null_frac=null_frac,
+                )
+                analyzed_columns += 1
+        self._persist_catalog(txn)
+        return Result(
+            affected=total_rows,
+            tag=f"ANALYZE {len(tables)} table(s), {analyzed_columns} column(s)",
+            notice=(
+                f"已分析 {len(tables)} 张表、{analyzed_columns} 列，"
+                f"可见行 {total_rows}；统计只影响估算，不改变结果"
+            ),
+        )
+
     def _reindex(self, stmt: Reindex, txn: Transaction) -> Result:
         """按堆表当前内容重建索引：只保留当前可见的版本，回收稀疏页。"""
         table = self._catalog.get_table(stmt.table)
@@ -4888,8 +4937,11 @@ def _describe_plan(
         est = node.estimated
         line += (
             f" (rows≈{est.rows:.0f} cpu≈{est.cpu:.0f} "
-            f"confidence={est.confidence})"
+            f"confidence={est.confidence}"
         )
+        if est.reason:
+            line += f"; reason={est.reason}"
+        line += ")"
     if profile is not None:
         entry = profile.get(id(node))
         if entry is None:

@@ -131,6 +131,35 @@ def _expr_column_refs(expr) -> Optional[list[ColumnRef]]:
     return refs
 
 
+def _column_literal_pair(expr: BinaryOp):
+    """返回 ``(ColumnRef, Literal)``，不是列/常量对就返回 ``(None, None)``。"""
+    left, right = expr.left, expr.right
+    if isinstance(right, ColumnRef) and isinstance(left, Literal):
+        left, right = right, left
+    if isinstance(left, ColumnRef) and isinstance(right, Literal):
+        return left, right
+    return None, None
+
+
+def _stats_equality_selectivity(catalog, ref: ColumnRef, schema: Schema) -> Optional[float]:
+    """查某列 ANALYZE 后的等值选择率；没有统计时返回 ``None``。"""
+    try:
+        index = schema.resolve(ref.table, ref.name)
+    except BinderError:
+        return None
+    source = schema.columns[index].source_table
+    if source is None:
+        return None
+    try:
+        table = catalog.get_table(source)
+    except Exception:
+        return None
+    stats = table.column_stats.get(ref.name.lower())
+    if stats is None or stats.n_distinct <= 0:
+        return None
+    return stats.equality_selectivity
+
+
 class Schema:
     """一行数据的列布局，用于把名字解析成下标。"""
 
@@ -1037,7 +1066,7 @@ class Binder:
                     columns=child.columns,
                     estimated=filter_estimate(
                         self._node_estimate(child),
-                        self._predicate_selectivity(select.where),
+                        self._predicate_selectivity(select.where, schema),
                     ),
                 )
         elif select.where is not None:
@@ -1048,7 +1077,7 @@ class Binder:
                 columns=node.columns,
                 estimated=filter_estimate(
                     self._node_estimate(node),
-                    self._predicate_selectivity(select.where),
+                    self._predicate_selectivity(select.where, schema),
                 ),
             )
 
@@ -1347,6 +1376,12 @@ class Binder:
         except ValueError:
             return None
 
+        base = scan.estimated or unknown_estimate()
+        selectivity = (
+            _stats_equality_selectivity(self.catalog, left, schema)
+            or EQ_SELECTIVITY
+        )
+        estimate = filter_estimate(base, selectivity)
         return IndexLookup(
             columns=scan.columns,
             table=scan.table,
@@ -1354,8 +1389,15 @@ class Binder:
             index_name=index.name,
             index_columns=index.columns,
             key=(value,),
-            estimated=filter_estimate(
-                scan.estimated or unknown_estimate(), EQ_SELECTIVITY
+            estimated=CostEstimate(
+                rows=estimate.rows,
+                cpu=estimate.cpu,
+                confidence=estimate.confidence,
+                algorithm=estimate.algorithm,
+                reason=(
+                    f"等值谓词命中索引；SeqScan≈{base.rows:.0f} → "
+                    f"IndexScan≈{estimate.rows:.0f}"
+                ),
             ),
         )
 
@@ -1418,6 +1460,8 @@ class Binder:
         except ValueError:
             return None
 
+        base = scan.estimated or unknown_estimate()
+        estimate = filter_estimate(base, RANGE_SELECTIVITY)
         return IndexRange(
             columns=scan.columns,
             table=scan.table,
@@ -1428,7 +1472,16 @@ class Binder:
             high=high_key,
             low_inclusive=low_inclusive,
             high_inclusive=high_inclusive,
-            estimated=scan.estimated or unknown_estimate(),
+            estimated=CostEstimate(
+                rows=estimate.rows,
+                cpu=estimate.cpu,
+                confidence=estimate.confidence,
+                algorithm=estimate.algorithm,
+                reason=(
+                    f"范围谓词命中索引；SeqScan≈{base.rows:.0f} → "
+                    f"IndexRange≈{estimate.rows:.0f}"
+                ),
+            ),
         )
 
     def _equi_keys(
@@ -1463,10 +1516,23 @@ class Binder:
     def _node_estimate(self, node: PlanNode):
         return node.estimated or unknown_estimate()
 
-    def _predicate_selectivity(self, expr) -> float:
-        """给常见谓词一个粗略选择率；未知谓词用默认值。"""
+    def _predicate_selectivity(self, expr, schema: Optional[Schema] = None) -> float:
+        """给常见谓词选择率；有 ANALYZE 统计时优先用列级 n_distinct。"""
         if isinstance(expr, BinaryOp):
+            if expr.op == "AND":
+                return self._predicate_selectivity(
+                    expr.left, schema
+                ) * self._predicate_selectivity(expr.right, schema)
+            if expr.op == "OR":
+                left = self._predicate_selectivity(expr.left, schema)
+                right = self._predicate_selectivity(expr.right, schema)
+                return left + right - left * right
             if expr.op == "=":
+                ref, literal = _column_literal_pair(expr)
+                if ref is not None and schema is not None:
+                    value = _stats_equality_selectivity(self.catalog, ref, schema)
+                    if value is not None:
+                        return value
                 return EQ_SELECTIVITY
             if expr.op in (">", ">=", "<", "<="):
                 return RANGE_SELECTIVITY
@@ -1876,7 +1942,17 @@ class Binder:
             columns=columns,
             table=table.name,
             alias=effective,
-            estimated=scan_estimate(table.row_count_hint),
+            estimated=scan_estimate(
+                table.row_count_hint,
+                reason=(
+                    (
+                        "顺序扫描基表；有索引，但当前 WHERE 没有可用的单列等值/范围条件"
+                        if table.indexes
+                        else "顺序扫描基表；表没有索引"
+                    )
+                    + ("，行数来自 ANALYZE" if table.stats_rows >= 0 else "")
+                ),
+            ),
         )
         schema = Schema(
             [

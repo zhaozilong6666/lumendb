@@ -601,8 +601,15 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 计划节点带有 `estimated` 字段（`plan/cost.py` 的 `CostEstimate`）：扫描用堆表
 维护的 `row_count_hint`，过滤按等值/范围/其他谓词的选择率估算，连接按等值键
 数量估算并区分哈希与嵌套循环，投影/聚合/排序/去重/集合/`LIMIT` 继续向上
-传播估算。`EXPLAIN` 会把 `rows≈N cpu≈M confidence=...` 标在节点后面；
-`EXPLAIN ANALYZE` 再追加实际耗时、行数与循环次数。
+传播估算。`EXPLAIN` 会把 `rows≈N cpu≈M confidence=...; reason=...` 标在节点
+后面；`reason` 说明为什么选这个访问路径或放弃别的路径。`EXPLAIN ANALYZE`
+再追加实际耗时、行数与循环次数。
+
+`ANALYZE [TABLE] t` 会扫描当前可见行，把 `row_count_hint` 对齐到实际行数，
+并为每一列记录 `n_distinct` 与 `null_frac`，随目录 JSON 持久化。等值谓词
+（`col = 常量`）不再固定使用 0.1，而是优先用
+`(1 - null_frac) / n_distinct`；没有 ANALYZE 统计时仍回退默认选择率。当前
+只做列级计数，没有直方图或范围分位，范围谓词仍用 0.33 的固定选择率。
 
 这些估算目前只用于观测，不改变执行顺序。索引选择仍是两条规则：
 

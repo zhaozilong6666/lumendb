@@ -14,6 +14,7 @@ from typing import Optional
 from ..datatypes import DataType, TypeSpec
 from ..errors import BinderError, NotSupportedError, SQLSyntaxError
 from .ast import (
+    Analyze,
     Between,
     Begin,
     BinaryOp,
@@ -274,6 +275,13 @@ class Parser:
         if kw == "CHECKPOINT":
             self._advance()
             return Checkpoint()
+        if kw == "ANALYZE":
+            self._advance()
+            self._match_kw("TABLE")
+            table = None
+            if self._cur.kind == "ident":
+                table = self._parse_ident("表名")
+            return Analyze(table)
         if kw == "REINDEX":
             self._advance()
             self._match_kw("TABLE")
@@ -301,7 +309,7 @@ class Parser:
         raise self._error(
             f"无法识别的语句起始关键字 {tok.value.upper()}",
             hint="支持 SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / BEGIN / COMMIT / "
-            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / REINDEX / VACUUM",
+            "ROLLBACK / EXPLAIN / SHOW TABLES / CHECKPOINT / ANALYZE / REINDEX / VACUUM",
         )
 
     def _parse_set_constraints(self) -> SetConstraints:
