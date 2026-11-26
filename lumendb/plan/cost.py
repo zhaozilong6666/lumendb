@@ -184,27 +184,36 @@ def join_estimate(
     right: CostEstimate,
     *,
     equi_keys: int = 0,
+    build_side: str = "right",
 ) -> CostEstimate:
     """连接估算。
 
     有等值键时优先哈希连接：代价是两侧行数之和；没有等值键时只能嵌套循环，
     代价是两侧行数之积。输出行数按等值键选择率计算，并下限为 1。
+    ``reason`` 把这条选择写进 EXPLAIN，避免只看到 HashJoin 却不知道
+    为什么没有走嵌套循环、build 又是哪一侧。
     """
     if equi_keys > 0:
         rows = _positive(left.rows * right.rows * equality_selectivity(equi_keys))
         cpu = left.cpu + right.cpu + left.rows + right.rows
         algorithm = "hash"
+        reason = f"哈希连接：{equi_keys} 个等值键；build={build_side}"
     else:
         rows = _positive(left.rows * right.rows)
         cpu = left.cpu + right.cpu + left.rows * right.rows
         algorithm = "nested_loop"
+        reason = "嵌套循环：没有等值连接键"
     confidence = (
         left.confidence
         if left.confidence == right.confidence
         else "derived"
     )
     return CostEstimate(
-        rows=rows, cpu=cpu, confidence=confidence, algorithm=algorithm
+        rows=rows,
+        cpu=cpu,
+        confidence=confidence,
+        algorithm=algorithm,
+        reason=reason,
     )
 
 

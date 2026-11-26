@@ -1752,10 +1752,12 @@ class Binder:
                     keys, _labels = self._equi_keys(
                         on_expr, merged, len(prev_schema)
                     )
+                right_est = self._node_estimate(bindings[last][0])
                 est = join_estimate(
                     prev_est,
-                    self._node_estimate(bindings[last][0]),
+                    right_est,
                     equi_keys=len(keys),
+                    build_side=choose_build_side(prev_est, right_est),
                 )
                 order = prev_order + (last,)
                 rank = (est.total, est.rows, est.cpu, order)
@@ -1880,6 +1882,10 @@ class Binder:
                 )
             left_est = self._node_estimate(node)
             right_est = self._node_estimate(sub_node)
+            build_left = (
+                bool(hash_keys)
+                and choose_build_side(left_est, right_est) == "left"
+            )
             node = Join(
                 left=node,
                 right=sub_node,
@@ -1888,14 +1894,14 @@ class Binder:
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
                 hash_keys=hash_keys,
                 hash_labels=hash_labels,
-                build_left=(
-                    bool(hash_keys)
-                    and choose_build_side(left_est, right_est) == "left"
-                ),
+                build_left=build_left,
                 order_reason="dp" if reordered else "",
                 dp_candidates=dp_candidates,
                 estimated=join_estimate(
-                    left_est, right_est, equi_keys=len(hash_keys)
+                    left_est,
+                    right_est,
+                    equi_keys=len(hash_keys),
+                    build_side="left" if build_left else "right",
                 ),
             )
             schema = merged
@@ -2147,6 +2153,11 @@ class Binder:
                 )
             left_est = self._node_estimate(node)
             right_est = self._node_estimate(right_node)
+            build_left = (
+                join.kind == "INNER"
+                and bool(hash_keys)
+                and choose_build_side(left_est, right_est) == "left"
+            )
             node = Join(
                 left=node,
                 right=right_node,
@@ -2155,13 +2166,12 @@ class Binder:
                 columns=[OutputColumn(c.name, c.type) for c in merged.columns],
                 hash_keys=hash_keys,
                 hash_labels=hash_labels,
-                build_left=(
-                    join.kind == "INNER"
-                    and bool(hash_keys)
-                    and choose_build_side(left_est, right_est) == "left"
-                ),
+                build_left=build_left,
                 estimated=join_estimate(
-                    left_est, right_est, equi_keys=len(hash_keys)
+                    left_est,
+                    right_est,
+                    equi_keys=len(hash_keys),
+                    build_side="left" if build_left else "right",
                 ),
             )
             schema = merged

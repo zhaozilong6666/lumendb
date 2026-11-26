@@ -369,6 +369,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
+2026-11-26 D 连接淘汰原因可见：`EXPLAIN` 的连接行估算 `reason` 写明
+“几个等值键、build 哪一侧”，无等值键时写明嵌套循环；DP 候选数继续由
+`[candidates=N]` 暴露。候选逐项代价仍不展开。
+
 2026-11-26 D 统计目录视图：`SHOW STATISTICS [FROM table]` 只读输出
 表/列/行数/n_distinct/null_frac/min/max/桶数，ANALYZE 结果可直接核查，
 不再只能从目录 JSON 里猜。

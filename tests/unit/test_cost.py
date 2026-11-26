@@ -56,6 +56,8 @@ def test_join_estimate_prefers_hash_when_equi_keys_exist():
     assert est.rows == pytest.approx(20)
     assert est.algorithm == "hash"
     assert est.cpu == pytest.approx(10 + 20 + 10 + 20)
+    assert "哈希连接：1 个等值键" in est.reason
+    assert "build=right" in est.reason
 
 
 def test_join_estimate_uses_nested_loop_without_keys():
@@ -63,6 +65,7 @@ def test_join_estimate_uses_nested_loop_without_keys():
     assert est.rows == 200
     assert est.algorithm == "nested_loop"
     assert est.cpu >= 200
+    assert "没有等值连接键" in est.reason
 
 
 def test_choose_build_side_prefers_smaller_left():

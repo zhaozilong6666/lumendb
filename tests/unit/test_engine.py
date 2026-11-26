@@ -1758,6 +1758,7 @@ class TestJoin:
         )
         assert "HashJoin (INNER)" in plan
         assert "a.id = b.id" in plan
+        assert "reason=哈希连接" in plan
         assert rows(
             db,
             "SELECT a.id FROM a, b WHERE a.id = b.id ORDER BY a.id",
