@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1625 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1627 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -421,6 +421,11 @@ notice 判断。全量基线 1622。
 P0 第一切片已落地：`SHOW COMMIT LOG [LIMIT n]` 输出当前 WAL 窗口内
 `xid / commit_lsn`，事务标记 COMMITTED 时才登记，重开从 WAL 重建；checkpoint
 截断前的持久历史尚未保留。未实现 `AS OF` 前不宣称时间旅行。全量基线 1625。
+
+2026-11-26 ① P1 第一切片：`HeapFile.scan_at(commit_lsns, target_lsn)` 按提交
+LSN 截止点做历史顺序扫描，INSERT/UPDATE/DELETE 三个边界各有测试；未提交或
+账本缺失的 xid 一律不可见。仍未接 SQL、索引、JOIN 与 VACUUM 保留水位，
+所以它只是 AS OF 的存储层地基，不是用户可用的时间旅行。全量基线 1627。
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
 会泄漏 BufferPool 锁。并发全量全绿、

@@ -764,3 +764,49 @@ def test_vacuum_online_all_dead_multipage_keeps_chain_walkable(env):
     new_rid = heap.insert(txn, [100, "n" * 100, 1])
     assert list(heap.scan(txn)) == [(new_rid, [100, "n" * 100, 1])]
     txns.commit(txn)
+
+
+def test_scan_at_uses_commit_lsn_boundaries(env):
+    """历史扫描只看提交 LSN：插入、更新、删除三个边界各读到正确版本。"""
+    heap, txns, bp, table = env
+    ledger = {}
+
+    txn = txns.begin()
+    rid = heap.insert(txn, [1, "a", 10])
+    txns.commit(txn)
+    insert_lsn = txn.last_lsn
+    ledger[txn.xid] = insert_lsn
+
+    txn = txns.begin()
+    heap.update(txn, rid, [1, "a2", 11])
+    txns.commit(txn)
+    update_lsn = txn.last_lsn
+    ledger[txn.xid] = update_lsn
+
+    txn = txns.begin()
+    heap.delete(txn, rid)
+    txns.commit(txn)
+    delete_lsn = txn.last_lsn
+    ledger[txn.xid] = delete_lsn
+
+    assert list(heap.scan_at(ledger, insert_lsn - 1)) == []
+    assert [v for _, v in heap.scan_at(ledger, insert_lsn)] == [[1, "a", 10]]
+    assert [v for _, v in heap.scan_at(ledger, update_lsn - 1)] == [[1, "a", 10]]
+    assert [v for _, v in heap.scan_at(ledger, update_lsn)] == [[1, "a2", 11]]
+    assert [v for _, v in heap.scan_at(ledger, delete_lsn - 1)] == [[1, "a2", 11]]
+    assert list(heap.scan_at(ledger, delete_lsn)) == []
+
+
+def test_scan_at_ignores_uncommitted_versions(env):
+    heap, txns, bp, table = env
+    ledger = {}
+    txn = txns.begin()
+    heap.insert(txn, [1, "a", 10])
+    txns.commit(txn)
+    ledger[txn.xid] = txn.last_lsn
+
+    pending = txns.begin()
+    heap.insert(pending, [2, "b", 20])
+    assert [v for _, v in heap.scan_at(ledger, 10**12)] == [[1, "a", 10]]
+    txns.abort(pending)
+    assert [v for _, v in heap.scan_at(ledger, 10**12)] == [[1, "a", 10]]

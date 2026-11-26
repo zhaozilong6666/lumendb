@@ -102,6 +102,9 @@ checkpoint 落盘后回收旧段；恢复只读取保留下来的段，仍然从
 
 - 单调递增的 `xid`，`xmin/xmax` 写在每行头部；
 - 快照 = (自己的 xid, 活跃事务列表)。可见性：`xmin` 已提交且不在快照活跃集，且 `xmax` 未提交或已回滚；
+- 历史读第一切片：`HeapFile.scan_at(commit_lsns, target_lsn)` 不伪造事务，
+  只按提交 LSN 截止点判断版本；目标点后才提交的 `xmin` 不可见，目标点后才
+  提交的 `xmax` 不隐藏行。它目前只覆盖基表顺序扫描，未接 SQL、索引或 JOIN；
 - 隔离级别固定为**快照隔离**，不提供 `SET TRANSACTION ISOLATION LEVEL`
   切换（会明确报 `NotSupportedError`）。既然只有一种语义，就不假装有多种。
 

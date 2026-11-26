@@ -344,10 +344,8 @@ class HeapFile:
             newest = latest
         return None
 
-    def scan(
-        self, txn: Transaction, *, ri: bool = False
-    ) -> Iterator[Tuple[RID, list[Any]]]:
-        """顺序扫描所有可见行，产出 ``(根 RID, 值列表)``。
+    def _scan_with(self, visible) -> Iterator[Tuple[RID, list[Any]]]:
+        """按调用方给的可见性谓词顺序扫描，产出 ``(根 RID, 值列表)``。
 
         产出根 RID 而不是物理 RID，是因为索引与后续 UPDATE/DELETE 都按根 RID
         定位逻辑行——把物理 RID 交给上层会让"更新后再删"指向错误的版本。
@@ -370,13 +368,58 @@ class HeapFile:
                     if raw is None:
                         continue
                     rec = self._decode_raw(raw)
-                    if not self._visible(txn, rec, ri=ri):
+                    if not visible(rec):
                         continue
                     root = self.resolve_root((page_id, slot), rec.header)
                     yield root, rec.values
             finally:
                 self._release(page)
             page_id = next_id
+
+    def scan(
+        self, txn: Transaction, *, ri: bool = False
+    ) -> Iterator[Tuple[RID, list[Any]]]:
+        """按当前事务快照扫描所有可见行。"""
+        yield from self._scan_with(lambda rec: self._visible(txn, rec, ri=ri))
+
+    def scan_at(
+        self,
+        commit_lsns: dict[int, int],
+        target_lsn: int,
+    ) -> Iterator[Tuple[RID, list[Any]]]:
+        """按提交 LSN 截止点扫描；不伪造 Transaction 快照。
+
+        ``commit_lsns`` 是 ``xid -> COMMIT LSN`` 的账本。目标时刻之前提交的
+        xmin 才可见；目标时刻之前提交的 xmax 才表示删除。账本里没有的 xid
+        （未提交、回滚或已随 checkpoint 裁剪）一律按不可见处理，宁缺毋滥。
+        """
+        yield from self._scan_with(
+            lambda rec: self._visible_at(rec, commit_lsns, target_lsn)
+        )
+
+    def _visible_at(
+        self,
+        rec: DecodedRecord,
+        commit_lsns: dict[int, int],
+        target_lsn: int,
+    ) -> bool:
+        from .record import FLAG_ABORTED
+
+        h = rec.header
+        if h.flags & FLAG_ABORTED:
+            return False
+
+        def committed(xid: int) -> bool:
+            if xid == 0:
+                return True  # 未写入
+            lsn = commit_lsns.get(xid)
+            return lsn is not None and lsn <= target_lsn
+
+        if not committed(h.xmin):
+            return False
+        if h.xmax == 0:
+            return True
+        return not committed(h.xmax)
 
     def count(self, txn: Transaction) -> int:
         return sum(1 for _ in self.scan(txn))

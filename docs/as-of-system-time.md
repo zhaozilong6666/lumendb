@@ -42,11 +42,13 @@ SELECT * FROM t AS OF SYSTEM TIME 123456;  -- commit LSN，二选一后再定
 
 ### P1 历史可见性
 
-- 从账本构造目标点的已提交集合，而不是伪造一个当前事务快照。
-- `HeapFile.scan` 增加显式的“按集合判可见”路径；默认路径行为不变。
-- 索引扫描仍回表复核；覆盖索引暂不支持历史读。
+- 已落地第一切片：`HeapFile.scan_at(commit_lsns, target_lsn)` 按提交 LSN
+  截止点判断版本，不伪造 `Transaction`；默认 `scan` 路径不变。
+- 账本里没有的 xid（未提交/回滚/已裁剪）按不可见处理；目标点后才提交的
+  `xmax` 不会提前隐藏旧行。
+- 仍未接 SQL 语法、索引扫描和 JOIN；覆盖索引暂不支持历史读。
 - 验收：同一行 INSERT → UPDATE → DELETE 的三个时间点分别读到不存在、
-  旧值、新值、不存在；与 VACUUM 未运行时一致。
+  旧值、新值、不存在；已由 `tests/unit/test_heap.py` 钉住。
 
 ### P2 保留水位
 
