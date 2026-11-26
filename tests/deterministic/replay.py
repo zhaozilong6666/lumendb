@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 from .scenario_ddl import run_ddl_case
+from .scenario_fsync import run_fsync_case
 from .scenario_replica import run_replica_case
 from .scenario_row_lock import run_row_case
 from .scenario_split import run_case
@@ -40,20 +41,25 @@ def _run_replica(seed: int, root: pathlib.Path) -> str:
     return f"replica applied_after_promote={detail['applied_after_promote']}"
 
 
+def _run_fsync(seed: int, root: pathlib.Path) -> str:
+    trace, detail = run_fsync_case(seed, root / f"fsync-{seed}")
+    return f"fsync visible_before={detail['visible_before']} rows_after={detail['rows_after']}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LumenDB 确定性重放")
     parser.add_argument("--seeds", type=int, default=10, help="跑 0..N-1 个种子")
     parser.add_argument("--seed", type=int, default=None, help="只跑一个种子")
     parser.add_argument(
         "--scenario",
-        choices=["split", "row", "ddl", "replica", "all"],
+        choices=["split", "row", "ddl", "replica", "fsync", "all"],
         default="all",
-        help="split=叶分裂；row=行锁等待；ddl=并发 DDL；replica=apply 中途换主",
+        help="split=叶分裂；row=行锁等待；ddl=并发 DDL；replica=apply 中途换主；fsync=提交 durability 窗口",
     )
     args = parser.parse_args(argv)
 
     seeds = [args.seed] if args.seed is not None else list(range(args.seeds))
-    scenarios = ["split", "row", "ddl", "replica"] if args.scenario == "all" else [args.scenario]
+    scenarios = ["split", "row", "ddl", "replica", "fsync"] if args.scenario == "all" else [args.scenario]
     failures = 0
     for seed in seeds:
         with tempfile.TemporaryDirectory(prefix=f"lumendb_replay_{seed}_") as td:
@@ -66,8 +72,10 @@ def main(argv: list[str] | None = None) -> int:
                         detail = _run_row(seed, root)
                     elif scenario == "ddl":
                         detail = _run_ddl(seed, root)
-                    else:
+                    elif scenario == "replica":
                         detail = _run_replica(seed, root)
+                    else:
+                        detail = _run_fsync(seed, root)
                 except BaseException as exc:  # noqa: BLE001
                     failures += 1
                     print(f"[seed {seed}][{scenario}] FAIL: {type(exc).__name__}: {exc}")

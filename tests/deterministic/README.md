@@ -1,4 +1,4 @@
-# 确定性重放（② 骨架的四个场景）
+# 确定性重放（② 骨架的五个场景）
 
 这不是概率性并发压测。它把真实引擎里的关键交错点变成可命名的闸门，用固定
 种子决定参数，用事件轨迹断言因果顺序；失败时按同一 seed 重跑会走到同一个点。
@@ -48,6 +48,19 @@
 
 若旧 apply 继续写旧句柄，最后会静默少行，而不是崩溃。
 
+## 场景五：COMMIT 的 fsync durability 窗口
+
+`scenario_fsync.py` 固定：
+
+1. 写线程把 INSERT 的 COMMIT 记录交给 WAL，停在 `fsync` 内部；
+2. 主线程通过 `TransactionManager.is_visible(..., ri=True)` 检查：写事务
+   仍是 `ACTIVE`，这一行不可见；
+3. 放行 fsync 后写线程才 `COMMITTED`，行出现；
+4. 关闭重开，行仍在。
+
+若提交判定发生在 fsync 之前，第 2 步会看到行；若 fsync 失败被吞掉，第 4 步
+会丢行。这个闸门钉住的是“可见性必须晚于 durable”。
+
 ## 运行
 
 ```bash
@@ -58,11 +71,12 @@ python -m tests.deterministic.replay --seed 3 --scenario row
 python -m tests.deterministic.replay --seed 3 --scenario ddl
 python -m tests.deterministic.replay --seed 3 --scenario replica
 python -m tests.deterministic.replay --seed 3 --scenario split
+python -m tests.deterministic.replay --seed 3 --scenario fsync
 ```
 
 ## 边界
 
 这是 ② 的基础设施，覆盖了 Cherry 要求的三个场景（行锁等待、并发 DDL、
-副本 apply 中途换主），外加一个 B+ 树分裂结构窗口。四场景各 1000 个种子
-已实测 **4000/4000 通过**；`fsync` / `page.fetch` 仍只有结构窗口这一处闸门，
-是下一轮要补的故障点。
+副本 apply 中途换主），外加 B+ 树分裂结构窗口和 COMMIT fsync durability
+窗口。五场景各 1000 个种子已实测 **5000/5000 通过**。`page.fetch` 不在重放里：它是
+缓冲池读盘故障点，由 `tests/unit/test_faults.py` 钉住“EIO 不能装空页”。

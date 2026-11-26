@@ -529,7 +529,7 @@ Step 4 的前置项在这条路径上落地：
   B 的行）与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，
   快照看旧版本）。
 
-**确定性重放四场景（2026-11-26，② 骨架）**：
+**确定性重放五场景（2026-11-26，② 骨架）**：
 
 - `tests/deterministic/trace.py` 提供可命名闸门 `HoldPoint` 与因果轨迹 `Trace`：
   事件带全局序号、线程名和字段；`Trace.wait_for()` 不靠 sleep 猜，`dump()`
@@ -546,17 +546,20 @@ Step 4 的前置项在这条路径上落地：
 - `scenario_replica.py` 第四个场景：副本应用完第一个事务后停在组边界，主线程
   `promote` 换句柄；旧 apply 必须把剩余记录放回暂存区，由新主库幂等重放，
   最终所有行都在。旧 apply 继续写旧句柄会静默丢行。
+- `scenario_fsync.py` 第五个场景：写线程的 COMMIT 记录已进 WAL，停在
+  `os.fsync` 内部；主线程用 `is_visible(ri=True)` 断言写事务仍是 ACTIVE、行
+  不可见；放行后事务才 COMMITTED，行出现，关闭重开仍在。这钉住“可见性必须
+  晚于 durable”，而不是只看最终查询。
 - 复现命令：
   `python -m pytest tests/unit/test_deterministic_replay.py -q`；
-  `python -m tests.deterministic.replay --seeds 1000` 一次跑四场景共 4000 个
-  种子，已实测 4000/4000 通过（91s）。
-- 边界：Cherry 要求的三个场景（行锁等待、并发 DDL、副本 apply 中途换主）
-  和 B+ 树结构窗口均已覆盖并各跑 1000 个种子；`fsync` / `page.fetch` 还只有
-  结构窗口这一处闸门，是下一轮要补的故障点。
+  `python -m tests.deterministic.replay --seeds 1000` 一次跑五场景共 5000 个
+  种子，已实测 5000/5000 通过。
+- 边界：`page.fetch` 没有放进重放（它是缓冲池读盘故障点，不是线程交错），
+  由 `tests/unit/test_faults.py` 钉住“读盘 EIO 必须报错、不能装空页”。
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1600 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1611 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -1213,7 +1216,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1600 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1611 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

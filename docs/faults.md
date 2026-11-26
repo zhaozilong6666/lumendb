@@ -30,6 +30,7 @@ faults.disarm()                          # 全部撤掉
 | `wal_segment.append` | 分段 WAL 追加入口 | 整条记录未进入 pending |
 | `wal_segment.fsync` | **写完 pending、`os.fsync` 之前** | 同上，且会先尝试段轮转 |
 | `disk.write_page` | 页写入口 / 写前半页 | `io` 整页失败；`torn` 半页新半页旧 |
+| `page.fetch` | 缓冲池未命中、`DiskManager.read_page` 前 | 读盘 EIO；不能把空页装进缓存 |
 | `disk.sync` | `fflush` 后、`fsync` 前 | 元数据可能只在 OS 页缓存 |
 | `disk.allocate_page` | 分配入口 | 不改变页数，避免“注入失败反而分配了一页” |
 

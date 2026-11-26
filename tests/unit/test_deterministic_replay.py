@@ -11,6 +11,7 @@ import pathlib
 import pytest
 
 from tests.deterministic.scenario_ddl import run_ddl_case
+from tests.deterministic.scenario_fsync import run_fsync_case
 from tests.deterministic.scenario_replica import run_replica_case
 from tests.deterministic.scenario_row_lock import run_row_case
 from tests.deterministic.scenario_split import run_case
@@ -47,3 +48,12 @@ def test_replica_apply_mid_promotion_is_deterministic(tmp_path: pathlib.Path, se
     assert detail["rows"] == [(1, 1)] + [(seed + 2 + i, seed + 2 + i) for i in range(3)]
     assert detail["applied_after_promote"] > 0
     assert trace.count("apply.yield") == 1
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_fsync_commit_visibility_is_durable(tmp_path: pathlib.Path, seed: int) -> None:
+    trace, detail = run_fsync_case(seed, tmp_path / f"fsync-seed-{seed}")
+    assert detail["visible_before"] is False
+    assert detail["rows_after"] == [(seed, seed)]
+    assert trace.count("reader.check", thread="MainThread") == 1
+    assert trace.first_seq("fsync.start") < trace.first_seq("reader.check")

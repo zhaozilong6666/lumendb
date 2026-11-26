@@ -52,6 +52,7 @@ POINTS = frozenset(
         "wal_segment.append",
         "wal_segment.fsync",
         "disk.write_page",
+        "page.fetch",
         "disk.sync",
         "disk.allocate_page",
     }

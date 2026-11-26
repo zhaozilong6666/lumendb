@@ -19,6 +19,7 @@ import contextlib
 from collections import OrderedDict
 from typing import Optional
 
+from .. import faults
 from ..errors import StorageError
 from .page import INVALID_PAGE_ID, PAGE_SIZE, Page, PageType
 from .pager import DiskManager
@@ -151,6 +152,9 @@ class BufferPoolManager:
 
             self.stats.misses += 1
             self._ensure_room()
+            # 读盘失败必须原样上抛：不能把空页当成合法页装进缓存，否则一次
+            # EIO 会静默变成“这页没有记录”。
+            faults.check("page.fetch")
             raw = self._disk.read_page(page_id)
             page = Page(page_id, raw)
             self._frames[page_id] = page

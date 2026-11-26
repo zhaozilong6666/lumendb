@@ -115,6 +115,24 @@ class TestInjectedIoFailures:
         finally:
             reopened.close()
 
+    def test_page_fetch_failure_does_not_install_a_blank_page(self, tmp_path):
+        """读盘 EIO 必须报错，不能把空页塞进缓存后假装没有记录。"""
+        db = self._seed(tmp_path)
+        try:
+            # 新分配的页不在缓冲池里，下一次 fetch 必然走磁盘读。
+            page_id = db.disk.allocate_page()
+            faults.arm("page.fetch@1")
+            with pytest.raises((OSError, LumenError)):
+                db.bp.fetch_page(page_id)
+            faults.disarm()
+            page = db.bp.fetch_page(page_id)
+            db.bp.unpin(page_id)
+            assert page.page_id == page_id
+            assert db.execute_one("SELECT id FROM t ORDER BY id").rows == [(1,)]
+        finally:
+            faults.disarm()
+            db.close()
+
     def test_wal_append_failure_aborts_the_statement(self, tmp_path):
         db = self._seed(tmp_path)
         try:
