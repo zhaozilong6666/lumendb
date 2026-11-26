@@ -174,10 +174,14 @@ class ForeignKeyDef:
 
 @dataclass
 class ColumnStats:
-    """一列的 ANALYZE 结果；只存估算需要的字段。"""
+    """一列的 ANALYZE 结果：等值用 n_distinct，范围用 min/max + 简单直方图。"""
 
     n_distinct: int = 0
     null_frac: float = 0.0
+    min_value: object = None
+    max_value: object = None
+    #: 等宽直方图：每项 ``(lo, hi, count)``；空表示没有范围统计。
+    histogram: list[tuple[float, float, int]] = field(default_factory=list)
 
     @property
     def equality_selectivity(self) -> float:
@@ -186,14 +190,52 @@ class ColumnStats:
             return 0.0
         return max(0.0, min(1.0, (1.0 - self.null_frac) / self.n_distinct))
 
+    def range_selectivity(
+        self, low: float | None, high: float | None
+    ) -> float | None:
+        """用直方图估算 ``low <= col <= high`` 的行占比；无统计返回 None。"""
+        if not self.histogram:
+            return None
+        total = sum(count for _lo, _hi, count in self.histogram)
+        if total <= 0:
+            return None
+        touched = 0.0
+        for lo, hi, count in self.histogram:
+            if count <= 0 or hi <= lo:
+                continue
+            if high is not None and lo >= high:
+                continue
+            if low is not None and hi <= low:
+                continue
+            span = hi - lo
+            overlap_lo = lo if low is None else max(lo, low)
+            overlap_hi = hi if high is None else min(hi, high)
+            if overlap_hi <= overlap_lo:
+                continue
+            touched += count * ((overlap_hi - overlap_lo) / span)
+        return max(0.0, min(1.0, touched / total))
+
     def to_json(self) -> dict:
-        return {"n_distinct": int(self.n_distinct), "null_frac": float(self.null_frac)}
+        return {
+            "n_distinct": int(self.n_distinct),
+            "null_frac": float(self.null_frac),
+            "min_value": self.min_value,
+            "max_value": self.max_value,
+            "histogram": [[float(lo), float(hi), int(count)] for lo, hi, count in self.histogram],
+        }
 
     @classmethod
     def from_json(cls, data: dict) -> "ColumnStats":
+        histogram = []
+        for item in data.get("histogram", []):
+            if len(item) == 3:
+                histogram.append((float(item[0]), float(item[1]), int(item[2])))
         return cls(
             n_distinct=int(data.get("n_distinct", 0)),
             null_frac=float(data.get("null_frac", 0.0)),
+            min_value=data.get("min_value"),
+            max_value=data.get("max_value"),
+            histogram=histogram,
         )
 
 

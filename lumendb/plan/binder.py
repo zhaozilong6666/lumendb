@@ -141,6 +141,53 @@ def _column_literal_pair(expr: BinaryOp):
     return None, None
 
 
+def _column_range_pair(expr):
+    """把 ``col > 常量`` / ``col BETWEEN a AND b`` 还原成 ``(ref, low, high)``。"""
+    if isinstance(expr, BinaryOp) and expr.op in (">", ">=", "<", "<="):
+        left, right = expr.left, expr.right
+        op = expr.op
+        if isinstance(left, Literal) and isinstance(right, ColumnRef):
+            left, right = right, left
+            op = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}[op]
+        if not isinstance(left, ColumnRef) or not isinstance(right, Literal):
+            return None
+        try:
+            value = float(right.value)
+        except (TypeError, ValueError):
+            return None
+        if op in (">", ">="):
+            return left, value, None
+        return left, None, value
+    if isinstance(expr, Between) and not expr.negated:
+        if not isinstance(expr.operand, ColumnRef):
+            return None
+        if not isinstance(expr.low, Literal) or not isinstance(expr.high, Literal):
+            return None
+        try:
+            low, high = float(expr.low.value), float(expr.high.value)
+        except (TypeError, ValueError):
+            return None
+        return expr.operand, low, high
+    return None
+
+
+def _stats_range_selectivity(catalog, ref: ColumnRef, schema: Schema, low, high) -> Optional[float]:
+    try:
+        index = schema.resolve(ref.table, ref.name)
+    except BinderError:
+        return None
+    source = schema.columns[index].source_table
+    if source is None:
+        return None
+    try:
+        stats = catalog.get_table(source).column_stats.get(ref.name.lower())
+    except Exception:
+        return None
+    if stats is None:
+        return None
+    return stats.range_selectivity(low, high)
+
+
 def _stats_equality_selectivity(catalog, ref: ColumnRef, schema: Schema) -> Optional[float]:
     """查某列 ANALYZE 后的等值选择率；没有统计时返回 ``None``。"""
     try:
@@ -1060,13 +1107,25 @@ class Binder:
                 range_node = self._try_index_range(select.where, schema, node)
                 predicate, _ = self.compile(select.where, schema, allow_agg=False)
                 child = range_node if range_node is not None else node
+                # IndexRange 已经按范围选择率估过一次；上层 Filter 只是复核
+                # 边界（BETWEEN/开闭区间），不能再把同一谓词的选择率乘一遍。
+                selectivity = (
+                    1.0
+                    if range_node is not None
+                    else self._predicate_selectivity(select.where, schema)
+                )
                 node = Filter(
                     child=child,
                     predicate=predicate,
                     columns=child.columns,
                     estimated=filter_estimate(
                         self._node_estimate(child),
-                        self._predicate_selectivity(select.where, schema),
+                        selectivity,
+                        reason=(
+                            "范围已由 IndexRange 应用，Filter 只复核边界"
+                            if range_node is not None
+                            else "WHERE 谓词过滤"
+                        ),
                     ),
                 )
         elif select.where is not None:
@@ -1461,7 +1520,13 @@ class Binder:
             return None
 
         base = scan.estimated or unknown_estimate()
-        estimate = filter_estimate(base, RANGE_SELECTIVITY)
+        stats_selectivity = _stats_range_selectivity(
+            self.catalog, column_ref, schema, low, high
+        )
+        estimate = filter_estimate(
+            base,
+            stats_selectivity if stats_selectivity is not None else RANGE_SELECTIVITY,
+        )
         return IndexRange(
             columns=scan.columns,
             table=scan.table,
@@ -1535,8 +1600,24 @@ class Binder:
                         return value
                 return EQ_SELECTIVITY
             if expr.op in (">", ">=", "<", "<="):
+                pair = _column_range_pair(expr)
+                if pair is not None and schema is not None:
+                    ref, low, high = pair
+                    value = _stats_range_selectivity(
+                        self.catalog, ref, schema, low, high
+                    )
+                    if value is not None:
+                        return value
                 return RANGE_SELECTIVITY
         if isinstance(expr, Between):
+            pair = _column_range_pair(expr)
+            if pair is not None and schema is not None:
+                ref, low, high = pair
+                value = _stats_range_selectivity(
+                    self.catalog, ref, schema, low, high
+                )
+                if value is not None:
+                    return value
             return RANGE_SELECTIVITY
         return OTHER_SELECTIVITY
 

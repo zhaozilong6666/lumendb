@@ -62,3 +62,20 @@ def test_explain_reports_index_choice_reason(tmp_path):
         assert "SeqScan≈12" in plan and "IndexScan≈3" in plan
     finally:
         db.close()
+
+
+def test_analyze_histogram_drives_range_estimate(tmp_path):
+    db = Database(tmp_path / "range")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        for i in range(100):
+            db.execute_one(f"INSERT INTO t VALUES ({i}, {i})")
+        before = _plan(db, "SELECT id FROM t WHERE id > 90")
+        assert "rows≈33" in before, before
+        db.execute_one("ANALYZE t")
+        after = _plan(db, "SELECT id FROM t WHERE id > 90")
+        assert "rows≈10" in after, after
+        assert "范围已由 IndexRange 应用" in after
+        assert "SeqScan≈100 → IndexRange≈10" in after
+    finally:
+        db.close()

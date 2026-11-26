@@ -3119,10 +3119,38 @@ class Executor:
                         distinct.add(repr(value))
                 n_distinct = len(distinct)
                 null_frac = (nulls / len(rows)) if rows else 0.0
-                table.column_stats[column.name] = ColumnStats(
+                stats = ColumnStats(
                     n_distinct=n_distinct,
                     null_frac=null_frac,
                 )
+                if column.type.is_numeric and n_distinct > 1:
+                    numbers = [
+                        float(values[index])
+                        for values in rows
+                        if values[index] is not None
+                    ]
+                    minimum, maximum = min(numbers), max(numbers)
+                    stats.min_value = minimum
+                    stats.max_value = maximum
+                    if maximum > minimum:
+                        buckets = 16
+                        width = (maximum - minimum) / buckets
+                        counts = [0] * buckets
+                        for number in numbers:
+                            slot = min(
+                                buckets - 1,
+                                int((number - minimum) / width),
+                            )
+                            counts[slot] += 1
+                        stats.histogram = [
+                            (
+                                minimum + width * slot,
+                                minimum + width * (slot + 1),
+                                counts[slot],
+                            )
+                            for slot in range(buckets)
+                        ]
+                table.column_stats[column.name] = stats
                 analyzed_columns += 1
         self._persist_catalog(txn)
         return Result(
