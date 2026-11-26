@@ -116,6 +116,33 @@ ReplicationMonitor(
 
 ---
 
+## 3.4 重试契约（应用侧先读这一节）
+
+不要靠读源码猜"这个错能不能重试"。`lumendb.errors.RETRY_POLICY` 是**唯一声明处**，
+`tests/unit/test_retry_contract.py` 会遍历全部异常类，新错误码没登记就红。
+
+```python
+from lumendb import retry_policy
+try:
+    db.execute_one(sql)
+except Exception as exc:
+    policy = retry_policy(exc)   # 四种之一
+```
+
+| 策略 | 含义 | 典型 SQLSTATE |
+|---|---|---|
+| `retry_transaction` | 事务已 abort，**整个事务重来** | `40001` 序列化失败、`40P01` 死锁、`55P03` 锁超时 |
+| `recheck` | **结果未知**：先读一次确认，再决定是否重放 | `40003` 提交时多数派水位没追上 |
+| `no_retry` | 确定性错误或需人工介入 | `23505/23502/23514/23503` 约束、`42xxx` 语句错误、`XX001/XX002` 数据损坏、`08xxx` 连接 |
+| `retry_statement` | 只重放这一条语句（仅当错误发生在写入之前） | 当前没有内置错误用到，留给扩展 |
+
+两条纪律：
+
+1. **`40003` 绝不能当失败**：本地 COMMIT 记录已经 fsync，数据可能已生效；
+   重放前必须先用同一幂等键读一次。
+2. **约束类错误（23xxx）重试没有意义**：数据本身就是错的，重试只会得到同一个错；
+   要修的是应用逻辑或数据。
+
 ## 4. 故障剧本
 
 ### 4.1 写语句报 `40001`（另一个事务正在写）

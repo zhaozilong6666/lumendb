@@ -11,4 +11,6 @@
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+from .errors import RETRY_POLICY, retry_policy
+
+__all__ = ["RETRY_POLICY", "__version__", "retry_policy"]
