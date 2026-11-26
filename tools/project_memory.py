@@ -799,7 +799,13 @@ def cmd_query(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     ledger = Ledger(Path(args.ledger), Path(args.root))
-    targets = ledger.facts if not args.ids else [ledger.get(i) for i in args.ids]
+    # 被取代的记录是历史，不是当前主张：默认不再校验，否则一条旧证据
+    # 的失效会永久挡住审计。显式 --ids 仍可点名复核历史记录。
+    if args.ids:
+        targets = [ledger.get(i) for i in args.ids]
+    else:
+        superseded = _superseded_ids(ledger.facts)
+        targets = [f for f in ledger.facts if f.id not in superseded]
     targets = [t for t in targets if t is not None]
     if args.only_stale:
         targets = [t for t in targets if t.verify.get("status") not in ("ok",)]

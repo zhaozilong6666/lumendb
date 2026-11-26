@@ -240,6 +240,23 @@ def test_cli_add_with_evidence_round_trips(tmp_path, capsys):
     assert fact.evidence[1]["anchor"] == "量级参考"
 
 
+def test_verify_check_skips_superseded_history(tmp_path, capsys):
+    """被取代的旧记录可以带失效证据，但不该永久挡住只读审计。"""
+    from tools.project_memory import main
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
+    ledger.append(_fact("bad-old", "旧结论", evidence=[{"type": "bogus", "value": "x", "anchor": ""}]))
+    ledger.append(_fact("new", "新结论", evidence=[], supersedes="bad-old"))
+    assert main(["--ledger", str(ledger.path), "--root", str(tmp_path), "verify", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "bad-old" not in out
+    assert "new" in out
+    # 显式点名仍可复核历史记录
+    assert main(
+        ["--ledger", str(ledger.path), "--root", str(tmp_path), "verify", "--check", "--ids", "bad-old"]
+    ) == 1
+
+
 def test_number_conflicts_ignores_fact_being_superseded(tmp_path):
     ledger = Ledger(tmp_path / "ledger.jsonl", root=tmp_path)
     old = _fact("old", "外键子表插入 374 行/秒", tags=["bench"])
