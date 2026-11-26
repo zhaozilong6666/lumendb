@@ -321,7 +321,10 @@ class Parser:
             table = None
             if self._cur.kind == "ident":
                 table = self._parse_ident("表名")
-            return Analyze(table)
+            sample = None
+            if self._match_word("SAMPLE"):
+                sample = self._expect_int()
+            return Analyze(table, sample=sample)
         if kw == "REINDEX":
             self._advance()
             self._match_kw("TABLE")

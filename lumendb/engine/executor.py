@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import random
 import re
 import time
 import weakref
@@ -3109,14 +3110,35 @@ class Executor:
             if stmt.table
             else self._catalog.list_tables()
         )
+        if stmt.sample is not None and stmt.sample < 1:
+            raise BinderError(
+                "ANALYZE SAMPLE 必须大于 0",
+                hint="SAMPLE 行数上限至少为 1；不要抽样时省略 SAMPLE",
+            )
         total_rows = 0
         analyzed_columns = 0
+        sampled_rows = 0
         for table in tables:
             heap = HeapFile(self._bp, table, self._txns)
-            rows = [values for _rid, values in heap.scan(txn)]
-            total_rows += len(rows)
-            table.row_count_hint = len(rows)
-            table.stats_rows = len(rows)
+            if stmt.sample is None:
+                rows = [values for _rid, values in heap.scan(txn)]
+                exact_rows = len(rows)
+            else:
+                rows = []
+                exact_rows = 0
+                rng = random.Random(f"analyze:{table.name}:{stmt.sample}")
+                for _rid, values in heap.scan(txn):
+                    exact_rows += 1
+                    if len(rows) < stmt.sample:
+                        rows.append(values)
+                    else:
+                        slot = rng.randrange(exact_rows)
+                        if slot < stmt.sample:
+                            rows[slot] = values
+                sampled_rows += len(rows)
+            total_rows += exact_rows
+            table.row_count_hint = exact_rows
+            table.stats_rows = exact_rows
             table.column_stats = {}
             for index, column in enumerate(table.columns):
                 nulls = 0
@@ -3192,7 +3214,13 @@ class Executor:
             tag=f"ANALYZE {len(tables)} table(s), {analyzed_columns} column(s)",
             notice=(
                 f"已分析 {len(tables)} 张表、{analyzed_columns} 列，"
-                f"可见行 {total_rows}；统计只影响估算，不改变结果"
+                f"可见行 {total_rows}；"
+                + (
+                    f"抽样 {sampled_rows} 行，统计为近似值；"
+                    if stmt.sample is not None
+                    else ""
+                )
+                + "统计只影响估算，不改变结果"
             ),
         )
 

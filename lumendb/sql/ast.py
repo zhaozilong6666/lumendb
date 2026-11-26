@@ -704,9 +704,10 @@ class Checkpoint(Statement):
 
 @dataclass
 class Analyze(Statement):
-    """``ANALYZE [table]``：扫描表并记录列级 n_distinct / null_frac。"""
+    """``ANALYZE [table] [SAMPLE n]``：扫描表并记录列级统计。"""
 
     table: Optional[str] = None
+    sample: Optional[int] = None
 
 
 @dataclass

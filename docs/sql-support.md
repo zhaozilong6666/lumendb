@@ -406,7 +406,9 @@ SHOW COLUMNS FROM table [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
 SHOW STATISTICS [FROM table];
                          -- 表/列/行数/n_distinct/null_frac/min/max/桶数；只读
 CHECKPOINT;
-ANALYZE [TABLE] table;   -- 扫描可见行，记录列级 n_distinct / null_frac
+ANALYZE [TABLE] table [SAMPLE n];
+                         -- 扫描可见行；SAMPLE n 只保留 n 行做列统计（近似），
+                         -- 行数仍精确；不写 SAMPLE 时全量统计
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
 VACUUM [FULL] [table];  -- 回收死版本；无活跃事务时重排堆页并重建索引，
                          -- 有活跃事务时转保 RID 在线回收；不带表名处理所有表

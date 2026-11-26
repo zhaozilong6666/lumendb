@@ -622,8 +622,11 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 后面；`reason` 说明为什么选这个访问路径或放弃别的路径。`EXPLAIN ANALYZE`
 再追加实际耗时、行数与循环次数。
 
-`ANALYZE [TABLE] t` 会扫描当前可见行，把 `row_count_hint` 对齐到实际行数，
-并为每一列记录 `n_distinct` 与 `null_frac`，随目录 JSON 持久化。等值谓词
+`ANALYZE [TABLE] t [SAMPLE n]` 会扫描当前可见行，把 `row_count_hint` 对齐到
+实际行数，并为每一列记录 `n_distinct` 与 `null_frac`，随目录 JSON 持久化。
+`SAMPLE n` 用固定种子的蓄水池抽样只保留 n 行参与列统计，行数仍精确计数；
+此时 `n_distinct`、`min/max` 和直方图都是近似值，`SHOW STATISTICS` 的
+`rows` 仍是总行数而不是样本行数。等值谓词
 （`col = 常量`）不再固定使用 0.1，而是优先用
 `(1 - null_frac) / n_distinct`；没有 ANALYZE 统计时仍回退默认选择率。
 

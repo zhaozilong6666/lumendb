@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from lumendb.engine.database import Database
+from lumendb.errors import BinderError
 
 
 def _plan(db: Database, sql: str) -> str:
@@ -129,3 +130,22 @@ def test_show_statistics_exposes_analyzed_catalog(tmp_path):
         assert result.tag == "STATISTICS 2"
     finally:
         db.close()
+
+
+def test_analyze_sample_bounds_memory_and_stays_approximate(tmp_path):
+    db = Database(tmp_path / "sample")
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+    for i in range(100):
+        db.execute_one(f"INSERT INTO t VALUES ({i}, '{i:03d}')")
+    result = db.execute_one("ANALYZE t SAMPLE 10")
+    assert result.affected == 100
+    assert "抽样 10 行" in result.notice
+    table = db.catalog.get_table("t")
+    assert table.stats_rows == 100
+    assert table.row_count_hint == 100
+    id_stats = table.column_stats["id"]
+    assert id_stats.n_distinct <= 10
+    assert sum(bucket[2] for bucket in id_stats.histogram) == 10
+    with pytest.raises(BinderError):
+        db.execute_one("ANALYZE t SAMPLE 0")
+    db.close()
