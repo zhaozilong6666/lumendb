@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1611 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1612 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点

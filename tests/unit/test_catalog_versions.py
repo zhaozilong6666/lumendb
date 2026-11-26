@@ -41,9 +41,9 @@ def test_show_catalog_versions(tmp_path):
     db.execute_one("ALTER TABLE t ADD COLUMN v INT")
     result = db.execute_one("SHOW CATALOG VERSIONS")
     assert result.columns[0].name == "catalog_version"
-    assert [(row[0], row[1], row[2]) for row in result.rows] == [
-        (2, 1, "t"),
-        (1, 1, "t"),
+    assert [(row[0], row[3], row[1], row[2]) for row in result.rows] == [
+        (2, 1, "t", ""),
+        (1, 1, "t", ""),
     ]
     db.close()
 
@@ -77,4 +77,21 @@ def test_reopen_does_not_mistake_dml_for_schema_change(tmp_path):
     db.execute_one("ALTER TABLE t ADD COLUMN w INT")
     assert db.catalog.catalog_version == 3
     assert [item["catalog_version"] for item in db.catalog.history()] == [3, 2, 1]
+    db.close()
+
+
+def test_history_keeps_view_definitions(tmp_path):
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT)")
+    db.execute_one("CREATE VIEW v1 AS SELECT id FROM t")
+    db.execute_one("ALTER TABLE t ADD COLUMN z INT")
+    db.execute_one("DROP VIEW v1")
+    view = db.catalog.view_at(2, "v1")
+    assert view is not None
+    assert view["dependencies"] == ["t"]
+    assert [token[1] for token in view["tokens"]] == ["SELECT", "id", "FROM", "t"]
+    assert db.catalog.view_at(3, "v1") is not None
+    assert db.catalog.view_at(4, "v1") is None
+    versions = db.execute_one("SHOW CATALOG VERSIONS").rows
+    assert versions[1][2] == "v1", "删除前的历史版本仍应能看到视图名"
     db.close()

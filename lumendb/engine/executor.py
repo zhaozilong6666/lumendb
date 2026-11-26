@@ -3386,16 +3386,18 @@ class Executor:
         rows = [
             (
                 item["catalog_version"],
-                len(item["tables"]),
                 ", ".join(table["name"] for table in item["tables"]),
+                ", ".join(view["name"] for view in item["views"]),
+                len(item["tables"]) + len(item["views"]),
             )
             for item in history
         ]
         return Result(
             columns=[
                 ColumnMeta("catalog_version", TypeSpec(DataType.INT)),
-                ColumnMeta("objects", TypeSpec(DataType.INT)),
                 ColumnMeta("tables", TypeSpec(DataType.TEXT)),
+                ColumnMeta("views", TypeSpec(DataType.TEXT)),
+                ColumnMeta("objects", TypeSpec(DataType.INT)),
             ],
             rows=rows,
             tag=f"CATALOG VERSIONS {len(rows)}",

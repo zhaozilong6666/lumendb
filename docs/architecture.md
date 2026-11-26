@@ -147,7 +147,8 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 指向上一条 schema 链；普通 DML 只更新页根，仍写新链但沿用同一
 `catalog_version`，不会伪造 schema 版本。旧链从不覆盖，`Catalog.history()`
 可沿 `previous_root` 回溯历史表定义，`Catalog.table_at(version, name)` 读出
-当时的列；`SHOW CATALOG VERSIONS` 暴露版本、对象数和表名。回滚的 DDL 通过
+当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；
+`SHOW CATALOG VERSIONS` 暴露版本、表名、视图名和对象数。回滚的 DDL 通过
 `txn.undo_log` 把版本号和上一版根页恢复，不留下从未提交的版本。
 这仍是**目录历史**，不是并发 DDL：当前只有一个可写根指针，DDL 依旧由目录锁
 串行化；历史链为后续 `AS OF SYSTEM TIME` 提供了版本索引，但数据页还没有

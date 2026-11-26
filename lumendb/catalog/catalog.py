@@ -253,6 +253,7 @@ class Catalog:
                 break
             data = json.loads(raw.decode("utf-8"))
             tables = data.get("tables", [])
+            views = data.get("views", [])
             result.append(
                 {
                     "catalog_version": int(data.get("catalog_version", 1)),
@@ -268,10 +269,45 @@ class Catalog:
                         }
                         for table in tables
                     ],
+                    "views": [
+                        {
+                            "name": view.get("name", ""),
+                            "columns": list(view.get("columns", [])),
+                            "dependencies": sorted(view.get("dependencies", [])),
+                        }
+                        for view in views
+                    ],
                 }
             )
             root = int(data.get("previous_root", 0))
         return result
+
+    @_locked
+    def view_at(self, catalog_version: int, name: str) -> Optional[dict]:
+        """读某个历史 catalog 版本里的视图定义；不存在返回 None。"""
+        for snapshot in self.history():
+            if snapshot["catalog_version"] != catalog_version:
+                continue
+            root = snapshot["root_page"]
+            raw = self._store.load_at_root(root)
+            if not raw:
+                return None
+            data = json.loads(raw.decode("utf-8"))
+            key = name.lower()
+            for vdata in data.get("views", []):
+                if vdata.get("name", "").lower() != key:
+                    continue
+                return {
+                    "name": vdata.get("name", ""),
+                    "tokens": [
+                        (kind, value)
+                        for kind, value in vdata.get("tokens", [])
+                    ],
+                    "columns": list(vdata.get("columns", [])),
+                    "dependencies": sorted(vdata.get("dependencies", [])),
+                }
+            return None
+        return None
 
     @_locked
     def table_at(self, catalog_version: int, name: str) -> Optional[TableDef]:
