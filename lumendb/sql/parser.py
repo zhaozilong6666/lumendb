@@ -60,6 +60,7 @@ from .ast import (
     Select,
     SelectItem,
     SetConstraints,
+    ShowCatalogVersions,
     ShowTables,
     ShowViews,
     TableConstraint,
@@ -271,7 +272,11 @@ class Parser:
                 return ShowTables()
             if self._match_kw("VIEWS"):
                 return ShowViews()
-            raise self._error("SHOW 之后期望 TABLES 或 VIEWS")
+            if self._match_word("CATALOG"):
+                if not self._match_word("VERSIONS"):
+                    raise self._error("SHOW CATALOG 之后期望 VERSIONS")
+                return ShowCatalogVersions()
+            raise self._error("SHOW 之后期望 TABLES、VIEWS 或 CATALOG VERSIONS")
         if kw == "CHECKPOINT":
             self._advance()
             return Checkpoint()

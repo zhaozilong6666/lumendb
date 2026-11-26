@@ -71,6 +71,7 @@ from ..sql.ast import (
     SetConstraints,
     Vacuum,
     Truncate,
+    ShowCatalogVersions,
     ShowTables,
     ShowViews,
     Statement,
@@ -107,6 +108,7 @@ _NON_WRITING_STATEMENTS = frozenset(
         "Explain",
         "ShowTables",
         "ShowViews",
+        "ShowCatalogVersions",
         "SetConstraints",
         "Checkpoint",
     }
@@ -341,6 +343,8 @@ class Executor:
                 return self._show_tables()
             if isinstance(stmt, ShowViews):
                 return self._show_views()
+            if isinstance(stmt, ShowCatalogVersions):
+                return self._show_catalog_versions()
             if isinstance(stmt, Explain):
                 return self._explain(stmt)
             if isinstance(stmt, Statement) and type(stmt).__name__ == "Checkpoint":
@@ -3375,6 +3379,26 @@ class Executor:
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",
+        )
+
+    def _show_catalog_versions(self) -> Result:
+        history = self._catalog.history()
+        rows = [
+            (
+                item["catalog_version"],
+                len(item["tables"]),
+                ", ".join(table["name"] for table in item["tables"]),
+            )
+            for item in history
+        ]
+        return Result(
+            columns=[
+                ColumnMeta("catalog_version", TypeSpec(DataType.INT)),
+                ColumnMeta("objects", TypeSpec(DataType.INT)),
+                ColumnMeta("tables", TypeSpec(DataType.TEXT)),
+            ],
+            rows=rows,
+            tag=f"CATALOG VERSIONS {len(rows)}",
         )
 
     def _explain(self, stmt: Explain) -> Result:

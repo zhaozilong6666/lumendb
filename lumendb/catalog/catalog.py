@@ -93,6 +93,12 @@ class Catalog:
         self._store = store
         self._lock = threading.RLock()
         self.tables: dict[str, TableDef] = {}
+        #: 逻辑 schema 版本序号；只在 schema 形状变化时递增，纯页根更新不增。
+        self.catalog_version = 0
+        #: 上一个 schema 版本的目录根页；用于版本链回溯。
+        self._previous_root = 0
+        #: 最近一次落盘的 schema_version，用来识别“这次 persist 是否改形状”。
+        self._last_schema_version = 0
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
         self.views: dict[str, list[tuple[str, str]]] = {}
         #: 视图名 -> 显式列名（可选）；空列表表示沿用查询输出的列名。
@@ -157,6 +163,8 @@ class Catalog:
                     f"目录版本 {version} 不受支持",
                     detail=f"当前仅支持版本 {CATALOG_VERSION}",
                 )
+            self.catalog_version = int(data.get("catalog_version", 1))
+            self._previous_root = int(data.get("previous_root", 0))
             for tdata in data.get("tables", []):
                 table = TableDef.from_json(tdata)
                 self.tables[table.name] = table
@@ -174,13 +182,35 @@ class Catalog:
         self._loaded = True
         # 副本收到主库的目录页后会重载：旧计划引用的表/列对象已经过期。
         self.schema_version += 1
+        # schema_version 是进程内计划缓存代际，不是持久值；重开库后从当前
+        # 代际起算，避免把一次普通 DML 的目录保存误判成 schema 变化。
+        self._last_schema_version = self.schema_version
 
     @_locked
     def persist(self, txn: Transaction) -> None:
         txn.wrote = True
+        previous_root = self._store.current_root()
+        schema_changed = self.schema_version != self._last_schema_version
+        if schema_changed:
+            self.catalog_version += 1
+            before_version = self.catalog_version - 1
+            before_previous = self._previous_root
+
+            def undo_version() -> None:
+                # 回滚/失败的 DDL 不能留下一个“从未提交过”的 catalog 版本号。
+                # schema_version 不回滚（它只负责失效计划缓存），所以这里
+                # 只恢复版本序号和上一版根页。
+                self.catalog_version = before_version
+                self._previous_root = before_previous
+
+            # 在写盘之前登记：save 中途 EIO 时事务 abort 也要把版本号退回去。
+            txn.undo_log.append(undo_version)
+        history_root = previous_root if schema_changed else self._previous_root
         payload = json.dumps(
             {
                 "version": CATALOG_VERSION,
+                "catalog_version": self.catalog_version,
+                "previous_root": history_root,
                 "tables": [t.to_json() for t in self.tables.values()],
                 "views": [
                     {
@@ -201,7 +231,65 @@ class Catalog:
             separators=(",", ":"),
         ).encode("utf-8")
         self._store.save(txn, payload)
+        if schema_changed:
+            self._previous_root = previous_root
+            self._last_schema_version = self.schema_version
         self.dirty = False
+
+    # ------------------------------------------------------------------
+    # 版本历史
+    # ------------------------------------------------------------------
+
+    @_locked
+    def history(self, limit: int = 1000) -> list[dict]:
+        """沿 ``previous_root`` 回溯 schema 版本链，返回当前在前的快照元数据。"""
+        result: list[dict] = []
+        root = self._store.current_root()
+        seen: set[int] = set()
+        while root and root not in seen and len(result) < limit:
+            seen.add(root)
+            raw = self._store.load_at_root(root)
+            if not raw:
+                break
+            data = json.loads(raw.decode("utf-8"))
+            tables = data.get("tables", [])
+            result.append(
+                {
+                    "catalog_version": int(data.get("catalog_version", 1)),
+                    "root_page": root,
+                    "tables": [
+                        {
+                            "name": table.get("name", ""),
+                            "columns": [
+                                column.get("name", "")
+                                for column in table.get("columns", [])
+                            ],
+                            "indexes": sorted(table.get("indexes", {})),
+                        }
+                        for table in tables
+                    ],
+                }
+            )
+            root = int(data.get("previous_root", 0))
+        return result
+
+    @_locked
+    def table_at(self, catalog_version: int, name: str) -> Optional[TableDef]:
+        """读某个历史 catalog 版本里的表定义；不存在返回 None。"""
+        for snapshot in self.history():
+            if snapshot["catalog_version"] != catalog_version:
+                continue
+            root = snapshot["root_page"]
+            raw = self._store.load_at_root(root)
+            if not raw:
+                return None
+            data = json.loads(raw.decode("utf-8"))
+            for tdata in data.get("tables", []):
+                table = TableDef.from_json(tdata)
+                if table.name == name.lower():
+                    return table
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # 查询

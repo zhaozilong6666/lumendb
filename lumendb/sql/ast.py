@@ -679,6 +679,11 @@ class ShowViews(Statement):
 
 
 @dataclass
+class ShowCatalogVersions(Statement):
+    pass
+
+
+@dataclass
 class Checkpoint(Statement):
     pass
 

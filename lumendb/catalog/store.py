@@ -34,20 +34,22 @@ class CatalogStore:
 
     # ------------------------------------------------------------------
 
-    def load(self) -> Optional[bytes]:
-        # page 0 是元数据页，catalog_root 存在 +12 处。
-        # 走 Buffer Pool 而不是直接读磁盘，是为了让未落盘的目录更新也能被看到。
+    def current_root(self) -> int:
+        """当前目录根页号；0/INVALID 表示还没有目录。"""
         meta = self._bp.fetch_page(0)
         try:
             with meta.latch:
-                root = meta.get_u32(META_OFF_CATALOG_ROOT)
-                next_page_id = meta.get_u32(8)
+                return meta.get_u32(META_OFF_CATALOG_ROOT)
         finally:
             self._bp.unpin(0)
 
+    def load(self) -> Optional[bytes]:
+        return self.load_at_root(self.current_root())
+
+    def load_at_root(self, root: int) -> Optional[bytes]:
+        """读取指定目录链；用于版本化目录回溯旧 schema。"""
         if root == INVALID_PAGE_ID or root == 0:
             return None
-
         parts: list[bytes] = []
         page_id = root
         guard = 0

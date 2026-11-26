@@ -188,7 +188,14 @@ def _is_read_only_statement(statement: object) -> bool:
     return type(statement).__name__ in _READ_ONLY_STATEMENTS
 
 
-_PURE_READ_STATEMENTS = {"Query", "Select", "Explain", "ShowTables", "ShowViews"}
+_PURE_READ_STATEMENTS = {
+    "Query",
+    "Select",
+    "Explain",
+    "ShowTables",
+    "ShowViews",
+    "ShowCatalogVersions",
+}
 
 #: 会重排/重写堆页的语句：VACUUM 重排 RID 并重建索引，TRUNCATE 清空页链，
 #: ALTER TYPE / DROP COLUMN 走 shadow heap（写新页再切根）。这些操作期间，
