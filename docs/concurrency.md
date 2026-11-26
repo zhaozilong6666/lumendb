@@ -529,26 +529,30 @@ Step 4 的前置项在这条路径上落地：
   B 的行）与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，
   快照看旧版本）。
 
-**确定性重放前两块（2026-11-26，② 骨架）**：
+**确定性重放四场景（2026-11-26，② 骨架）**：
 
 - `tests/deterministic/trace.py` 提供可命名闸门 `HoldPoint` 与因果轨迹 `Trace`：
   事件带全局序号、线程名和字段；`Trace.wait_for()` 不靠 sleep 猜，`dump()`
   直接打印完整交错序。
-- `tests/deterministic/scenario_split.py` 把刚修好的 B+ 树结构窗口做成第一个
-  真实场景：9 条长键占满叶 → splitter 插第 10 条触发分裂 → 闸门停在“叶已
-  分裂、父键未装” → follower 填满新右页并尝试第二次分裂。
-- 断言：`install.end(splitter)` 的序号必须小于 `split.start(follower)`；
-  旧实现 10 个种子全部失败，新实现 10/10 通过。
-- `tests/deterministic/scenario_row_lock.py` 覆盖第二个场景：A 显式事务持行锁、
-  停在 COMMIT 前；B 自动提交 UPDATE 进入 `LockManager.acquire` 阻塞；断言
-  B 的 `acquire.end` 在 A 的 `COMMIT` 之前没有发生，放行后最终值是两次增量。
+- `tests/deterministic/scenario_split.py` 第一个场景：9 条长键占满叶 →
+  splitter 插第 10 条触发分裂 → 闸门停在“叶已分裂、父键未装” → follower
+  填满新右页并尝试第二次分裂；旧实现 10 个种子全失败，新实现 10/10 通过。
+- `scenario_row_lock.py` 第二个场景：A 显式事务持行锁停在 COMMIT 前；B 自动
+  提交 UPDATE 阻塞在 `LockManager.acquire`，断言 B 的 `acquire.end` 不早于
+  A 的 `commit.start`，放行后最终值是两次增量而非 40001。
+- `scenario_ddl.py` 第三个场景：A 有未提交插入时，B 的 `ALTER TABLE ADD
+  COLUMN` 必须被 40001 拒绝；A 提交后重试成功，两行都保留并按新列形状读出。
+  门失效会让未提交行落在被替换的旧 heap 里静默丢失。
+- `scenario_replica.py` 第四个场景：副本应用完第一个事务后停在组边界，主线程
+  `promote` 换句柄；旧 apply 必须把剩余记录放回暂存区，由新主库幂等重放，
+  最终所有行都在。旧 apply 继续写旧句柄会静默丢行。
 - 复现命令：
   `python -m pytest tests/unit/test_deterministic_replay.py -q`；
-  `python -m tests.deterministic.replay --seeds 100` 一次跑两场景共 200 个种子，
-  已实测 200/200 通过。
-- 边界：已覆盖 B+ 树结构窗口、两个事务写同一行；Cherry 要求的“并发 DDL /
-  副本 apply 中途换主”和每场景 1000 个种子尚未覆盖，下一步要把闸门继续插到
-  `fsync` / `page.fetch` / 复制 apply。
+  `python -m tests.deterministic.replay --seeds 1000` 一次跑四场景共 4000 个
+  种子，已实测 4000/4000 通过（91s）。
+- 边界：Cherry 要求的三个场景（行锁等待、并发 DDL、副本 apply 中途换主）
+  和 B+ 树结构窗口均已覆盖并各跑 1000 个种子；`fsync` / `page.fetch` 还只有
+  结构窗口这一处闸门，是下一轮要补的故障点。
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/

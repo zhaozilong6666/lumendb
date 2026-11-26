@@ -63,5 +63,6 @@ python -m tests.deterministic.replay --seed 3 --scenario split
 ## 边界
 
 这是 ② 的基础设施，覆盖了 Cherry 要求的三个场景（行锁等待、并发 DDL、
-副本 apply 中途换主），外加一个 B+ 树分裂结构窗口。尚未达到每场景 1000 个
-种子；`fsync` / `page.fetch` 也还只有结构窗口这一处闸门。
+副本 apply 中途换主），外加一个 B+ 树分裂结构窗口。四场景各 1000 个种子
+已实测 **4000/4000 通过**；`fsync` / `page.fetch` 仍只有结构窗口这一处闸门，
+是下一轮要补的故障点。
