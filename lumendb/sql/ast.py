@@ -285,6 +285,8 @@ class Join:
 class TableRef:
     name: str
     alias: Optional[str] = None
+    #: ``AS OF SYSTEM TIME LSN n`` 的目标提交点；None 表示当前读。
+    as_of_lsn: Optional[int] = None
     joins: list[Join] = field(default_factory=list)
     #: FROM 里的派生表 ``(SELECT ...) AS alias``；普通表为 None。
     query: Optional[Union[Select, CompoundSelect, Query]] = None
@@ -688,6 +690,11 @@ class ShowCatalogVersions(Statement):
 @dataclass
 class ShowCommitLog(Statement):
     limit: Optional[int] = None
+
+
+@dataclass
+class ShowHistoryWindow(Statement):
+    pass
 
 
 @dataclass

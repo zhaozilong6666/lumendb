@@ -76,6 +76,7 @@ from ..sql.ast import (
     ShowCatalogVersions,
     ShowColumns,
     ShowCommitLog,
+    ShowHistoryWindow,
     ShowStatistics,
     ShowTables,
     ShowViews,
@@ -87,6 +88,7 @@ from ..sql.ast import (
 from ..storage.btree import BPlusTree, KeyCodec
 from ..storage.bufferpool import BufferPoolManager
 from ..storage.heap import HeapFile, VACUUM_ONLINE_MAX_VERSIONS
+from ..storage.history import HistoryWindow
 from ..storage.page import INVALID_PAGE_ID
 from ..storage.record import RID
 from ..storage.recovery import RecoveryManager
@@ -116,6 +118,7 @@ _NON_WRITING_STATEMENTS = frozenset(
         "ShowCatalogVersions",
         "ShowColumns",
         "ShowCommitLog",
+        "ShowHistoryWindow",
         "ShowStatistics",
         "SetConstraints",
         "Checkpoint",
@@ -198,11 +201,15 @@ class Executor:
         read_only: bool = False,
         concurrent_dml: bool = False,
         vacuum_online_max_versions: int = VACUUM_ONLINE_MAX_VERSIONS,
+        history: Optional[HistoryWindow] = None,
     ) -> None:
         self._bp = buffer_pool
         self._catalog = catalog
         self._txns = txns
         self._wal = wal
+        #: 历史读水位；直接构造 Executor 的旧测试可以传 None，此时 AS OF
+        #: 会明确报"未接入历史窗口"，而不是退回当前读。
+        self._history = history
         self._locks = locks if locks is not None else LockManager()
         #: 写并发模式：DML 不拿数据库写者锁，由行/键锁 + 页 latch 保护。
         self._concurrent_dml = concurrent_dml
@@ -250,6 +257,10 @@ class Executor:
     ) -> Result:
         self._txn = txn
         self._schema_statement = type(stmt) in _SCHEMA_CHANGING_STATEMENTS
+        if self._schema_statement and self._history is not None:
+            # 当前 schema 只能安全解码"DDL 之后"的数据页；把历史下界抬到
+            # DDL 开始前的 WAL 位置，AS OF 不会拿新 schema 解旧页。
+            self._history.advance(self._wal.next_lsn)
         if txn.capture_row_undo and self._schema_statement:
             raise NotSupportedError(
                 "逻辑保存点事务未升级，不能执行 DDL/TRUNCATE",
@@ -355,6 +366,8 @@ class Executor:
                 return self._show_catalog_versions()
             if isinstance(stmt, ShowCommitLog):
                 return self._show_commit_log(stmt)
+            if isinstance(stmt, ShowHistoryWindow):
+                return self._show_history_window(stmt)
             if isinstance(stmt, ShowColumns):
                 return self._show_columns(stmt)
             if isinstance(stmt, ShowStatistics):
@@ -363,7 +376,7 @@ class Executor:
                 return self._explain(stmt)
             if isinstance(stmt, Statement) and type(stmt).__name__ == "Checkpoint":
                 RecoveryManager(
-                    self._disk, self._wal, self._bp, self._txns
+                    self._disk, self._wal, self._bp, self._txns, self._history
                 ).checkpoint()
                 return Result(tag="CHECKPOINT")
             raise NotSupportedError(
@@ -635,7 +648,7 @@ class Executor:
         )
 
     def _new_binder(self) -> Binder:
-        binder = Binder(self._catalog, self._params)
+        binder = Binder(self._catalog, self._params, history=self._history)
         binder.subquery_runner = self._run_subquery
         return binder
 
@@ -800,7 +813,54 @@ class Executor:
     def _scan(self, node: Scan, txn: Transaction) -> Iterator[tuple]:
         table = self._catalog.get_table(node.table)
         heap = HeapFile(self._bp, table, self._txns)
+        if node.as_of_lsn is not None:
+            yield from self._scan_as_of(node, table, heap)
+            return
         for _rid, values in heap.scan(txn):
+            yield tuple(values)
+
+    def _scan_as_of(
+        self, node: Scan, table, heap: HeapFile
+    ) -> Iterator[tuple]:
+        """执行一次历史堆扫描；窗口不足时明确拒绝，不退回当前读。"""
+        assert node.as_of_lsn is not None
+        if self._history is None:
+            raise NotSupportedError(
+                "当前执行器没有接入历史读窗口",
+                detail="AS OF 需要 checkpoint / VACUUM / DDL 水位",
+                hint="通过 Database 打开数据库后再使用 AS OF",
+            )
+        target = int(node.as_of_lsn)
+        floor = self._history.floor_lsn
+        if target < floor:
+            raise BinderError(
+                "AS OF 目标早于可用的历史窗口",
+                detail=(
+                    f"目标 LSN={target}，历史下界 LSN={floor}；"
+                    "checkpoint/VACUUM/DDL 之后更早的版本不再保证可读"
+                ),
+                hint="用 SHOW HISTORY WINDOW 查看下界，换一个不早于下界的目标点",
+            )
+        entries = dict(self._txns.commit_log())
+        if not entries:
+            raise NotSupportedError(
+                "当前 WAL 窗口还没有可用的提交点",
+                detail="提交账本为空，无法定位任何历史目标",
+                hint="先执行一条写语句并提交，再用 SHOW COMMIT LOG 选择 LSN",
+            )
+        latest = max(entries.values())
+        if target > latest:
+            raise BinderError(
+                "AS OF 目标晚于最近一次提交",
+                detail=f"目标 LSN={target}，最近提交 LSN={latest}",
+                hint="历史读只能读到已提交的点；先提交事务或选择更早的 LSN",
+            )
+        for _rid, values in heap.scan_at(
+            entries,
+            target,
+            assume_committed_before=floor,
+            strict_unknown_xmax=True,
+        ):
             yield tuple(values)
 
     def _recursive_cte(
@@ -3283,6 +3343,11 @@ class Executor:
                 detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
                 hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时改用 --physical-savepoints",
             )
+        if self._history is not None:
+            # VACUUM 开始之后回收掉的旧版本，任何不早于这个位置的目标点都
+            # 不再需要（删除/覆盖都发生在这个位置之前）。保守抬到 WAL 的
+            # 下一个 LSN，避免把正好在 VACUUM 里提交的版本算进可读窗口。
+            self._history.advance(self._wal.next_lsn)
         tables = (
             [self._catalog.get_table(stmt.table)]
             if stmt.table
@@ -3577,6 +3642,33 @@ class Executor:
             rows=rows,
             tag=f"COMMITS {len(rows)}",
             notice="进程内新增提交 + 启动时从当前 WAL 窗口重建；更早的持久提交历史尚未保留",
+        )
+
+    def _show_history_window(self, stmt: ShowHistoryWindow) -> Result:
+        if self._history is None:
+            raise NotSupportedError(
+                "当前执行器没有接入历史读窗口",
+                detail="SHOW HISTORY WINDOW 需要 checkpoint / VACUUM / DDL 水位",
+                hint="通过 Database 打开数据库后再查询",
+            )
+        entries = self._txns.commit_log()
+        latest = max((lsn for _xid, lsn in entries), default=None)
+        checkpoint = self._history.checkpoint_lsn
+        floor = self._history.floor_lsn
+        rows = [(checkpoint, floor, latest, len(entries))]
+        return Result(
+            columns=[
+                ColumnMeta("checkpoint_lsn", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("floor_lsn", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("latest_commit_lsn", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("commits", TypeSpec(DataType.BIGINT)),
+            ],
+            rows=rows,
+            tag="HISTORY WINDOW",
+            notice=(
+                "AS OF SYSTEM TIME LSN 的可用窗口是 [floor_lsn, latest_commit_lsn]；"
+                "checkpoint/VACUUM/DDL 会把 floor 抬高"
+            ),
         )
 
     def _show_columns(self, stmt: ShowColumns) -> Result:

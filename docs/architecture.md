@@ -72,6 +72,11 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 用于验证提交顺序与崩溃前后一致性。checkpoint 会截断 WAL，截断前的持久提交
 尚未进入这个账本——它还不是 `AS OF SYSTEM TIME` 所需的完整历史。
 
+`AS OF SYSTEM TIME LSN n` 在这个账本之上提供只读历史读，可读窗口是
+`[floor_lsn, latest_commit_lsn]`，由 `SHOW HISTORY WINDOW` 暴露。floor 取
+最近 checkpoint、VACUUM 开始、DDL 开始三者的最大值；超出窗口明确报错。
+目前只允许基表顺序扫描，索引路径禁用，同一查询里的多表必须使用同一 LSN。
+
 ### 2.4 恢复
 
 启动时：
@@ -163,8 +168,9 @@ UTC 微秒级 `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时�
 时间会先经 `version_at_or_before` 解析到目录版本，再取该版本的 `TableDef`。回滚的 DDL 通过
 `txn.undo_log` 把版本号和上一版根页恢复，不留下从未提交的版本。
 这仍是**目录历史**，不是并发 DDL：当前只有一个可写根指针，DDL 依旧由目录锁
-串行化；历史链为后续 `AS OF SYSTEM TIME` 提供了版本索引，但数据页还没有
-按时间保留。
+串行化；历史链用于目录回溯。数据页的历史读走 `AS OF SYSTEM TIME LSN`，但它
+只覆盖最近 DDL / VACUUM / checkpoint 之后的窗口，不复用目录版本链做历史
+schema 解码。
 
 `SAVEPOINT` 记录当时 Buffer Pool 的页 undo 深度和 `txn.undo_log` 深度。
 `ROLLBACK TO SAVEPOINT` 只应用这个深度之后的页原像（同样写 CLR），再逆序

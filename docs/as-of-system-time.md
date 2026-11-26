@@ -1,90 +1,107 @@
-# AS OF SYSTEM TIME 设计（未实现）
+# AS OF SYSTEM TIME：设计与已交付边界
 
-本文是 ① 的设计边界，不是已交付能力。P0 的第一块只读提交账本已经落地：
-`SHOW COMMIT LOG` 暴露当前 WAL 窗口的 `xid / commit_lsn`，但它还不是完整
-历史，也没有驱动任何 `AS OF` 读。当前只有目录版本链：
-`SHOW ... AT CATALOG VERSION n` / `AT TIME '...'` 能读历史 **schema 与列统计**，
-但数据页仍只有当前版本；VACUUM 也会回收旧行版本。因此不能把
-`SHOW ... AT TIME` 当成 `AS OF SYSTEM TIME`。
-
-## 目标语法（候选）
+`AS OF SYSTEM TIME LSN n` 已经接到 SQL 表面。它不是“无限历史”：可读窗口是
+`[floor_lsn, latest_commit_lsn]`，超出窗口必须报错，不会静默退化成当前读。
 
 ```sql
-SELECT * FROM t AS OF SYSTEM TIME '2026-11-26T08:00:00+00:00';
-SELECT * FROM t AS OF SYSTEM TIME 123456;  -- commit LSN，二选一后再定
+SHOW HISTORY WINDOW;
+SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
+EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 ```
 
-只允许只读查询。`INSERT/UPDATE/DELETE/DDL`、显式事务内的 `AS OF`、
-`AS OF` 与 `FOR UPDATE` 组合都应报错，而不是静默退化成当前读。
+`SHOW HISTORY WINDOW` 输出 `checkpoint_lsn / floor_lsn / latest_commit_lsn / commits`。
+`latest_commit_lsn` 在账本为空时为 `NULL`。
 
-## 必须先成立的不变量
+## 已交付的 P0 / P1 / P3 切片
 
-1. **提交点可定位**：每个提交事务都有持久、单调的提交标识（UTC 时间或
-   COMMIT 记录的 LSN）。仅靠 xid 不够：xid 分配顺序不等于提交顺序。
-2. **旧版本有保留期**：VACUUM 只能回收“保留水位之前就已删除”的版本；
-   否则 `AS OF` 只能碰运气读到还没被清理的旧行。
-3. **可见性按提交点判断**：`xmin` 在目标点之前提交才可见；`xmax` 在目标点
-   之前提交才表示删除。回滚/未提交/目标点之后才提交的 `xmax` 都不能隐藏行。
-4. **索引不作历史真值**：B+ 树项只指向 RID，历史可见性必须回到堆页复核；
-   不能因为索引里还有键就认为该行在目标时刻存在。
-5. **schema 与数据同一快照**：目标时刻的目录版本给出列布局；数据页必须按
-   该版本的 `TableDef` 解码，不能拿当前 schema 解旧页。
+### 提交账本
 
-## 分阶段落地
+- `TransactionManager` 维护 `xid -> COMMIT LSN`，只在事务真正标记 `COMMITTED`
+  后登记；回滚、未提交事务不进入账本。
+- 重开时从 WAL 当前窗口重建；`SHOW COMMIT LOG [LIMIT n]` 暴露
+  `xid / commit_lsn`，按 LSN 升序，供用户选目标点。
+- checkpoint 仍会裁剪 WAL 窗口内的旧 COMMIT 记录。更早的提交账本尚未持久化
+  到 checkpoint 之外，这是当前最大的 P0 缺口。
 
-### P0 提交账本
+### 历史可见性
 
-- 在 COMMIT 记录里带上提交时间（或在 WAL 头部维护单调 commit LSN 映射）。
-- `TransactionManager` 维护 `xid -> commit_lsn/commit_time`，恢复时从 WAL
-  重建；checkpoint 截断 WAL 后仍要保留最近窗口的映射。
-- 暴露最小只读视图，例如 `SHOW COMMIT LOG`，用于验证账本与测试断言。
-- 验收：重启前后同一 xid 的提交点一致；未提交/回滚事务不在账本里。
+- `HeapFile.scan_at(..., assume_committed_before=..., strict_unknown_xmax=...)`
+  按提交 LSN 截止点判断版本，不伪造 `Transaction`；默认 `scan` 路径不变。
+- 目标点之前提交的 `xmin` 可见；目标点之后才提交的 `xmax` 不会提前隐藏旧行。
+- 账本里没有的 `xmin` 视为“水位前已提交”：该物理版本仍留在堆里，且目标点
+  不早于水位；只要 `xmax` 没有在水位后提交，它在目标点就应可见。这样
+  checkpoint 之前的存量行不会因为账本裁剪而整表读空。
+- 非零 `xmax` 不在账本、也没有已知结局时，SQL 路径严格报错，不猜“未提交”，
+  避免复活已经删除的旧版本。
 
-### P1 历史可见性
+### SQL 表面
 
-- 已落地第一切片：`HeapFile.scan_at(commit_lsns, target_lsn)` 按提交 LSN
-  截止点判断版本，不伪造 `Transaction`；默认 `scan` 路径不变。
-- 账本里没有的 xid（未提交/回滚/已裁剪）按不可见处理；目标点后才提交的
-  `xmax` 不会提前隐藏旧行。
-- 仍未接 SQL 语法、索引扫描和 JOIN；覆盖索引暂不支持历史读。
-- 验收：同一行 INSERT → UPDATE → DELETE 的三个时间点分别读到不存在、
-  旧值、新值、不存在；已由 `tests/unit/test_heap.py` 钉住。
+- 语法只接受 `LSN <非负整数>`；时间字面量明确报 `NotSupportedError`，提示先用
+  `SHOW COMMIT LOG` 选 LSN。暂不支持 `AS OF SYSTEM TIME '...'`。
+- 只允许基表顺序扫描：索引项只保存当前 RID，`AS OF` 时禁用 `IndexLookup` /
+  `IndexRange`，统一走堆表扫描后按提交点复核。
+- 同一查询内所有 `AS OF` 数据源必须停在同一个 LSN；JOIN、CTE、派生表、标量
+  子查询共用目标点集合，出现多个目标直接报 `BinderError`。
+- `AS OF` 只能直接作用于基表；视图、CTE、派生表作为数据源时拒绝，视图定义里也不允许
+  藏 `AS OF`。
+- 显式事务内拒绝 `AS OF`，避免和事务自己的快照混在一起。
+- 只允许独立的只读 `SELECT` / `EXPLAIN`；`INSERT ... SELECT`、`CREATE TABLE AS
+  SELECT` 等写语句里出现 `AS OF` 直接报 `NotSupportedError`，不把历史行当作
+  当前写入输入。
+- `EXPLAIN` 的 `SeqScan` 会带 `[AS OF LSN n]`，不会出现 `IndexScan`。
+
+### 历史窗口
+
+`floor_lsn = max(latest checkpoint LSN, 最近 VACUUM 开始 LSN, 最近 DDL 开始 LSN)`。
+
+- checkpoint 推进下界：更早的 COMMIT 账本被裁剪，不保证还能精确判断。
+- VACUUM 推进下界：开始回收旧版本之前的点不再保证能读回。
+- DDL 推进下界：当前 schema 不能安全解码 DDL 之前的旧页。于是所有被允许的
+  目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要历史 schema
+  解码。
+- 目标点早于下界报 `BinderError`；晚于 `latest_commit_lsn` 也报 `BinderError`。
+
+## 仍未交付
+
+### P0 持久提交账本
+
+`SHOW COMMIT LOG` 仍只覆盖当前 WAL 窗口；checkpoint 后更早的 COMMIT 记录被
+裁剪。AS OF 用“水位前已提交”假设补存量行，但没有跨 checkpoint 的完整账本。
+因此 checkpoint 之前被删除、又还没被 VACUUM 回收的旧版本，遇到未知 `xmax`
+会严格报错，而不是猜测。
 
 ### P2 保留水位
 
-- 维护 `history_retention_floor`（时间或 LSN），VACUUM 以它为下限。
-- `AS OF` 早于水位时报 `BinderError`/`FeatureNotSupported`，并提示可用窗口；
-  不允许悄悄返回不完整结果。
-- `VACUUM` 仍可在线执行，但只能清理 `xmax` 提交点早于水位的版本。
-- 验收：水位前/后各一个删除版本；VACUUM 后水位内仍可读，水位外明确报错。
+VACUUM 会推进 floor，但没有“保留 N 个 LSN / N 小时”的显式参数。VACUUM 之后
+更早的目标点直接不可用。在线 VACUUM 能复用空页，但文件仍不缩盘。
 
-### P3 SQL 表面
+### P1 剩余面
 
-- parser 支持 `AS OF SYSTEM TIME <literal>`，只挂在 `SELECT`/`EXPLAIN` 上。
-- binder 解析目标点、选目录版本、构造历史快照；写语句与显式事务拒绝。
-- `EXPLAIN` 标注 `as_of=...` 与使用的目录版本，避免用户误以为当前读。
-- 验收：非法时间、未来时间、早于水位、写语句组合各有稳定错误码。
+- 索引路径禁用；覆盖索引、索引真值没有历史读。
+- JOIN 已强制同一目标点，但还没有“查询级共享快照对象”；每个 Scan 各自调用
+  `scan_at`，目标点相同即可。
+- 不承诺跨 checkpoint 的完整历史，也不承诺历史 schema 解码。
+- 写入、DDL、序列/自增回滚、外部副作用的时间倒流都不支持。
 
-### P4 测试与重放
+## 验收现状
 
-- 确定性重放增加 `asof` 场景：固定种子下交替 INSERT/UPDATE/DELETE，
-  在多个目标点读，轨迹必须可复现。
-- 崩溃恢复测试：提交账本落盘后重启，目标点读数不变。
-- 并发测试：`AS OF` 读与在线 VACUUM/DDL 的交错必须有明确门禁，不能靠
-  “读得快”碰运气。
+`tests/unit/test_as_of.py` 覆盖：
 
-## 明确不承诺
+- INSERT / UPDATE / DELETE 三个提交点的读数；
+- checkpoint 后仍能读 checkpoint 前的存量行；
+- `EXPLAIN` 标注 AS OF 且禁用索引；
+- 早于 floor、晚于 latest、显式事务、视图数据源、时间字面量的稳定报错；
+- VACUUM 推进 floor；
+- JOIN / 子查询的多目标点拒绝。
 
-- 不复制 PostgreSQL 的 `pg_xact` / `txid_current_snapshot` 语义。
-- 不支持写入、DDL、序列/自增回滚、外部副作用的时间倒流。
-- 不承诺无限制历史；窗口由保留水位决定，超出必须报错。
-- 时钟回拨时以持久提交标识为准，不以墙上时钟排序。
+全量基线见 [`docs/roadmap.md`](roadmap.md)。
 
-## 开放问题
+## 后续设计问题
 
-1. 目标点用 UTC 时间还是 commit LSN？时间对用户友好，LSN 更抗时钟回拨；
-   可以内部用 LSN、对外同时接受时间并映射。
-2. 保留水位默认多长？按时间（例如 1 小时）还是按 WAL 大小/版本数？
-3. checkpoint 截断 WAL 后，提交账本放 meta、目录 JSON 还是独立文件？
-4. 历史读是否允许 `JOIN` 多表？允许，但所有表必须绑定同一目标点与同一
-   目录版本，不能一张表当前、一张表历史。
+1. 持久提交账本放 meta 页、目录 JSON 还是独立文件？独立文件更容易原子替换，
+   但复制/备份要一起带走。
+2. 保留水位默认多长？按 LSN 数、WAL 大小还是小时？
+3. 是否允许 `AS OF SYSTEM TIME '...'` 由时间映射到最近提交 LSN？内部仍以
+   LSN 为准，避免时钟回拨。
+4. 索引历史读是否值得做：要么保留历史索引项，要么只在目标点等于 latest 时
+   允许索引并回堆复核。

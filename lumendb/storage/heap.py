@@ -24,7 +24,7 @@ import struct
 from typing import Any, Iterator, Optional, Sequence, Tuple
 
 from ..catalog.schema import TableDef
-from ..errors import CorruptedPageError, RowTooLargeError, StorageError
+from ..errors import CorruptedPageError, NotSupportedError, RowTooLargeError, StorageError
 from .btree import BPlusTree, KeyCodec
 from .bufferpool import BufferPoolManager
 from .page import INVALID_PAGE_ID, PAGE_SIZE, HeapPage
@@ -386,15 +386,33 @@ class HeapFile:
         self,
         commit_lsns: dict[int, int],
         target_lsn: int,
+        *,
+        assume_committed_before: int = 0,
+        strict_unknown_xmax: bool = False,
     ) -> Iterator[Tuple[RID, list[Any]]]:
         """按提交 LSN 截止点扫描；不伪造 Transaction 快照。
 
         ``commit_lsns`` 是 ``xid -> COMMIT LSN`` 的账本。目标时刻之前提交的
-        xmin 才可见；目标时刻之前提交的 xmax 才表示删除。账本里没有的 xid
-        （未提交、回滚或已随 checkpoint 裁剪）一律按不可见处理，宁缺毋滥。
+        xmin 才可见；目标时刻之前提交的 xmax 才表示删除。
+
+        默认对账本里没有的 xid 一律按不可见处理，宁缺毋滥。SQL 的 AS OF
+        路径会多给一个 ``assume_committed_before`` 水位：xmin 早于该水位
+        且仍留在堆里的版本，视为"水位前已提交"；只要它的 xmax 没有在
+        水位后提交，目标点（目标点必须不早于水位）就仍应看到它。这样
+        checkpoint 之前的存量行不会因为账本裁剪而全部消失。
+
+        ``strict_unknown_xmax=True`` 时，非零 xmax 如果既不在账本里、也
+        没有已知结局，就报错而不是猜"未提交"。历史读宁可明确拒绝，也
+        不能把已被删除的旧版本复活。
         """
         yield from self._scan_with(
-            lambda rec: self._visible_at(rec, commit_lsns, target_lsn)
+            lambda rec: self._visible_at(
+                rec,
+                commit_lsns,
+                target_lsn,
+                assume_committed_before=assume_committed_before,
+                strict_unknown_xmax=strict_unknown_xmax,
+            )
         )
 
     def _visible_at(
@@ -402,6 +420,9 @@ class HeapFile:
         rec: DecodedRecord,
         commit_lsns: dict[int, int],
         target_lsn: int,
+        *,
+        assume_committed_before: int = 0,
+        strict_unknown_xmax: bool = False,
     ) -> bool:
         from .record import FLAG_ABORTED
 
@@ -409,17 +430,49 @@ class HeapFile:
         if h.flags & FLAG_ABORTED:
             return False
 
+        def state(xid: int) -> Optional[TxnState]:
+            return self._txns.state_of(xid)
+
+        def committed_before_floor(xid: int) -> bool:
+            if target_lsn < assume_committed_before:
+                return False
+            known = state(xid)
+            if known in (TxnState.ABORTED, TxnState.ACTIVE):
+                return False
+            # 已提交但账本被 checkpoint 裁剪；或结局表已清理。目标点不早
+            # 于水位时，这种"水位前提交"的假设成立。
+            return True
+
         def committed(xid: int) -> bool:
             if xid == 0:
                 return True  # 未写入
             lsn = commit_lsns.get(xid)
-            return lsn is not None and lsn <= target_lsn
+            if lsn is not None:
+                return lsn <= target_lsn
+            if assume_committed_before > 0:
+                return committed_before_floor(xid)
+            return False
 
         if not committed(h.xmin):
             return False
         if h.xmax == 0:
             return True
-        return not committed(h.xmax)
+        lsn = commit_lsns.get(h.xmax)
+        if lsn is not None:
+            return lsn > target_lsn
+        known = state(h.xmax)
+        if known in (TxnState.ABORTED, TxnState.ACTIVE):
+            return True  # 删除未生效
+        if strict_unknown_xmax and assume_committed_before > 0:
+            raise NotSupportedError(
+                "历史读遇到无法归类的删除版本",
+                detail=(
+                    f"xmax={h.xmax} 既不在提交账本里，也没有已回滚/活跃"
+                    f"结局；目标 LSN={target_lsn}，水位 LSN={assume_committed_before}"
+                ),
+                hint="换一个不早于当前历史下界的目标点，或先 VACUUM 掉死版本",
+            )
+        return True
 
     def count(self, txn: Transaction) -> int:
         return sum(1 for _ in self.scan(txn))

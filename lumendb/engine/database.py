@@ -11,6 +11,7 @@ import contextlib
 import os
 import time
 from collections import deque
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -29,6 +30,7 @@ from ..sql.ast import (
 )
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
+from ..storage.history import HistoryWindow
 from ..storage.lock import LockManager
 from ..storage.pager import DiskManager
 from ..storage.recovery import RecoveryManager
@@ -198,7 +200,33 @@ _PURE_READ_STATEMENTS = {
     "ShowColumns",
     "ShowStatistics",
     "ShowCommitLog",
+    "ShowHistoryWindow",
 }
+
+
+def _contains_as_of(node: Any, seen: Optional[set[int]] = None) -> bool:
+    """AST 里是否含 ``AS OF SYSTEM TIME``（含子查询/派生表/EXPLAIN 内部）。"""
+    if seen is None:
+        seen = set()
+    if id(node) in seen:
+        return False
+    if is_dataclass(node) and not isinstance(node, type):
+        seen.add(id(node))
+        if getattr(node, "as_of_lsn", None) is not None:
+            return True
+        for item in fields(node):
+            if _contains_as_of(getattr(node, item.name), seen):
+                return True
+        return False
+    if isinstance(node, (list, tuple, set, frozenset)):
+        for item in node:
+            if _contains_as_of(item, seen):
+                return True
+    elif isinstance(node, dict):
+        for item in node.values():
+            if _contains_as_of(item, seen):
+                return True
+    return False
 
 #: 会重排/重写堆页的语句：VACUUM 重排 RID 并重建索引，TRUNCATE 清空页链，
 #: ALTER TYPE / DROP COLUMN 走 shadow heap（写新页再切根）。这些操作期间，
@@ -356,8 +384,11 @@ class Database:
         self._checkpoint_every_commits = max(0, checkpoint_every_commits)
         self._commits_since_checkpoint = 0
 
+        # 历史读窗口必须在恢复之前建：recover() 结束时自己会做一次
+        # checkpoint，那个位置会把下界抬到当前 WAL 窗口的起点。
+        self.history = HistoryWindow(self.disk.meta.checkpoint_lsn)
         self.recovery = RecoveryManager(
-            self.disk, self.wal, self.bp, self.txns
+            self.disk, self.wal, self.bp, self.txns, self.history
         )
         self.recovery_report = self.recovery.recover()
         self.txns.install_commit_lsns(self.recovery_report.commit_lsns)
@@ -374,6 +405,7 @@ class Database:
             read_only=self._read_only,
             concurrent_dml=self._concurrent_dml,
             vacuum_online_max_versions=self._vacuum_online_max_versions,
+            history=self.history,
         )
 
         self._txn: Optional[Transaction] = None
@@ -411,6 +443,7 @@ class Database:
             read_only=self._read_only,
             concurrent_dml=self._concurrent_dml,
             vacuum_online_max_versions=self._vacuum_online_max_versions,
+            history=self.history,
         )
 
     def assert_writable(self) -> None:
@@ -760,6 +793,21 @@ class Database:
         return True
 
     def _run_locked(self, statement, params: Optional[list[Any]]) -> Result:
+        if self._txn is not None and _contains_as_of(statement):
+            raise NotSupportedError(
+                "AS OF SYSTEM TIME 不能在显式事务内使用",
+                detail="显式事务已有自己的当前快照；混用历史目标与未提交修改会得到无法解释的结果",
+                hint="在 BEGIN 之外单独执行 AS OF SELECT，或者只查当前快照",
+            )
+        if (
+            _contains_as_of(statement)
+            and type(statement).__name__ not in _PURE_READ_STATEMENTS
+        ):
+            raise NotSupportedError(
+                "AS OF SYSTEM TIME 只支持只读查询",
+                detail="写语句、DDL 或 SHOW 不能把历史行当作当前输入",
+                hint="把 AS OF 放在独立的 SELECT / EXPLAIN 里读取，不要包进 INSERT/UPDATE/DELETE/DDL",
+            )
         # 保存点事务已经持有写者锁并置了 ``_no_readers``：它自己的后续语句
         # 不能再进 ``read_guard``，否则会等自己放行。这里直接执行，关闭/围栏
         # 检查仍然保留。

@@ -28,6 +28,7 @@ from ..errors import (
     TypeMismatchError,
     UndefinedParameterError,
 )
+from ..storage.history import HistoryWindow
 from ..sql.ast import (
     Between,
     BinaryOp,
@@ -370,8 +371,17 @@ class Binder:
         params: Optional[list[Any]] = None,
         *,
         outer_schemas: Optional[list[Schema]] = None,
+        history: Optional[HistoryWindow] = None,
+        as_of_targets: Optional[set[int]] = None,
     ) -> None:
         self.catalog = catalog
+        #: 历史读下界；只有 ``AS OF SYSTEM TIME LSN`` 需要。
+        self.history = history
+        #: 同一条查询（含 CTE / 派生表 / 子查询）出现过的 AS OF 目标点。
+        #: 多表 JOIN 必须停在同一时刻，否则会把不同 LSN 的行拼在一起。
+        self.as_of_targets: set[int] = (
+            as_of_targets if as_of_targets is not None else set()
+        )
         #: 外层查询的 schema 链（由内向外）。相关子查询里的列引用会按
         #: 当前查询优先、外层由近到远的顺序解析。
         self.outer_schemas: list[Schema] = list(outer_schemas or ())
@@ -852,6 +862,8 @@ class Binder:
             self.catalog,
             self.params,
             outer_schemas=[schema] + self.outer_schemas,
+            history=self.history,
+            as_of_targets=self.as_of_targets,
         )
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)
@@ -1297,7 +1309,19 @@ class Binder:
                 ),
             )
 
+        self._check_as_of_targets()
         return node, proj_cols
+
+    def _check_as_of_targets(self) -> None:
+        """同一条查询里的所有 AS OF 数据源必须停在同一个 LSN。"""
+        if len(self.as_of_targets) <= 1:
+            return
+        targets = ", ".join(str(value) for value in sorted(self.as_of_targets))
+        raise BinderError(
+            "同一查询里的 AS OF 目标点不一致",
+            detail=f"查询里出现了多个历史目标：LSN {targets}",
+            hint="JOIN / 子查询 / CTE 的每个基表都要写同一个 AS OF LSN",
+        )
 
     def _bind_compound(self, select: CompoundSelect) -> tuple[PlanNode, list[OutputColumn]]:
         parts = select.parts
@@ -1428,6 +1452,10 @@ class Binder:
         """
         if not isinstance(scan, Scan):
             return None
+        # 索引项只有当前 RID，历史可见性必须回堆页复核；目标点不是当前
+        # 快照时直接禁用索引路径，避免拿当前索引当历史真值。
+        if scan.as_of_lsn is not None:
+            return None
         if not isinstance(where, BinaryOp) or where.op != "=":
             return None
 
@@ -1484,6 +1512,8 @@ class Binder:
         留给全表扫描 + Filter。原因和等值查找一样：只做能保证正确的匹配。
         """
         if not isinstance(scan, Scan):
+            return None
+        if scan.as_of_lsn is not None:
             return None
 
         low = high = None
@@ -1969,9 +1999,26 @@ class Binder:
         return result
 
     def _source_for(
-        self, name: str, alias: Optional[str]
+        self,
+        name: str,
+        alias: Optional[str],
+        as_of_lsn: Optional[int] = None,
     ) -> tuple[PlanNode, Schema, list[OutputColumn]]:
         """解析 ``FROM`` 里的一个数据源：优先查 CTE，再查目录表。"""
+        if as_of_lsn is not None and self.view_stack:
+            raise NotSupportedError(
+                "视图定义里不能使用 AS OF SYSTEM TIME",
+                detail="历史目标点必须由最终查询给出，不能藏进视图",
+                hint="把 AS OF 写在最外层 SELECT 的基表上",
+            )
+        if as_of_lsn is not None and (
+            name.lower() in self.ctes or self.catalog.has_view(name)
+        ):
+            raise NotSupportedError(
+                "AS OF SYSTEM TIME 只能直接作用于基表",
+                detail=f"{name!r} 是 CTE 或视图，历史语义无法沿定义传递",
+                hint="先把视图展开为基表查询，或去掉 AS OF 做当前读",
+            )
         entry = self.ctes.get(name.lower())
         if entry is not None:
             child, cols = entry
@@ -2038,12 +2085,31 @@ class Binder:
 
         table = self.catalog.get_table(name)
         self.source_dependencies.add(table.name)
+        if as_of_lsn is not None:
+            self.as_of_targets.add(int(as_of_lsn))
+            if self.history is None:
+                raise NotSupportedError(
+                    "当前执行器没有接入历史读窗口",
+                    detail="AS OF 需要 checkpoint / VACUUM / DDL 水位",
+                    hint="通过 Database 打开数据库后再使用 AS OF",
+                )
+            floor = self.history.floor_lsn
+            if as_of_lsn < floor:
+                raise BinderError(
+                    "AS OF 目标早于可用的历史窗口",
+                    detail=(
+                        f"目标 LSN={as_of_lsn}，历史下界 LSN={floor}；"
+                        "checkpoint/VACUUM/DDL 之后更早的版本不再保证可读"
+                    ),
+                    hint="用 SHOW HISTORY WINDOW 查看下界，换一个不早于下界的目标点",
+                )
         effective = (alias or table.name).lower()
         columns = [OutputColumn(col.name, col.type) for col in table.columns]
         node = Scan(
             columns=columns,
             table=table.name,
             alias=effective,
+            as_of_lsn=as_of_lsn,
             estimated=scan_estimate(
                 table.row_count_hint,
                 reason=(
@@ -2069,9 +2135,17 @@ class Binder:
     def _bind_relation(self, ref) -> tuple[PlanNode, Schema]:
         """绑定一个 FROM 数据源；派生表复用 CteScan 执行其子计划。"""
         if ref.query is not None:
+            if getattr(ref, "as_of_lsn", None) is not None:
+                raise NotSupportedError(
+                    "AS OF SYSTEM TIME 只能直接作用于基表",
+                    detail="派生表是一段子查询，历史目标点必须写进它内部的基表",
+                    hint="把 AS OF 移到派生表内部的 FROM 基表上",
+                )
             node, schema = self._bind_derived(ref)
         else:
-            node, schema, _cols = self._source_for(ref.name, ref.alias)
+            node, schema, _cols = self._source_for(
+                ref.name, ref.alias, getattr(ref, "as_of_lsn", None)
+            )
         return self._apply_column_aliases(ref, node, schema)
 
     def _apply_column_aliases(
@@ -2113,6 +2187,8 @@ class Binder:
             self.catalog,
             self.params,
             outer_schemas=list(self.outer_schemas),
+            history=self.history,
+            as_of_targets=self.as_of_targets,
         )
         binder.subquery_runner = self.subquery_runner
         binder.ctes = dict(self.ctes)

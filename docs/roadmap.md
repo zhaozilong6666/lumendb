@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1627 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1638 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -426,6 +426,20 @@ P0 第一切片已落地：`SHOW COMMIT LOG [LIMIT n]` 输出当前 WAL 窗口�
 LSN 截止点做历史顺序扫描，INSERT/UPDATE/DELETE 三个边界各有测试；未提交或
 账本缺失的 xid 一律不可见。仍未接 SQL、索引、JOIN 与 VACUUM 保留水位，
 所以它只是 AS OF 的存储层地基，不是用户可用的时间旅行。全量基线 1627。
+
+2026-11-26 ① P3 SQL 表面：新增 `HistoryWindow`、`SHOW HISTORY WINDOW`、
+`SELECT ... FROM t AS OF SYSTEM TIME LSN n` 与 `Scan.as_of_lsn`。窗口为
+`[floor_lsn, latest_commit_lsn]`，floor 取最近 checkpoint / VACUUM 开始 /
+DDL 开始的最大值；超出窗口报 `BinderError`。只允许基表顺序扫描，索引路径
+禁用；同一查询里的 JOIN / 子查询 / CTE 必须共享同一 LSN；视图数据源、视图
+定义内、显式事务内使用都拒绝。checkpoint 前的存量行按“水位前已提交”假设
+保留，未知 `xmax` 严格报错。`tests/unit/test_as_of.py` 12 例（新增重开用例单文件 12 passed）；全量基线 1638。
+持久提交账本、VACUUM 保留水位、索引历史读仍未完成。
+
+2026-11-26 并发 B+ 树删除路由修复：500 删 + 500 并发插时，叶分裂与父分隔键
+更新之间有一个窗口，`delete` 会按旧路由落到左半、返回 `False` 并静默留下
+`old0019` 这类残键（约 1/30）。`delete` 现在最多从当前根重试 8 次；隔离用例
+连续 80 次 0 失败，默认/并发全量各 1638 passed。
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
 会泄漏 BufferPool 锁。并发全量全绿、

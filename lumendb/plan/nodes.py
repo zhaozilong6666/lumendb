@@ -64,6 +64,8 @@ class PlanNode:
 class Scan(PlanNode):
     table: str = ""
     alias: str = ""
+    #: 历史读目标提交 LSN；None 表示当前快照。
+    as_of_lsn: Optional[int] = None
     #: 堆表上的过滤谓词（谓词下推后可能为空）
     filter: Optional[EvalFn] = None
     #: 是否走索引（EXPLAIN 用）
@@ -74,6 +76,8 @@ class Scan(PlanNode):
         text = f"SeqScan {self.table}"
         if self.alias and self.alias != self.table:
             text += f" AS {self.alias}"
+        if self.as_of_lsn is not None:
+            text += f" [AS OF LSN {self.as_of_lsn}]"
         if self.index_name:
             text += f" [index {self.index_name}({', '.join(self.index_columns)})]"
         return text

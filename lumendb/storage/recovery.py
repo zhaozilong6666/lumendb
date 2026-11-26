@@ -26,6 +26,7 @@ from typing import Optional
 
 from ..errors import StorageError
 from .bufferpool import BufferPoolManager
+from .history import HistoryWindow
 from .pager import DiskManager
 from .txn import TransactionManager
 from .wal import (
@@ -62,11 +63,13 @@ class RecoveryManager:
         wal: WAL,
         buffer_pool: BufferPoolManager,
         txn_mgr: TransactionManager,
+        history: Optional[HistoryWindow] = None,
     ) -> None:
         self._disk = disk
         self._wal = wal
         self._bp = buffer_pool
         self._txns = txn_mgr
+        self._history = history
 
     # ------------------------------------------------------------------
     # 恢复
@@ -196,6 +199,10 @@ class RecoveryManager:
         self._disk.meta.checkpoint_lsn = lsn
         self._disk._persist_meta()
         self._disk.sync()
+        if self._history is not None:
+            # checkpoint 之前的 COMMIT 账本会被裁剪；历史读下界必须同步
+            # 抬到这条 CHECKPOINT 记录的位置。
+            self._history.observe_checkpoint(lsn)
         # 分段 WAL 可以在 checkpoint 后回收旧段。安全下界是活跃事务的
         # BEGIN LSN：这些事务崩溃后仍需要 before image 做 undo。没有活跃
         # 事务时，checkpoint 之前的所有记录都可以回收。

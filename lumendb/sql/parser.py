@@ -63,6 +63,7 @@ from .ast import (
     ShowCatalogVersions,
     ShowColumns,
     ShowCommitLog,
+    ShowHistoryWindow,
     ShowStatistics,
     ShowTables,
     ShowViews,
@@ -137,6 +138,31 @@ class Parser:
         if self._cur.is_keyword(*names):
             return self._advance()
         return None
+
+    def _peek_kw(self, *names: str) -> bool:
+        """看下一个非 eof token 是否是给定关键字，不消费当前 token。"""
+        i = self._i + 1
+        if i >= len(self._tokens):
+            return False
+        tok = self._tokens[i]
+        return tok.kind != "eof" and tok.is_keyword(*names)
+
+    def _peek_word(self, *names: str) -> bool:
+        """看下一个 token 是否是给定词（ident 或 keyword 都算）。"""
+        i = self._i + 1
+        if i >= len(self._tokens):
+            return False
+        tok = self._tokens[i]
+        return (
+            tok.kind in ("ident", "keyword")
+            and tok.value.upper() in names
+        )
+
+    def _expect_word(self, *names: str) -> Token:
+        tok = self._match_word(*names)
+        if tok is None:
+            raise self._error(f"期望词 {' 或 '.join(names)}")
+        return tok
 
     def _match_word(self, *names: str) -> Optional[Token]:
         """匹配非保留关键字（例如类型名 TYPE/DATA），大小写不敏感。"""
@@ -300,6 +326,10 @@ class Parser:
                 if self._match_kw("LIMIT") or self._match_word("LIMIT"):
                     limit = self._expect_int()
                 return ShowCommitLog(limit=limit)
+            if self._match_word("HISTORY"):
+                if not self._match_word("WINDOW"):
+                    raise self._error("SHOW HISTORY 之后期望 WINDOW")
+                return ShowHistoryWindow()
             if self._match_word("COLUMNS"):
                 if not self._match_kw("FROM") and not self._match_word("FROM"):
                     raise self._error("SHOW COLUMNS 之后期望 FROM")
@@ -1489,7 +1519,10 @@ class Parser:
 
         name = self._parse_ident("表名")
         alias = None
-        if self._match_kw("AS"):
+        # ``AS OF`` 的 AS 不是别名前缀；这里必须先看后一个 token，否则
+        # ``FROM t AS OF SYSTEM TIME ...`` 会把 OF 当成别名。
+        if self._cur.is_keyword("AS") and not self._peek_word("OF"):
+            self._advance()
             alias = self._parse_ident("别名")
         elif self._cur.kind == "ident":
             alias = self._advance().value
@@ -1505,6 +1538,36 @@ class Parser:
         self._expect_punct("rparen", ")")
         return names
 
+    def _parse_as_of_clause(self, ref: TableRef) -> None:
+        """解析可选的 ``AS OF SYSTEM TIME LSN n``。
+
+        目前只接受 commit LSN。时间字面量需要先把时间映射到提交点；在提交
+        账本还没有提交时间的阶段，静默把时间当成 LSN 是错误的，所以这里
+        明确拒绝并给出替代写法。
+        """
+        if not (self._cur.is_keyword("AS") and self._peek_word("OF")):
+            return
+        self._advance()  # AS
+        self._expect_word("OF")
+        self._expect_word("SYSTEM")
+        self._expect_word("TIME")
+        if not self._match_word("LSN"):
+            raise NotSupportedError(
+                "AS OF SYSTEM TIME 目前只支持 LSN 目标点",
+                detail="时间字面量尚未映射到持久提交点",
+                hint="先用 SHOW COMMIT LOG 找到目标提交 LSN，再写 AS OF SYSTEM TIME LSN n",
+            )
+        target = self._expect_int()
+        if target < 0:
+            raise self._error("AS OF 的 LSN 不能为负数")
+        ref.as_of_lsn = target
+        # 允许 ``... AS OF SYSTEM TIME LSN 7 AS t1`` 这种后置别名；别名
+        # 必须放在历史子句之后，避免和 AS OF 的 AS 混淆。
+        if self._match_kw("AS"):
+            ref.alias = self._parse_ident("别名")
+        elif self._cur.kind == "ident":
+            ref.alias = self._advance().value
+
     def _parse_table_ref(self) -> TableRef:
         name, alias, query, column_aliases = self._parse_relation()
         ref = TableRef(
@@ -1513,6 +1576,7 @@ class Parser:
             query=query,
             column_aliases=column_aliases,
         )
+        self._parse_as_of_clause(ref)
 
         while True:
             kind: Optional[str] = None
@@ -1549,6 +1613,7 @@ class Parser:
                 query=right_query,
                 column_aliases=right_aliases,
             )
+            self._parse_as_of_clause(right)
             on = None
             if cross:
                 pass

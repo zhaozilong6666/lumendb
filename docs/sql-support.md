@@ -276,6 +276,7 @@ DELETE 在**旧行**上求值。绑定阶段就会检查列是否存在，因此
 ```sql
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [alias] [, t2 ...]
+  [AS OF SYSTEM TIME LSN n]        -- 只读历史快照；只允许基表
   [INNER | LEFT | RIGHT | FULL | CROSS] JOIN t2 ON cond
 WHERE cond
 GROUP BY expr [, expr...]        -- 列引用或任意标量表达式，同形表达式可直接用于 SELECT
@@ -291,6 +292,12 @@ FETCH {FIRST|NEXT} {n | ROW} {ROW|ROWS} {ONLY | WITH TIES}
 `FETCH FIRST ROW ONLY` 是 `FETCH FIRST 1 ROWS ONLY` 的简写。
 `WITH TIES` 在前 n 行之后继续输出与最后一行排序键相同的行；没有 `ORDER BY`
 时所有行互为并列，因此会返回偏移之后的所有行。计数仍然受 `OFFSET` 影响。
+
+`AS OF SYSTEM TIME LSN n` 是只读历史快照：只接受 LSN，不支持时间字面量；
+只允许直接作用于基表，视图 / CTE / 派生表数据源、显式事务内使用都会明确报错。
+同一查询里的多个 AS OF 数据源必须使用同一个 LSN；索引扫描路径被禁用。
+`INSERT ... SELECT` / `CREATE TABLE AS SELECT` 等写语句里出现 `AS OF` 也会拒绝。
+可读窗口由 `SHOW HISTORY WINDOW` 给出，早于下界或晚于最近提交都报错。
 
 集合运算：
 
@@ -404,6 +411,9 @@ SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对�
 SHOW COMMIT LOG [LIMIT n];
                          -- 当前 WAL 窗口内已提交事务的 xid 与 COMMIT LSN；只读
                          -- LIMIT 0 返回空；更早的持久提交历史尚未保留
+SHOW HISTORY WINDOW;
+                         -- checkpoint_lsn / floor_lsn / latest_commit_lsn / commits
+                         -- AS OF 可读 [floor_lsn, latest_commit_lsn]；只读
 SHOW COLUMNS FROM table [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列名/类型/可空/主键/默认值；带版本或时间时读历史 schema
 SHOW STATISTICS [FROM table] [AT CATALOG VERSION n | AT TIME '...'];
