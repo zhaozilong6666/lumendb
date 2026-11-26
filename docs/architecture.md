@@ -630,6 +630,9 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
 上层 Filter 只复核边界，不会把同一谓词的选择率乘第二遍。字符串边界按字典序
 比较，不做数值转换（`'090' < '1'`）。
 
+`SHOW STATISTICS [FROM t]` 把这些列统计暴露成只读目录视图（行数、n_distinct、
+null_frac、min/max、桶数），不复制 PostgreSQL 的 `pg_statistic` 二进制布局。
+
 这些估算目前只用于观测，不改变执行顺序。索引选择仍是两条规则：
 
 - 单表查询、`WHERE` 形如 `col = 常量`、且该列上有索引 → `IndexLookup`；

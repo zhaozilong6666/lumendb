@@ -690,6 +690,11 @@ class ShowColumns(Statement):
 
 
 @dataclass
+class ShowStatistics(Statement):
+    table: Optional[str] = None
+
+
+@dataclass
 class Checkpoint(Statement):
     pass
 

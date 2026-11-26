@@ -73,6 +73,7 @@ from ..sql.ast import (
     Truncate,
     ShowCatalogVersions,
     ShowColumns,
+    ShowStatistics,
     ShowTables,
     ShowViews,
     Statement,
@@ -111,6 +112,7 @@ _NON_WRITING_STATEMENTS = frozenset(
         "ShowViews",
         "ShowCatalogVersions",
         "ShowColumns",
+        "ShowStatistics",
         "SetConstraints",
         "Checkpoint",
     }
@@ -349,6 +351,8 @@ class Executor:
                 return self._show_catalog_versions()
             if isinstance(stmt, ShowColumns):
                 return self._show_columns(stmt)
+            if isinstance(stmt, ShowStatistics):
+                return self._show_statistics(stmt)
             if isinstance(stmt, Explain):
                 return self._explain(stmt)
             if isinstance(stmt, Statement) and type(stmt).__name__ == "Checkpoint":
@@ -3404,6 +3408,42 @@ class Executor:
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",
+        )
+
+    def _show_statistics(self, stmt: ShowStatistics) -> Result:
+        if stmt.table is None:
+            tables = sorted(self._catalog.list_tables(), key=lambda t: t.name)
+        else:
+            tables = [self._catalog.get_table(stmt.table)]
+        rows = []
+        for table in tables:
+            for column in table.columns:
+                stats = table.column_stats.get(column.name)
+                rows.append(
+                    (
+                        table.name,
+                        column.name,
+                        table.stats_rows,
+                        stats.n_distinct if stats is not None else 0,
+                        stats.null_frac if stats is not None else 0.0,
+                        "" if stats is None or stats.min_value is None else str(stats.min_value),
+                        "" if stats is None or stats.max_value is None else str(stats.max_value),
+                        len(stats.histogram) if stats is not None else 0,
+                    )
+                )
+        return Result(
+            columns=[
+                ColumnMeta("table", TypeSpec(DataType.TEXT)),
+                ColumnMeta("column", TypeSpec(DataType.TEXT)),
+                ColumnMeta("rows", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("n_distinct", TypeSpec(DataType.BIGINT)),
+                ColumnMeta("null_frac", TypeSpec(DataType.FLOAT)),
+                ColumnMeta("min", TypeSpec(DataType.TEXT)),
+                ColumnMeta("max", TypeSpec(DataType.TEXT)),
+                ColumnMeta("buckets", TypeSpec(DataType.BIGINT)),
+            ],
+            rows=rows,
+            tag=f"STATISTICS {len(rows)}",
         )
 
     def _show_columns(self, stmt: ShowColumns) -> Result:

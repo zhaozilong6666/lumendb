@@ -103,3 +103,29 @@ def test_string_histogram_drives_lexicographic_range_estimate(tmp_path):
         assert stats.range_selectivity("090", None) == pytest.approx(0.13)
     finally:
         db.close()
+
+
+def test_show_statistics_exposes_analyzed_catalog(tmp_path):
+    db = Database(tmp_path / "show_stats")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        for i in range(20):
+            db.execute_one(f"INSERT INTO t VALUES ({i}, '{i:02d}')")
+        db.execute_one("ANALYZE t")
+        result = db.execute_one("SHOW STATISTICS FROM t")
+        assert [col.name for col in result.columns] == [
+            "table",
+            "column",
+            "rows",
+            "n_distinct",
+            "null_frac",
+            "min",
+            "max",
+            "buckets",
+        ]
+        rows = {row[1]: row for row in result.rows}
+        assert rows["id"][2:] == (20, 20, 0.0, "0.0", "19.0", 16)
+        assert rows["s"][2:] == (20, 20, 0.0, "00", "19", 16)
+        assert result.tag == "STATISTICS 2"
+    finally:
+        db.close()

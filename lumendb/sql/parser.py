@@ -62,6 +62,7 @@ from .ast import (
     SetConstraints,
     ShowCatalogVersions,
     ShowColumns,
+    ShowStatistics,
     ShowTables,
     ShowViews,
     TableConstraint,
@@ -287,8 +288,13 @@ class Parser:
                     version = self._expect_int()
                     return ShowColumns(table=table, catalog_version=version)
                 return ShowColumns(table=table)
+            if self._match_word("STATISTICS"):
+                table = None
+                if self._match_kw("FROM") or self._match_word("FROM"):
+                    table = self._parse_ident("表名")
+                return ShowStatistics(table=table)
             raise self._error(
-                "SHOW 之后期望 TABLES、VIEWS、COLUMNS FROM table 或 CATALOG VERSIONS"
+                "SHOW 之后期望 TABLES、VIEWS、COLUMNS、STATISTICS 或 CATALOG VERSIONS"
             )
         if kw == "CHECKPOINT":
             self._advance()

@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1616 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1617 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -369,6 +369,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
+2026-11-26 D 统计目录视图：`SHOW STATISTICS [FROM table]` 只读输出
+表/列/行数/n_distinct/null_frac/min/max/桶数，ANALYZE 结果可直接核查，
+不再只能从目录 JSON 里猜。
+
 2026-11-26 D 字符串范围统计：`ANALYZE` 为字符串列生成 16 桶等频直方图，
 桶边界取排序后的实际值；范围谓词按整桶命中估算，边界按字典序比较而不是
 数值转换。字符串范围从固定 0.33 变为统计驱动，`EXPLAIN` 可观测。
