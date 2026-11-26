@@ -345,9 +345,9 @@ class Executor:
             if isinstance(stmt, SetConstraints):
                 return self._set_constraints(stmt, txn)
             if isinstance(stmt, ShowTables):
-                return self._show_tables()
+                return self._show_tables(stmt)
             if isinstance(stmt, ShowViews):
-                return self._show_views()
+                return self._show_views(stmt)
             if isinstance(stmt, ShowCatalogVersions):
                 return self._show_catalog_versions()
             if isinstance(stmt, ShowColumns):
@@ -3381,11 +3381,49 @@ class Executor:
         self._persist_catalog(txn)
         return removed
 
-    def _show_tables(self) -> Result:
-        rows = [
-            (t.name, len(t.columns), t.row_count_hint)
-            for t in self._catalog.list_tables()
-        ]
+    def _catalog_version_at_time(self, timestamp: str) -> Optional[int]:
+        try:
+            moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            raise BinderError(
+                f"无法解析 catalog 时间 {timestamp!r}",
+                hint="要求 ISO-8601，例如 '2026-11-26T08:57:07+00:00'",
+            )
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        normalized = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+        return self._catalog.version_at_or_before(normalized)
+
+    def _history_version(self, catalog_version: Optional[int], catalog_time: Optional[str]) -> Optional[int]:
+        if catalog_time is not None:
+            return self._catalog_version_at_time(catalog_time)
+        if catalog_version is not None and not self._catalog.version_exists(catalog_version):
+            raise BinderError(
+                f"catalog 版本 {catalog_version} 不在当前版本链上",
+                hint="用 SHOW CATALOG VERSIONS 查可用版本；历史链默认保留最近 1000 个版本",
+            )
+        return catalog_version
+
+    def _show_tables(self, stmt: ShowTables) -> Result:
+        has_history = stmt.catalog_version is not None or stmt.catalog_time is not None
+        version = self._history_version(stmt.catalog_version, stmt.catalog_time)
+        if not has_history:
+            rows = [
+                (t.name, len(t.columns), t.row_count_hint)
+                for t in self._catalog.list_tables()
+            ]
+            notice = ""
+        elif version is None:
+            rows = []
+            notice = f"{stmt.catalog_time!r} 早于第一个 catalog 版本，没有表"
+        else:
+            rows = [
+                (t.name, len(t.columns), t.row_count_hint)
+                for t in self._catalog.tables_at(version)
+            ]
+            notice = (
+                f"按目录版本 {version} 列出表；行数是该版本的 hint，不是旧数据页"
+            )
         return Result(
             columns=[
                 ColumnMeta("table", TypeSpec(DataType.TEXT)),
@@ -3394,14 +3432,28 @@ class Executor:
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",
+            notice=notice,
         )
 
-    def _show_views(self) -> Result:
-        rows = [
-            (name, " ".join(value for _kind, value in tokens))
-            for name in self._catalog.view_names()
-            for tokens in [self._catalog.get_view(name)]
-        ]
+    def _show_views(self, stmt: ShowViews) -> Result:
+        has_history = stmt.catalog_version is not None or stmt.catalog_time is not None
+        version = self._history_version(stmt.catalog_version, stmt.catalog_time)
+        if not has_history:
+            rows = [
+                (name, " ".join(value for _kind, value in tokens))
+                for name in self._catalog.view_names()
+                for tokens in [self._catalog.get_view(name)]
+            ]
+            notice = ""
+        elif version is None:
+            rows = []
+            notice = f"{stmt.catalog_time!r} 早于第一个 catalog 版本，没有视图"
+        else:
+            rows = [
+                (view["name"], " ".join(value for _kind, value in view["tokens"]))
+                for view in self._catalog.views_at(version)
+            ]
+            notice = f"按目录版本 {version} 列出视图；不读取旧数据页"
         return Result(
             columns=[
                 ColumnMeta("view", TypeSpec(DataType.TEXT)),
@@ -3409,6 +3461,7 @@ class Executor:
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",
+            notice=notice,
         )
 
     def _show_statistics(self, stmt: ShowStatistics) -> Result:
@@ -3449,19 +3502,7 @@ class Executor:
 
     def _show_columns(self, stmt: ShowColumns) -> Result:
         if stmt.catalog_time is not None:
-            try:
-                moment = datetime.fromisoformat(
-                    stmt.catalog_time.replace("Z", "+00:00")
-                )
-            except ValueError:
-                raise BinderError(
-                    f"无法解析 catalog 时间 {stmt.catalog_time!r}",
-                    hint="要求 ISO-8601，例如 '2026-11-26T08:57:07+00:00'",
-                )
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            timestamp = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
-            version = self._catalog.version_at_or_before(timestamp)
+            version = self._catalog_version_at_time(stmt.catalog_time)
             if version is None:
                 raise TableNotFoundError(
                     f"表 {stmt.table!r} 在 {stmt.catalog_time!r} 及之前不存在",

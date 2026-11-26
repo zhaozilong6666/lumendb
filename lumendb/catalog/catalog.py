@@ -293,32 +293,33 @@ class Catalog:
             root = int(data.get("previous_root", 0))
         return result
 
+    def _view_record(self, vdata: dict) -> dict:
+        return {
+            "name": vdata.get("name", ""),
+            "tokens": [(kind, value) for kind, value in vdata.get("tokens", [])],
+            "columns": list(vdata.get("columns", [])),
+            "dependencies": sorted(vdata.get("dependencies", [])),
+        }
+
     @_locked
     def view_at(self, catalog_version: int, name: str) -> Optional[dict]:
         """读某个历史 catalog 版本里的视图定义；不存在返回 None。"""
-        for snapshot in self.history():
-            if snapshot["catalog_version"] != catalog_version:
-                continue
-            root = snapshot["root_page"]
-            raw = self._store.load_at_root(root)
-            if not raw:
-                return None
-            data = json.loads(raw.decode("utf-8"))
-            key = name.lower()
-            for vdata in data.get("views", []):
-                if vdata.get("name", "").lower() != key:
-                    continue
-                return {
-                    "name": vdata.get("name", ""),
-                    "tokens": [
-                        (kind, value)
-                        for kind, value in vdata.get("tokens", [])
-                    ],
-                    "columns": list(vdata.get("columns", [])),
-                    "dependencies": sorted(vdata.get("dependencies", [])),
-                }
+        data = self._root_data(catalog_version)
+        if data is None:
             return None
+        key = name.lower()
+        for vdata in data.get("views", []):
+            if vdata.get("name", "").lower() == key:
+                return self._view_record(vdata)
         return None
+
+    @_locked
+    def views_at(self, catalog_version: int) -> list[dict]:
+        """读某个历史 catalog 版本里的全部视图定义；版本不存在返回空列表。"""
+        data = self._root_data(catalog_version)
+        if data is None:
+            return []
+        return [self._view_record(vdata) for vdata in data.get("views", [])]
 
     @_locked
     def version_at_or_before(self, timestamp: str) -> Optional[int]:
@@ -334,22 +335,42 @@ class Catalog:
         return None
 
     @_locked
-    def table_at(self, catalog_version: int, name: str) -> Optional[TableDef]:
-        """读某个历史 catalog 版本里的表定义；不存在返回 None。"""
+    def version_exists(self, catalog_version: int) -> bool:
+        return any(
+            snapshot["catalog_version"] == catalog_version
+            for snapshot in self.history()
+        )
+
+    def _root_data(self, catalog_version: int) -> Optional[dict]:
+        """读某个历史版本的目录 JSON；版本不在链上返回 None。"""
         for snapshot in self.history():
             if snapshot["catalog_version"] != catalog_version:
                 continue
-            root = snapshot["root_page"]
-            raw = self._store.load_at_root(root)
+            raw = self._store.load_at_root(snapshot["root_page"])
             if not raw:
                 return None
-            data = json.loads(raw.decode("utf-8"))
-            for tdata in data.get("tables", []):
-                table = TableDef.from_json(tdata)
-                if table.name == name.lower():
-                    return table
-            return None
+            return json.loads(raw.decode("utf-8"))
         return None
+
+    @_locked
+    def table_at(self, catalog_version: int, name: str) -> Optional[TableDef]:
+        """读某个历史 catalog 版本里的表定义；不存在返回 None。"""
+        data = self._root_data(catalog_version)
+        if data is None:
+            return None
+        for tdata in data.get("tables", []):
+            table = TableDef.from_json(tdata)
+            if table.name == name.lower():
+                return table
+        return None
+
+    @_locked
+    def tables_at(self, catalog_version: int) -> list[TableDef]:
+        """读某个历史 catalog 版本里的全部表定义；版本不存在返回空列表。"""
+        data = self._root_data(catalog_version)
+        if data is None:
+            return []
+        return [TableDef.from_json(tdata) for tdata in data.get("tables", [])]
 
     # ------------------------------------------------------------------
     # 查询

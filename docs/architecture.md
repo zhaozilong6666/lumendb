@@ -351,7 +351,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 所有视图的依赖快照，避免依赖视图继续引用已经被移除的旧表，或漏掉新表依赖。
 
 当前限制：没有物化视图，视图不能作为 `INSERT`/`UPDATE`/`DELETE` 的目标；
-`SHOW TABLES` 只列基表，`SHOW VIEWS` 单独列出视图。
+`SHOW TABLES` 只列基表，`SHOW VIEWS` 单独列出视图；两者也接受
+`AT CATALOG VERSION n` / `AT TIME '…'`，从历史目录重建当时的表/视图清单。
+行数列来自该版本的 `row_count_hint`，不是旧数据页。
 
 ### 2.11 只读副本与物理 WAL 流
 

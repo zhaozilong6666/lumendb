@@ -670,12 +670,14 @@ class Explain(Statement):
 
 @dataclass
 class ShowTables(Statement):
-    pass
+    catalog_version: Optional[int] = None
+    catalog_time: Optional[str] = None
 
 
 @dataclass
 class ShowViews(Statement):
-    pass
+    catalog_version: Optional[int] = None
+    catalog_time: Optional[str] = None
 
 
 @dataclass

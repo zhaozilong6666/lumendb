@@ -397,7 +397,9 @@ ROLLBACK TO [SAVEPOINT] name;  -- 撤销到保存点，事务继续
 RELEASE [SAVEPOINT] name;       -- 释放保存点及其之后建立的保存点
 EXPLAIN <query>;          -- 计划树每行带 rows≈ / cpu≈ / confidence 估算
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
-SHOW TABLES;
+SHOW TABLES [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
+SHOW VIEWS  [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
+                         -- 列出表/视图；带版本或时间时读历史目录，不读旧数据页
 SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数、创建时间；只读
 SHOW COLUMNS FROM table [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列名/类型/可空/主键/默认值；带版本或时间时读历史 schema

@@ -210,6 +210,18 @@ class Parser:
     # 语句
     # ------------------------------------------------------------------
 
+    def _parse_show_history(self) -> tuple[Optional[int], Optional[str]]:
+        """解析 SHOW ... 的可选 ``AT CATALOG VERSION n`` / ``AT TIME '...'``。"""
+        if not self._match_word("AT"):
+            return None, None
+        if self._match_word("TIME"):
+            if self._cur.kind != "string":
+                raise self._error("AT TIME 之后期望带引号的 ISO-8601 时间")
+            return None, self._advance().value
+        if not self._match_word("CATALOG") or not self._match_word("VERSION"):
+            raise self._error("AT 之后期望 CATALOG VERSION n 或 TIME '...'")
+        return self._expect_int(), None
+
     def _parse_statement(self) -> Statement:
         tok = self._cur
         if tok.kind != "keyword":
@@ -271,9 +283,11 @@ class Parser:
         if kw == "SHOW":
             self._advance()
             if self._match_kw("TABLES"):
-                return ShowTables()
+                version, timestamp = self._parse_show_history()
+                return ShowTables(catalog_version=version, catalog_time=timestamp)
             if self._match_kw("VIEWS"):
-                return ShowViews()
+                version, timestamp = self._parse_show_history()
+                return ShowViews(catalog_version=version, catalog_time=timestamp)
             if self._match_word("CATALOG"):
                 if not self._match_word("VERSIONS"):
                     raise self._error("SHOW CATALOG 之后期望 VERSIONS")
@@ -282,20 +296,13 @@ class Parser:
                 if not self._match_kw("FROM") and not self._match_word("FROM"):
                     raise self._error("SHOW COLUMNS 之后期望 FROM")
                 table = self._parse_ident("表名")
-                if self._match_word("AT"):
-                    if self._match_word("TIME"):
-                        if self._cur.kind != "string":
-                            raise self._error(
-                                "SHOW COLUMNS ... AT TIME 之后期望带引号的 UTC 时间"
-                            )
-                        timestamp = self._advance().value
-                        return ShowColumns(table=table, catalog_time=timestamp)
-                    if not self._match_word("CATALOG") or not self._match_word("VERSION"):
-                        raise self._error(
-                            "SHOW COLUMNS ... AT 之后期望 CATALOG VERSION n 或 TIME '...'"
-                        )
-                    version = self._expect_int()
-                    return ShowColumns(table=table, catalog_version=version)
+                version, timestamp = self._parse_show_history()
+                if version is not None or timestamp is not None:
+                    return ShowColumns(
+                        table=table,
+                        catalog_version=version,
+                        catalog_time=timestamp,
+                    )
                 return ShowColumns(table=table)
             if self._match_word("STATISTICS"):
                 table = None

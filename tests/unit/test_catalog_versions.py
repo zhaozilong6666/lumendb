@@ -162,3 +162,41 @@ def test_show_columns_at_time_resolves_catalog_version(tmp_path):
     with pytest.raises(BinderError):
         db.execute_one("SHOW COLUMNS FROM t AT TIME 'not-a-time'")
     db.close()
+
+
+def test_show_tables_and_views_can_target_history(tmp_path):
+    import time
+
+    from lumendb.errors import BinderError
+
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    db.execute_one("CREATE VIEW v AS SELECT id FROM t")
+    view_version = db.catalog.catalog_version
+    first = db.catalog.catalog_created_at
+    time.sleep(1.05)
+    db.execute_one("ALTER TABLE t ADD COLUMN z INT")
+    db.execute_one("DROP VIEW v")
+    second = db.catalog.catalog_created_at
+    assert first != second
+    assert db.execute_one("SHOW TABLES").rows == [("t", 2, 0)]
+    assert db.execute_one("SHOW VIEWS").rows == []
+    assert db.execute_one(
+        f"SHOW TABLES AT TIME '{first}'"
+    ).rows == [("t", 1, 0)]
+    assert db.execute_one(
+        f"SHOW VIEWS AT TIME '{first}'"
+    ).rows == [("v", "SELECT id FROM t")]
+    assert db.execute_one("SHOW TABLES AT CATALOG VERSION 1").rows == [("t", 1, 0)]
+    assert db.execute_one(
+        f"SHOW VIEWS AT CATALOG VERSION {view_version}"
+    ).rows == [("v", "SELECT id FROM t")]
+    assert db.execute_one(
+        "SHOW TABLES AT TIME '1970-01-01T00:00:00+00:00'"
+    ).rows == []
+    assert db.execute_one(
+        "SHOW VIEWS AT TIME '1970-01-01T00:00:00+00:00'"
+    ).rows == []
+    with pytest.raises(BinderError):
+        db.execute_one("SHOW TABLES AT CATALOG VERSION 99")
+    db.close()
