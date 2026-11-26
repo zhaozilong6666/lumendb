@@ -23,6 +23,22 @@
 * **一个失败不拖垮其它**：停止阶段的异常被记录到 `status()`，不会中断后续停止；
 * **启动失败要回滚**：已经起来的先停掉，再把异常抛给调用方。
 
+## 迁移状态与豁免（2026-11）
+
+已迁：`Replica` 的 keeper / heartbeat（`_stop_background()` → `registry.clear()`）。
+
+豁免（**不**归注册表管，理由写在代码里）：
+
+* `wal_stream` 的 accept / per-connection handler 线程——生命周期是"连接"而不是
+  "进程"，靠 `WALServer.stop()` + handler prune 兜底；
+* `replica._schedule_rebuild` 的临时线程——生命周期是"一次重建"，靠
+  `_rebuild_in_flight` 去重；
+* 测试里的假对象。
+
+新增后台任务时：只要能"启动一次、活很久、随 close 停"，就必须走注册表；
+`tests/unit/test_thread_leaks.py` 会在创建/关闭之后断言"没有 `lumendb-*`
+线程残留"，漏停会红。
+
 用法：
 
 ```python
