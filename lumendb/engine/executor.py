@@ -72,6 +72,7 @@ from ..sql.ast import (
     Vacuum,
     Truncate,
     ShowCatalogVersions,
+    ShowColumns,
     ShowTables,
     ShowViews,
     Statement,
@@ -109,6 +110,7 @@ _NON_WRITING_STATEMENTS = frozenset(
         "ShowTables",
         "ShowViews",
         "ShowCatalogVersions",
+        "ShowColumns",
         "SetConstraints",
         "Checkpoint",
     }
@@ -345,6 +347,8 @@ class Executor:
                 return self._show_views()
             if isinstance(stmt, ShowCatalogVersions):
                 return self._show_catalog_versions()
+            if isinstance(stmt, ShowColumns):
+                return self._show_columns(stmt)
             if isinstance(stmt, Explain):
                 return self._explain(stmt)
             if isinstance(stmt, Statement) and type(stmt).__name__ == "Checkpoint":
@@ -3379,6 +3383,38 @@ class Executor:
             ],
             rows=rows,
             tag=f"SHOW {len(rows)}",
+        )
+
+    def _show_columns(self, stmt: ShowColumns) -> Result:
+        if stmt.catalog_version is None:
+            table = self._catalog.get_table(stmt.table)
+        else:
+            table = self._catalog.table_at(stmt.catalog_version, stmt.table)
+            if table is None:
+                raise TableNotFoundError(
+                    f"表 {stmt.table!r} 在 catalog 版本 {stmt.catalog_version} 不存在",
+                    hint="用 SHOW CATALOG VERSIONS 查可用版本；版本号从 1 开始",
+                )
+        rows = [
+            (
+                column.name,
+                column.type.name,
+                "YES" if column.nullable else "NO",
+                "YES" if column.primary_key else "NO",
+                "" if column.default is None else repr(column.default),
+            )
+            for column in table.columns
+        ]
+        return Result(
+            columns=[
+                ColumnMeta("column", TypeSpec(DataType.TEXT)),
+                ColumnMeta("type", TypeSpec(DataType.TEXT)),
+                ColumnMeta("nullable", TypeSpec(DataType.TEXT)),
+                ColumnMeta("primary_key", TypeSpec(DataType.TEXT)),
+                ColumnMeta("default", TypeSpec(DataType.TEXT)),
+            ],
+            rows=rows,
+            tag=f"COLUMNS {len(rows)}",
         )
 
     def _show_catalog_versions(self) -> Result:

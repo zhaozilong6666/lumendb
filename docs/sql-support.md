@@ -399,6 +399,8 @@ EXPLAIN <query>;          -- 计划树每行带 rows≈ / cpu≈ / confidence �
 EXPLAIN ANALYZE <query>;  -- 真正执行，计划树每行带 actual time / rows / loops
 SHOW TABLES;
 SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数；只读
+SHOW COLUMNS FROM table [AT CATALOG VERSION n];
+                         -- 列名/类型/可空/主键/默认值；带版本时读历史 schema
 CHECKPOINT;
 ANALYZE [TABLE] table;   -- 扫描可见行，记录列级 n_distinct / null_frac
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引

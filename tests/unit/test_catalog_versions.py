@@ -1,6 +1,9 @@
 """版本化目录：只有 schema 形状变化才产生新版本，旧版本可回溯。"""
 
+import pytest
+
 from lumendb.engine.database import Database
+from lumendb.errors import TableNotFoundError
 
 
 def test_catalog_version_advances_only_on_schema_shape(tmp_path):
@@ -94,4 +97,22 @@ def test_history_keeps_view_definitions(tmp_path):
     assert db.catalog.view_at(4, "v1") is None
     versions = db.execute_one("SHOW CATALOG VERSIONS").rows
     assert versions[1][2] == "v1", "删除前的历史版本仍应能看到视图名"
+    db.close()
+
+
+def test_show_columns_can_target_historical_catalog_version(tmp_path):
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    db.execute_one("ALTER TABLE t ADD COLUMN z INT DEFAULT 7")
+    assert db.execute_one("SHOW COLUMNS FROM t").rows == [
+        ("id", "INT", "NO", "YES", ""),
+        ("v", "TEXT", "YES", "NO", ""),
+        ("z", "INT", "YES", "NO", "7"),
+    ]
+    assert db.execute_one("SHOW COLUMNS FROM t AT CATALOG VERSION 1").rows == [
+        ("id", "INT", "NO", "YES", ""),
+        ("v", "TEXT", "YES", "NO", ""),
+    ]
+    with pytest.raises(TableNotFoundError):
+        db.execute_one("SHOW COLUMNS FROM t AT CATALOG VERSION 99")
     db.close()

@@ -195,6 +195,7 @@ _PURE_READ_STATEMENTS = {
     "ShowTables",
     "ShowViews",
     "ShowCatalogVersions",
+    "ShowColumns",
 }
 
 #: 会重排/重写堆页的语句：VACUUM 重排 RID 并重建索引，TRUNCATE 清空页链，

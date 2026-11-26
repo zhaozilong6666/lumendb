@@ -684,6 +684,12 @@ class ShowCatalogVersions(Statement):
 
 
 @dataclass
+class ShowColumns(Statement):
+    table: str
+    catalog_version: Optional[int] = None
+
+
+@dataclass
 class Checkpoint(Statement):
     pass
 

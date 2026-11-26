@@ -61,6 +61,7 @@ from .ast import (
     SelectItem,
     SetConstraints,
     ShowCatalogVersions,
+    ShowColumns,
     ShowTables,
     ShowViews,
     TableConstraint,
@@ -276,7 +277,19 @@ class Parser:
                 if not self._match_word("VERSIONS"):
                     raise self._error("SHOW CATALOG 之后期望 VERSIONS")
                 return ShowCatalogVersions()
-            raise self._error("SHOW 之后期望 TABLES、VIEWS 或 CATALOG VERSIONS")
+            if self._match_word("COLUMNS"):
+                if not self._match_kw("FROM") and not self._match_word("FROM"):
+                    raise self._error("SHOW COLUMNS 之后期望 FROM")
+                table = self._parse_ident("表名")
+                if self._match_word("AT"):
+                    if not self._match_word("CATALOG") or not self._match_word("VERSION"):
+                        raise self._error("SHOW COLUMNS ... AT 之后期望 CATALOG VERSION n")
+                    version = self._expect_int()
+                    return ShowColumns(table=table, catalog_version=version)
+                return ShowColumns(table=table)
+            raise self._error(
+                "SHOW 之后期望 TABLES、VIEWS、COLUMNS FROM table 或 CATALOG VERSIONS"
+            )
         if kw == "CHECKPOINT":
             self._advance()
             return Checkpoint()
