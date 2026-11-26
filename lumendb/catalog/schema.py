@@ -180,8 +180,9 @@ class ColumnStats:
     null_frac: float = 0.0
     min_value: object = None
     max_value: object = None
-    #: 等宽直方图：每项 ``(lo, hi, count)``；空表示没有范围统计。
-    histogram: list[tuple[float, float, int]] = field(default_factory=list)
+    #: 直方图：每项 ``(lo, hi, count)``。数值列等宽，字符串列等频；
+    #: 空表示没有范围统计。
+    histogram: list[tuple[object, object, int]] = field(default_factory=list)
 
     @property
     def equality_selectivity(self) -> float:
@@ -191,9 +192,14 @@ class ColumnStats:
         return max(0.0, min(1.0, (1.0 - self.null_frac) / self.n_distinct))
 
     def range_selectivity(
-        self, low: float | None, high: float | None
+        self, low: object | None, high: object | None
     ) -> float | None:
-        """用直方图估算 ``low <= col <= high`` 的行占比；无统计返回 None。"""
+        """用直方图估算 ``low <= col <= high`` 的行占比；无统计返回 None。
+
+        数值桶按区间长度线性折算；字符串桶是等频分桶，无法在不读数据的情况下
+        知道桶内分布，命中即按整桶计数。因此字符串范围估算是保守的桶级近似，
+        但比固定 0.33 更贴近真实分布。
+        """
         if not self.histogram:
             return None
         total = sum(count for _lo, _hi, count in self.histogram)
@@ -201,18 +207,27 @@ class ColumnStats:
             return None
         touched = 0.0
         for lo, hi, count in self.histogram:
-            if count <= 0 or hi <= lo:
+            if count <= 0 or lo is None or hi is None:
                 continue
-            if high is not None and lo >= high:
-                continue
-            if low is not None and hi <= low:
-                continue
-            span = hi - lo
-            overlap_lo = lo if low is None else max(lo, low)
-            overlap_hi = hi if high is None else min(hi, high)
-            if overlap_hi <= overlap_lo:
-                continue
-            touched += count * ((overlap_hi - overlap_lo) / span)
+            if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                if hi <= lo:
+                    continue
+                if high is not None and lo >= high:
+                    continue
+                if low is not None and hi <= low:
+                    continue
+                span = float(hi) - float(lo)
+                overlap_lo = float(lo) if low is None else max(float(lo), float(low))
+                overlap_hi = float(hi) if high is None else min(float(hi), float(high))
+                if overlap_hi <= overlap_lo:
+                    continue
+                touched += count * ((overlap_hi - overlap_lo) / span)
+            else:
+                if high is not None and lo > high:
+                    continue
+                if low is not None and hi < low:
+                    continue
+                touched += count
         return max(0.0, min(1.0, touched / total))
 
     def to_json(self) -> dict:
@@ -221,7 +236,7 @@ class ColumnStats:
             "null_frac": float(self.null_frac),
             "min_value": self.min_value,
             "max_value": self.max_value,
-            "histogram": [[float(lo), float(hi), int(count)] for lo, hi, count in self.histogram],
+            "histogram": [[lo, hi, int(count)] for lo, hi, count in self.histogram],
         }
 
     @classmethod
@@ -229,7 +244,7 @@ class ColumnStats:
         histogram = []
         for item in data.get("histogram", []):
             if len(item) == 3:
-                histogram.append((float(item[0]), float(item[1]), int(item[2])))
+                histogram.append((item[0], item[1], int(item[2])))
         return cls(
             n_distinct=int(data.get("n_distinct", 0)),
             null_frac=float(data.get("null_frac", 0.0)),

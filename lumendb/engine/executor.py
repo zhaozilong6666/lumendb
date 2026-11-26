@@ -3158,6 +3158,27 @@ class Executor:
                             )
                             for slot in range(buckets)
                         ]
+                elif column.type.is_string and n_distinct > 1:
+                    # 字符串没有“等宽”概念；用排序后的等频分桶。桶边界取每桶
+                    # 首尾实际值，桶内计数相同，范围估算按整桶命中。
+                    strings = sorted(
+                        values[index]
+                        for values in rows
+                        if values[index] is not None
+                    )
+                    stats.min_value = strings[0]
+                    stats.max_value = strings[-1]
+                    if strings[-1] > strings[0]:
+                        buckets = min(16, len(strings))
+                        stats.histogram = []
+                        for slot in range(buckets):
+                            start = slot * len(strings) // buckets
+                            end = (slot + 1) * len(strings) // buckets
+                            if end <= start:
+                                continue
+                            stats.histogram.append(
+                                (strings[start], strings[end - 1], end - start)
+                            )
                 table.column_stats[column.name] = stats
                 analyzed_columns += 1
         self._persist_catalog(txn)

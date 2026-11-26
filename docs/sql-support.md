@@ -426,7 +426,7 @@ TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
 | `HAVING` 里引用 SELECT 别名 | 别名不进入聚合输出 schema；请重复写聚合表达式 |
 | 服务端 SQL 级 `PREPARE` / `EXECUTE` | 只支持 wire 协议的 Parse/Bind，不支持 SQL 文本里的 PREPARE |
 | autovacuum / 后台触发 | 不做后台自动触发，只能显式执行 `VACUUM`；`ANALYZE` 也需显式执行 |
-| 统计直方图 / 范围分位 | 数值列有 16 桶等宽直方图与 min/max；字符串列没有直方图，范围谓词回退固定选择率 |
+| 统计直方图 / 范围分位 | 数值列 16 桶等宽；字符串列 16 桶等频（按排序实际值分桶）；日期等其它类型暂未做 |
 | 缩小数据文件 / 回收根记录 | 离线 `VACUUM` 回收页内空间但文件不缩；在线模式保 RID，不回收根记录与空洞槽位 |
 
 ## 已知的行为细节

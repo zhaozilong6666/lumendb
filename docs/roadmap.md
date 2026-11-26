@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1615 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1616 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -369,6 +369,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
+2026-11-26 D 字符串范围统计：`ANALYZE` 为字符串列生成 16 桶等频直方图，
+桶边界取排序后的实际值；范围谓词按整桶命中估算，边界按字典序比较而不是
+数值转换。字符串范围从固定 0.33 变为统计驱动，`EXPLAIN` 可观测。
+
 2026-11-26 A 仲裁节点生命周期收口：`QuorumNode` 的 serve 与 election-watchdog
 改由内部 `ServiceRegistry` 管理，start 幂等、stop 反向、可重新 start；
 `services_status()` 可观测。线程泄漏与多数派/租约/同步复制用例全绿。

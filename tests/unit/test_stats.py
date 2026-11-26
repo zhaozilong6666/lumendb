@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from lumendb.engine.database import Database
 
 
@@ -77,5 +79,27 @@ def test_analyze_histogram_drives_range_estimate(tmp_path):
         assert "rows≈10" in after, after
         assert "范围已由 IndexRange 应用" in after
         assert "SeqScan≈100 → IndexRange≈10" in after
+    finally:
+        db.close()
+
+
+def test_string_histogram_drives_lexicographic_range_estimate(tmp_path):
+    db = Database(tmp_path / "string_range")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        for i in range(100):
+            db.execute_one(f"INSERT INTO t VALUES ({i}, '{i:03d}')")
+        before = _plan(db, "SELECT id FROM t WHERE s > '090'")
+        assert "rows≈33" in before, before
+        db.execute_one("ANALYZE t")
+        stats = db.catalog.get_table("t").column_stats["s"]
+        assert stats.min_value == "000"
+        assert stats.max_value == "099"
+        assert len(stats.histogram) == 16
+        assert sum(count for _lo, _hi, count in stats.histogram) == 100
+        after = _plan(db, "SELECT id FROM t WHERE s > '090'")
+        assert "rows≈13" in after, after
+        # 字符串边界不能按数值转换：'090' 在字典序里仍小于 '1'。
+        assert stats.range_selectivity("090", None) == pytest.approx(0.13)
     finally:
         db.close()

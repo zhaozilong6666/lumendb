@@ -141,7 +141,27 @@ def _column_literal_pair(expr: BinaryOp):
     return None, None
 
 
-def _column_range_pair(expr):
+def _coerce_range_bound(schema, ref, value):
+    """把范围边界按列类型归一化。
+
+    TEXT 列不能把 ``'090'`` 转成 ``90.0``：字符串序是 ``'090' < '1'``，数值化会
+    得到完全错误的选择率。数值列仍转成 float；日期等其它可比较类型保留原值。
+    """
+    if schema is not None:
+        try:
+            index = schema.resolve(ref.table, ref.name)
+            column_type = schema.columns[index].type
+        except Exception:
+            column_type = None
+        if column_type is not None and column_type.is_string:
+            return str(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _column_range_pair(expr, schema=None):
     """把 ``col > 常量`` / ``col BETWEEN a AND b`` 还原成 ``(ref, low, high)``。"""
     if isinstance(expr, BinaryOp) and expr.op in (">", ">=", "<", "<="):
         left, right = expr.left, expr.right
@@ -151,10 +171,7 @@ def _column_range_pair(expr):
             op = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}[op]
         if not isinstance(left, ColumnRef) or not isinstance(right, Literal):
             return None
-        try:
-            value = float(right.value)
-        except (TypeError, ValueError):
-            return None
+        value = _coerce_range_bound(schema, left, right.value)
         if op in (">", ">="):
             return left, value, None
         return left, None, value
@@ -163,10 +180,8 @@ def _column_range_pair(expr):
             return None
         if not isinstance(expr.low, Literal) or not isinstance(expr.high, Literal):
             return None
-        try:
-            low, high = float(expr.low.value), float(expr.high.value)
-        except (TypeError, ValueError):
-            return None
+        low = _coerce_range_bound(schema, expr.operand, expr.low.value)
+        high = _coerce_range_bound(schema, expr.operand, expr.high.value)
         return expr.operand, low, high
     return None
 
@@ -1600,7 +1615,7 @@ class Binder:
                         return value
                 return EQ_SELECTIVITY
             if expr.op in (">", ">=", "<", "<="):
-                pair = _column_range_pair(expr)
+                pair = _column_range_pair(expr, schema)
                 if pair is not None and schema is not None:
                     ref, low, high = pair
                     value = _stats_range_selectivity(
@@ -1610,7 +1625,7 @@ class Binder:
                         return value
                 return RANGE_SELECTIVITY
         if isinstance(expr, Between):
-            pair = _column_range_pair(expr)
+            pair = _column_range_pair(expr, schema)
             if pair is not None and schema is not None:
                 ref, low, high = pair
                 value = _stats_range_selectivity(
