@@ -26,8 +26,9 @@
 ## 迁移状态与豁免（2026-11）
 
 已迁：`Replica` 的 keeper / heartbeat（`_stop_background()` → `registry.clear()`）；
-`ReplicationMonitor` 的 poll / election-watchdog（内部注册表，`start_all()` 按序启动，
-`stop_all()` 反向停止，`services_status()` 可观测）。
+`ReplicationMonitor` 的 poll / election-watchdog 与 `QuorumNode` 的 serve /
+election-watchdog（各自内部注册表，`start_all()` 按序启动，`stop_all()` 反向停止，
+`services_status()` 可观测，stop 后可重新 start）。
 
 豁免（**不**归注册表管，理由写在代码里）：
 

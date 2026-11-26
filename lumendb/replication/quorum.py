@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import NotSupportedError, StorageError
+from ..services import ServiceRegistry
 from ._atomic import atomic_replace
 from .fence import PromotionFence
 from .lease import Lease
@@ -589,6 +590,15 @@ class QuorumNode:
         self.on_leader_lost: Callable[[], None] | None = None
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
+        self._services = ServiceRegistry(f"quorum-{self.node_id}")
+        self._services.register(
+            "serve", start=self._start_serve, stop=self._stop_serve
+        )
+        self._services.register(
+            "election-watchdog",
+            start=self.start_election_watchdog,
+            stop=self.stop_election_watchdog,
+        )
         #: 最近一轮心跳里各 peer 真正 apply 到的 LSN / 任期。leader 侧的
         #: ``push_entries_to_peers`` 从这里取得 append_entries 的 prev 边界。
         self.last_matches: dict[str, int] = {}
@@ -1475,6 +1485,8 @@ class QuorumNode:
         return term
 
     def start(self) -> "QuorumNode":
+        if self._thread is not None and self._thread.is_alive():
+            return self
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self.host, self.port))
@@ -1483,15 +1495,17 @@ class QuorumNode:
         self.host, self.port = self._sock.getsockname()
         self._stop.clear()
         self._handlers: list[threading.Thread] = []
+        self._services.start_all()
+        return self
+
+    def _start_serve(self) -> None:
         self._thread = threading.Thread(
             target=self._serve, name=f"lumendb-quorum-{self.node_id}", daemon=True
         )
         self._thread.start()
-        return self
 
-    def stop(self) -> None:
+    def _stop_serve(self) -> None:
         self._stop.set()
-        self.stop_election_watchdog()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -1501,6 +1515,12 @@ class QuorumNode:
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
+
+    def services_status(self) -> dict:
+        return self._services.status()
+
+    def stop(self) -> None:
+        self._services.stop_all()
         for handler in list(self._handlers):
             handler.join(timeout=1)
 

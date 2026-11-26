@@ -1536,3 +1536,23 @@ def test_push_entries_transport_timeout_backs_off_instead_of_raising(tmp_path, m
         _stop(nodes)
         leader.db.close()
         primary.close()
+
+
+def test_quorum_services_are_registry_managed_and_restartable(tmp_path):
+    node = QuorumNode("n0", state_path=tmp_path / "vote.json")
+    try:
+        assert node.services_status()["running"] == []
+        node.start()
+        status = node.services_status()
+        assert set(status["running"]) == {"serve", "election-watchdog"}
+        assert status["healthy"] is True
+        node.stop()
+        assert node.services_status()["running"] == []
+        node.start()
+        assert set(node.services_status()["running"]) == {
+            "serve",
+            "election-watchdog",
+        }
+    finally:
+        node.stop()
+        assert node.services_status()["running"] == []
