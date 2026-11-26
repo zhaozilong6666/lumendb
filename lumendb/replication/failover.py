@@ -22,6 +22,7 @@ from enum import Enum
 from pathlib import Path
 
 from ..errors import NotSupportedError, RedirectError, StorageError
+from ..services import ServiceRegistry
 from .replica import Replica
 from .wal_stream import WALClient, WALServer
 
@@ -88,6 +89,13 @@ class ReplicationMonitor:
         self.poll_interval = max(0.05, float(poll_interval))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._services = ServiceRegistry("replication-monitor")
+        self._services.register("poll", start=self._start_poll, stop=self._stop_poll)
+        self._services.register(
+            "election-watchdog",
+            start=self._start_election_watchdog,
+            stop=self._stop_election_watchdog,
+        )
         self.fence_path = Path(fence_path) if fence_path is not None else None
         self.node_id = node_id
         self.lease_path = Path(lease_path) if lease_path is not None else None
@@ -205,12 +213,15 @@ class ReplicationMonitor:
 
     def start(self, interval: float | None = None) -> "ReplicationMonitor":
         """在后台线程里周期执行 :meth:`poll`，直到 :meth:`stop`。"""
-        if self._thread is not None and self._thread.is_alive():
-            return self
         if interval is not None:
             self.poll_interval = max(0.05, float(interval))
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._services.start_all()
+        return self
+
+    def _start_poll(self) -> None:
         self._stop.clear()
-        self._start_election_watchdog()
 
         def loop() -> None:
             while not self._stop.wait(self.poll_interval):
@@ -231,14 +242,18 @@ class ReplicationMonitor:
             target=loop, name="lumendb-replication-monitor", daemon=True
         )
         self._thread.start()
-        return self
 
-    def stop(self) -> None:
+    def _stop_poll(self) -> None:
         self._stop.set()
-        self._stop_election_watchdog()
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
+
+    def services_status(self) -> dict:
+        return self._services.status()
+
+    def stop(self) -> None:
+        self._services.stop_all()
         server = self.server
         self.server = None
         if server is not None:

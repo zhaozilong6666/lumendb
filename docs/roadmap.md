@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1613 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1614 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -369,6 +369,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
+2026-11-26 A 复制监控生命周期收口：`ReplicationMonitor` 的 poll 与
+election-watchdog 改由内部 `ServiceRegistry` 管理，启动按注册顺序、停止反向，
+`services_status()` 可观测；stop 后可重新 start。复制/故障切换/线程泄漏用例全绿。
+
 2026-11-26 C 历史 schema 可查：`SHOW COLUMNS FROM table AT CATALOG VERSION n`
 从目录历史根重建 `TableDef`，输出列名/类型/可空/主键/默认值；未知版本或表报
 `42P01`。它只读目录，不读旧数据页，仍不是 `AS OF`。全量基线 1613。

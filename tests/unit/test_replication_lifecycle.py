@@ -287,3 +287,40 @@ class TestStepDownWaitsForInflightWrites:
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
         db.close()
         db.close()  # step_down()/Replica.close() 会重复关闭，不能抛异常
+
+
+def test_monitor_background_services_are_registry_managed(tmp_path):
+    primary, server, replica = _replica_ready(tmp_path)
+    node = _single_node(tmp_path)
+    monitor = ReplicationMonitor(
+        replica,
+        server.host,
+        server.port,
+        quorum=node,
+        election_timeout=0.2,
+        poll_interval=0.05,
+    )
+    try:
+        assert monitor.services_status()["running"] == []
+        monitor.start()
+        status = monitor.services_status()
+        assert set(status["running"]) == {"poll", "election-watchdog"}
+        assert status["healthy"] is True
+    finally:
+        monitor.stop()
+        assert monitor.services_status()["running"] == []
+        monitor.start()
+        assert set(monitor.services_status()["running"]) == {
+            "poll",
+            "election-watchdog",
+        }
+        monitor.stop()
+        assert monitor.services_status()["running"] == []
+        assert all(
+            not t.name.startswith("lumendb-replication-monitor")
+            for t in threading.enumerate()
+        )
+        replica.close()
+        node.stop()
+        server.stop()
+        primary.close()
