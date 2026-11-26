@@ -283,8 +283,17 @@ class Parser:
                     raise self._error("SHOW COLUMNS 之后期望 FROM")
                 table = self._parse_ident("表名")
                 if self._match_word("AT"):
+                    if self._match_word("TIME"):
+                        if self._cur.kind != "string":
+                            raise self._error(
+                                "SHOW COLUMNS ... AT TIME 之后期望带引号的 UTC 时间"
+                            )
+                        timestamp = self._advance().value
+                        return ShowColumns(table=table, catalog_time=timestamp)
                     if not self._match_word("CATALOG") or not self._match_word("VERSION"):
-                        raise self._error("SHOW COLUMNS ... AT 之后期望 CATALOG VERSION n")
+                        raise self._error(
+                            "SHOW COLUMNS ... AT 之后期望 CATALOG VERSION n 或 TIME '...'"
+                        )
                     version = self._expect_int()
                     return ShowColumns(table=table, catalog_version=version)
                 return ShowColumns(table=table)

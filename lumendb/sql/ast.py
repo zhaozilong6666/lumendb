@@ -687,6 +687,7 @@ class ShowCatalogVersions(Statement):
 class ShowColumns(Statement):
     table: str
     catalog_version: Optional[int] = None
+    catalog_time: Optional[str] = None
 
 
 @dataclass

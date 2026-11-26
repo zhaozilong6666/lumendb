@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import re
 import time
 import weakref
@@ -3447,7 +3448,32 @@ class Executor:
         )
 
     def _show_columns(self, stmt: ShowColumns) -> Result:
-        if stmt.catalog_version is None:
+        if stmt.catalog_time is not None:
+            try:
+                moment = datetime.fromisoformat(
+                    stmt.catalog_time.replace("Z", "+00:00")
+                )
+            except ValueError:
+                raise BinderError(
+                    f"无法解析 catalog 时间 {stmt.catalog_time!r}",
+                    hint="要求 ISO-8601，例如 '2026-11-26T08:57:07+00:00'",
+                )
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            timestamp = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+            version = self._catalog.version_at_or_before(timestamp)
+            if version is None:
+                raise TableNotFoundError(
+                    f"表 {stmt.table!r} 在 {stmt.catalog_time!r} 及之前不存在",
+                    hint="时间不早于本库第一个 catalog 版本；用 SHOW CATALOG VERSIONS 查 created_at",
+                )
+            table = self._catalog.table_at(version, stmt.table)
+            if table is None:
+                raise TableNotFoundError(
+                    f"表 {stmt.table!r} 在 {stmt.catalog_time!r} 对应的版本 {version} 不存在",
+                    hint="该时间点是其他表的 schema 版本；用 SHOW CATALOG VERSIONS 查版本历史",
+                )
+        elif stmt.catalog_version is None:
             table = self._catalog.get_table(stmt.table)
         else:
             table = self._catalog.table_at(stmt.catalog_version, stmt.table)
