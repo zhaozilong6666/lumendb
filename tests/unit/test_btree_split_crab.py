@@ -111,6 +111,89 @@ def test_concurrent_inserts_from_empty_trigger_root_split(tmp_path) -> None:
         db.close()
 
 
+def test_leaf_split_installs_parent_before_next_split(tmp_path) -> None:
+    """叶分裂 + 父页装键必须是一个原子结构步骤。
+
+    真实竞态：叶 A 分裂出新右页 R 后，R 先挂进叶子链、父页还没有它；
+    另一线程沿 ``next`` 找到 R 并把 R 再分裂一次，此时 R 的父页在树里
+    根本不存在，``_install_sep`` 报"找不到父页"，留下半截分裂——叶子链成环、
+    后续 ``check_invariants`` 报「键不小于上界」。
+
+    这里用 ``_install_sep`` 的测试钩子把第一线程停在"已分裂、未装父键"
+    的窗口里，第二线程去填满/分裂新右页。修复前第二线程会撞"找不到父页"；
+    修复后它被 ``_split_lock`` 挡住，等第一线程装完新根再继续。
+    """
+    db = Database(tmp_path, checkpoint_wal_bytes=0)
+    tree = BPlusTree(
+        db.bp, KeyCodec([TypeSpec(DataType.VARCHAR, 512)]), unique=False, name="idx"
+    )
+
+    def long_key(i: int) -> str:
+        return "k" + "x" * 400 + f"{i:05d}"
+
+    # 9 条长键刚好占满一片叶；第 10 条触发根叶分裂。
+    t0 = db.txns.begin()
+    for i in range(9):
+        tree.insert(t0, (long_key(i),), (0, i))
+    db.txns.commit(t0)
+
+    split_entered = threading.Event()
+    release_install = threading.Event()
+    calls = 0
+    original_install = tree._install_sep
+
+    def delayed_install(txn, left_id, sep, right_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            split_entered.set()
+            assert release_install.wait(timeout=10), "测试钩子等待超时"
+        return original_install(txn, left_id, sep, right_id)
+
+    tree._install_sep = delayed_install  # type: ignore[method-assign]
+    errors: list[str] = []
+
+    def splitter() -> None:
+        try:
+            txn = db.txns.begin()
+            tree.insert(txn, (long_key(9),), (0, 9))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"splitter: {type(exc).__name__}: {exc}")
+
+    def follower() -> None:
+        try:
+            txn = db.txns.begin()
+            # 全部大于分裂后的右页最小键，必然沿 next 进入新右页；
+            # 20 条足够把右页填满并再次触发分裂。
+            for i in range(20, 40):
+                tree.insert(txn, (long_key(i),), (1, i))
+            db.txns.commit(txn)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"follower: {type(exc).__name__}: {exc}")
+
+    try:
+        first = threading.Thread(target=splitter)
+        first.start()
+        assert split_entered.wait(timeout=10), "第一线程没有走到装父键窗口"
+
+        second = threading.Thread(target=follower)
+        second.start()
+        # 给第二线程足够时间填满右页并尝试第二次分裂；修复前它会在这里报错。
+        release_install.wait(0.5)
+        release_install.set()
+
+        first.join(timeout=30)
+        second.join(timeout=30)
+        assert not first.is_alive() and not second.is_alive(), "线程未退出"
+        assert errors == [], f"并发分裂结构窗口出错: {errors[:2]}"
+        stats = tree.check_invariants()
+        assert stats["entries"] == 9 + 1 + 20
+    finally:
+        release_install.set()
+        db.close()
+
+
 def test_concurrent_inserts_trigger_internal_splits(tmp_path) -> None:
     """预置多层树后并发插相交键，触发内部页分裂（B-link 沿 next 路由）。"""
     db = Database(tmp_path, checkpoint_wal_bytes=0)

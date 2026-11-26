@@ -102,6 +102,8 @@ class _NodeOverflow(Exception):
 #: ``_leaf_insert_or_split`` 的哨兵返回值：本次要插的键已经越过本页 high key，
 #: 调用方应沿 next 右移重试（而不是把键硬插进已经分裂成左半的页）。
 _REDIRECT = object()
+#: 叶分裂已经把分隔键装进父页（由分裂方在结构锁内完成），调用方无需再装。
+_SPLIT_INSTALLED = object()
 
 
 class KeyCodec:
@@ -166,6 +168,14 @@ class BPlusTree:
         #: 并发删完 12000 条后，页 197 的 next 是 224，但中序下一叶是 203）。
         #: 锁序固定「链锁 → 页 latch」：任何持叶 latch 的路径都不得再取链锁。
         self._link_lock = threading.RLock()
+        #: 结构变更锁：叶分裂 + 把分隔键装进父页必须是一个原子步骤。否则新右
+        #: 页已挂进叶子链、但父页还没有它：别的线程沿 ``next`` 找到它并再次分裂，
+        #: 它的父页在树里根本不存在，``_install_sep`` 只能报"找不到父页"，
+        #: 留下半截分裂（实测四线程插入时页 485 找不到父页、叶子链成环）。
+        #: 只包结构变更，不包普通插入；因此不会把整个索引退化成单线程。
+        #: 直接复用根锁：执行器每条语句新建一棵 BPlusTree，根锁由目录按索引
+        #: 共享，若不共用同一把锁，结构窗口仍会跨实例漏过去。
+        self._split_lock = self._root_lock
         #: 只给 ``_descend`` 用的内部页解码缓存，键是 (页号, pageLSN)。
         #: 由执行器跨语句持有（每次查询都新建 BPlusTree，缓存挂在树上没意义）。
         #: 页被写过后 pageLSN 会推进，旧条目自然再也不会命中。
@@ -384,13 +394,19 @@ class BPlusTree:
     def _leaf_insert_or_split(
         self, txn: Transaction, page: Page, key: tuple, rid: RID
     ):
-        """在叶内插入；空间不够时在同一页 latch 内分裂。
+        """在叶内插入；空间不够时在结构锁内完成"分裂 + 父页装键"。
 
         "发现满 → 读页 → 分裂"必须发生在同一个 latch 内：若 `_leaf_insert_at`
         释放 latch 后再分裂，两个线程会各自基于同一份旧页分裂，各建一个右页
         并重写本叶，导致丢行 / 叶子链断裂。返回 ``None`` 表示已插入/已存在；
-        返回 ``(sep_key, right_id)`` 表示本叶已分裂，调用方需把分隔键插入父页；
+        返回 ``_SPLIT_INSTALLED`` 表示本叶已分裂且分隔键已装进父页；
         返回 ``_REDIRECT`` 表示 key 已越过本页 high key，调用方应沿 next 右移。
+
+        为什么分裂和装父键必须在同一个 ``_split_lock`` 内：新右页一旦挂进叶子
+        链，别的线程就能沿 ``next`` 到达它；如果此时父页还没有它的分隔键，
+        另一个线程把它再分裂一次时，``_install_sep`` 在树里找不到它的父页，
+        会留下"链上有页、树里没有父亲"的半截分裂（实测页 485 找不到父页，
+        随后叶子链成环、页键越界）。结构锁只串行分裂，不串行普通插入。
 
         为什么要返回 ``_REDIRECT``：调用方判 high key 是"上一次持锁时"的事，
         中间可能释放过 latch；若这段时间本页被别的线程分裂，再持锁重插就会把
@@ -419,17 +435,23 @@ class BPlusTree:
         # 若持着叶 latch 去拿链锁，会与「持链锁摘叶、正等这片叶 latch」的删除
         # 线程成环（ABBA）。链锁只保护叶子链的指针手术（分裂改写邻居 prev /
         # 摘叶改写前后邻居 next-prev），是低频操作，代价可接受。
-        with self._link_lock:
-            with page.latch:
-                if _check_high():
-                    return _REDIRECT  # 这段窗口里本页被分裂了
-                idx = self._leaf_insert_at(txn, page, key, rid)
-                if idx is None:
-                    return None
-                keys, rids, _ = self._read_leaf(page)
-                keys.insert(idx, key)
-                rids.insert(idx, rid)
-                return self._split_leaf(txn, page, keys, rids)
+        with self._split_lock:
+            with self._link_lock:
+                with page.latch:
+                    if _check_high():
+                        return _REDIRECT  # 这段窗口里本页被分裂了
+                    idx = self._leaf_insert_at(txn, page, key, rid)
+                    if idx is None:
+                        return None
+                    keys, rids, _ = self._read_leaf(page)
+                    keys.insert(idx, key)
+                    rids.insert(idx, rid)
+                    sep, right_id = self._split_leaf(txn, page, keys, rids)
+            # 链锁先放，再装父键：装父键可能要拿根锁，而根塌陷是
+            # 「根锁 → 链锁」，不能在这里形成「链锁 → 根锁」的 ABBA。
+            # _split_lock 仍然持有，别的分裂线程进不来。
+            self._install_sep(txn, page.page_id, sep, right_id)
+            return _SPLIT_INSTALLED
 
     def _leaf_delete_at(self, txn: Transaction, page: Page, index: int) -> None:
         """摘掉一个槽位。记录字节留作碎片，由后续 compact 回收。"""
@@ -1029,7 +1051,7 @@ class BPlusTree:
                     page.latch.release()
                     held = False
                     result = self._leaf_insert_or_split(txn, page, key, rid)
-                    if result is None:
+                    if result is None or result is _SPLIT_INSTALLED:
                         return None
                     if result is _REDIRECT:
                         # 这段窗口里本页被分裂成左半：重新拿锁、回到循环顶部按

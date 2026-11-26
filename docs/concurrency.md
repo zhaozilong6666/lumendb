@@ -329,9 +329,10 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 
 - 下行：`_insert_owned` 持父页 latch 选孩子 → `fetch + latch` 子页 → 释放父页，
   递归进子页；叶子层在叶 latch 内判断 high key，越界就释放、沿 `next` 右移。
-- 叶分裂：`_leaf_insert_or_split` 返回 `(left_id, sep, right_id)`。分裂需要叶链
-  指针手术时**先释放叶 latch 再取 `_link_lock`**（锁序链锁 → 页 latch），重新
-  取锁后**再判一次 high key**：若本键已越过本页 high key（说明这页在让锁窗口里
+- 叶分裂：`_leaf_insert_or_split` 在 `_split_lock` 内完成"叶分裂 + 父页装键"，
+  返回哨兵 `_SPLIT_INSTALLED`（调用方无需再装）。分裂需要叶链指针手术时
+  **先释放叶 latch 再取 `_link_lock`**（锁序链锁 → 页 latch），重新取锁后
+  **再判一次 high key**：若本键已越过本页 high key（说明这页在让锁窗口里
   被别人分裂成了左半），返回哨兵 `_REDIRECT`，调用方沿链右移重试。少了这一判，
   本应进右页的键会写进左半（实测现场：`L488 n=7 [11/4.11..13/2.13] high=13/0.13`）。
 - 上推：`_install_sep` 不信任下行时的旧下标，`_locate_parent(left_id, sep)` 从
@@ -344,6 +345,27 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
 - 修掉的三个实测 bug：①surplus 不带分裂页身份，父页按旧 `child_id` 装错位置
   （报"页 553 的键不小于上界"）；②用旧下标定位（报"页 494 的键不小于上界"）；
   ③重新取锁后不判 high key（上述 `_REDIRECT` 场景）。
+
+**第四个实测 bug（2026-11-26）：叶分裂与父页装键之间的结构窗口**：
+
+- 现象：四线程 ×200 长键插入在四进程并行门禁下约每 50~90 轮复现一次：
+  worker 报"索引 idx 找不到页 484 的父页"，随后 `check_invariants` 报
+  "页 484 的键不小于上界"或"叶子链断裂：页 485 的 next 是 484，但中序下一叶是 4"。
+- 根因：`_split_leaf` 先把新右页挂进叶子链，调用方才去 `_install_sep` 装父键。
+  这段窗口里，别的线程可以沿 `next` 到达新右页；它一旦把右页再分裂一次，
+  这个右页还没有父亲（父页的 `children` 里没有它），`_locate_parent` 只能
+  报"找不到父页"。异常退出留下"链上有页、树里没有父亲"的半截分裂，叶子链
+  因此成环/越界。16ms 的短重试是症状，不是根因。
+- 修法：新增 `_split_lock`（直接复用按索引共享的 `_root_lock`，所以跨语句
+  新建的 BPlusTree 实例也共享同一把锁），把"叶分裂 + `_install_sep` 上推"
+  包成一个原子结构步骤。普通插入不受影响，只有需要分裂的路径串行；
+  `_link_lock` 在装父键前释放，避免与根塌陷的「根锁 → 链锁」形成 ABBA。
+- 回归：`test_btree_split_crab.py::test_leaf_split_installs_parent_before_next_split`
+  用 `_install_sep` 钩子把第一线程停在"已分裂、未装父键"的窗口，第二线程去
+  填满新右页；旧实现稳定报"找不到页 2 的父页"，新实现等结构装完再继续。
+- 实测：修复前四路并行复现轮次 6/12/45/66/71/90（各进程独立），修复后
+  四路并行各跑 260+ 轮（合计 1000+ 次 2800 条插入）零失败；`concurrency_gate.py`
+  四路并行 ×3 轮全部 11 项 PASS。
 
 **顺带修掉的缓存失效 bug（内部页解码缓存）**：
 
@@ -361,7 +383,7 @@ crabbing 一次设计完（含删除合并的反向路径），而不是现在�
   事后不再清（`test_internal_cache_cleared_on_ddl` 钉住）。
 
 - 实测：`test_btree.py + test_btree_page_latch.py` 22 passed、
-  `test_btree_split_crab.py` 11 passed；压测探针（2000 长键 + 4 线程 × 200 插入）
+  `test_btree_split_crab.py` 12 passed；压测探针（2000 长键 + 4 线程 × 200 插入）
   5/5 轮 `errors []`、不变量 `depth 4 / entries 2800`；全量 **1386 passed**（4m40s）。
 
 **并发门禁（`scripts/concurrency_gate.py`，2026-11-20 落地）**：
@@ -509,7 +531,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1555 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1556 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -705,6 +727,9 @@ fetch 下一页并在同一临界区里校验 `next.prev == 当前页号`，这�
   4 线程从空树并发插相交键，钉住建根竞态（丢最小键）+ 根分裂 B-link 路由。
 - `tests/unit/test_btree_split_crab.py::test_concurrent_inserts_trigger_internal_splits`
   预置 depth≥2 的多层树后 4 线程并发插相交键触发内部页分裂，断言不变量 + 条目数。
+- `tests/unit/test_btree_split_crab.py::test_leaf_split_installs_parent_before_next_split`
+  用 `_install_sep` 钩子把"叶已分裂、父键未装"的窗口强行撑开，第二线程去填满
+  新右页：钉住"结构窗口里不能开始下一次分裂"（旧实现稳定报找不到父页）。
 - `tests/unit/test_btree_split_crab.py::test_sequential_delete_large_tree_no_orphan`
   2000 条长键值顺序全删：每次 delete 必须为 True、最终 entries=0（钉住退化内部页
   摘除丢叶）。
@@ -1163,7 +1188,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1555 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1556 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
