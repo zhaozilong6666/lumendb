@@ -188,7 +188,7 @@ def render(report: AuditReport) -> str:
     lines.append("")
     lines.append(
         "> 审计只回答「验证了什么」，不回答「功能全不全」。"
-        "未覆盖项（如 AS OF SYSTEM TIME、确定性重放）见 docs/concurrency.md 与 roadmap。"
+        "未覆盖项（如 AS OF SYSTEM TIME、确定性重放的完整三场景）见 docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)
 

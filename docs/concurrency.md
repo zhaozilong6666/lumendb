@@ -529,9 +529,26 @@ Step 4 的前置项在这条路径上落地：
   B 的行）与 `sql_vacuum_online`（模拟 5s 超时，活跃快照存在时 VACUUM 仍完成，
   快照看旧版本）。
 
+**确定性重放第一块（2026-11-26，② 骨架）**：
+
+- `tests/deterministic/trace.py` 提供可命名闸门 `HoldPoint` 与因果轨迹 `Trace`：
+  事件带全局序号、线程名和字段；`Trace.wait_for()` 不靠 sleep 猜，`dump()`
+  直接打印完整交错序。
+- `tests/deterministic/scenario_split.py` 把刚修好的 B+ 树结构窗口做成第一个
+  真实场景：9 条长键占满叶 → splitter 插第 10 条触发分裂 → 闸门停在“叶已
+  分裂、父键未装” → follower 填满新右页并尝试第二次分裂。
+- 断言：`install.end(splitter)` 的序号必须小于 `split.start(follower)`；
+  旧实现 10 个种子全部失败，新实现 10/10 通过。
+- 复现命令：
+  `python -m pytest tests/unit/test_deterministic_replay.py -q` 或
+  `python -m tests.deterministic.replay --seed 3`。
+- 边界：目前只覆盖 B+ 树分裂结构窗口；Cherry 要求的“两个事务写同一行 /
+  并发 DDL / 副本 apply 中途换主各 1000 个种子”尚未覆盖，下一步要把闸门
+  插到 `lock.acquire` / `fsync` / `page.fetch`。
+
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1556 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1566 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -1188,7 +1205,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1556 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1566 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；
