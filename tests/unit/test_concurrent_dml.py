@@ -1289,3 +1289,39 @@ def test_single_column_equality_dml_uses_index_instead_of_scan(env, monkeypatch)
     assert stale_delete.affected == 0
     assert _rows(server, writer, "SELECT v FROM t WHERE id = 10") == [(9,)]
     assert _rows(server, writer, "SELECT id FROM t WHERE id = 11") == []
+
+
+def test_on_conflict_do_nothing_still_locks_the_unique_key(tmp_path):
+    """``ON CONFLICT DO NOTHING`` 跳过唯一检查后，插入索引项前仍必须拿键锁。
+
+    唯一检查入口的一把键锁只能挡住"检查"这一步；``DO NOTHING`` 明确跳过
+    唯一检查，此时真正把两个未提交事务隔开的是 :meth:`_insert` 在
+    ``tree.insert`` 前的键锁。去掉这把锁，第二个事务会看到第一个事务的
+    物理索引项并抛 23505，或者两条同键记录都写进索引；正确行为是等锁后
+    返回可重试的 40001。
+    """
+    db = Database(tmp_path / "db", concurrent_dml=True)
+    try:
+        db.execute_one("CREATE TABLE u (id INT PRIMARY KEY, code INT)")
+        db.execute_one("CREATE UNIQUE INDEX uq_code ON u (code)")
+        server = PGWireServer(db)
+        first, second = Session(database=db), Session(database=db)
+
+        _run(server, first, "BEGIN")
+        _run(server, second, "BEGIN")
+        inserted = _run(
+            server, first, "INSERT INTO u VALUES (1, 7) ON CONFLICT DO NOTHING"
+        )[0]
+        assert inserted.affected == 1
+        with pytest.raises(SerializationError) as exc:
+            _run(
+                server,
+                second,
+                "INSERT INTO u VALUES (2, 7) ON CONFLICT DO NOTHING",
+            )
+        assert exc.value.sqlstate == "40001"
+        _run(server, first, "ROLLBACK")
+        _run(server, second, "ROLLBACK")
+        assert _rows(server, first, "SELECT COUNT(*) FROM u") == [(0,)]
+    finally:
+        db.close()

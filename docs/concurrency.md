@@ -509,7 +509,7 @@ Step 4 的前置项在这条路径上落地：
 
 **仍未做 / 切默认模式前必须解决**：
 - 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1554 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+  并发各 **1555 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -1098,6 +1098,15 @@ WAL 尾已经是 41k，0.15s 同步屏障必然超时。这是测试的等待条
 回归 `test_clean_barrier_releases_lock_when_final_sync_fails` 从另一个线程抢锁，
 旧实现失败、新实现通过。
 
+**2026-11-26 补：`ON CONFLICT DO NOTHING` 仍然需要插入路径键锁。**
+变异审计真跑时发现原来的“键锁失效”变异是假阳性：它删的是唯一性检查前
+的键锁，但 `_insert` 在 `tree.insert` 前还有一把键锁，原目标用例仍然绿。
+两把锁保护不同路径：唯一检查前那把让未提交冲突变成 40001；插入索引项前
+那把在 `ON CONFLICT DO NOTHING` 跳过唯一检查时才是唯一屏障。新增
+`test_on_conflict_do_nothing_still_locks_the_unique_key` 后，删掉插入路径
+键锁会让第二个事务看到未提交索引项并报 23505 或双写，变异才真正变红。
+`mutation_check.py` 现在 4/4 符合预期（3 红 + 1 条已知冗余的行锁）。
+
 并发全量本地还碰到 `test_write_fence.py::TestLeasePathOnOpen::
 test_lease_expiry_after_open_blocks_the_next_write` 的时间敏感失败：租约 TTL
 只有 0.15s，而 Windows 慢盘上“打开 Database + CREATE TABLE”本身就可能超过
@@ -1154,7 +1163,7 @@ Ubuntu 3.12 初期长时间停在并发全量步骤，最终完成。其后的
 
 ### 切默认的判据（2026-11-22，结论：仍不切）
 
-- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1554 passed；门禁
+- **正确性：过关。** 默认与 `LUMEN_CONCURRENT_DML=1` 全量各 1555 passed；门禁
   脚本 3 轮 PASS（11 项，含混合 INSERT/UPDATE/DELETE、保存点并发/逻辑保存点、VACUUM 等待与在线回收探针）；
   CI run 296（`36e8e27`）与 run 297（`aecd3bb`）四矩阵全绿；行级逻辑保存点提交
   `31b6fd2` 由 run **45101946693** 四矩阵全绿（Python 3.12/3.13 × Ubuntu/Windows）；

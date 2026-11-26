@@ -44,13 +44,17 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         label="键锁失效",
         file="lumendb/engine/executor.py",
-        original="                self._lock_key(table, idx, self._key_for(table, idx, values), txn)",
-        mutated="                pass  # mutation: 唯一性判断前不拿键锁",
+        original="            self._lock_key(table, idx, key, txn)",
+        mutated="            pass  # mutation: 插入索引项前不拿键锁",
         target=(
-            "tests/unit/test_concurrency.py::TestWriteWriteConflict"
-            "::test_two_writers_on_the_same_unique_key_conflict"
+            "tests/unit/test_concurrent_dml.py"
+            "::test_on_conflict_do_nothing_still_locks_the_unique_key"
         ),
-        why="去掉键锁后，未提交的唯一键冲突会被误判成真冲突（或回滚后键复活）",
+        why=(
+            "唯一性检查前的那把键锁只是第一道；真正把两个事务隔开的是插入索引项"
+            "前的这把。去掉它，两个未提交事务会同时把同一个键写进物理索引，"
+            "测试应看到 23505 或双写，而不是等锁得到的 40001。"
+        ),
     ),
     Mutation(
         label="first-updater-wins 失效",
