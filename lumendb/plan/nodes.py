@@ -92,10 +92,15 @@ class IndexLookup(PlanNode):
     index_name: str = ""
     index_columns: tuple = ()
     key: tuple = ()
+    #: 非 None 时按历史目标点回堆解析版本；索引项只提供候选根 RID。
+    as_of_lsn: Optional[int] = None
 
     def describe(self) -> str:
         values = ", ".join(repr(v) for v in self.key)
-        return f"IndexScan {self.table} [{self.index_name}({', '.join(self.index_columns)}) = ({values})]"
+        text = f"IndexScan {self.table} [{self.index_name}({', '.join(self.index_columns)}) = ({values})]"
+        if self.as_of_lsn is not None:
+            text += f" [AS OF LSN {self.as_of_lsn}]"
+        return text
 
 
 @dataclass
@@ -110,17 +115,22 @@ class IndexRange(PlanNode):
     high: Optional[tuple] = None
     low_inclusive: bool = True
     high_inclusive: bool = True
+    #: 非 None 时按历史目标点回堆解析版本；索引项只提供候选根 RID。
+    as_of_lsn: Optional[int] = None
 
     def describe(self) -> str:
         lower = ", ".join(repr(v) for v in self.low) if self.low else "-inf"
         upper = ", ".join(repr(v) for v in self.high) if self.high else "+inf"
         left = "[" if self.low_inclusive else "("
         right = "]" if self.high_inclusive else ")"
-        return (
+        text = (
             f"IndexRangeScan {self.table} "
             f"[{self.index_name}({', '.join(self.index_columns)})] "
             f"{left}{lower}, {upper}{right}"
         )
+        if self.as_of_lsn is not None:
+            text += f" [AS OF LSN {self.as_of_lsn}]"
+        return text
 
 
 @dataclass

@@ -344,6 +344,41 @@ class HeapFile:
             newest = latest
         return None
 
+    def get_at(
+        self,
+        root_rid: RID,
+        commit_lsns: dict[int, int],
+        target_lsn: int,
+        *,
+        assume_committed_before: int = 0,
+        strict_unknown_xmax: bool = False,
+    ) -> Optional[list[Any]]:
+        """按历史目标点从根 RID 取可见版本；供 AS OF 索引回堆使用。"""
+        newest = self._newest_for_root(root_rid)
+        if newest is None:
+            return None
+        cur: Optional[RID] = newest
+        visited = 0
+        while cur is not None and visited < 10_000:
+            got = self._read_rid(cur)
+            if got is None:
+                return None
+            page, rec = got
+            try:
+                if self._visible_header_at(
+                    rec.header,
+                    commit_lsns,
+                    target_lsn,
+                    assume_committed_before=assume_committed_before,
+                    strict_unknown_xmax=strict_unknown_xmax,
+                ):
+                    return rec.values
+                cur = rec.header.prev_rid
+            finally:
+                self._release(page)
+            visited += 1
+        return None
+
     def _scan_with(self, visible) -> Iterator[Tuple[RID, list[Any]]]:
         """按调用方给的可见性谓词顺序扫描，产出 ``(根 RID, 值列表)``。
 

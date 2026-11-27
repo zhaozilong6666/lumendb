@@ -44,8 +44,11 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 
 - 语法只接受 `LSN <非负整数>`；时间字面量明确报 `NotSupportedError`，提示先用
   `SHOW COMMIT LOG` 选 LSN。暂不支持 `AS OF SYSTEM TIME '...'`。
-- 只允许基表顺序扫描：索引项只保存当前 RID，`AS OF` 时禁用 `IndexLookup` /
-  `IndexRange`，统一走堆表扫描后按提交点复核。
+- 基表顺序扫描与索引扫描都支持：索引项只提供候选根 RID，`HeapFile.get_at`
+  从根沿版本链找到目标点可见的版本，再按该版本的键复核索引条件。索引里的
+  旧键项是历史候选，不会因为当前键已改走而直接返回。
+- 索引重建（`CREATE INDEX` / `REINDEX`）会推进结构下界，丢掉更早的旧键项；
+  因此索引历史读与堆表历史读共享同一个可读窗口。
 - 同一查询内所有 `AS OF` 数据源必须停在同一个 LSN；JOIN、CTE、派生表、标量
   子查询共用目标点集合，出现多个目标直接报 `BinderError`。
 - `AS OF` 只能直接作用于基表；视图、CTE、派生表作为数据源时拒绝，视图定义里也不允许
@@ -54,7 +57,8 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 - 只允许独立的只读 `SELECT` / `EXPLAIN`；`INSERT ... SELECT`、`CREATE TABLE AS
   SELECT` 等写语句里出现 `AS OF` 直接报 `NotSupportedError`，不把历史行当作
   当前写入输入。
-- `EXPLAIN` 的 `SeqScan` 会带 `[AS OF LSN n]`，不会出现 `IndexScan`。
+- `EXPLAIN` 的 `SeqScan` / `IndexScan` 都会带 `[AS OF LSN n]`；索引计划只说明
+  候选入口，历史版本仍要回堆解析。
 
 ### 历史窗口
 
@@ -94,7 +98,8 @@ VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个�
 
 ### P1 剩余面
 
-- 索引路径禁用；覆盖索引、索引真值没有历史读。
+- 索引历史读是“索引候选 + 回堆解析”，没有覆盖索引或索引-only 历史扫描；
+  索引重建会推进结构下界，丢掉更早的旧键项。
 - JOIN 已强制同一目标点，但还没有“查询级共享快照对象”；每个 Scan 各自调用
   `scan_at`，目标点相同即可。
 - 不承诺超出账本保留窗口的完整历史，也不承诺历史 schema 解码。
@@ -109,7 +114,9 @@ VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个�
 - checkpoint 之前删除、未 VACUUM 的旧版本，重开后由持久账本正确判为不可见；
 - VACUUM / DDL 推进的结构下界跨重启仍然生效；
 - `VACUUM ... RETAIN LSN n` 保留目标点版本，目标越界报错，重开后仍可读；
-- `EXPLAIN` 标注 AS OF 且禁用索引；
+- 等值/范围索引扫描在目标点解析旧版本，旧键项不会混入；删除后仍可点查；
+- `CREATE INDEX` / `REINDEX` 推进下界，索引重建前的目标点明确拒绝；
+- `EXPLAIN` 的 SeqScan / IndexScan 都标注 AS OF 目标；
 - 早于 floor、晚于 latest、显式事务、视图数据源、时间字面量的稳定报错；
 - JOIN / 子查询的多目标点拒绝。
 
@@ -124,7 +131,7 @@ VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个�
    窗口”的语义，但需要同时考虑写入速率。
 2. 是否允许 `AS OF SYSTEM TIME '...'` 由时间映射到最近提交 LSN？内部仍以
    LSN 为准，避免时钟回拨。
-3. 索引历史读是否值得做：要么保留历史索引项，要么只在目标点等于 latest 时
-   允许索引并回堆复核。
+3. 索引历史读已落地为“候选 + 回堆解析”；要不要进一步做覆盖索引的历史
+   索引-only 扫描，需要单独保留历史键值或可见性元数据。
 4. 账本文件如何进入备份/复制链路：基准备份要原子携带它，增量备份要处理
    checkpoint 之间的追加。

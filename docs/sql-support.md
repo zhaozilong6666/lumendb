@@ -295,7 +295,8 @@ FETCH {FIRST|NEXT} {n | ROW} {ROW|ROWS} {ONLY | WITH TIES}
 
 `AS OF SYSTEM TIME LSN n` 是只读历史快照：只接受 LSN，不支持时间字面量；
 只允许直接作用于基表，视图 / CTE / 派生表数据源、显式事务内使用都会明确报错。
-同一查询里的多个 AS OF 数据源必须使用同一个 LSN；索引扫描路径被禁用。
+同一查询里的多个 AS OF 数据源必须使用同一个 LSN；索引扫描可作为候选入口，
+但必须回堆按目标 LSN 解析版本并复核键，不做索引-only 历史扫描。
 `INSERT ... SELECT` / `CREATE TABLE AS SELECT` 等写语句里出现 `AS OF` 也会拒绝。
 可读窗口由 `SHOW HISTORY WINDOW` 给出，早于下界或晚于最近提交都报错。
 

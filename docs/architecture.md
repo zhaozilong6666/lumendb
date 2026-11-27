@@ -77,8 +77,9 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 `[max(structural_floor_lsn, ledger_floor_lsn), latest_commit_lsn]`，由
 `SHOW HISTORY WINDOW` 暴露。结构下界取最近 VACUUM / DDL 开始位置，并持久化
 到元数据页；账本下界是最老保留提交。checkpoint 本身不再限制历史读，因此
-目标点可以早于最近 checkpoint。目前只允许基表顺序扫描，索引路径禁用，同一
-查询里的多表必须使用同一 LSN。
+目标点可以早于最近 checkpoint。基表顺序扫描与索引扫描都可用：索引项只提供
+候选根 RID，执行器必须回堆按目标 LSN 解析版本并复核索引键，不能把当前索引
+直接当历史真值。同一查询里的多表必须使用同一 LSN。
 
 ### 2.4 恢复
 

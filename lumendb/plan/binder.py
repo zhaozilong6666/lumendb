@@ -1452,10 +1452,6 @@ class Binder:
         """
         if not isinstance(scan, Scan):
             return None
-        # 索引项只有当前 RID，历史可见性必须回堆页复核；目标点不是当前
-        # 快照时直接禁用索引路径，避免拿当前索引当历史真值。
-        if scan.as_of_lsn is not None:
-            return None
         if not isinstance(where, BinaryOp) or where.op != "=":
             return None
 
@@ -1491,6 +1487,7 @@ class Binder:
             index_name=index.name,
             index_columns=index.columns,
             key=(value,),
+            as_of_lsn=scan.as_of_lsn,
             estimated=CostEstimate(
                 rows=estimate.rows,
                 cpu=estimate.cpu,
@@ -1512,8 +1509,6 @@ class Binder:
         留给全表扫描 + Filter。原因和等值查找一样：只做能保证正确的匹配。
         """
         if not isinstance(scan, Scan):
-            return None
-        if scan.as_of_lsn is not None:
             return None
 
         low = high = None
@@ -1582,6 +1577,7 @@ class Binder:
             high=high_key,
             low_inclusive=low_inclusive,
             high_inclusive=high_inclusive,
+            as_of_lsn=scan.as_of_lsn,
             estimated=CostEstimate(
                 rows=estimate.rows,
                 cpu=estimate.cpu,

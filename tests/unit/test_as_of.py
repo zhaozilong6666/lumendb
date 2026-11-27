@@ -61,28 +61,102 @@ def test_as_of_after_checkpoint_keeps_pre_window_rows(tmp_path):
         db.close()
 
 
-def test_as_of_disables_index_lookup(tmp_path):
+def test_as_of_index_lookup_reads_target_version(tmp_path):
     db = Database(tmp_path)
     try:
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("CREATE UNIQUE INDEX t_v ON t(v)")
         db.execute("INSERT INTO t VALUES (1, 'old')")
         old_lsn = _last_commit(db)
         db.execute("UPDATE t SET v = 'new' WHERE id = 1")
 
         rows = db.execute(
-            f"SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn} WHERE id = 1"
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn} WHERE v = 'old'"
         )[0].rows
         assert rows == [(1, "old")]
+        # 目标点之后才出现的键不能从索引的当前项里混进来。
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn} WHERE v = 'new'"
+        )[0].rows == []
 
         plan = "\n".join(
             row[0]
             for row in db.execute(
                 f"EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn} "
-                "WHERE id = 1"
+                "WHERE v = 'old'"
             )[0].rows
         )
-        assert "SeqScan t [AS OF LSN" in plan
-        assert "IndexScan" not in plan
+        assert "IndexScan t [t_v(v) = ('old')] [AS OF LSN" in plan
+        assert "SeqScan t [" not in plan
+    finally:
+        db.close()
+
+
+def test_as_of_index_range_reads_target_versions(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("CREATE INDEX t_v ON t(v)")
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        old_lsn = _last_commit(db)
+        db.execute("UPDATE t SET v = 'z'")
+
+        rows = db.execute(
+            f"SELECT id, v FROM t AS OF SYSTEM TIME LSN {old_lsn} "
+            "WHERE v BETWEEN 'a' AND 'c' ORDER BY id"
+        )[0].rows
+        assert rows == [(1, "a"), (2, "b"), (3, "c")]
+        assert db.execute(
+            f"SELECT id FROM t AS OF SYSTEM TIME LSN {old_lsn} "
+            "WHERE v = 'z'"
+        )[0].rows == []
+    finally:
+        db.close()
+
+
+def test_as_of_index_after_delete_and_vacuum_retain(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("CREATE UNIQUE INDEX t_v ON t(v)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        db.execute("UPDATE t SET v = 'new' WHERE id = 1")
+        update_lsn = _last_commit(db)
+        db.execute("DELETE FROM t WHERE id = 1")
+        db.execute(f"VACUUM t RETAIN LSN {update_lsn}")
+
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {update_lsn} WHERE v = 'new'"
+        )[0].rows == [(1, "new")]
+        assert db.execute("SELECT * FROM t WHERE v = 'new'")[0].rows == []
+    finally:
+        db.close()
+
+
+def test_reindex_closes_index_history_window(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        old_lsn = _last_commit(db)
+        # 建索引会重建整份索引，之前的键历史不再保证在树里。
+        db.execute("CREATE INDEX t_v ON t(v)")
+        with pytest.raises(BinderError, match="历史窗口"):
+            db.execute(
+                f"SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn} WHERE v = 'old'"
+            )
+
+        db.execute("UPDATE t SET v = 'new' WHERE id = 1")
+        mid_lsn = _last_commit(db)
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {mid_lsn} WHERE v = 'new'"
+        )[0].rows == [(1, "new")]
+        # REINDEX 同样会丢掉旧键项，所以它也必须关掉更早的索引历史窗口。
+        db.execute("REINDEX t")
+        with pytest.raises(BinderError, match="历史窗口"):
+            db.execute(
+                f"SELECT * FROM t AS OF SYSTEM TIME LSN {mid_lsn} WHERE v = 'new'"
+            )
     finally:
         db.close()
 

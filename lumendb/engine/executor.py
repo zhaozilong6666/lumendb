@@ -769,17 +769,41 @@ class Executor:
         table = self._catalog.get_table(node.table)
         index = table.indexes.get(node.index_name)
         if index is None:
-            # 索引在计划生成之后被删掉了：退化成全表扫描，结果仍然正确
-            yield from self._scan(Scan(columns=node.columns, table=node.table, alias=node.alias), txn)
+            # 索引在计划生成之后被删掉了：退化成全表扫描，并按原索引键复核。
+            # AS OF 必须把目标点一起带过去，不能退化成当前读。
+            scan = Scan(
+                columns=node.columns,
+                table=node.table,
+                alias=node.alias,
+                as_of_lsn=node.as_of_lsn,
+            )
+            positions = [table.column_index(c) for c in node.index_columns]
+            for values in self._scan(scan, txn):
+                if all(values[pos] == key for pos, key in zip(positions, node.key)):
+                    yield tuple(values)
             return
         tree = self._tree_for(table, index)
         heap = HeapFile(self._bp, table, self._txns)
+        entries = None
+        target = node.as_of_lsn
+        floor = 0
+        if target is not None:
+            entries, floor = self._as_of_context(int(target))
         for rid in tree.lookup(txn, list(node.key)):
-            values = heap.get(txn, rid)
+            if entries is None:
+                values = heap.get(txn, rid)
+            else:
+                values = heap.get_at(
+                    rid,
+                    entries,
+                    int(target),
+                    assume_committed_before=floor,
+                    strict_unknown_xmax=True,
+                )
             if values is None:
                 continue
             # 索引项可能陈旧（删除/更新后不摘项，等 VACUUM 回收）：以堆里的
-            # 当前版本为准复核键，否则会把已经改走键的行当成命中返回。
+            # 目标版本为准复核键，否则会把已经改走键的行当成命中返回。
             if self._key_for(table, index, values) != list(node.key):
                 continue
             yield tuple(values)
@@ -789,12 +813,23 @@ class Executor:
         index = table.indexes.get(node.index_name)
         if index is None:
             yield from self._scan(
-                Scan(columns=node.columns, table=node.table, alias=node.alias), txn
+                Scan(
+                    columns=node.columns,
+                    table=node.table,
+                    alias=node.alias,
+                    as_of_lsn=node.as_of_lsn,
+                ),
+                txn,
             )
             return
         tree = self._tree_for(table, index)
         heap = HeapFile(self._bp, table, self._txns)
         prefix = len(node.index_columns)
+        entries = None
+        target = node.as_of_lsn
+        floor = 0
+        if target is not None:
+            entries, floor = self._as_of_context(int(target))
         for key, rid in tree.scan_range(
             prefix,
             low=node.low,
@@ -802,12 +837,21 @@ class Executor:
             low_inclusive=node.low_inclusive,
             high_inclusive=node.high_inclusive,
         ):
-            values = heap.get(txn, rid)
+            if entries is None:
+                values = heap.get(txn, rid)
+            else:
+                values = heap.get_at(
+                    rid,
+                    entries,
+                    int(target),
+                    assume_committed_before=floor,
+                    strict_unknown_xmax=True,
+                )
             if values is None:
                 continue
             row_key = self._key_for(table, index, values)
             if row_key is None or tuple(row_key) != tuple(key[:prefix]):
-                continue  # 陈旧索引项：这一行的当前键已不在该范围内
+                continue  # 陈旧索引项：这一行的目标键已不在该范围内
             yield tuple(values)
 
     def _scan(self, node: Scan, txn: Transaction) -> Iterator[tuple]:
@@ -819,18 +863,14 @@ class Executor:
         for _rid, values in heap.scan(txn):
             yield tuple(values)
 
-    def _scan_as_of(
-        self, node: Scan, table, heap: HeapFile
-    ) -> Iterator[tuple]:
-        """执行一次历史堆扫描；窗口不足时明确拒绝，不退回当前读。"""
-        assert node.as_of_lsn is not None
+    def _as_of_context(self, target: int) -> tuple[dict[int, int], int]:
+        """校验历史目标窗口，返回提交账本与持久化下界。"""
         if self._history is None:
             raise NotSupportedError(
                 "当前执行器没有接入历史读窗口",
                 detail="AS OF 需要 checkpoint / VACUUM / DDL 水位",
                 hint="通过 Database 打开数据库后再使用 AS OF",
             )
-        target = int(node.as_of_lsn)
         floor = self._history.floor_lsn
         if target < floor:
             raise BinderError(
@@ -855,6 +895,15 @@ class Executor:
                 detail=f"目标 LSN={target}，最近提交 LSN={latest}",
                 hint="历史读只能读到已提交的点；先提交事务或选择更早的 LSN",
             )
+        return entries, floor
+
+    def _scan_as_of(
+        self, node: Scan, table, heap: HeapFile
+    ) -> Iterator[tuple]:
+        """执行一次历史堆扫描；窗口不足时明确拒绝，不退回当前读。"""
+        assert node.as_of_lsn is not None
+        target = int(node.as_of_lsn)
+        entries, floor = self._as_of_context(target)
         for _rid, values in heap.scan_at(
             entries,
             target,
