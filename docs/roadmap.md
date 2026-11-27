@@ -530,6 +530,9 @@ B+ 树页不记物理原像；事务内 VACUUM 一旦重排页链、回收死版
 串行回滚 160 行后空闲 100 页、重插不再增长。默认全量 1685；并发 1683 + 2
 skipped。
 
+CI #387 在 `014cceb` 上五个 job（Ubuntu/Windows 3.12/3.13 + Concurrent
+DML）全部 Success，9m38s。
+
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
 `freed_pages`，提交后永久泄漏（实测 160 行 900B 唯一约束删除后空闲页仍为 0，
