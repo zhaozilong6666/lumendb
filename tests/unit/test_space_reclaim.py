@@ -15,6 +15,7 @@ from lumendb.storage.pager import (
     META_OFF_NEXT_PAGE,
     PAGE_SIZE,
 )
+from lumendb.storage.page import Page
 
 
 def _data_file(db: Database):
@@ -203,7 +204,9 @@ def test_alter_shadow_heap_releases_old_pages(tmp_path, monkeypatch, concurrent)
         db.execute_one("ROLLBACK")
         assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
         assert _rows(db, "SELECT pad FROM t WHERE id = 0") == [(pad,)]
-        assert db.disk.free_page_count <= free_before + 1
+        # 旧堆页仍被目录/WAL undo 引用，不能释放；回滚可以回收本次 shadow
+        # heap 新建的少数页（160 行只剩 id 列，约 3 页），所以留一点余量。
+        assert db.disk.free_page_count <= free_before + 5
 
         # 提交路径：切换根页后旧堆页可复用；后续插入不应让文件线性增长。
         db.execute_one("ALTER TABLE t DROP COLUMN pad")
@@ -513,3 +516,96 @@ def test_truncate_tail_is_never_replayed_by_recovery(tmp_path):
         assert os.path.getsize(_data_file(reopened)) % PAGE_SIZE == 0
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_rollback_reclaims_new_pages_when_no_overlap(
+    tmp_path, monkeypatch, concurrent
+):
+    """事务回滚后，新分配的堆页在无重叠事务时可以还给空闲表。
+
+    这是保守回收：只有当回滚时没有别的活跃事务、且本事务开始后没有别的
+    提交时，才敢复用这些页。测试同时验证页确实被后续插入复用，而不是只把
+    空闲计数做大。
+    """
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT, pad TEXT)")
+        free_before = db.disk.free_page_count
+        pad = "r" * 900
+
+        db.execute_one("BEGIN")
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        db.execute_one("ROLLBACK")
+
+        assert _rows(db, "SELECT count(*) FROM t") == [(0,)]
+        if not concurrent:
+            # 物理回滚后页链/根指针已撤回，新页确实可以还给空闲表。
+            assert db.disk.free_page_count > free_before + 10
+            pages_after_rollback = _file_pages(db)
+
+            # 空闲页必须能真正复用：同样 160 行插回去，文件不应再线性增长。
+            for i in range(160):
+                db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+            assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+            assert _file_pages(db) <= pages_after_rollback + 1
+        else:
+            # 并发写模式是逻辑回滚：页链仍指向这些页，只是行不可见；
+            # 此时绝不能把页写成 FREE，否则下一次扫描会走进空洞。
+            assert db.disk.free_page_count <= free_before + 1
+            db.execute_one("VACUUM t")  # 清掉逻辑回滚留下的不可见死行
+            for i in range(160):
+                db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+            assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        reopened.close()
+
+
+def test_rollback_does_not_reclaim_pages_when_another_txn_is_active(tmp_path):
+    """有重叠的活跃事务时，回滚不能释放新页——对方可能已把页挂进自己的链。"""
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT)")
+        free_before = db.disk.free_page_count
+        owner = db.txns.begin()
+        page = db.bp.new_page(Page, owner=owner)
+        db.bp.unpin(page.page_id)
+
+        bystander = db.txns.begin()
+        db.txns.abort(owner)
+        assert db.disk.free_page_count == free_before
+
+        # 亲眼确认页没有被写成 FREE、也没有进入空闲表。
+        assert page.page_id not in db.disk.free_page_ids()
+        db.txns.abort(bystander)
+    finally:
+        db.close()
+
+
+def test_rollback_does_not_reclaim_pages_when_another_txn_committed(tmp_path):
+    """本事务开始后有别的提交，同样保守跳过回收。"""
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT)")
+        free_before = db.disk.free_page_count
+        owner = db.txns.begin()
+        page = db.bp.new_page(Page, owner=owner)
+        db.bp.unpin(page.page_id)
+
+        other = db.txns.begin()
+        db.txns.commit(other)
+        db.txns.abort(owner)
+        assert db.disk.free_page_count == free_before
+        assert page.page_id not in db.disk.free_page_ids()
+    finally:
+        db.close()

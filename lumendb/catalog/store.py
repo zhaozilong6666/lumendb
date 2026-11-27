@@ -116,7 +116,7 @@ class CatalogStore:
         ]
         pages: list[Page] = []
         for _ in chunks:
-            page = self._bp.new_page(Page)
+            page = self._bp.new_page(Page, owner=txn)
             page.buf[:] = bytes(PAGE_SIZE)
             page.page_type = PageType.CATALOG
             page.set_u32(16, page.page_id)

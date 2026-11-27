@@ -850,7 +850,7 @@ class BPlusTree:
             # 两个线程同时插第一条时都要建根，双重检查 + 树级锁串行
             with self._root_lock:
                 if self.root_page == INVALID_PAGE_ID:
-                    page = self._bp.new_page(Page)
+                    page = self._bp.new_page(Page, owner=txn)
                     try:
                         self._init_leaf(page)
                         self._commit_page(
@@ -927,7 +927,7 @@ class BPlusTree:
                 with self._root_lock:
                     if self.root_page != left_id:
                         continue  # 根已被别的线程分裂，重新定位
-                    new_root = self._bp.new_page(Page)
+                    new_root = self._bp.new_page(Page, owner=txn)
                     try:
                         self._init_internal(new_root)
                         self._commit_page(
@@ -1102,7 +1102,7 @@ class BPlusTree:
     ) -> Tuple[tuple, int]:
         mid = (len(keys) + 1) // 2
         sep = keys[mid]
-        right = self._bp.new_page(Page)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
+        right = self._bp.new_page(Page, owner=txn)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
         right_id = right.page_id
         try:
             self._init_leaf(right)
@@ -1154,7 +1154,7 @@ class BPlusTree:
         sep = keys[mid]
         old_high = self._read_internal(page)[2]
         old_next = page.next_page
-        right = self._bp.new_page(Page)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
+        right = self._bp.new_page(Page, owner=txn)  # new_page 已 pin，勿再 fetch（否则双 pin 泄漏）
         right_id = right.page_id
         try:
             self._init_internal(right)

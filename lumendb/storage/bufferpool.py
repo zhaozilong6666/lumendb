@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import contextlib
 from collections import OrderedDict
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from .. import faults
 from ..errors import StorageError
@@ -162,8 +162,14 @@ class BufferPoolManager:
             self._bump_version(page_id)
             return page if page_cls is Page else page.view(page_cls)
 
-    def new_page(self, page_cls: type[Page] = Page) -> Page:
-        """分配新页并 pin。返回的页处于未初始化状态，由调用方填入内容。"""
+    def new_page(
+        self, page_cls: type[Page] = Page, *, owner: Optional[Any] = None
+    ) -> Page:
+        """分配新页并 pin。返回的页处于未初始化状态，由调用方填入内容。
+
+        ``owner`` 是发起分配的事务；它只用于事务回滚时判断新页能否安全
+        还给空闲表，不改变页的可见性或持久化语义。
+        """
         with self._lock:
             self._ensure_room()
             page_id = self._disk.allocate_page()
@@ -174,6 +180,8 @@ class BufferPoolManager:
             self._dirty.add(page_id)
             self._fresh_pages.add(page_id)
             self._bump_version(page_id)
+            if owner is not None:
+                owner.allocated_pages.add(page_id)
             return page if page_cls is Page else page.view(page_cls)
 
     def unpin(self, page_id: int, *, dirty: bool = False) -> None:

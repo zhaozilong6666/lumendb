@@ -201,7 +201,10 @@ def render(report: AuditReport) -> str:
         "自动提交 VACUUM 仍走在线/离线路径；ALTER TABLE 的 shadow heap 切换根页"
         "后旧堆页登记进空闲表，回滚则丢弃登记、保留旧根；DROP TABLE / "
         "DROP INDEX 删除目录项前收集堆页与索引树页，提交后同样回收；"
-        "DROP CONSTRAINT 删除唯一/主键索引同样先收集旧树页。"
+        "DROP CONSTRAINT 删除唯一/主键索引同样先收集旧树页；"
+        "串行物理回滚在本事务开始后没有别的提交、回滚时也没有别的活跃事务时，"
+        "会把本次新分配且已无人引用的页还给空闲表；并发逻辑回滚和重叠场景"
+        "保守跳过，宁可泄漏也不复用仍被页链引用的页。"
         "其它边界见 docs/as-of-system-time.md、docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)

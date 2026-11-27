@@ -81,7 +81,7 @@ class HeapFile:
 
     def _append_page(self, txn: Transaction) -> HeapPage:
         """在链尾追加一个新页，返回处于 pin 状态的页。"""
-        page = self._bp.new_page(HeapPage)
+        page = self._bp.new_page(HeapPage, owner=txn)
         # 新页的"初始化"本身必须是一条能重放的日志：否则崩溃恢复后这一页
         # 仍是磁盘上的空页（page_type=FREE），而后续的行插入日志只覆盖了
         # 页头里的几个计数器，页类型永远补不回来。初始化与整页镜像日志

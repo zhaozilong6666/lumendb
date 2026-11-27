@@ -118,6 +118,10 @@ class Transaction:
     #: 本事务已经摘链/重建后不再被任何结构引用的页号。只在 COMMIT 后交给
     #: DiskManager 复用；ROLLBACK 时直接丢弃，页面仍由 WAL undo 指回旧结构。
     freed_pages: set[int] = field(default_factory=set)
+    #: 本事务通过 ``BufferPool.new_page`` 新分配的页号。回滚时只有"没有别的
+    #: 事务与它重叠"才敢放回空闲表：其他写事务可能已经把这些页挂进自己的
+    #: 页链，提前复用会让已提交结构指向被覆盖的页。重叠场景宁可泄漏。
+    allocated_pages: set[int] = field(default_factory=set)
     #: 入口就确定"这条语句只会读"的事务（自动提交的 SELECT/EXPLAIN/SHOW）。
     #: 它们不写 BEGIN/COMMIT/ABORT 记录，所以既不争 WAL 锁，也不在提交时
     #: 触发 fsync；MVCC 只需要内存里的结局表。
@@ -344,6 +348,7 @@ class TransactionManager:
         txn.undo_log.clear()
         txn.savepoints.clear()
         txn.touched_tables.clear()
+        txn.allocated_pages.clear()
         if self._current is txn:
             self._current = None
         self._release_locks(txn.xid)
@@ -411,6 +416,40 @@ class TransactionManager:
             if limit is not None and limit >= 0:
                 entries = entries[-limit:] if limit else []
             return list(entries)
+
+    def _reclaim_allocated_pages(self, txn: Transaction) -> None:
+        """回滚后把本事务新分配、且确定无人引用的页还给空闲表。
+
+        只在两个保守条件同时成立时动手：回滚时没有别的活跃事务，且本事务
+        开始后没有别的提交。满足这两条，别的写事务就不可能在共享的
+        ``table.last_page`` / B+ 树根之后追加页，也不可能还持着本事务新页
+        的读引用。只要有一丝重叠就不回收——空间泄漏比把已提交页链指向被
+        复用页安全得多。
+        """
+        pages = set(txn.allocated_pages)
+        try:
+            if not pages or self._bp is None:
+                return
+            # 逻辑回滚不恢复页链/根指针：堆页仍在表里，只是行不可见；把页
+            # 还回去会让下一次扫描沿链走进一个 FREE 页。只在物理 undo 后收。
+            if self._bp.logical_abort:
+                return
+            if self._active - {txn.xid}:
+                return
+            if any(lsn > txn.first_lsn for _xid, lsn in self._commit_order):
+                return
+            dropped = self._bp.drop_pages(sorted(pages))
+            if not dropped:
+                return
+            accepted = self._disk.release_pages(dropped)
+            if accepted:
+                _log.debug(
+                    "回滚事务 %s 回收 %s 个新分配页", txn.xid, accepted
+                )
+        except Exception:  # pragma: no cover - 回收是尽力而为
+            _log.exception("事务 %s 回滚后回收新分配页失败，页面保持泄漏", txn.xid)
+        finally:
+            txn.allocated_pages.clear()
 
     def _release_locks(self, xid: int) -> None:
         """事务结束时释放它持有的全部锁（写者锁在这里被交出）。"""
@@ -492,6 +531,7 @@ class TransactionManager:
                 txn.touched_tables.clear()
                 txn.last_lsn = self._wal.abort(txn.xid)
                 self._wal.flush()
+                self._reclaim_allocated_pages(txn)
             except BaseException:
                 # [Review-Fix] WAL 写失败（磁盘满 / IO 错误）时 abort 自己也会
                 # 抛错。若就此退出，事务仍登记为 ACTIVE、写者锁仍被持有——

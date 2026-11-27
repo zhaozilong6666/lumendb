@@ -447,6 +447,9 @@ Step 4 的前置项在这条路径上落地：
   xmin/xmax 可见性与 VACUUM 回收；WAL `PAGE_UPDATE` 用 `old_len=0xFFFF` 哨兵省略
   before image，恢复时跳过。目录页在 DML 保存时也走逻辑（线程局部
   `BufferPool.logical_undo_scope()`），避免 A 回滚把 B 随后保存的新根抹掉；
+  因此回滚后的新分配页仍被页链引用，**不能**像串行物理回滚那样还给空闲表。
+  串行物理回滚的回收也只在没有别的活跃事务、且本事务开始后没有别的提交时
+  进行；重叠场景保守泄漏，避免释放 B 已挂链的页。
   DDL 用 `_undo_override=False` 强制物理原像，保证 TRUNCATE/DROP 能真正撤回。
 - **读者计数锁独立**：`read_guard()` 不再借 `_write_lock` 做计数（此前每条
   并发 DML 都要在这把全局锁上进/出一次，等于把语句重新串行）。现在读者计数用
@@ -561,8 +564,8 @@ Step 4 的前置项在这条路径上落地：
   由 `tests/unit/test_faults.py` 钉住“读盘 EIO 必须报错、不能装空页”。
 
 **仍未做 / 切默认模式前必须解决**：
-- 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认 **1681 passed**、并发
-  **1679 通过 + 2 skipped**（跳过并发显式事务 VACUUM 回滚的既有限制），门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+- 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认 **1685 passed**、并发
+  **1683 通过 + 2 skipped**（跳过并发显式事务 VACUUM 回滚的既有限制），门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。

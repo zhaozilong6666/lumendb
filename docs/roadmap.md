@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1681 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1679 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1685 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1683 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -519,6 +519,16 @@ B+ 树页不记物理原像；事务内 VACUUM 一旦重排页链、回收死版
 丢弃登记。修复后 `DROP INDEX` 释放 81 页、`DROP TABLE` 释放 122 页，新建
 表优先复用旧页。新增 DROP TABLE/DROP INDEX 各串行+并发 4 例回归（含回滚
 不释放），默认全量 1679；并发 1677 + 2 skipped。
+
+2026-11-27 回滚事务新分配页回收：事务内 INSERT 新开的堆页、B+ 树分裂页与
+目录新链页，ROLLBACK 后没有任何结构引用，却从未登记释放；实测 160 行 900B
+表回滚后文件仍停在 102 页、空闲 0。`BufferPool.new_page` 接 `owner` 事务，
+把页号记进 `txn.allocated_pages`；`abort` 仅在“本事务开始后没有别的提交、
+且回滚时没有别的活跃事务”时把这些页写回空闲表。任何重叠都保守跳过：别的
+写事务可能已把这些页挂进自己的链，提前复用会让已提交结构指向被覆盖页。
+并发写模式的逻辑回滚不恢复页链，因此不启用；手动重叠用例覆盖两条保守门禁，
+串行回滚 160 行后空闲 100 页、重插不再增长。默认全量 1685；并发 1683 + 2
+skipped。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
