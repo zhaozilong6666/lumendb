@@ -29,6 +29,26 @@ def test_commit_ledger_roundtrip_and_retention(tmp_path):
     assert CommitLedger(exported).entries() == [(3, 33), (6, 60)]
 
 
+def test_commit_ledger_retries_transient_replace_lock(tmp_path, monkeypatch):
+    """Windows 杀毒/索引短暂锁住目标文件时，一次 os.replace 失败不能丢账本。"""
+    from lumendb.storage import commit_ledger as module
+
+    real_replace = module.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "simulated Windows sharing violation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(module.os, "replace", flaky_replace)
+    ledger = CommitLedger(tmp_path / "flaky.bin")
+    ledger.write([(1, 10)])
+    assert calls["n"] == 3
+    assert CommitLedger(tmp_path / "flaky.bin").entries() == [(1, 10)]
+
+
 def test_commit_ledger_rejects_corrupted_file(tmp_path):
     path = tmp_path / "commit-ledger.bin"
     path.write_bytes(b"not-a-lumen-ledger")

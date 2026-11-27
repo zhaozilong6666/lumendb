@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -30,6 +31,25 @@ _VERSION = 1
 #: magic(8) + version(2) + count(8)
 _HEADER = struct.Struct("<8sHQ")
 _ENTRY = struct.Struct("<QQ")
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """Windows 上 ``os.replace`` 可能被杀毒/索引短暂锁住目标文件。
+
+    副本读账本与 checkpoint 重写账本会并发；一次 ``WinError 5`` 不代表
+    账本损坏，源文件仍在。有限退避重试吸收瞬时锁，其他异常照常抛出。
+    """
+    last: PermissionError | None = None
+    for attempt in range(8):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last = exc
+            if attempt < 7:
+                time.sleep(0.02 * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 class CommitLedger:
@@ -156,7 +176,7 @@ class CommitLedger:
                 fh.write(body)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(temp, self.path)
+            _replace_with_retry(temp, self.path)
             self._fsync_dir()
             self._entries = retained
             return list(retained)
