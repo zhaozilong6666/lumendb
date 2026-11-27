@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,10 @@ def _run(*args: str) -> subprocess.CompletedProcess:
         encoding="utf-8",
         errors="replace",
         timeout=300,
+        # 子进程把中文写进管道时，Windows 默认用 locale 编码（cp936）；
+        # 我们不显式指定的话，父进程按 utf-8 解码会得到乱码，
+        # 于是"断言输出里含某个中文短语"会**只在整库跑时**假红。
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
 
 
