@@ -184,6 +184,77 @@ def test_vacuum_rollback_does_not_release_pages(tmp_path):
         db.close()
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_alter_shadow_heap_releases_old_pages(tmp_path, monkeypatch, concurrent):
+    """ALTER 切换 shadow heap 后，旧堆页必须进入空闲表；回滚则不能释放。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        pad = "y" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+
+        # 回滚路径：旧根页仍被目录/WAL undo 引用，不能进入空闲表。
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t DROP COLUMN pad")
+        db.execute_one("ROLLBACK")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        assert _rows(db, "SELECT pad FROM t WHERE id = 0") == [(pad,)]
+        assert db.disk.free_page_count <= free_before + 1
+
+        # 提交路径：切换根页后旧堆页可复用；后续插入不应让文件线性增长。
+        db.execute_one("ALTER TABLE t DROP COLUMN pad")
+        assert db.disk.free_page_count > free_before + 10
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        after_alter_pages = _file_pages(db)
+        for i in range(160, 320):
+            db.execute_one("INSERT INTO t VALUES ($1)", [i])
+        # 新插入优先复用旧堆页；文件不应再随插入线性增长。
+        assert _file_pages(db) <= after_alter_pages
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(320,)]
+        assert reopened.disk.free_page_count > 10  # 旧页仍在空闲表里
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_alter_type_shadow_heap_releases_old_pages(tmp_path, monkeypatch, concurrent):
+    """ALTER COLUMN TYPE 走 shadow heap 后同样回收旧堆页。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        pad = "x" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+
+        db.execute_one("ALTER TABLE t ALTER COLUMN id TYPE BIGINT")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        assert db.disk.free_page_count > free_before + 10
+        after_alter_pages = _file_pages(db)
+        for i in range(160, 320):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        assert _file_pages(db) <= after_alter_pages
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(320,)]
+    finally:
+        reopened.close()
+
+
 def test_vacuum_empty_table_releases_all_but_root(tmp_path):
     db = Database(tmp_path / "db")
     try:

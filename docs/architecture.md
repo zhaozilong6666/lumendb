@@ -231,7 +231,10 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 最多 1008 个 u32 页号），分配新页时优先复用；表满或崩溃丢掉空闲表只会
 泄漏空间，不会把仍被引用的页交给新对象。提交点后 `Database` 才把该事务
 登记的 `freed_pages` 交给空闲表（仍被 pin 的页跳过），回滚则直接丢弃这批
-登记，靠 WAL undo 指回旧页链。释放时把页头重写成 `FREE`；恢复 redo 结束后
+登记，靠 WAL undo 指回旧页链。`ALTER TYPE` / `DROP COLUMN` 的 shadow heap
+切换根页后，旧堆页链也会登记到 `txn.freed_pages`：DDL 开始时历史下界已经
+前移，旧堆页不再供 `AS OF` 读取；提交后这些页进入空闲表复用，回滚仍由
+页原像恢复旧根。释放时把页头重写成 `FREE`；恢复 redo 结束后
 `validate_free_list` 逐项复核页头，持久表里"已被重新分配但仍记为空闲"的
 陈旧项会被剔除，宁可泄漏也不复用已提交页。`Database.close()` 在关闭 Buffer Pool、且
 先做一次 checkpoint 之后，才从文件尾截掉连续空闲页；checkpoint 保证下次

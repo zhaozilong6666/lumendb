@@ -2084,6 +2084,7 @@ class Executor:
         old_columns = list(table.columns)
         old_indexes = dict(table.indexes)
         self._snapshot_table_state(table, txn)
+        old_heap_pages = heap.collect_pages()
 
         # 旧版本仍按旧列类型编码；不能在原堆页上 UPDATE，否则后续扫描
         # 会用新 schema 解码旧版本。这里把可见行写入一棵新的堆页链，
@@ -2097,6 +2098,7 @@ class Executor:
         table.root_page = shadow.root_page
         table.last_page = shadow.last_page
         table.row_count_hint = shadow.row_count_hint
+        txn.freed_pages.update(old_heap_pages)
 
         def undo() -> None:
             table.columns = old_columns
@@ -2303,6 +2305,7 @@ class Executor:
         old_columns = list(table.columns)
         old_indexes = dict(table.indexes)
         self._snapshot_table_state(table, txn)
+        old_heap_pages = heap.collect_pages()
 
         shadow = TableDef(name=table.name, columns=new_columns)
         shadow_heap = HeapFile(self._bp, shadow, self._txns)
@@ -2313,6 +2316,7 @@ class Executor:
         table.root_page = shadow.root_page
         table.last_page = shadow.last_page
         table.row_count_hint = shadow.row_count_hint
+        txn.freed_pages.update(old_heap_pages)
 
         def undo() -> None:
             table.columns = old_columns

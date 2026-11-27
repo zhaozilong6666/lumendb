@@ -379,6 +379,32 @@ class HeapFile:
             visited += 1
         return None
 
+    def collect_pages(self) -> list[int]:
+        """收集从根可达的整条堆页链（只读遍历，不改页内容）。
+
+        ``ALTER TABLE`` 的 shadow heap 切换根页后，旧链不再被当前目录引用；
+        调用方可在提交后把这份列表交给空闲页表复用。历史下界在 DDL 开始时
+        已经前移，因此旧链不再供 ``AS OF`` 读取。
+        """
+        page_ids: list[int] = []
+        visited: set[int] = set()
+        page_id = self.table.root_page
+        while page_id != INVALID_PAGE_ID:
+            if page_id in visited:
+                raise CorruptedPageError(
+                    f"堆页链出现环：{page_id}",
+                    detail=f"表 {self.table.name} 的 next_page 链重复访问",
+                )
+            visited.add(page_id)
+            page = self._fetch(page_id)
+            try:
+                next_id = page.next_page
+            finally:
+                self._release(page)
+            page_ids.append(page_id)
+            page_id = next_id
+        return page_ids
+
     def _scan_with(self, visible) -> Iterator[Tuple[RID, list[Any]]]:
         """按调用方给的可见性谓词顺序扫描，产出 ``(根 RID, 值列表)``。
 

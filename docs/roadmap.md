@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1671 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1669 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1675 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1673 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -501,6 +501,15 @@ B+ 树页不记物理原像；事务内 VACUUM 一旦重排页链、回收死版
 `os.replace` 可能被杀毒/索引短暂锁住目标文件（`WinError 5`）。账本写入改为
 8 次线性退避重试；一次瞬时锁失败不再让整库回归红。新增 1 例重试回归，
 默认全量 1671。
+
+2026-11-27 ALTER shadow heap 旧堆页回收：`ALTER COLUMN TYPE` / `DROP COLUMN`
+把可见行写入新堆页链并切换根页后，旧链不再被目录引用；此前旧索引页会进
+`freed_pages`，旧堆页却永久泄漏。新增 `HeapFile.collect_pages()` 只读遍历
+`root_page` 的 `next_page` 链（带环检测）；两条 shadow 路径在切换根页后把
+旧页登记进 `txn.freed_pages`。DDL 开始时历史下界已前移，旧页不再供 `AS OF`；
+回滚丢弃登记并由 WAL 原像恢复旧根。实测 160 行 900B 表 `DROP COLUMN` 释放
+41 页，后续 160 行插入复用空闲页、文件不再增长。新增 DROP/TYPE 各串行+
+并发 4 例回归，默认全量 1675；并发 1673 + 2 skipped。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
