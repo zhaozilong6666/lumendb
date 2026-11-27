@@ -22,6 +22,12 @@ def test_commit_ledger_roundtrip_and_retention(tmp_path):
     assert retained == [(3, 33), (6, 60), (7, 70)]
     assert CommitLedger(path, max_entries=3).entries() == retained
 
+    # 备份导出的账本必须裁到数据文件的 checkpoint，不能把领先数据的新提交
+    # 一起发给副本；to_bytes(max_lsn) 仍保持完整文件头，可直接落盘重开。
+    exported = tmp_path / "exported.bin"
+    exported.write_bytes(reopened.to_bytes(60))
+    assert CommitLedger(exported).entries() == [(3, 33), (6, 60)]
+
 
 def test_commit_ledger_rejects_corrupted_file(tmp_path):
     path = tmp_path / "commit-ledger.bin"

@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1654 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1656 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -460,6 +460,13 @@ fsync），默认保留最近 100000 条提交；checkpoint 固定为“写账�
 历史窗口拆成持久化的结构下界（VACUUM/DDL，meta offset 48）与账本下界
 （最老保留提交），checkpoint 不再阻断历史读；目标点可以早于 checkpoint。
 VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
+
+2026-11-27 ① P0 账本纳入基准备份与副本：`backup` / `backup_stream` 在
+`backup_end` 前用 `ledger_chunk` 分块发送 `commit-ledger.bin`，客户端 CRC
+校验后原子落盘；页级增量备份携带最新账本，`rebase_from_server` 替换数据
+文件时同步替换账本。副本应用 `COMMIT` 时登记提交 LSN，每批应用后重写
+账本，因此副本的 `SHOW COMMIT LOG` / AS OF 覆盖基准备份之后的新提交。
+新增基准备份历史读与增量重建账本 2 例；默认全量 1656。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败

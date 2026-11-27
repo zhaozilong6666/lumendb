@@ -86,8 +86,13 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 ### P0 剩余风险
 
 持久账本解决了“checkpoint 后提交历史消失”，但它仍是**有界保留**：超过
-`commit_ledger_max_entries` 的更老提交会被裁掉，目标点随之下界抬高。账本
-文件也还没有纳入基准备份/增量备份的传输清单；副本侧的历史读需要单独设计。
+`commit_ledger_max_entries` 的更老提交会被裁掉，目标点随之下界抬高。
+
+基准备份、页级增量基准备份和副本 WAL 应用都已携带/维护账本：主库备份流
+把 `commit-ledger.bin` 作为独立分块发送，客户端整包 CRC 校验后原子落盘；
+副本每应用到一个 `COMMIT` 记录，就把该记录的 LSN 登记为提交点并重写账本
+（不需要等副本自己 checkpoint）。因此副本侧的 `SHOW COMMIT LOG` 与 AS OF
+不再依赖主库 WAL 窗口，也不再只覆盖基准备份时的那一段历史。
 
 ### P2 保留水位（已交付显式目标点）
 
@@ -118,7 +123,9 @@ VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个�
 - `CREATE INDEX` / `REINDEX` 推进下界，索引重建前的目标点明确拒绝；
 - `EXPLAIN` 的 SeqScan / IndexScan 都标注 AS OF 目标；
 - 早于 floor、晚于 latest、显式事务、视图数据源、时间字面量的稳定报错；
-- JOIN / 子查询的多目标点拒绝。
+- JOIN / 子查询的多目标点拒绝；
+- 基准备份携带账本后，副本可读基准备份之前的提交点；页级增量重建会刷新
+  账本；副本应用新 `COMMIT` 后 AS OF 目标点可立即使用，且账本已落盘。
 
 `tests/unit/test_commit_log.py` 与 `tests/unit/test_commit_ledger.py` 覆盖
 账本跨 checkpoint、重开、保留窗口裁剪、文件损坏和 checkpoint 写入失败保护。
@@ -133,5 +140,5 @@ VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个�
    LSN 为准，避免时钟回拨。
 3. 索引历史读已落地为“候选 + 回堆解析”；要不要进一步做覆盖索引的历史
    索引-only 扫描，需要单独保留历史键值或可见性元数据。
-4. 账本文件如何进入备份/复制链路：基准备份要原子携带它，增量备份要处理
-   checkpoint 之间的追加。
+4. 账本进入备份链路后，副本每次应用 `COMMIT` 都会重写账本；高频复制下每
+   批写入成本是否需要用追加段或延迟合并优化，需要按复制吞吐量评估。

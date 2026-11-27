@@ -501,6 +501,34 @@ class WALServer:
             except OSError:
                 pass
 
+    def _send_ledger_chunks(
+        self,
+        conn: socket.socket,
+        *,
+        compress: bool,
+        chunk_size: int,
+        checkpoint_lsn: int,
+    ) -> None:
+        """把持久提交账本作为独立分块随基准备份发送。
+
+        账本可能比一个 chunk 大，单独分块而不是塞进 ``backup_end``，
+        避免控制消息无限膨胀；每块自带 CRC，客户端整包校验后再原子落盘。
+        只发送 commit_lsn 不晚于本次 checkpoint 的条目，避免账本领先于
+        已拷贝的数据文件。
+        """
+        ledger = self.primary.commit_ledger.to_bytes(checkpoint_lsn)
+        for offset in range(0, len(ledger), chunk_size):
+            chunk = ledger[offset : offset + chunk_size]
+            _send_line(
+                conn,
+                {
+                    "type": "ledger_chunk",
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                    "crc": _crc32(chunk),
+                },
+                compress=compress,
+            )
+
     def _handle_backup(self, conn: socket.socket, request: dict) -> None:
         compress = bool(request.get("compress"))
         try:
@@ -514,6 +542,7 @@ class WALServer:
         retain = getattr(self.primary.wal, "retain_lsn", None)
         if retain is not None and self.slot_dir is None:
             self.primary.wal.retain_lsn = checkpoint_lsn
+        ledger = self.primary.commit_ledger.to_bytes(checkpoint_lsn)
         _send_line(
             conn,
             {
@@ -521,6 +550,10 @@ class WALServer:
                 "checkpoint_lsn": checkpoint_lsn,
                 "data": base64.b64encode(data).decode("ascii"),
                 "crc": _crc32(data),
+                # 账本是跨 checkpoint 的历史窗口；只传数据文件会让副本在
+                # 基准备份后丢失旧提交点，AS OF 只能退回到空账本。
+                "ledger": base64.b64encode(ledger).decode("ascii"),
+                "ledger_crc": _crc32(ledger),
             },
             compress=compress,
         )
@@ -557,6 +590,12 @@ class WALServer:
                         },
                         compress=compress,
                     )
+            self._send_ledger_chunks(
+                conn,
+                compress=compress,
+                chunk_size=chunk_size,
+                checkpoint_lsn=checkpoint_lsn,
+            )
             _send_line(
                 conn,
                 {"type": "backup_end", "checkpoint_lsn": checkpoint_lsn},
@@ -610,6 +649,12 @@ class WALServer:
                     },
                     compress=compress,
                 )
+            self._send_ledger_chunks(
+                conn,
+                compress=compress,
+                chunk_size=256 * 1024,
+                checkpoint_lsn=checkpoint_lsn,
+            )
             _send_line(
                 conn,
                 {"type": "incremental_end", "checkpoint_lsn": checkpoint_lsn},
@@ -859,6 +904,27 @@ class WALClient:
                 self.close()
                 raise
 
+    @staticmethod
+    def _install_ledger(directory: str | Path, payload: bytes) -> None:
+        """把收到的账本原子写到目标目录的 ``commit-ledger.bin``。"""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        sidecar = directory / "commit-ledger.bin"
+        tmp = sidecar.with_name(sidecar.name + ".part")
+        with open(tmp, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(tmp, sidecar)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
     def backup_to(self, target: str | Path, *, chunk_size: int = 256 * 1024) -> int:
         """分块接收基准备份并落盘，返回基础 checkpoint LSN。"""
         target = Path(target)
@@ -866,18 +932,28 @@ class WALClient:
         tmp = target.with_name(target.name + ".part")
         try:
             checkpoint_lsn = None
+            ledger = bytearray()
             with open(tmp, "wb") as fh:
                 for data in self._request(
                     {"type": "backup_stream", "chunk_size": chunk_size}
                 ):
                     if data.get("type") == "backup_chunk":
                         fh.write(_decode_blob(data, what="基准备份分块"))
+                    elif data.get("type") == "ledger_chunk":
+                        ledger.extend(
+                            _decode_blob(data, what="提交账本分块")
+                        )
                     elif data.get("type") == "backup_end":
                         checkpoint_lsn = int(data["checkpoint_lsn"])
                         break
             if checkpoint_lsn is None:
                 raise StorageError("基准备份流没有结束标记")
             atomic_replace(tmp, target)
+            if ledger:
+                # 数据文件先就位，账本再原子替换：如果中途崩溃，最坏是
+                # 新数据没有账本（历史读显式不可用），而不是旧账本配新
+                # 数据造成静默错读。账本损坏时 Database 打开即报错。
+                self._install_ledger(target.parent, bytes(ledger))
             return checkpoint_lsn
         except Exception:
             try:
@@ -899,6 +975,7 @@ class WALClient:
         checkpoint_lsn = None
         expected_count = None
         page_count = 0
+        ledger = bytearray()
         for data in self._request(
             {"type": "incremental", "base_lsn": int(base_lsn)}
         ):
@@ -918,6 +995,8 @@ class WALClient:
                     )
                 (target / f"{page_id:08d}.page").write_bytes(page_bytes)
                 page_count += 1
+            elif data.get("type") == "ledger_chunk":
+                ledger.extend(_decode_blob(data, what="提交账本分块"))
             elif data.get("type") == "incremental_end":
                 checkpoint_lsn = int(data["checkpoint_lsn"])
                 break
@@ -928,6 +1007,10 @@ class WALClient:
                 "增量基准备份页数不完整",
                 detail=f"收到 {page_count} 页，期望 {expected_count} 页",
             )
+        if ledger:
+            # 页文件由调用方在关闭数据库后落回数据文件；账本必须先就位，
+            # 这样重开后的 AS OF 与 SHOW COMMIT LOG 立即覆盖新 checkpoint。
+            self._install_ledger(target, bytes(ledger))
         return checkpoint_lsn, page_count
 
     def backup(self) -> tuple[bytes, int]:

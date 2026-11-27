@@ -24,6 +24,7 @@ from lumendb.replication.wal_stream import (
     _record_from_json,
     _record_to_json,
 )
+from lumendb.storage.commit_ledger import CommitLedger
 from lumendb.storage.pager import DiskManager
 from lumendb.storage.page import PageType
 from lumendb.storage.wal import LogRecord, LogType
@@ -904,3 +905,66 @@ class TestReplicaApplyInterleavingWithReads:
             assert applied == 0
         finally:
             primary.close()
+
+
+def test_backup_carries_commit_ledger_and_replica_history_read(tmp_path):
+    primary = make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+    primary.execute_one("INSERT INTO t VALUES (1, 'old')")
+    old_lsn = primary.txns.commit_log()[-1][1]
+    primary.execute_one("UPDATE t SET v = 'new' WHERE id = 1")
+    server = WALServer(primary, slot_dir=tmp_path / "slots").start()
+    replica = None
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica", replica_id="asof"
+        )
+        # 基准备份必须把跨 checkpoint 的提交账本一起带来；否则副本只拿到
+        # 数据文件，旧提交点不在内存账本里，AS OF 直接落在窗口外。
+        assert (replica.path / "commit-ledger.bin").exists()
+        assert replica.execute_one(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {old_lsn}"
+        ).rows == [(1, "old")]
+
+        primary.execute_one("INSERT INTO t VALUES (2, 'after')")
+        after_lsn = primary.txns.commit_log()[-1][1]
+        replica.replicate_from_server(server.host, server.port, replica_id="asof")
+        assert replica.execute_one(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {after_lsn}"
+        ).rows == [(1, "new"), (2, "after")]
+        assert after_lsn in {lsn for _xid, lsn in replica.db.txns.commit_log()}
+        persisted = CommitLedger(replica.path / "commit-ledger.bin")
+        assert after_lsn in {lsn for _xid, lsn in persisted.entries()}
+    finally:
+        if replica is not None:
+            replica.db.close()
+        server.stop()
+        primary.close()
+
+
+def test_incremental_backup_refreshes_replica_commit_ledger(tmp_path):
+    primary = make_primary(tmp_path)
+    primary.execute_one("CREATE TABLE t (id INT PRIMARY KEY)")
+    primary.execute_one("INSERT INTO t VALUES (1)")
+    server = WALServer(primary, slot_dir=tmp_path / "slots").start()
+    replica = None
+    try:
+        replica = Replica.bootstrap_from_server(
+            server.host, server.port, tmp_path / "replica", replica_id="rebase"
+        )
+        primary.execute_one("INSERT INTO t VALUES (2)")
+        new_lsn = primary.txns.commit_log()[-1][1]
+        checkpoint_lsn = replica.rebase_from_server(
+            server.host, server.port, replica_id="rebase"
+        )
+        assert checkpoint_lsn >= new_lsn
+        # rebase 换掉数据文件后，账本必须同步刷新；只用旧基准备份账本时
+        # 目标点会被判成晚于最近提交。
+        assert replica.execute_one(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {new_lsn}"
+        ).rows == [(1,), (2,)]
+    finally:
+        if replica is not None:
+            replica.db.close()
+        server.stop()
+        primary.close()

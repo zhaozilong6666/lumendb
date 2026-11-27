@@ -79,6 +79,7 @@ class Replica:
             read_only=True,
             checkpoint_wal_bytes=0,
             wal_segment_bytes=wal_segment_bytes,
+            commit_ledger_writeable=True,
         )
         self._applied_lsn = applied_lsn
         #: 提升成主库时下一条 WAL 记录应使用的 LSN。基准备份后是
@@ -581,6 +582,7 @@ class Replica:
     def _apply_records(self, records, primary: Database | None) -> int:
         """在已持有数据锁的前提下应用一段记录（连续性与幂等检查在内）。"""
         count = 0
+        committed = False
         for record in records:
             if record.lsn <= self._applied_lsn:
                 continue
@@ -603,6 +605,11 @@ class Replica:
                 self.db.txns.note_replica_state(record.xid, TxnState.ACTIVE)
             elif record.rtype == LogType.COMMIT:
                 self.db.txns.note_replica_state(record.xid, TxnState.COMMITTED)
+                # COMMIT 记录本身的 LSN 就是该事务的提交点；副本没有自己的
+                # WAL 账本，必须在这里把提交点补进内存账本和持久账本，否则
+                # 基准备份之后的历史读会停在基准备份的 checkpoint LSN。
+                self.db.txns.install_commit_lsns({record.xid: record.lsn})
+                committed = True
             elif record.rtype == LogType.ABORT:
                 self.db.txns.note_replica_state(record.xid, TxnState.ABORTED)
             # CHECKPOINT 只对主库自己的恢复有意义；副本按 LSN 继续追。
@@ -610,6 +617,11 @@ class Replica:
             self._expected_end_lsn = record.lsn + len(record.encode())
             self._next_lsn = self._expected_end_lsn
             count += 1
+        if committed:
+            # 每批有提交就原子重写账本。副本不跑 checkpoint，不能等主库的
+            # checkpoint 才落盘；写到一半崩溃时旧账本仍完整，重启后最多
+            # 重放本批 WAL 补回这些提交点。
+            self.db.commit_ledger.write(self.db.txns.commit_log())
         return count
 
     def _apply_page_image(self, record) -> None:
@@ -1053,6 +1065,7 @@ class Replica:
                 read_only=True,
                 checkpoint_wal_bytes=0,
                 wal_segment_bytes=getattr(self, "_wal_segment_bytes", 1024 * 1024),
+                commit_ledger_writeable=True,
             )
             db = self.db
         for callback in list(self._step_down_listeners):
@@ -1139,8 +1152,17 @@ class Replica:
                 finally:
                     disk.close()
                 atomic_replace(staged_path, data_path)
+                ledger_staged = temp / "commit-ledger.bin"
+                if ledger_staged.exists():
+                    # 页级增量已经带着新 checkpoint 的完整账本；必须在
+                    # 重开数据库前替换掉旧账本，否则副本只认得旧 checkpoint
+                    # 之前的提交点，新的 AS OF 目标会被判成“晚于最近提交”。
+                    atomic_replace(ledger_staged, self.path / "commit-ledger.bin")
                 self.db = Database(
-                    self.path, read_only=True, checkpoint_wal_bytes=0
+                    self.path,
+                    read_only=True,
+                    checkpoint_wal_bytes=0,
+                    commit_ledger_writeable=True,
                 )
                 self._applied_lsn = checkpoint_lsn
                 self._next_lsn = checkpoint_lsn + 1
@@ -1155,7 +1177,10 @@ class Replica:
                 # 网络或页传输失败时，副本句柄不能留在已关闭状态。
                 if getattr(self.db, "disk", None) is None or self.db.disk._fh.closed:
                     self.db = Database(
-                        self.path, read_only=True, checkpoint_wal_bytes=0
+                        self.path,
+                        read_only=True,
+                        checkpoint_wal_bytes=0,
+                        commit_ledger_writeable=True,
                     )
                 raise
             finally:
@@ -1214,7 +1239,10 @@ class Replica:
             base_lsn = client.backup_to(data_path)
             try:
                 self.db = Database(
-                    self.path, read_only=True, checkpoint_wal_bytes=0
+                    self.path,
+                    read_only=True,
+                    checkpoint_wal_bytes=0,
+                    commit_ledger_writeable=True,
                 )
             except Exception:
                 # 基准备份文件打不开（磁盘截断/校验失败）时退成可写句柄，

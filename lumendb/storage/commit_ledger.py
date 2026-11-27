@@ -117,6 +117,26 @@ class CommitLedger:
         ordered = sorted(by_xid.items(), key=lambda item: (item[1], item[0]))
         return ordered[-self.max_entries :]
 
+    def _encode(self, entries: Iterable[tuple[int, int]]) -> bytes:
+        body = bytearray(_HEADER.pack(_MAGIC, _VERSION, len(entries)))
+        for xid, lsn in entries:
+            body.extend(_ENTRY.pack(xid, lsn))
+        return bytes(body)
+
+    def to_bytes(self, max_lsn: int | None = None) -> bytes:
+        """导出当前账本的完整二进制，供基准备份/增量备份携带。
+
+        ``max_lsn`` 用于把账本裁剪到数据文件对应的 checkpoint：并发
+        checkpoint 可能在数据文件快照之后又写入更新的提交点，不能把
+        这些“账本领先数据”的条目发给副本。
+        """
+        with self._lock:
+            entries = self._entries
+            if max_lsn is not None:
+                limit = int(max_lsn)
+                entries = [item for item in entries if item[1] <= limit]
+            return self._encode(entries)
+
     def write(
         self, entries: Iterable[tuple[int, int]] | dict[int, int]
     ) -> list[tuple[int, int]]:
@@ -130,11 +150,7 @@ class CommitLedger:
         retained = self._compact(entries)
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            body = bytearray(
-                _HEADER.pack(_MAGIC, _VERSION, len(retained))
-            )
-            for xid, lsn in retained:
-                body.extend(_ENTRY.pack(xid, lsn))
+            body = self._encode(retained)
             temp = self.path.with_name(self.path.name + ".tmp")
             with open(temp, "w+b") as fh:
                 fh.write(body)

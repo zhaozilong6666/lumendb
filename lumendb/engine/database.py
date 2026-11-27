@@ -269,6 +269,7 @@ class Database:
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
         checkpoint_every_commits: int = 0,
         commit_ledger_max_entries: int = 100_000,
+        commit_ledger_writeable: bool = False,
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
         write_fence: Optional[Callable[[], None]] = None,
@@ -290,7 +291,7 @@ class Database:
         self.commit_ledger = CommitLedger(
             self.path / "commit-ledger.bin",
             max_entries=commit_ledger_max_entries,
-            read_only=read_only,
+            read_only=read_only and not commit_ledger_writeable,
         )
         version_cap = int(vacuum_online_max_versions)
         if version_cap <= 0:

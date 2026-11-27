@@ -386,8 +386,9 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 
 - `PAGE_IMAGE`：先 `DiskManager.ensure_page` 补齐页号，再写完整页镜像；
 - `UPDATE` / `CLR`：按 pageLSN 判断是否需要写 after image；
-- `BEGIN` / `COMMIT` / `ABORT`：只更新副本的 `TransactionManager` 状态，
-  让快照读看到与主库一致的事务可见性；副本不参与本机提交队列。
+- `BEGIN` / `COMMIT` / `ABORT`：更新副本的 `TransactionManager` 状态，
+  让快照读看到与主库一致的事务可见性；`COMMIT` 还把该记录的 LSN 登记为
+  副本的提交点并重写 `commit-ledger.bin`，副本不参与本机提交队列。
 
 每批应用结束后先 `flush_all` 页、再原子写 `replica.lsn` marker，崩溃后
 从 marker 重放；pageLSN 保证重复应用幂等。副本的 `Database(read_only=True)`
@@ -402,6 +403,16 @@ Binder 在 `_source_for` 中把视图展开成一个 `CteScan(child=...)`：先�
 并恢复保留点。若起点已经落在已回收段之前，服务端返回明确错误，要求重新
 基准备份，避免静默丢段。
 
+基准备份不只传数据文件：`backup` / `backup_stream` 在 `backup_end` 之前用
+`ledger_chunk` 分块发送 `commit-ledger.bin`，只包含 `commit_lsn` 不晚于本次
+checkpoint 的条目（避免账本领先于已拷贝的数据文件），客户端整包 CRC 校验
+后原子写入目标目录；页级增量备份在同一流里带上主库最新账本，副本
+`rebase_from_server` 在替换数据文件后替换账本。副本应用 `COMMIT` 时把 LSN
+登记进内存账本，并在每批应用后重写账本；它不等副本 checkpoint，因此副本侧
+的 `SHOW COMMIT LOG` / AS OF 不会停在基准备份的 checkpoint LSN。账本文件
+损坏时副本打开数据库会明确报错；缺失时账本为空，历史读会显式拒绝，而不是
+猜一个错误的历史窗口。
+
 复制流的每个 WAL 记录额外携带 `has_crc` / `crc`：CRC32 覆盖逻辑帧头和
 payload（不覆盖帧尾自身的 CRC 字段），接收端在反序列化时校验；不带 `crc`
 的旧服务端仍可通信。更老的服务端连 `has_crc` 都不发送，接收端必须按
@@ -410,8 +421,8 @@ payload（不覆盖帧尾自身的 CRC 字段），接收端在反序列化时�
 下一条记录应有的字节边界，发现批次跳过记录时抛 `StorageError`，不把
 `replica.lsn` 静默推过缺口；基准备份和提升会重置这个进程内边界。
 
-提升时的另一个边界：基准备份只拷贝数据文件、不拷贝 WAL，副本提升后本地
-WAL 是空的。`Replica` 在 `replica.lsn` 里同时记录“最后 apply 的记录 LSN”
+提升时的另一个边界：基准备份拷贝数据文件与提交账本、不拷贝 WAL，副本
+提升后本地 WAL 是空的。`Replica` 在 `replica.lsn` 里同时记录“最后 apply 的记录 LSN”
 和“下一条记录边界”；`promote()` 在 WAL 仍为空时把分段 WAL 的 `next_lsn`
 接到这个边界，避免新主库从 LSN 1 重新开始、让已经追到高位的副本拒绝后续记录。
 旧版单整数 marker 仍可读，但只按 `applied_lsn + 1` 估算边界，精确边界从新
@@ -589,7 +600,8 @@ leader 复辟后仍可能写进一些“多数派没收到”的记录（共享 
   但槽位目录只属于一个主库数据目录，没有跨节点槽位复制；主库重启时用
   `Database(wal_retain_lsn=min_slot(...))` 在恢复和自动 checkpoint 之前
   恢复保留点，避免启动顺序造成误回收；
-- 基准备份已分块传输，但仍是完整全量拷贝；页级增量基准备份已做 MVP
+- 基准备份已分块传输，且数据文件与 `commit-ledger.bin` 同流携带，但仍是
+  完整全量拷贝；页级增量基准备份已做 MVP
   （`snapshot_pages(base_lsn)` 只传 pageLSN 大于基础 LSN 的页），基准备份
   内容本身的压缩仍未做；
 - `_write_lock` 只覆盖 `Database._run` 的写语句，跨进程或直接写磁盘不受
