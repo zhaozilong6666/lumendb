@@ -3,7 +3,8 @@
 这一层只认识"页"这一个概念，不知道页里装的是什么。所有页号都是文件内的
 线性偏移（``page_id * PAGE_SIZE``），因此页号本身就是地址。元数据页维护
 一个容量有限的空闲页号数组：上层在提交后把不再可达的页交进来，分配时优先
-复用；数组之外没有额外的空闲页链表文件。
+复用。数组满后多出的页进入进程内溢出列表：页头仍写成 FREE，本进程可继续
+复用、关闭截尾也能看到；但不写 page 0，崩溃后只泄漏，不会误用仍被引用的页。
 """
 
 from __future__ import annotations
@@ -168,6 +169,9 @@ class DiskManager:
         #: write，会把一页写到另一页的偏移（页内 page_id 与目标页号不符）。
         #: 这是进程内 IO 串行锁，与跨进程的 FileLock 是两件事。
         self._io_lock = threading.RLock()
+        #: 元数据页数组满后仍被释放的页。仅本进程内存态：不持久化，崩溃后
+        #: 丢失只泄漏；页头已经写成 FREE，重启时不会把它当活页复用。
+        self._overflow_free: list[int] = []
 
         try:
             existed = self.path.exists() and self.path.stat().st_size > 0
@@ -259,10 +263,11 @@ class DiskManager:
 
     @property
     def free_page_count(self) -> int:
-        return len(self._meta.free_page_ids())
+        return len(self._meta.free_page_ids()) + len(self._overflow_free)
 
     def free_page_ids(self) -> list[int]:
-        return self._meta.free_page_ids()
+        """返回所有可复用页：元数据数组 + 进程内溢出列表。"""
+        return self._meta.free_page_ids() + list(self._overflow_free)
 
     def allocate_page(self) -> int:
         """分配一个页号：优先复用空闲页，否则扩展文件。
@@ -276,6 +281,10 @@ class DiskManager:
             if free_ids:
                 pid = free_ids.pop()
                 self._meta.set_free_page_ids(free_ids)
+            elif self._overflow_free:
+                # 数组空但内存溢出列表还有页：继续复用，避免一次大 DROP
+                # 之后本进程只能向文件尾扩展。
+                pid = self._overflow_free.pop()
             else:
                 pid = self.num_pages
             buf = bytearray(PAGE_SIZE)
@@ -297,12 +306,14 @@ class DiskManager:
         持久化的空闲表可能落后于实际页分配：崩溃前最后一次 ``_persist_meta``
         之后，某个空闲页可能已被分配并写入一个已提交对象。恢复 redo 完成后
         这些页的页头不再是 ``FREE``；这里逐项读页头复核，非 FREE 或页号
-        不匹配的条目直接丢弃（只泄漏，不复用）。最多 1008 项，开销可控。
+        不匹配的条目直接丢弃（只泄漏，不复用）。page 0 数组最多 1008 项，
+        进程内溢出列表通常为空；一并复核，避免运行期调用后留下陈旧项。
         """
         valid: list[int] = []
+        valid_overflow: list[int] = []
         dropped = 0
         with self._io_lock:
-            for pid in self._meta.free_page_ids():
+            for pid in self._meta.free_page_ids() + self._overflow_free:
                 if pid <= 0 or pid >= self.num_pages:
                     dropped += 1
                     continue
@@ -318,15 +329,20 @@ class DiskManager:
                 ):
                     dropped += 1
                     continue
-                valid.append(pid)
+                if len(valid) < META_FREE_CAPACITY:
+                    valid.append(pid)
+                else:
+                    valid_overflow.append(pid)
             if valid != self._meta.free_page_ids():
                 self._meta.set_free_page_ids(valid)
+            self._overflow_free = valid_overflow
         return dropped
 
     def release_pages(self, page_ids: Iterable[int]) -> int:
         """把一批已不再被引用的页号加入空闲表，返回实际接受的页数。
 
-        这是**提示性回收**：空闲表满了或页号非法就跳过，最多是空间泄漏，
+        这是**提示性回收**：页号非法就跳过；page 0 数组满后多出的页进入
+        进程内溢出列表，本进程仍可复用，但不持久化。最多是崩溃后空间泄漏，
         不会把仍被引用的页交给分配器。调用方必须在提交点之后调用，并且
         确认这些页已经不在任何页链/索引/目录版本里。
 
@@ -340,14 +356,12 @@ class DiskManager:
         accepted = 0
         with self._io_lock:
             free_ids = self._meta.free_page_ids()
-            existing = set(free_ids)
+            existing = set(free_ids) | set(self._overflow_free)
             limit = self.num_pages
             for raw in page_ids:
                 pid = int(raw)
                 if pid <= 0 or pid >= limit or pid in existing:
                     continue
-                if len(free_ids) >= META_FREE_CAPACITY:
-                    break
                 buf = bytearray(PAGE_SIZE)
                 struct.pack_into("<H", buf, 0, PageType.FREE)
                 struct.pack_into("<I", buf, 16, pid)
@@ -357,7 +371,11 @@ class DiskManager:
                 except OSError:
                     # 释放是提示性回收，不能把一次写失败升级成提交失败。
                     continue
-                free_ids.append(pid)
+                if len(free_ids) >= META_FREE_CAPACITY:
+                    # page 0 数组已满：记进进程内溢出列表，页头已是 FREE。
+                    self._overflow_free.append(pid)
+                else:
+                    free_ids.append(pid)
                 existing.add(pid)
                 accepted += 1
             if accepted:
@@ -379,14 +397,20 @@ class DiskManager:
         removed = 0
         with self._io_lock:
             free_ids = self._meta.free_page_ids()
-            free_set = set(free_ids)
+            free_set = set(free_ids) | set(self._overflow_free)
             end = self.num_pages
             while end > 1 and (end - 1) in free_set:
                 end -= 1
                 removed += 1
             if removed == 0:
                 return 0
-            kept = [pid for pid in free_ids if pid < end]
+            kept_meta = [pid for pid in free_ids if pid < end]
+            kept_overflow = [pid for pid in self._overflow_free if pid < end]
+            # 截尾后把溢出页尽量回填进 page 0 数组，减少下一次崩溃的泄漏。
+            room = META_FREE_CAPACITY - len(kept_meta)
+            if room > 0 and kept_overflow:
+                kept_meta.extend(kept_overflow[:room])
+                kept_overflow = kept_overflow[room:]
             self._fh.truncate(end * PAGE_SIZE)
             self._fh.flush()
             os.fsync(self._fh.fileno())
@@ -394,7 +418,8 @@ class DiskManager:
             # 让一个陈旧的低水位继续留着，下一次启动的 _sanitize 会误删
             # 文件里仍然存在的空闲项。
             self._meta.next_page_id = end
-            self._meta.set_free_page_ids(kept)
+            self._meta.set_free_page_ids(kept_meta)
+            self._overflow_free = kept_overflow
             self._persist_meta()
         return removed
 

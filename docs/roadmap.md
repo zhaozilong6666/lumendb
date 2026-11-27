@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1685 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1683 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1687 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1685 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -366,9 +366,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 仍是快照隔离（不是 PostgreSQL READ COMMITTED），静默切换会改变用户可见语义；
 默认串行短事务吞吐也更好。文件级空间回收已补 MVP：离线 VACUUM 摘掉链尾
 空页、REINDEX/VACUUM 旧索引页、普通 DML 的旧目录中间根页在提交后进入
-元数据页空闲表（最多 1008 项），分配优先复用；关闭时先 checkpoint 再从
-文件尾截掉连续空闲页。中间空页仍只复用不搬移，在线 VACUUM 仍不摘页链；
-空闲表溢出只泄漏空间，不会误用活页。`VACUUM` 在线模式只保 RID、不重排
+元数据页空闲表（page 0 最多 1008 项），分配优先复用；数组满后溢出页进
+进程内列表，本进程仍可复用并参与关闭截尾，但列表不持久化，崩溃/重启只泄漏
+空间、不会误用活页。关闭时先 checkpoint 再从文件尾截掉连续空闲页。中间空页
+仍只复用不搬移，在线 VACUUM 仍不摘页链。`VACUUM` 在线模式只保 RID、不重排
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
@@ -479,7 +480,7 @@ VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 `Transaction.freed_pages`；COMMIT 成功后才 `BufferPool.drop_pages` +
 `release_pages`，ROLLBACK 直接丢弃登记。`Database.close()` 先 checkpoint
 再截尾，避免恢复用旧 WAL 把已截页扩回。空闲表是提示性结构：释放时把页头写成 FREE，恢复 redo 后
-`validate_free_list` 按页头剔除陈旧项；崩溃丢失或 1008 项溢出只泄漏空间，
+`validate_free_list` 按页头剔除陈旧项；崩溃丢失或溢出列表不持久化只泄漏空间，
 不会把活页交给分配器。新增 12 例空间回收测试；
 默认全量 1668。
 
@@ -532,6 +533,18 @@ skipped。
 
 CI #387 在 `014cceb` 上五个 job（Ubuntu/Windows 3.12/3.13 + Concurrent
 DML）全部 Success，9m38s。
+
+2026-11-27 空闲表溢出兜底：page 0 的空闲页数组容量固定 1008，`release_pages`
+在数组满后直接丢弃剩余页号，页头虽是 FREE 却无人知道，进程内也不能复用。
+实测 4200 行、900B 填充表 `DROP TABLE` 后空闲计数仍只有 1008，而实际已释放
+1050 页，42 页立即泄漏。`DiskManager` 新增进程内 `_overflow_free`：数组满后
+多出的页进入该列表，`allocate_page` 在数组空后继续弹溢出页，
+`truncate_free_tail` 用“数组 + 溢出”并集识别文件尾并把剩余项回填数组；
+`free_page_count` / `free_page_ids()` 也返回合并结果。修复后同一场景
+`free_page_count` 为 1050；列表不持久化，重启后回到 1008，且若文件尾仍有
+目录活页，截尾不会搬移活页，文件可能仍不缩短。新增 1 例溢出页优先复用
+回归、改写容量溢出用例为“复用 + 截尾”；默认全量 1687 passed（167.92s），
+并发 1685 通过 + 2 skipped（177.14s）。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记

@@ -435,22 +435,80 @@ def test_free_list_survives_disk_reopen(tmp_path):
         reopened.close()
 
 
-def test_free_list_capacity_overflow_leaks_without_corruption(tmp_path):
+def test_free_list_capacity_overflow_is_reused_and_tail_truncated(tmp_path):
     from lumendb.storage.pager import META_FREE_CAPACITY
 
     disk = DiskManager(tmp_path / "space.data")
     try:
         for _ in range(META_FREE_CAPACITY + 2):
             disk.allocate_page()
-        # 释放全部页，但空闲表只能记 META_FREE_CAPACITY 个；多出的页
-        # 只泄漏空间，不会被误当作可用页。
-        accepted = disk.release_pages(range(1, META_FREE_CAPACITY + 2))
-        assert accepted == META_FREE_CAPACITY
-        assert disk.free_page_count == META_FREE_CAPACITY
-        # 仍可正常分配与读取，未出现页号越界。
+        # 释放全部页：page 0 数组只放得下 META_FREE_CAPACITY 个，多出的
+        # 页进入进程内溢出列表，但都必须可复用、可截尾，不能静默丢掉。
+        accepted = disk.release_pages(range(1, META_FREE_CAPACITY + 3))
+        assert accepted == META_FREE_CAPACITY + 2
+        assert disk.free_page_count == META_FREE_CAPACITY + 2
+        assert len(disk.free_page_ids()) == META_FREE_CAPACITY + 2
+
+        # 仍可正常分配与读取，未出现页号越界；溢出页也算可用页。
         pid = disk.allocate_page()
         assert pid <= META_FREE_CAPACITY + 2
         disk.read_page(pid)
+        assert disk.free_page_count == META_FREE_CAPACITY + 1
+
+        # 释放顺序把最后两页放进溢出列表；刚才的分配取自数组尾页 1008，
+        # 所以能从文件尾截掉的正是溢出页 1009/1010。
+        removed = disk.truncate_free_tail()
+        assert removed == 2
+        assert disk.num_pages == META_FREE_CAPACITY + 1
+        assert disk.free_page_count == META_FREE_CAPACITY - 1
+    finally:
+        disk.close()
+
+
+def test_overflow_free_pages_are_allocated_before_file_growth(tmp_path):
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    disk = DiskManager(tmp_path / "space.data")
+    try:
+        for _ in range(META_FREE_CAPACITY + 2):
+            disk.allocate_page()
+        disk.release_pages(range(1, META_FREE_CAPACITY + 3))
+        pages_before = disk.num_pages
+        assert disk.free_page_count == META_FREE_CAPACITY + 2
+
+        # 把数组和溢出列表全部取完：一次都不能扩展文件。
+        for _ in range(META_FREE_CAPACITY + 2):
+            pid = disk.allocate_page()
+            assert pid <= META_FREE_CAPACITY + 2
+        assert disk.free_page_count == 0
+        assert disk.num_pages == pages_before
+
+        # 只有两者都空了才允许向文件尾扩展。
+        disk.allocate_page()
+        assert disk.num_pages == pages_before + 1
+    finally:
+        disk.close()
+
+
+def test_truncate_refills_overflow_free_pages_into_meta(tmp_path):
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    disk = DiskManager(tmp_path / "space.data")
+    try:
+        # 页 1 和 10 保持存活；把 1012..11 先释放填满数组，再释放 9..2
+        # 让低页号落在溢出列表；文件尾 1012..11 可截，10 挡住继续截。
+        for _ in range(META_FREE_CAPACITY + 4):
+            disk.allocate_page()
+        disk.release_pages(range(META_FREE_CAPACITY + 4, 10, -1))
+        disk.release_pages(range(9, 1, -1))
+        assert disk.free_page_count == META_FREE_CAPACITY + 2
+
+        removed = disk.truncate_free_tail()
+        assert removed == 1002
+        assert disk.num_pages == 11
+        # 溢出页 2/3 回填进 page 0 数组，不能因截尾被丢掉。
+        assert disk.free_page_count == 8
+        assert sorted(disk.free_page_ids()) == list(range(2, 10))
     finally:
         disk.close()
 
