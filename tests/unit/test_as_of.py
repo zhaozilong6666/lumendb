@@ -208,6 +208,96 @@ def test_as_of_survives_reopen_with_pre_checkpoint_rows(tmp_path):
         db.close()
 
 
+def test_as_of_uses_persistent_ledger_for_pre_checkpoint_delete(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        db.execute("DELETE FROM t WHERE id = 1")
+        delete_lsn = _last_commit(db)
+        db.checkpoint()
+    finally:
+        db.close()
+
+    db = Database(tmp_path)
+    try:
+        # 旧版本仍留在堆里，xmax 指向 checkpoint 之前提交的删除事务。
+        # 如果只靠当前 WAL 窗口，这个 xmax 无法归类，严格历史读会报错；
+        # 持久账本必须能证明它在目标点之前已经提交。
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+        latest = _last_commit(db)
+        log_lsns = [row[1] for row in db.execute("SHOW COMMIT LOG")[0].rows]
+        assert delete_lsn in log_lsns
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {latest}"
+        )[0].rows == [(2, "two")]
+    finally:
+        db.close()
+
+
+def test_as_of_reads_before_checkpoint_with_persistent_ledger(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        insert_lsn = _last_commit(db)
+        db.checkpoint()
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+
+        # checkpoint 只落盘和裁 WAL，不回收旧版本；持久账本仍保留两个提交，
+        # 所以目标点可以落在 checkpoint 之前。
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {insert_lsn}"
+        )[0].rows == [(1, "old")]
+    finally:
+        db.close()
+
+
+def test_as_of_vacuum_floor_survives_reopen(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute("INSERT INTO t VALUES (1)")
+        insert_lsn = _last_commit(db)
+        db.execute("DELETE FROM t WHERE id = 1")
+        db.execute("VACUUM t")
+    finally:
+        db.close()
+
+    db = Database(tmp_path)
+    try:
+        window = db.execute("SHOW HISTORY WINDOW")[0].rows[0]
+        assert window[1] > insert_lsn
+        with pytest.raises(BinderError, match="历史窗口"):
+            db.execute(
+                f"SELECT * FROM t AS OF SYSTEM TIME LSN {insert_lsn}"
+            )
+    finally:
+        db.close()
+
+
+def test_as_of_ddl_floor_survives_reopen(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute("INSERT INTO t VALUES (1)")
+        insert_lsn = _last_commit(db)
+        db.execute("ALTER TABLE t ADD COLUMN v TEXT")
+    finally:
+        db.close()
+
+    db = Database(tmp_path)
+    try:
+        window = db.execute("SHOW HISTORY WINDOW")[0].rows[0]
+        assert window[1] > insert_lsn
+        with pytest.raises(BinderError, match="历史窗口"):
+            db.execute(
+                f"SELECT * FROM t AS OF SYSTEM TIME LSN {insert_lsn}"
+            )
+    finally:
+        db.close()
+
+
 def test_as_of_rejects_write_statements(tmp_path):
     db = Database(tmp_path)
     try:

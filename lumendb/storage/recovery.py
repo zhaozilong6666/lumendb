@@ -21,11 +21,13 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ..errors import StorageError
 from .bufferpool import BufferPoolManager
+from .commit_ledger import CommitLedger
 from .history import HistoryWindow
 from .pager import DiskManager
 from .txn import TransactionManager
@@ -64,12 +66,18 @@ class RecoveryManager:
         buffer_pool: BufferPoolManager,
         txn_mgr: TransactionManager,
         history: Optional[HistoryWindow] = None,
+        commit_ledger: Optional[CommitLedger] = None,
     ) -> None:
         self._disk = disk
         self._wal = wal
         self._bp = buffer_pool
         self._txns = txn_mgr
         self._history = history
+        self._commit_ledger = commit_ledger
+        #: 并发 DML 下多个线程可能同时触发 `_maybe_checkpoint`。账本重写、
+        #: checkpoint_lsn 推进、WAL 裁剪必须是一个串行序列；否则后一个
+        #: checkpoint 可能拿旧快照覆盖前一个账本，再把 WAL 裁掉。
+        self._checkpoint_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 恢复
@@ -92,8 +100,12 @@ class RecoveryManager:
                 states[rec.xid] = "active"
             elif rec.rtype == LogType.COMMIT:
                 states[rec.xid] = "committed"
-                if rec.lsn > start_lsn:
-                    report.commit_lsns[rec.xid] = rec.lsn
+                # 不能只收 ``lsn > checkpoint_lsn`` 的提交：崩溃可能发生在
+                # “元数据已推进 checkpoint、WAL 还没来得及裁剪”之间。那些
+                # 早于 checkpoint 的 COMMIT 记录如果被跳过，而持久账本又
+                # 恰好还没写入，提交历史就永久丢失。这里全收，checkpoint
+                # 收尾时再按账本保留策略裁剪。
+                report.commit_lsns[rec.xid] = rec.lsn
             elif rec.rtype == LogType.ABORT:
                 states[rec.xid] = "aborted"
 
@@ -182,6 +194,11 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def checkpoint(self) -> int:
+        """串行执行一次 checkpoint；并发触发时排队。"""
+        with self._checkpoint_lock:
+            return self._checkpoint_locked()
+
+    def _checkpoint_locked(self) -> int:
         """把所有脏页落盘，然后写一条 checkpoint 日志并记录到元数据页。
 
         并发 DML 不拿 ``Database._write_lock``，所以 flush 与 checkpoint 之间
@@ -196,12 +213,21 @@ class RecoveryManager:
             # 且此时新事务即使 BEGIN 也写不了页，不会在 checkpoint 前留脏页。
             lsn = self._wal.checkpoint(self._txns.active_xids_for_checkpoint())
         self._wal.flush()
+
+        # 账本必须先于元数据页里的 checkpoint_lsn 落盘。若账本写入失败，
+        # checkpoint_lsn 保持旧值，WAL 不裁剪，恢复仍能从 WAL 重建全部提交；
+        # 反过来先推进 checkpoint_lsn 再写账本，崩溃就可能同时失去两条路径。
+        retained: Optional[list[tuple[int, int]]] = None
+        if self._commit_ledger is not None:
+            entries = self._durable_commit_entries(lsn)
+            retained = self._commit_ledger.write(entries)
+
         self._disk.meta.checkpoint_lsn = lsn
         self._disk._persist_meta()
         self._disk.sync()
         if self._history is not None:
-            # checkpoint 之前的 COMMIT 账本会被裁剪；历史读下界必须同步
-            # 抬到这条 CHECKPOINT 记录的位置。
+            # checkpoint 只登记固化点，不限制历史读；结构下界由 VACUUM/DDL
+            # 自己持久化，账本下界随后跟着最老保留提交走。
             self._history.observe_checkpoint(lsn)
         # 分段 WAL 可以在 checkpoint 后回收旧段。安全下界是活跃事务的
         # BEGIN LSN：这些事务崩溃后仍需要 before image 做 undo。没有活跃
@@ -211,12 +237,39 @@ class RecoveryManager:
         truncate = getattr(self._wal, "truncate_before", None)
         if truncate is not None:
             truncate(safe_lsn)
-        prune = getattr(self._txns, "prune_commit_log_before", None)
-        if prune is not None:
-            # 与重开恢复一致：以 checkpoint LSN 为界，而不是可能更早的
-            # active_start；旧提交已经随 checkpoint 固化，不应留在当前窗口。
-            prune(lsn)
+        if retained is not None:
+            # 持久账本已经覆盖 checkpoint 之前的提交；内存账本对齐磁盘账本，
+            # 不再按 checkpoint LSN 一刀切。历史读的账本下界也跟着最老
+            # 保留提交走：保留窗口裁短时抬高，首次写入旧提交时降低。
+            self._txns.replace_commit_log(retained)
+            if self._history is not None and retained:
+                self._history.observe_ledger(retained[0][1])
+        else:
+            prune = getattr(self._txns, "prune_commit_log_before", None)
+            if prune is not None:
+                # 没有持久账本时保持旧语义：以 checkpoint LSN 为界。
+                prune(lsn)
+                if self._history is not None:
+                    self._history.observe_ledger(lsn)
         return lsn
+
+    def _durable_commit_entries(self, checkpoint_lsn: int) -> dict[int, int]:
+        """收集 checkpoint 记录之前已经落盘的 COMMIT 条目。
+
+        不能只读 ``TransactionManager.commit_log()``：一个提交可能已经把
+        COMMIT 记录追加到 WAL、但还卡在 ``_mark_committed`` 的 BP 锁上，
+        此时内存账本还没有它。checkpoint 已经把 WAL flush 到 ``lsn``，所以
+        直接扫当前 WAL 里的 COMMIT 记录是唯一没有竞态的取证方式。WAL 窗口
+        通常只有几 MB，且 checkpoint 本身就是维护动作，这个扫描可以接受。
+        """
+        entries = dict(self._txns.commit_log())
+        for rec in self._wal.read_all():
+            if rec.rtype != LogType.COMMIT or rec.lsn > checkpoint_lsn:
+                continue
+            previous = entries.get(rec.xid)
+            if previous is None or rec.lsn > previous:
+                entries[rec.xid] = rec.lsn
+        return entries
 
 
 __all__ = ["RecoveryManager", "RecoveryReport"]

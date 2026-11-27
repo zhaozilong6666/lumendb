@@ -68,14 +68,17 @@ COMMIT 记录入队，由一个 leader 在锁外统一 `flush`，一次刷盘可
 
 `TransactionManager` 同时维护 `xid -> COMMIT LSN` 的提交账本：只有 COMMIT
 记录持久化、事务真正标记 `COMMITTED` 后才登记，成功恢复时从 WAL 的 COMMIT
-记录重建。`SHOW COMMIT LOG` 暴露当前窗口（xid、commit_lsn，按 LSN 升序），
-用于验证提交顺序与崩溃前后一致性。checkpoint 会截断 WAL，截断前的持久提交
-尚未进入这个账本——它还不是 `AS OF SYSTEM TIME` 所需的完整历史。
+记录重建。账本另外原子持久化到数据目录的 `commit-ledger.bin`，默认保留最近
+100000 条提交；`SHOW COMMIT LOG` 暴露跨 checkpoint 的 xid/commit_lsn（按 LSN
+升序）。checkpoint 的顺序固定为“写账本 → 推进 `checkpoint_lsn` → 裁 WAL”，
+账本写失败就不推进，WAL 仍可重建。
 
 `AS OF SYSTEM TIME LSN n` 在这个账本之上提供只读历史读，可读窗口是
-`[floor_lsn, latest_commit_lsn]`，由 `SHOW HISTORY WINDOW` 暴露。floor 取
-最近 checkpoint、VACUUM 开始、DDL 开始三者的最大值；超出窗口明确报错。
-目前只允许基表顺序扫描，索引路径禁用，同一查询里的多表必须使用同一 LSN。
+`[max(structural_floor_lsn, ledger_floor_lsn), latest_commit_lsn]`，由
+`SHOW HISTORY WINDOW` 暴露。结构下界取最近 VACUUM / DDL 开始位置，并持久化
+到元数据页；账本下界是最老保留提交。checkpoint 本身不再限制历史读，因此
+目标点可以早于最近 checkpoint。目前只允许基表顺序扫描，索引路径禁用，同一
+查询里的多表必须使用同一 LSN。
 
 ### 2.4 恢复
 

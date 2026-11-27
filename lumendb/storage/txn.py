@@ -348,12 +348,48 @@ class TransactionManager:
         self._active_cv.notify_all()
 
     def install_commit_lsns(self, entries: dict[int, int]) -> None:
-        """恢复时装入 WAL 窗口内的提交 LSN 账本（按 LSN 排序，去重）。"""
-        for xid, lsn in sorted(entries.items(), key=lambda item: item[1]):
-            if xid in self._commit_lsns:
-                continue
-            self._commit_lsns[xid] = int(lsn)
-            self._commit_order.append((xid, int(lsn)))
+        """恢复时装入提交 LSN 账本（按 LSN 排序，去重）。"""
+        with self._lock:
+            merged = dict(self._commit_lsns)
+            for xid, lsn in entries.items():
+                value = int(lsn)
+                previous = merged.get(int(xid))
+                if previous is None or value > previous:
+                    merged[int(xid)] = value
+            self._commit_lsns = merged
+            self._commit_order = sorted(
+                merged.items(), key=lambda item: (item[1], item[0])
+            )
+
+    def replace_commit_log(self, entries: list[tuple[int, int]] | dict[int, int]) -> None:
+        """用持久账本中实际保留的条目重建内存账本。
+
+        checkpoint 之后 WAL 会裁掉旧段，但提交账本仍保留最近若干条；这里
+        把内存账本对齐到磁盘账本，避免“账本文件有、SHOW COMMIT LOG 没有”。
+        checkpoint 生成账本快照与替换内存账本之间可能有新提交：它们的
+        COMMIT LSN 大于快照里最大的条目，必须保留，不能被这次对齐误删。
+        """
+        if isinstance(entries, dict):
+            items = list(entries.items())
+        else:
+            items = list(entries)
+        retained: dict[int, int] = {}
+        for xid, lsn in items:
+            value = int(lsn)
+            previous = retained.get(int(xid))
+            if previous is None or value > previous:
+                retained[int(xid)] = value
+        with self._lock:
+            cutoff = max(retained.values()) if retained else None
+            for xid, lsn in self._commit_lsns.items():
+                if cutoff is None or int(lsn) > cutoff:
+                    previous = retained.get(int(xid))
+                    if previous is None or int(lsn) > previous:
+                        retained[int(xid)] = int(lsn)
+            self._commit_lsns = retained
+            self._commit_order = sorted(
+                retained.items(), key=lambda item: (item[1], item[0])
+            )
 
     def prune_commit_log_before(self, lsn: int) -> None:
         """checkpoint 截断 WAL 后，丢掉已经不在 WAL 窗口里的提交记录。"""

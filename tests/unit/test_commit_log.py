@@ -1,4 +1,4 @@
-"""SHOW COMMIT LOG：当前 WAL 窗口内的提交 LSN 账本。"""
+"""SHOW COMMIT LOG：跨 checkpoint 的持久提交 LSN 账本。"""
 
 import pytest
 
@@ -37,17 +37,61 @@ def test_commit_log_limit_and_validation(tmp_path):
     db.close()
 
 
-def test_checkpoint_trims_commit_log_to_current_wal_window(tmp_path):
+def test_checkpoint_keeps_wal_recoverable_when_ledger_write_fails(
+    tmp_path, monkeypatch
+):
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT)")
+    db.execute_one("INSERT INTO t VALUES (1)")
+    before = db.disk.meta.checkpoint_lsn
+
+    with monkeypatch.context() as patch:
+        def fail_write(entries):
+            raise OSError("模拟账本落盘失败")
+
+        patch.setattr(db.commit_ledger, "write", fail_write)
+        with pytest.raises(OSError, match="账本落盘失败"):
+            db.checkpoint()
+
+    # 账本先写、checkpoint_lsn 后推进：写入失败时元数据必须停在旧值，
+    # WAL 也没有被裁，重启仍能重建提交账本。
+    assert db.disk.meta.checkpoint_lsn == before
+    db.close()
+
+    db = Database(tmp_path)
+    rows = db.execute_one("SHOW COMMIT LOG").rows
+    assert len(rows) == 2
+    db.close()
+
+
+def test_replace_commit_log_keeps_commits_after_checkpoint_snapshot(tmp_path):
+    db = Database(tmp_path)
+    try:
+        # checkpoint 生成账本快照后、替换内存账本前，可能有新提交；对齐
+        # 磁盘账本时不能把它们误删。
+        db.txns.install_commit_lsns({1: 10, 2: 20})
+        db.txns.replace_commit_log([(1, 10)])
+        assert db.txns.commit_log() == [(1, 10), (2, 20)]
+
+        db.txns.replace_commit_log([(2, 20)])
+        assert db.txns.commit_log() == [(2, 20)]
+    finally:
+        db.close()
+
+
+def test_checkpoint_preserves_commit_log_in_persistent_ledger(tmp_path):
     db = Database(tmp_path)
     db.execute_one("CREATE TABLE t (id INT)")
     db.execute_one("INSERT INTO t VALUES (1)")
     assert len(db.execute_one("SHOW COMMIT LOG").rows) == 2
     db.checkpoint()
-    assert db.execute_one("SHOW COMMIT LOG").rows == []
+    # checkpoint 会裁 WAL 旧段，但持久账本保留最近提交；SHOW COMMIT LOG
+    # 仍应看到 checkpoint 之前的两个提交点，而不是变成空表。
+    assert len(db.execute_one("SHOW COMMIT LOG").rows) == 2
     db.execute_one("INSERT INTO t VALUES (2)")
-    assert len(db.execute_one("SHOW COMMIT LOG").rows) == 1
+    assert len(db.execute_one("SHOW COMMIT LOG").rows) == 3
     db.close()
 
     db = Database(tmp_path)
-    assert len(db.execute_one("SHOW COMMIT LOG").rows) == 1
+    assert len(db.execute_one("SHOW COMMIT LOG").rows) == 3
     db.close()

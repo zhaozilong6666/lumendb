@@ -33,6 +33,9 @@ META_OFF_NEXT_XID = 16
 # 把 checkpoint_lsn 放到页头之后的 40 字节处，避免每次刷新元数据时
 # 把 pageLSN 覆盖成 0，导致恢复阶段重放已经回滚的 catalog_root 更新。
 META_OFF_CHECKPOINT_LSN = 40
+#: 历史读的结构下界（VACUUM / DDL 开始 LSN）。与 checkpoint 分开保存：
+#: checkpoint 不再限制历史读，只有真正回收旧版本或改 schema 的操作才限制。
+META_OFF_HISTORY_FLOOR = 48
 
 
 class MetaPage(Page):
@@ -51,6 +54,7 @@ class MetaPage(Page):
         self.set_u32(META_OFF_CATALOG_ROOT, 0)
         self.set_u64(META_OFF_NEXT_XID, 1)
         self.set_u64(META_OFF_CHECKPOINT_LSN, 0)
+        self.set_u64(META_OFF_HISTORY_FLOOR, 0)
 
     def validate(self) -> None:
         magic = self.get_u32(META_OFF_MAGIC)
@@ -103,6 +107,14 @@ class MetaPage(Page):
     @checkpoint_lsn.setter
     def checkpoint_lsn(self, v: int) -> None:
         self.set_u64(META_OFF_CHECKPOINT_LSN, v)
+
+    @property
+    def history_floor_lsn(self) -> int:
+        return self.get_u64(META_OFF_HISTORY_FLOOR)
+
+    @history_floor_lsn.setter
+    def history_floor_lsn(self, v: int) -> None:
+        self.set_u64(META_OFF_HISTORY_FLOOR, v)
 
 
 class DiskManager:
@@ -182,6 +194,7 @@ class DiskManager:
             struct.pack_into("<I", buf, META_OFF_NEXT_PAGE, self._meta.next_page_id)
             struct.pack_into("<Q", buf, META_OFF_NEXT_XID, self._meta.next_xid)
             struct.pack_into("<Q", buf, META_OFF_CHECKPOINT_LSN, self._meta.checkpoint_lsn)
+            struct.pack_into("<Q", buf, META_OFF_HISTORY_FLOOR, self._meta.history_floor_lsn)
             self._fh.seek(0)
             self._fh.write(buf)
             self._fh.flush()

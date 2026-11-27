@@ -1,7 +1,8 @@
 # AS OF SYSTEM TIME：设计与已交付边界
 
 `AS OF SYSTEM TIME LSN n` 已经接到 SQL 表面。它不是“无限历史”：可读窗口是
-`[floor_lsn, latest_commit_lsn]`，超出窗口必须报错，不会静默退化成当前读。
+`[max(structural_floor_lsn, ledger_floor_lsn), latest_commit_lsn]`，超出窗口
+必须报错，不会静默退化成当前读。
 
 ```sql
 SHOW HISTORY WINDOW;
@@ -18,21 +19,26 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 
 - `TransactionManager` 维护 `xid -> COMMIT LSN`，只在事务真正标记 `COMMITTED`
   后登记；回滚、未提交事务不进入账本。
-- 重开时从 WAL 当前窗口重建；`SHOW COMMIT LOG [LIMIT n]` 暴露
-  `xid / commit_lsn`，按 LSN 升序，供用户选目标点。
-- checkpoint 仍会裁剪 WAL 窗口内的旧 COMMIT 记录。更早的提交账本尚未持久化
-  到 checkpoint 之外，这是当前最大的 P0 缺口。
+- 账本跨 checkpoint 持久化到数据目录的 `commit-ledger.bin`：定长二进制、
+  `os.replace` 原子重写、fsync 文件与目录。默认保留最近
+  `commit_ledger_max_entries=100000` 条提交。
+- checkpoint 的顺序是“先写账本，再推进元数据页里的 `checkpoint_lsn`，最后
+  裁 WAL”。账本写入失败时 checkpoint 不推进，WAL 也不裁剪，恢复仍能重建。
+- 重开时把持久账本与 WAL 中所有 COMMIT 记录按 LSN 合并；不再只收
+  `checkpoint_lsn` 之后的记录，避免“元数据已推进、WAL 尚未裁剪”时丢提交。
+- `SHOW COMMIT LOG [LIMIT n]` 暴露 `xid / commit_lsn`，按 LSN 升序，供用户
+  选目标点；checkpoint 不再把它清空。
 
 ### 历史可见性
 
 - `HeapFile.scan_at(..., assume_committed_before=..., strict_unknown_xmax=...)`
   按提交 LSN 截止点判断版本，不伪造 `Transaction`；默认 `scan` 路径不变。
 - 目标点之前提交的 `xmin` 可见；目标点之后才提交的 `xmax` 不会提前隐藏旧行。
-- 账本里没有的 `xmin` 视为“水位前已提交”：该物理版本仍留在堆里，且目标点
-  不早于水位；只要 `xmax` 没有在水位后提交，它在目标点就应可见。这样
-  checkpoint 之前的存量行不会因为账本裁剪而整表读空。
+- 账本最老 LSN 之前的 `xmin` 视为“水位前已提交”：该物理版本仍留在堆里，
+  且目标点不早于水位；只要 `xmax` 没有在水位后提交，它在目标点就应可见。
 - 非零 `xmax` 不在账本、也没有已知结局时，SQL 路径严格报错，不猜“未提交”，
-  避免复活已经删除的旧版本。
+  避免复活已经删除的旧版本。持久账本覆盖 checkpoint 之前的删除后，这个
+  报错窗口只剩“目标点早于账本保留窗口”的情况。
 
 ### SQL 表面
 
@@ -52,35 +58,40 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 
 ### 历史窗口
 
-`floor_lsn = max(latest checkpoint LSN, 最近 VACUUM 开始 LSN, 最近 DDL 开始 LSN)`。
+`floor_lsn = max(structural_floor_lsn, ledger_floor_lsn)`：
 
-- checkpoint 推进下界：更早的 COMMIT 账本被裁剪，不保证还能精确判断。
-- VACUUM 推进下界：开始回收旧版本之前的点不再保证能读回。
-- DDL 推进下界：当前 schema 不能安全解码 DDL 之前的旧页。于是所有被允许的
-  目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要历史 schema
-  解码。
+- `structural_floor_lsn` 是 VACUUM / DDL 开始前的 WAL 位置，持久化在元数据
+  页 `history_floor` 字段（offset 48）。推进发生在任何页回收或 schema 变更
+  之前，崩溃重启后不会放宽。
+- `ledger_floor_lsn` 是持久提交账本里最老一条提交的 LSN。账本保留窗口裁短
+  时它会抬高；首次把 WAL 中的旧提交写入账本时它会降低。
+- checkpoint 不再推进下界：它只落盘和裁 WAL，旧版本仍在页里，提交账本也已
+  持久化。因此目标点可以落在 checkpoint 之前，只要不早于上述两个下界。
+- VACUUM 推进结构下界：开始回收旧版本之前的点不再保证能读回。
+- DDL 推进结构下界：当前 schema 不能安全解码 DDL 之前的旧页。于是所有被
+  允许的目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要
+  历史 schema 解码。
 - 目标点早于下界报 `BinderError`；晚于 `latest_commit_lsn` 也报 `BinderError`。
 
 ## 仍未交付
 
-### P0 持久提交账本
+### P0 剩余风险
 
-`SHOW COMMIT LOG` 仍只覆盖当前 WAL 窗口；checkpoint 后更早的 COMMIT 记录被
-裁剪。AS OF 用“水位前已提交”假设补存量行，但没有跨 checkpoint 的完整账本。
-因此 checkpoint 之前被删除、又还没被 VACUUM 回收的旧版本，遇到未知 `xmax`
-会严格报错，而不是猜测。
+持久账本解决了“checkpoint 后提交历史消失”，但它仍是**有界保留**：超过
+`commit_ledger_max_entries` 的更老提交会被裁掉，目标点随之下界抬高。账本
+文件也还没有纳入基准备份/增量备份的传输清单；副本侧的历史读需要单独设计。
 
 ### P2 保留水位
 
-VACUUM 会推进 floor，但没有“保留 N 个 LSN / N 小时”的显式参数。VACUUM 之后
-更早的目标点直接不可用。在线 VACUUM 能复用空页，但文件仍不缩盘。
+VACUUM 会推进结构下界，但没有“保留 N 个 LSN / N 小时”的显式参数。VACUUM
+之后更早的目标点直接不可用。在线 VACUUM 能复用空页，但文件仍不缩盘。
 
 ### P1 剩余面
 
 - 索引路径禁用；覆盖索引、索引真值没有历史读。
 - JOIN 已强制同一目标点，但还没有“查询级共享快照对象”；每个 Scan 各自调用
   `scan_at`，目标点相同即可。
-- 不承诺跨 checkpoint 的完整历史，也不承诺历史 schema 解码。
+- 不承诺超出账本保留窗口的完整历史，也不承诺历史 schema 解码。
 - 写入、DDL、序列/自增回滚、外部副作用的时间倒流都不支持。
 
 ## 验收现状
@@ -88,20 +99,25 @@ VACUUM 会推进 floor，但没有“保留 N 个 LSN / N 小时”的显式参�
 `tests/unit/test_as_of.py` 覆盖：
 
 - INSERT / UPDATE / DELETE 三个提交点的读数；
-- checkpoint 后仍能读 checkpoint 前的存量行；
+- checkpoint 前后都能读历史，目标点可以早于 checkpoint；
+- checkpoint 之前删除、未 VACUUM 的旧版本，重开后由持久账本正确判为不可见；
+- VACUUM / DDL 推进的结构下界跨重启仍然生效；
 - `EXPLAIN` 标注 AS OF 且禁用索引；
 - 早于 floor、晚于 latest、显式事务、视图数据源、时间字面量的稳定报错；
-- VACUUM 推进 floor；
 - JOIN / 子查询的多目标点拒绝。
+
+`tests/unit/test_commit_log.py` 与 `tests/unit/test_commit_ledger.py` 覆盖
+账本跨 checkpoint、重开、保留窗口裁剪、文件损坏和 checkpoint 写入失败保护。
 
 全量基线见 [`docs/roadmap.md`](roadmap.md)。
 
 ## 后续设计问题
 
-1. 持久提交账本放 meta 页、目录 JSON 还是独立文件？独立文件更容易原子替换，
-   但复制/备份要一起带走。
-2. 保留水位默认多长？按 LSN 数、WAL 大小还是小时？
-3. 是否允许 `AS OF SYSTEM TIME '...'` 由时间映射到最近提交 LSN？内部仍以
+1. 账本保留默认多长？当前按条数（100000）；按 LSN 距离或小时更贴近“历史
+   窗口”的语义，但需要同时考虑写入速率。
+2. 是否允许 `AS OF SYSTEM TIME '...'` 由时间映射到最近提交 LSN？内部仍以
    LSN 为准，避免时钟回拨。
-4. 索引历史读是否值得做：要么保留历史索引项，要么只在目标点等于 latest 时
+3. 索引历史读是否值得做：要么保留历史索引项，要么只在目标点等于 latest 时
    允许索引并回堆复核。
+4. 账本文件如何进入备份/复制链路：基准备份要原子携带它，增量备份要处理
+   checkpoint 之间的追加。

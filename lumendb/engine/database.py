@@ -30,6 +30,7 @@ from ..sql.ast import (
 )
 from ..sql.parser import parse_sql
 from ..storage.bufferpool import BufferPoolManager
+from ..storage.commit_ledger import CommitLedger
 from ..storage.history import HistoryWindow
 from ..storage.lock import LockManager
 from ..storage.pager import DiskManager
@@ -267,6 +268,7 @@ class Database:
         pool_size: int = 64,
         checkpoint_wal_bytes: int = 8 * 1024 * 1024,
         checkpoint_every_commits: int = 0,
+        commit_ledger_max_entries: int = 100_000,
         wal_segment_bytes: int = 1024 * 1024,
         read_only: bool = False,
         write_fence: Optional[Callable[[], None]] = None,
@@ -282,6 +284,14 @@ class Database:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        #: 提交账本跨 checkpoint 保留最近 ``commit_ledger_max_entries`` 条
+        #: ``(xid, commit_lsn)``；SHOW COMMIT LOG 与 AS OF 都从这里恢复历史，
+        #: 不再只依赖当前 WAL 窗口。
+        self.commit_ledger = CommitLedger(
+            self.path / "commit-ledger.bin",
+            max_entries=commit_ledger_max_entries,
+            read_only=read_only,
+        )
         version_cap = int(vacuum_online_max_versions)
         if version_cap <= 0:
             raise ValueError("vacuum_online_max_versions 必须是正整数")
@@ -385,13 +395,32 @@ class Database:
         self._commits_since_checkpoint = 0
 
         # 历史读窗口必须在恢复之前建：recover() 结束时自己会做一次
-        # checkpoint，那个位置会把下界抬到当前 WAL 窗口的起点。
-        self.history = HistoryWindow(self.disk.meta.checkpoint_lsn)
-        self.recovery = RecoveryManager(
-            self.disk, self.wal, self.bp, self.txns, self.history
+        # checkpoint，那个位置只登记 checkpoint LSN，不再限制历史读。
+        # 结构下界（VACUUM/DDL）从元数据页恢复；账本下界取持久账本最老提交。
+        ledger_entries = self.commit_ledger.entries()
+        ledger_floor = ledger_entries[0][1] if ledger_entries else 0
+        self.history = HistoryWindow(
+            self.disk.meta.checkpoint_lsn,
+            structural_floor_lsn=self.disk.meta.history_floor_lsn,
+            ledger_floor_lsn=ledger_floor,
+            persist_structural=self._persist_history_floor,
         )
+        self.recovery = RecoveryManager(
+            self.disk,
+            self.wal,
+            self.bp,
+            self.txns,
+            self.history,
+            self.commit_ledger,
+        )
+        # 先装持久账本，再叠加 WAL 窗口内的提交：两者按 LSN 合并排序，
+        # 同 xid 取更大的 LSN，避免 checkpoint 与裁剪之间的重复条目。
+        self.txns.install_commit_lsns(dict(self.commit_ledger.entries()))
         self.recovery_report = self.recovery.recover()
         self.txns.install_commit_lsns(self.recovery_report.commit_lsns)
+        commit_entries = self.txns.commit_log()
+        if commit_entries:
+            self.history.observe_ledger(commit_entries[0][1])
 
         self.catalog = Catalog(CatalogStore(self.bp))
         self.catalog.load()
@@ -414,6 +443,16 @@ class Database:
         self._savepoint_txn: Optional[Transaction] = None
 
     # ------------------------------------------------------------------
+
+    def _persist_history_floor(self, lsn: int) -> None:
+        """把 VACUUM/DDL 的结构下界写进元数据页并 fsync。
+
+        下界必须先于页回收/schema 变更持久化，否则进程在这些操作中途崩溃
+        后，重启会以为旧版本仍可读。该回调只在结构下界真正推进时触发。
+        """
+        self.disk.meta.history_floor_lsn = max(0, int(lsn))
+        self.disk._persist_meta()
+        self.disk.sync()
 
     def set_commit_barrier(
         self, barrier: Optional[Callable[[int], None]]

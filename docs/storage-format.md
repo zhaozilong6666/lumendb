@@ -167,9 +167,15 @@ WAL 只追加；checkpoint 成功后允许从头截断（保留 checkpoint 记�
 +16 u64 next_xid
 +24 u64 pageLSN       通用页头的日志位置（不能复用为 checkpoint）
 +40 u64 checkpoint_lsn
++48 u64 history_floor   历史读的结构下界（VACUUM / DDL 开始 LSN）
 ```
 
 注意：`+24` 是通用页头的 `pageLSN`。早期实现曾把 checkpoint_lsn 放在这里，
 导致 `_persist_meta` 每次刷元数据都会把 pageLSN 覆盖成 0，恢复阶段于是会
 重放已经回滚的 `catalog_root` 更新。现在 checkpoint 改到 `+40`，pageLSN
 保持独立。
+
+数据目录还包含 `commit-ledger.bin`：8 字节魔数 `LUMENCGL`、u16 版本、u64
+条目数，随后按 LSN 升序排列的 `(u64 xid, u64 commit_lsn)`。每次 checkpoint
+先原子重写该文件并 fsync，再推进 `checkpoint_lsn`；默认保留最近 100000 条
+提交，避免长跑库无限增长。
