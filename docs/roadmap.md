@@ -564,6 +564,14 @@ offset 8 的 `next_page` 串成单向链。`allocate_page` 在数组空后从链
 2 例（溢出链跨重开复用、陈旧溢出头页复核）；默认全量 1689 passed
 （170.18s），并发 1687 通过 + 2 skipped（169.53s）。
 
+CI #389 在 `0316c5d` 上只有 Windows 3.12 失败：两个同步复制 campaign 用例
+（`test_end_to_end_commit_waits_for_the_majority`、
+`test_sync_commit_waits_for_a_pushed_follower`）都在 `promote_with_quorum`
+拿到 1/3 票。预投票已通过、正式投票的单个 RPC 响应排到 0.5s 之外，不是多数派
+真的不可达；其余四个 job 全绿。`b54edea` 把测试集群的 `QuorumNode(timeout=...)`
+从 0.5s 放宽到默认 2s，仍保留“不可达 peer 快速失败”的语义。CI #390 在该提交上
+五个 job 全部 Success，6m38s；测试数不变，仍是 1689。
+
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
 `freed_pages`，提交后永久泄漏（实测 160 行 900B 唯一约束删除后空闲页仍为 0，
