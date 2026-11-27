@@ -546,6 +546,9 @@ DML）全部 Success，9m38s。
 回归、改写容量溢出用例为“复用 + 截尾”；默认全量 1687 passed（167.92s），
 并发 1685 通过 + 2 skipped（177.14s）。
 
+CI #388 在 `f571dee` 上五个 job（Ubuntu/Windows 3.12/3.13 + Concurrent
+DML）全部 Success，5m24s。
+
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
 `freed_pages`，提交后永久泄漏（实测 160 行 900B 唯一约束删除后空闲页仍为 0，
