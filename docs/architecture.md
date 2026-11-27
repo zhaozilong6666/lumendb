@@ -209,6 +209,11 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
    根记录不回收，页链不缩短。活跃 DDL 事务仍按原 `active_xids` 门禁报错，
    因为它的 abort 要按页面原像回滚，不能和在线整页回收交错。
 
+`VACUUM [table] RETAIN LSN n` 强制走在线模式，并额外保留在历史目标 `n`
+仍可见的版本；结构下界持久化到 `n`，因此 VACUUM 后 `AS OF ... LSN n` 仍能
+读回。它保留的是从目标点根记录到最新版本的整条链，目标越早占用越多；
+`RETAIN` 不是自动保留策略。
+
 两种模式都按页写 **before/after image**，崩溃后恢复能重放，不会出现
 "VACUUM 之后行凭空消失/复活"。文件本身不会缩小（和 PostgreSQL 的普通
 `VACUUM` 一样）；没有 autovacuum、没有增量回收；在线模式的根记录/空洞槽位

@@ -733,9 +733,12 @@ class Reindex(Statement):
 
 @dataclass
 class Vacuum(Statement):
-    """``VACUUM [table]``：回收死版本并重排堆页；不带表名则处理所有表。"""
+    """``VACUUM [table] [RETAIN LSN n]``：回收死版本，可保留一个历史目标点。"""
 
     table: Optional[str] = None
+    #: 非 None 时强制走保 RID 的在线回收，并保留该 LSN 仍可见的版本；
+    #: VACUUM 结束后结构下界至少停在这里。
+    retain_lsn: Optional[int] = None
 
 
 @dataclass

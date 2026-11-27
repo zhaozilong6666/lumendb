@@ -189,8 +189,9 @@ def render(report: AuditReport) -> str:
     lines.append(
         "> 审计只回答「验证了什么」，不回答「功能全不全」。"
         "AS OF 已接 SQL，可读窗口为 [max(VACUUM/DDL 结构下界, 持久提交账本最老 "
-        "LSN), latest_commit_lsn]；账本只保留最近若干条提交，VACUUM 保留水位、"
-        "索引历史读、跨 checkpoint 历史 schema 解码仍未覆盖。"
+        "LSN), latest_commit_lsn]；账本只保留最近若干条提交，"
+        "`VACUUM ... RETAIN LSN` 可保留一个显式目标点；索引历史读、"
+        "跨 checkpoint 历史 schema 解码仍未覆盖。"
         "其它边界见 docs/as-of-system-time.md、docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)

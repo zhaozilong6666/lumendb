@@ -906,6 +906,21 @@ class TestMaintenance:
         assert stmt.table == "users"
         assert parse_statement("VACUUM FULL").table is None
 
+    def test_vacuum_retain_lsn(self):
+        stmt = parse_statement("VACUUM users RETAIN LSN 42")
+        assert isinstance(stmt, Vacuum)
+        assert stmt.table == "users"
+        assert stmt.retain_lsn == 42
+
+        stmt = parse_statement("VACUUM RETAIN LSN 42")
+        assert stmt.table is None
+        assert stmt.retain_lsn == 42
+
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("VACUUM users RETAIN")
+        with pytest.raises(SQLSyntaxError):
+            parse_statement("VACUUM users RETAIN LSN -1")
+
     def test_reindex_table_keyword(self):
         from lumendb.sql.ast import Reindex
 

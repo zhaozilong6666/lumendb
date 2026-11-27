@@ -3343,22 +3343,57 @@ class Executor:
                 detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
                 hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时改用 --physical-savepoints",
             )
-        if self._history is not None:
-            # VACUUM 开始之后回收掉的旧版本，任何不早于这个位置的目标点都
-            # 不再需要（删除/覆盖都发生在这个位置之前）。保守抬到 WAL 的
-            # 下一个 LSN，避免把正好在 VACUUM 里提交的版本算进可读窗口。
-            self._history.advance(self._wal.next_lsn)
         tables = (
             [self._catalog.get_table(stmt.table)]
             if stmt.table
             else self._catalog.list_tables()
         )
+        if self._history is not None:
+            if stmt.retain_lsn is None:
+                # VACUUM 开始之后回收掉的旧版本，任何不早于这个位置的目标点都
+                # 不再需要（删除/覆盖都发生在这个位置之前）。保守抬到 WAL 的
+                # 下一个 LSN，避免把正好在 VACUUM 里提交的版本算进可读窗口。
+                self._history.advance(self._wal.next_lsn)
+        retain_entries: Optional[dict[int, int]] = None
+        retain = stmt.retain_lsn
+        if retain is not None:
+            if self._history is None:
+                raise NotSupportedError(
+                    "当前执行器没有接入历史读窗口",
+                    hint="通过 Database 打开数据库后再使用 VACUUM RETAIN",
+                )
+            entries = dict(self._txns.commit_log())
+            if not entries:
+                raise NotSupportedError(
+                    "当前 WAL 窗口还没有可用的提交点",
+                    hint="先执行一条写语句并提交，再用 VACUUM RETAIN 指定保留点",
+                )
+            latest = max(entries.values())
+            floor = self._history.floor_lsn
+            if retain < floor:
+                raise BinderError(
+                    "VACUUM RETAIN 的目标早于可用的历史窗口",
+                    detail=f"目标 LSN={retain}，历史下界 LSN={floor}",
+                    hint="用 SHOW HISTORY WINDOW 查看下界，换一个不早于下界的目标点",
+                )
+            if retain > latest:
+                raise BinderError(
+                    "VACUUM RETAIN 的目标晚于最近一次提交",
+                    detail=f"目标 LSN={retain}，最近提交 LSN={latest}",
+                    hint="先提交事务，或选择更早的 LSN",
+                )
+            # 物理回收前先把结构下界持久化到 retain；VACUUM 会保留该目标点
+            # 仍可见的版本。先推进后回收，崩溃也不会让下界落后于已删数据。
+            self._history.advance(retain)
+            retain_entries = entries
         active_others = [
             t for t in self._txns.active_transactions() if t.xid != txn.xid
         ]
         # 只对“没有持有 DDL 目录锁/物理 undo”的空闲事务走在线模式；
         # DDL 的 abort 会按页面原像回滚，和在线回收整页写日志不能交错。
-        online = (
+        # RETAIN 必须走保 RID 的在线路径：离线 vacuum 会把表重排成每行只剩
+        # 当前根元组，历史目标点需要的旧版本会被直接丢掉。
+        online = retain is not None or (
             self._concurrent_dml
             and bool(active_others)
             and all(not t.catalog_hold and not t.undo_log for t in active_others)
@@ -3374,6 +3409,8 @@ class Executor:
                     txn,
                     active_others,
                     max_versions=self._vacuum_online_max_versions,
+                    retain_lsn=retain or 0,
+                    commit_lsns=retain_entries,
                 )
                 online_tables += 1
             else:
@@ -3388,6 +3425,8 @@ class Executor:
         # 指纹变化后仍会落盘。
         self._persist_if_structure_changed(before, txn)
         suffix = ", online" if online_tables else ""
+        if retain is not None:
+            suffix += f", retain LSN {retain}"
         return Result(
             affected=dead,
             tag=(

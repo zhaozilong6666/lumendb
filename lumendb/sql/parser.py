@@ -377,9 +377,18 @@ class Parser:
             self._advance()
             self._match_kw("FULL")
             table = None
-            if self._cur.kind == "ident":
+            if self._cur.kind == "ident" and not (
+                self._cur.value.upper() == "RETAIN" and self._peek_word("LSN")
+            ):
                 table = self._parse_ident("表名")
-            return Vacuum(table)
+            retain = None
+            if self._match_word("RETAIN"):
+                if not self._match_word("LSN"):
+                    raise self._error("VACUUM ... RETAIN 之后期望 LSN")
+                retain = self._expect_int()
+                if retain < 0:
+                    raise self._error("VACUUM RETAIN 的 LSN 不能为负数")
+            return Vacuum(table, retain_lsn=retain)
         if kw == "TRUNCATE":
             self._advance()
             self._match_kw("TABLE")

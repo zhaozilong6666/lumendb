@@ -6,7 +6,7 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1647 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
+- 全量测试：1651 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
   用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -441,13 +441,19 @@ DDL 开始的最大值；超出窗口报 `BinderError`。只允许基表顺序�
 `old0019` 这类残键（约 1/30）。`delete` 现在最多从当前根重试 8 次；隔离用例
 连续 80 次 0 失败，默认/并发全量各 1638。
 
+2026-11-27 ① P2 VACUUM 保留水位：`VACUUM [table] RETAIN LSN n` 强制走保
+RID 的在线回收，额外保留目标点仍可见的版本；结构下界持久化到 `n`，不再
+无条件抬到 `wal.next_lsn`。目标必须落在 `[floor_lsn, latest_commit_lsn]`，
+越界分别报“早于/晚于”；VACUUM 结束后仍可 `AS OF ... LSN n`，重开也保持。
+索引历史读仍未做，`AS OF` 继续强制堆表顺序扫描。默认全量 1651 passed。
+
 2026-11-27 ① P0 持久提交账本：新增 `commit-ledger.bin`（定长二进制、原子替换、
 fsync），默认保留最近 100000 条提交；checkpoint 固定为“写账本 → 推进
 `checkpoint_lsn` → 裁 WAL”，写账本失败则不推进、WAL 保留可恢复记录。恢复时
 合并账本与 WAL 中全部 COMMIT，`SHOW COMMIT LOG` 不再因 checkpoint 清空。
 历史窗口拆成持久化的结构下界（VACUUM/DDL，meta offset 48）与账本下界
 （最老保留提交），checkpoint 不再阻断历史读；目标点可以早于 checkpoint。
-VACUUM/DDL 下界跨重启保持。默认/并发全量各 1647 passed。
+VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败

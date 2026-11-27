@@ -425,8 +425,10 @@ ANALYZE [TABLE] table [SAMPLE n];
                          -- 扫描可见行；SAMPLE n 只保留 n 行做列统计（近似），
                          -- 行数仍精确；不写 SAMPLE 时全量统计
 REINDEX [TABLE] table;   -- 按堆表当前内容重建该表所有索引
-VACUUM [FULL] [table];  -- 回收死版本；无活跃事务时重排堆页并重建索引，
-                         -- 有活跃事务时转保 RID 在线回收；不带表名处理所有表
+VACUUM [FULL] [table] [RETAIN LSN n];
+                         -- 回收死版本；RETAIN LSN 强制保 RID 的在线回收，
+                         -- 额外保留目标 LSN 仍可见的版本，并把结构下界停在 n；
+                         -- 目标必须落在当前历史窗口内。不带表名处理所有表
 TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
                          -- 清空一到多张表（页链保留、逐页重置）；RESTRICT 要求
                          -- 所有引用目标表的子表同时出现在列表中，CASCADE 自动递归清空

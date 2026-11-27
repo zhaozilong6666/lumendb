@@ -67,7 +67,11 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
   时它会抬高；首次把 WAL 中的旧提交写入账本时它会降低。
 - checkpoint 不再推进下界：它只落盘和裁 WAL，旧版本仍在页里，提交账本也已
   持久化。因此目标点可以落在 checkpoint 之前，只要不早于上述两个下界。
-- VACUUM 推进结构下界：开始回收旧版本之前的点不再保证能读回。
+- 默认 VACUUM 推进结构下界：开始回收旧版本之前的点不再保证能读回。
+- `VACUUM [table] RETAIN LSN n` 是显式保留水位：强制走保 RID 的在线回收，
+  额外保留在 `n` 仍可见的版本，结构下界只推进到 `n`。目标必须落在
+  `[floor_lsn, latest_commit_lsn]` 内；VACUUM 结束后仍可 `AS OF ... LSN n`。
+  这是“保留一个目标点”，不是自动保留最近 N 小时/N 条。
 - DDL 推进结构下界：当前 schema 不能安全解码 DDL 之前的旧页。于是所有被
   允许的目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要
   历史 schema 解码。
@@ -81,10 +85,12 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 `commit_ledger_max_entries` 的更老提交会被裁掉，目标点随之下界抬高。账本
 文件也还没有纳入基准备份/增量备份的传输清单；副本侧的历史读需要单独设计。
 
-### P2 保留水位
+### P2 保留水位（已交付显式目标点）
 
-VACUUM 会推进结构下界，但没有“保留 N 个 LSN / N 小时”的显式参数。VACUUM
-之后更早的目标点直接不可用。在线 VACUUM 能复用空页，但文件仍不缩盘。
+VACUUM 默认会推进结构下界；`VACUUM ... RETAIN LSN n` 可以把一个目标点
+保留下来，但仍没有“保留最近 N 个 LSN / N 小时”的自动策略。RETAIN 会保留
+该目标点到最新版本之间的整条版本链，目标越早，磁盘占用越大；文件本身仍
+不缩盘。
 
 ### P1 剩余面
 
@@ -102,6 +108,7 @@ VACUUM 会推进结构下界，但没有“保留 N 个 LSN / N 小时”的显�
 - checkpoint 前后都能读历史，目标点可以早于 checkpoint；
 - checkpoint 之前删除、未 VACUUM 的旧版本，重开后由持久账本正确判为不可见；
 - VACUUM / DDL 推进的结构下界跨重启仍然生效；
+- `VACUUM ... RETAIN LSN n` 保留目标点版本，目标越界报错，重开后仍可读；
 - `EXPLAIN` 标注 AS OF 且禁用索引；
 - 早于 floor、晚于 latest、显式事务、视图数据源、时间字面量的稳定报错；
 - JOIN / 子查询的多目标点拒绝。

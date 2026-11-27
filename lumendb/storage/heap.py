@@ -424,9 +424,24 @@ class HeapFile:
         assume_committed_before: int = 0,
         strict_unknown_xmax: bool = False,
     ) -> bool:
-        from .record import FLAG_ABORTED
+        return self._visible_header_at(
+            rec.header,
+            commit_lsns,
+            target_lsn,
+            assume_committed_before=assume_committed_before,
+            strict_unknown_xmax=strict_unknown_xmax,
+        )
 
-        h = rec.header
+    def _visible_header_at(
+        self,
+        h: RecordHeader,
+        commit_lsns: dict[int, int],
+        target_lsn: int,
+        *,
+        assume_committed_before: int = 0,
+        strict_unknown_xmax: bool = False,
+    ) -> bool:
+        """按提交 LSN 判断一条版本头是否可见；在线 VACUUM 只解头部也能用。"""
         if h.flags & FLAG_ABORTED:
             return False
 
@@ -729,8 +744,15 @@ class HeapFile:
         active_txns: Sequence[Transaction] = (),
         *,
         max_versions: int = VACUUM_ONLINE_MAX_VERSIONS,
+        retain_lsn: int = 0,
+        commit_lsns: Optional[dict[int, int]] = None,
     ) -> tuple[int, int, int]:
         """保 RID 的在线回收：不重排槽位、不重建索引，保留活跃快照要的版本。
+
+        ``retain_lsn`` > 0 时额外保留“在该历史目标点仍可见”的版本，用于
+        ``VACUUM ... RETAIN LSN``。这样 VACUUM 不会把用户显式要求保留的
+        历史窗口物理删掉。未知 ``xmax`` 按“可能未提交”保守保留，不因为
+        账本边界拒绝维护操作。
 
         与 ``vacuum`` 的区别：
         - 不把存活行重新打包，槽位号不变，所有 RID 与索引项继续有效；
@@ -785,12 +807,23 @@ class HeapFile:
         viewers.extend(t for t in active_txns if t.xid != txn.xid)
 
         def visible(header: RecordHeader) -> bool:
-            return any(
+            if any(
                 self._txns.is_visible(
                     viewer, header.xmin, header.xmax, header.flags
                 )
                 for viewer in viewers
-            )
+            ):
+                return True
+            if retain_lsn > 0:
+                if commit_lsns is None:
+                    raise ValueError("retain_lsn 需要提交账本")
+                return self._visible_header_at(
+                    header,
+                    commit_lsns,
+                    retain_lsn,
+                    assume_committed_before=retain_lsn,
+                )
+            return False
 
         keep: set[RID] = set()
         for rid, header in headers.items():

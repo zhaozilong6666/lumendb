@@ -298,6 +298,69 @@ def test_as_of_ddl_floor_survives_reopen(tmp_path):
         db.close()
 
 
+def test_vacuum_retain_keeps_target_versions(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        insert_lsn = _last_commit(db)
+        db.execute("UPDATE t SET v = 'new' WHERE id = 1")
+        update_lsn = _last_commit(db)
+        db.execute("DELETE FROM t WHERE id = 1")
+
+        result = db.execute(f"VACUUM t RETAIN LSN {update_lsn}")[0]
+        assert "retain LSN" in result.tag
+        assert db.execute("SELECT * FROM t")[0].rows == []
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {update_lsn}"
+        )[0].rows == [(1, "new")]
+        window = db.execute("SHOW HISTORY WINDOW")[0].rows[0]
+        assert window[1] >= update_lsn
+        with pytest.raises(BinderError, match="历史窗口"):
+            db.execute(
+                f"SELECT * FROM t AS OF SYSTEM TIME LSN {insert_lsn}"
+            )
+    finally:
+        db.close()
+
+
+def test_vacuum_retain_rejects_out_of_window(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        db.execute("INSERT INTO t VALUES (1)")
+        latest = _last_commit(db)
+        floor = db.execute("SHOW HISTORY WINDOW")[0].rows[0][1]
+        with pytest.raises(BinderError, match="早于"):
+            db.execute(f"VACUUM t RETAIN LSN {floor - 1}")
+        with pytest.raises(BinderError, match="晚于"):
+            db.execute(f"VACUUM t RETAIN LSN {latest + 100}")
+    finally:
+        db.close()
+
+
+def test_vacuum_retain_history_survives_reopen(tmp_path):
+    db = Database(tmp_path)
+    try:
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (1, 'old')")
+        db.execute("UPDATE t SET v = 'new' WHERE id = 1")
+        update_lsn = _last_commit(db)
+        db.execute("DELETE FROM t WHERE id = 1")
+        db.execute(f"VACUUM t RETAIN LSN {update_lsn}")
+    finally:
+        db.close()
+
+    db = Database(tmp_path)
+    try:
+        assert db.execute(
+            f"SELECT * FROM t AS OF SYSTEM TIME LSN {update_lsn}"
+        )[0].rows == [(1, "new")]
+        assert db.execute("SELECT * FROM t")[0].rows == []
+    finally:
+        db.close()
+
+
 def test_as_of_rejects_write_statements(tmp_path):
     db = Database(tmp_path)
     try:
