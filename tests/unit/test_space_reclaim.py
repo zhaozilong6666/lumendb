@@ -255,6 +255,76 @@ def test_alter_type_shadow_heap_releases_old_pages(tmp_path, monkeypatch, concur
         reopened.close()
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_drop_table_releases_heap_and_index_pages(tmp_path, monkeypatch, concurrent):
+    """DROP TABLE 必须回收堆页与索引树页；回滚则不能释放。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        db.execute_one("CREATE INDEX idx_pad ON t (pad)")
+        pad = "w" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+
+        db.execute_one("BEGIN")
+        db.execute_one("DROP TABLE t")
+        db.execute_one("ROLLBACK")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        assert db.disk.free_page_count <= free_before + 1
+
+        db.execute_one("DROP TABLE t")
+        assert db.disk.free_page_count > free_before + 50
+        after_drop_pages = _file_pages(db)
+        db.execute_one("CREATE TABLE u (id INT PRIMARY KEY, pad TEXT)")
+        for i in range(160):
+            db.execute_one("INSERT INTO u VALUES ($1, $2)", [i, pad])
+        assert _file_pages(db) <= after_drop_pages
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM u") == [(160,)]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_drop_index_releases_tree_pages(tmp_path, monkeypatch, concurrent):
+    """DROP INDEX 必须回收旧索引树页；回滚则不能释放。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        db.execute_one("CREATE INDEX idx_pad ON t (pad)")
+        pad = "v" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+
+        db.execute_one("BEGIN")
+        db.execute_one("DROP INDEX idx_pad")
+        db.execute_one("ROLLBACK")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        assert db.disk.free_page_count <= free_before + 1
+
+        db.execute_one("DROP INDEX idx_pad")
+        assert db.disk.free_page_count > free_before + 10
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        reopened.close()
+
+
 def test_vacuum_empty_table_releases_all_but_root(tmp_path):
     db = Database(tmp_path / "db")
     try:

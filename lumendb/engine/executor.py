@@ -2981,6 +2981,13 @@ class Executor:
             notice=f"已删除 CHECK 约束 {name}",
         )
 
+    def _collect_table_pages(self, table: TableDef) -> list[int]:
+        """收集表堆与全部索引树可达页，供 DROP/REBUILD 提交后回收。"""
+        pages = HeapFile(self._bp, table, self._txns).collect_pages()
+        for idx in table.indexes.values():
+            pages.extend(self._tree_for(table, idx).collect_pages())
+        return pages
+
     def _drop_table(self, stmt: DropTable, txn: Transaction) -> Result:
         views = 0
         foreign_keys = 0
@@ -3001,7 +3008,9 @@ class Executor:
                 for fk in other.foreign_keys.values():
                     if fk.ref_table == target.name:
                         removed_constraints.add(fk.name)
+            pages = self._collect_table_pages(target)
             v, f = self._catalog.drop_table(txn, name, stmt.cascade)
+            txn.freed_pages.update(pages)
             views += v
             foreign_keys += f
         old_modes = {
@@ -3117,6 +3126,11 @@ class Executor:
 
             txn.undo_log.append(undo_dependent_fks)
 
+        old_index_pages = (
+            self._tree_for(table, idx).collect_pages()
+            if idx is not None
+            else []
+        )
         try:
             self._catalog.drop_index(txn, name)
         except Exception:
@@ -3126,6 +3140,7 @@ class Executor:
             if stmt.if_exists:
                 return Result(tag="DROP INDEX", notice="索引不存在，已跳过")
             raise
+        txn.freed_pages.update(old_index_pages)
         dropped_names = {name} | {fk_name for _other, fk_name in dependents}
         old_modes = {
             n: txn.constraint_modes[n]

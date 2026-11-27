@@ -199,7 +199,8 @@ def render(report: AuditReport) -> str:
         "覆盖空闲表与高水位；溢出或崩溃丢表只泄漏空间，不会复用仍被引用的页。"
         "并发写模式下显式事务内 VACUUM 返回 0A000（逻辑回滚无法还原物理回收），"
         "自动提交 VACUUM 仍走在线/离线路径；ALTER TABLE 的 shadow heap 切换根页"
-        "后旧堆页登记进空闲表，回滚则丢弃登记、保留旧根。"
+        "后旧堆页登记进空闲表，回滚则丢弃登记、保留旧根；DROP TABLE / "
+        "DROP INDEX 删除目录项前收集堆页与索引树页，提交后同样回收。"
         "其它边界见 docs/as-of-system-time.md、docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)

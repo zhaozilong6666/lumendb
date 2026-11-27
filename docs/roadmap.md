@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1675 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1673 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1679 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1677 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -510,6 +510,15 @@ B+ 树页不记物理原像；事务内 VACUUM 一旦重排页链、回收死版
 回滚丢弃登记并由 WAL 原像恢复旧根。实测 160 行 900B 表 `DROP COLUMN` 释放
 41 页，后续 160 行插入复用空闲页、文件不再增长。新增 DROP/TYPE 各串行+
 并发 4 例回归，默认全量 1675；并发 1673 + 2 skipped。
+
+2026-11-27 DROP TABLE/INDEX 旧页回收：删除目录项后，表的堆页链与索引树页
+不再被目录引用，却未登记 `freed_pages`，提交后永久泄漏（实测 160 行 900B
+表带索引：`DROP INDEX` 前 126 页、空闲 1，删除后空闲仍只有 0；`DROP TABLE`
+同样）。新增 `_collect_table_pages` 收集堆页与全部索引树页，`DROP TABLE`
+删除目录项前、`DROP INDEX` 删除索引前登记；提交后复用，回滚随目录撤销
+丢弃登记。修复后 `DROP INDEX` 释放 81 页、`DROP TABLE` 释放 122 页，新建
+表优先复用旧页。新增 DROP TABLE/DROP INDEX 各串行+并发 4 例回归（含回滚
+不释放），默认全量 1679；并发 1677 + 2 skipped。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败
