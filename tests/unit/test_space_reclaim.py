@@ -416,6 +416,37 @@ def test_stale_free_entry_is_rejected_after_page_reuse(tmp_path):
         reopened.close()
 
 
+def test_stale_overflow_head_is_rejected_after_page_reuse(tmp_path):
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    path = tmp_path / "space.data"
+    disk = DiskManager(path)
+    try:
+        disk.allocate_page()
+        for _ in range(META_FREE_CAPACITY + 2):
+            disk.allocate_page()
+        disk.release_pages(range(2, META_FREE_CAPACITY + 4))
+        head = disk.meta.free_overflow_head
+        assert head
+        # 模拟头页已被重新写成堆页，但 page 0 还指着它。
+        raw = bytearray(PAGE_SIZE)
+        raw[0:2] = (1).to_bytes(2, "little")  # PageType.HEAP
+        raw[16:20] = head.to_bytes(4, "little")
+        disk.write_page(head, raw)
+    finally:
+        disk.close()
+
+    reopened = DiskManager(path)
+    try:
+        dropped = reopened.validate_free_list()
+        assert dropped >= 1
+        assert reopened.free_page_count == META_FREE_CAPACITY
+        assert head not in reopened.free_page_ids()
+        assert reopened.allocate_page() <= META_FREE_CAPACITY + 1
+    finally:
+        reopened.close()
+
+
 def test_free_list_survives_disk_reopen(tmp_path):
     path = tmp_path / "space.data"
     disk = DiskManager(path)
@@ -511,6 +542,40 @@ def test_truncate_refills_overflow_free_pages_into_meta(tmp_path):
         assert sorted(disk.free_page_ids()) == list(range(2, 10))
     finally:
         disk.close()
+
+
+def test_overflow_free_chain_survives_reopen(tmp_path):
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    disk = DiskManager(tmp_path / "space.data")
+    try:
+        for _ in range(META_FREE_CAPACITY + 2):
+            disk.allocate_page()
+        disk.release_pages(range(1, META_FREE_CAPACITY + 3))
+        assert disk.free_page_count == META_FREE_CAPACITY + 2
+    finally:
+        disk.close()
+
+    reopened = DiskManager(tmp_path / "space.data")
+    try:
+        assert reopened.free_page_count == META_FREE_CAPACITY + 2
+        assert len(reopened.free_page_ids()) == META_FREE_CAPACITY + 2
+        pages_before = reopened.num_pages
+        for _ in range(META_FREE_CAPACITY + 2):
+            pid = reopened.allocate_page()
+            assert pid <= META_FREE_CAPACITY + 2
+        assert reopened.free_page_count == 0
+        assert reopened.num_pages == pages_before
+    finally:
+        reopened.close()
+
+    # 链被取空后头指针也持久化，重开不能把旧页再发一次。
+    again = DiskManager(tmp_path / "space.data")
+    try:
+        assert again.free_page_count == 0
+        assert again.num_pages == META_FREE_CAPACITY + 3
+    finally:
+        again.close()
 
 
 def test_catalog_dml_versions_are_reclaimed_but_schema_history_survives(tmp_path):

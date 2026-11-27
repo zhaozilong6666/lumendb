@@ -3,8 +3,8 @@
 这一层只认识"页"这一个概念，不知道页里装的是什么。所有页号都是文件内的
 线性偏移（``page_id * PAGE_SIZE``），因此页号本身就是地址。元数据页维护
 一个容量有限的空闲页号数组：上层在提交后把不再可达的页交进来，分配时优先
-复用。数组满后多出的页进入进程内溢出列表：页头仍写成 FREE，本进程可继续
-复用、关闭截尾也能看到；但不写 page 0，崩溃后只泄漏，不会误用仍被引用的页。
+复用。数组满后多出的页用 page 0 的单个头指针串成 FREE 页 ``next`` 链：页头
+写成 FREE，重启后仍能复用并参与关闭截尾；链只记录页号，不记录页内容。
 """
 
 from __future__ import annotations
@@ -39,9 +39,12 @@ META_OFF_CHECKPOINT_LSN = 40
 #: checkpoint 不再限制历史读，只有真正回收旧版本或改 schema 的操作才限制。
 META_OFF_HISTORY_FLOOR = 48
 #: 空闲页号数组：u32 count + 最多 ``META_FREE_CAPACITY`` 个 u32 page_id。
-#: 放在元数据页尾部，避免再引入一个需要单独 fsync 的 sidecar；配额满时
-#: 新释放的页不再入表（只泄漏空间，不会误用仍被引用的页）。
+#: 放在元数据页尾部，避免再引入一个需要单独 fsync 的 sidecar；数组满后
+#: 新释放的页进入 ``META_OFF_FREE_OVERFLOW`` 指向的 FREE 页链。
 META_OFF_FREE_COUNT = 56
+#: 溢出空闲页链的头页号（0 表示无）。链节点复用 FREE 页头 offset 8 的
+#: ``next_page`` 指针；单头 + 单向链不额外占 page 0 或 sidecar。
+META_OFF_FREE_OVERFLOW = 60
 META_OFF_FREE_LIST = 64
 META_FREE_CAPACITY = (PAGE_SIZE - META_OFF_FREE_LIST) // 4
 
@@ -64,6 +67,7 @@ class MetaPage(Page):
         self.set_u64(META_OFF_CHECKPOINT_LSN, 0)
         self.set_u64(META_OFF_HISTORY_FLOOR, 0)
         self.set_u32(META_OFF_FREE_COUNT, 0)
+        self.set_u32(META_OFF_FREE_OVERFLOW, 0)
 
     def validate(self) -> None:
         magic = self.get_u32(META_OFF_MAGIC)
@@ -149,6 +153,14 @@ class MetaPage(Page):
         for i, pid in enumerate(page_ids):
             self.set_u32(META_OFF_FREE_LIST + i * 4, pid)
 
+    @property
+    def free_overflow_head(self) -> int:
+        return self.get_u32(META_OFF_FREE_OVERFLOW)
+
+    @free_overflow_head.setter
+    def free_overflow_head(self, pid: int) -> None:
+        self.set_u32(META_OFF_FREE_OVERFLOW, pid)
+
 
 class DiskManager:
     """数据库文件的门面。
@@ -169,9 +181,9 @@ class DiskManager:
         #: write，会把一页写到另一页的偏移（页内 page_id 与目标页号不符）。
         #: 这是进程内 IO 串行锁，与跨进程的 FileLock 是两件事。
         self._io_lock = threading.RLock()
-        #: 元数据页数组满后仍被释放的页。仅本进程内存态：不持久化，崩溃后
-        #: 丢失只泄漏；页头已经写成 FREE，重启时不会把它当活页复用。
-        self._overflow_free: list[int] = []
+        #: page 0 数组满后仍被释放的页，挂成 FREE 页 next 链；头指针在
+        #: META_OFF_FREE_OVERFLOW。计数缓存避免每次 free_page_count 都走链。
+        self._overflow_count = 0
 
         try:
             existed = self.path.exists() and self.path.stat().st_size > 0
@@ -192,6 +204,7 @@ class DiskManager:
             self._meta = MetaPage(0, self.read_page(0))
             self._meta.validate()
             self._sanitize_free_list()
+            self._load_overflow_chain()
         except BaseException:
             self._lock.release()
             raise
@@ -236,6 +249,61 @@ class DiskManager:
             self._meta.set_free_page_ids(valid)
             self._persist_meta()
 
+    def _load_overflow_chain(self) -> None:
+        """启动时加载溢出链，建立计数；不做页头复核（恢复前可能仍是旧内容）。"""
+        limit = self.num_pages
+        seen = set(self._meta.free_page_ids())
+        ids: list[int] = []
+        pid = self._meta.free_overflow_head
+        while pid:
+            if pid <= 0 or pid >= limit or pid in seen:
+                break
+            seen.add(pid)
+            ids.append(pid)
+            if len(ids) > limit:  # pragma: no cover - 防御性环保护
+                break
+            try:
+                raw = self.read_page(pid)
+            except (PageNotFoundError, OSError):
+                break
+            pid = Page(pid, raw).next_page
+        self._overflow_count = len(ids)
+
+    def _overflow_page_ids(self) -> list[int]:
+        """按链头遍历溢出页；遇到越界/环/重复立即停，避免无限循环。"""
+        limit = self.num_pages
+        seen = set(self._meta.free_page_ids())
+        ids: list[int] = []
+        pid = self._meta.free_overflow_head
+        while pid:
+            if pid <= 0 or pid >= limit or pid in seen:
+                break
+            seen.add(pid)
+            ids.append(pid)
+            if len(ids) > limit:  # pragma: no cover - 防御性环保护
+                break
+            try:
+                raw = self.read_page(pid)
+            except (PageNotFoundError, OSError):
+                break
+            pid = Page(pid, raw).next_page
+        return ids
+
+    def _replace_overflow_chain(self, page_ids: list[int]) -> None:
+        """把给定页号重建成 FREE 链，并更新 page 0 头指针。"""
+        head = 0
+        for pid in reversed(page_ids):
+            buf = bytearray(PAGE_SIZE)
+            struct.pack_into("<H", buf, 0, PageType.FREE)
+            struct.pack_into("<I", buf, 16, pid)
+            struct.pack_into("<I", buf, 8, head)
+            self._fh.seek(pid * PAGE_SIZE)
+            self._fh.write(buf)
+            head = pid
+        self._fh.flush()
+        self._meta.free_overflow_head = head
+        self._overflow_count = len(page_ids)
+
     def _persist_meta(self) -> None:
         """把 next_page_id / next_xid / checkpoint_lsn 写回 page 0。
 
@@ -255,6 +323,7 @@ class DiskManager:
             struct.pack_into("<I", buf, META_OFF_FREE_COUNT, len(free_ids))
             for i, pid in enumerate(free_ids):
                 struct.pack_into("<I", buf, META_OFF_FREE_LIST + i * 4, pid)
+            struct.pack_into("<I", buf, META_OFF_FREE_OVERFLOW, self._meta.free_overflow_head)
             self._fh.seek(0)
             self._fh.write(buf)
             self._fh.flush()
@@ -263,11 +332,11 @@ class DiskManager:
 
     @property
     def free_page_count(self) -> int:
-        return len(self._meta.free_page_ids()) + len(self._overflow_free)
+        return len(self._meta.free_page_ids()) + self._overflow_count
 
     def free_page_ids(self) -> list[int]:
-        """返回所有可复用页：元数据数组 + 进程内溢出列表。"""
-        return self._meta.free_page_ids() + list(self._overflow_free)
+        """返回所有可复用页：元数据数组 + 溢出链。"""
+        return self._meta.free_page_ids() + self._overflow_page_ids()
 
     def allocate_page(self) -> int:
         """分配一个页号：优先复用空闲页，否则扩展文件。
@@ -281,10 +350,24 @@ class DiskManager:
             if free_ids:
                 pid = free_ids.pop()
                 self._meta.set_free_page_ids(free_ids)
-            elif self._overflow_free:
-                # 数组空但内存溢出列表还有页：继续复用，避免一次大 DROP
-                # 之后本进程只能向文件尾扩展。
-                pid = self._overflow_free.pop()
+            elif self._meta.free_overflow_head:
+                # 数组空但溢出链还有页：继续复用，避免一次大 DROP 之后
+                # 本进程只能向文件尾扩展。
+                head = self._meta.free_overflow_head
+                if head <= 0 or head >= self.num_pages:
+                    self._meta.free_overflow_head = 0
+                    self._overflow_count = 0
+                    pid = self.num_pages
+                else:
+                    pid = head
+                    page = Page(pid, self.read_page(pid))
+                    next_pid = page.next_page
+                    if next_pid <= 0 or next_pid >= self.num_pages:
+                        next_pid = 0
+                        self._overflow_count = 0
+                    else:
+                        self._overflow_count -= 1
+                    self._meta.free_overflow_head = next_pid
             else:
                 pid = self.num_pages
             buf = bytearray(PAGE_SIZE)
@@ -312,8 +395,10 @@ class DiskManager:
         valid: list[int] = []
         valid_overflow: list[int] = []
         dropped = 0
+        meta_changed = False
         with self._io_lock:
-            for pid in self._meta.free_page_ids() + self._overflow_free:
+            raw_overflow = self._overflow_page_ids()
+            for pid in self._meta.free_page_ids() + raw_overflow:
                 if pid <= 0 or pid >= self.num_pages:
                     dropped += 1
                     continue
@@ -335,45 +420,59 @@ class DiskManager:
                     valid_overflow.append(pid)
             if valid != self._meta.free_page_ids():
                 self._meta.set_free_page_ids(valid)
-            self._overflow_free = valid_overflow
+                meta_changed = True
+            if valid_overflow != raw_overflow or (
+                self._meta.free_overflow_head and not valid_overflow
+            ):
+                self._replace_overflow_chain(valid_overflow)
+                meta_changed = True
+            if meta_changed:
+                self._persist_meta()
         return dropped
 
     def release_pages(self, page_ids: Iterable[int]) -> int:
         """把一批已不再被引用的页号加入空闲表，返回实际接受的页数。
 
-        这是**提示性回收**：页号非法就跳过；page 0 数组满后多出的页进入
-        进程内溢出列表，本进程仍可复用，但不持久化。最多是崩溃后空间泄漏，
-        不会把仍被引用的页交给分配器。调用方必须在提交点之后调用，并且
+        这是**提示性回收**：页号非法就跳过；page 0 数组满后多出的页挂进
+        溢出链，本进程与重启后都可复用。空页只泄漏空间，不会把仍被引用的
+        页交给分配器。调用方必须在提交点之后调用，并且
         确认这些页已经不在任何页链/索引/目录版本里。
 
         接受前先把页头重写成 ``FREE``（只改页头/整页清零，不走 WAL——页已
         不可达）。这样崩溃后若空闲表落后于实际分配，``validate_free_list``
         能凭页头识别"已被重新分配的旧空闲项"并丢弃，不会复用已提交页。
-        这里只更新内存里的 meta，不立刻落盘：空闲表是空间复用提示，不是
-        正确性依赖；崩溃丢掉它只会让那批页在下一次 checkpoint 前不可复用。
-        ``close`` / ``checkpoint`` 会随 ``next_page_id`` 一起持久化。
+        数组项沿用旧口径：内存里的 meta 在 ``close`` / ``checkpoint`` 时随
+        ``next_page_id`` 一起持久化。溢出链多写一次 page 0 的头指针，让
+        重启后的分配器仍能看到它；写失败只让这批页在重启后泄漏。
         """
         accepted = 0
         with self._io_lock:
             free_ids = self._meta.free_page_ids()
-            existing = set(free_ids) | set(self._overflow_free)
+            existing = set(free_ids) | set(self._overflow_page_ids())
             limit = self.num_pages
+            overflow_changed = False
             for raw in page_ids:
                 pid = int(raw)
                 if pid <= 0 or pid >= limit or pid in existing:
                     continue
+                use_overflow = len(free_ids) >= META_FREE_CAPACITY
+                old_head = self._meta.free_overflow_head if use_overflow else 0
                 buf = bytearray(PAGE_SIZE)
                 struct.pack_into("<H", buf, 0, PageType.FREE)
                 struct.pack_into("<I", buf, 16, pid)
+                if use_overflow:
+                    struct.pack_into("<I", buf, 8, old_head)
                 try:
                     self._fh.seek(pid * PAGE_SIZE)
                     self._fh.write(buf)
                 except OSError:
                     # 释放是提示性回收，不能把一次写失败升级成提交失败。
                     continue
-                if len(free_ids) >= META_FREE_CAPACITY:
-                    # page 0 数组已满：记进进程内溢出列表，页头已是 FREE。
-                    self._overflow_free.append(pid)
+                if use_overflow:
+                    # page 0 数组已满：挂到溢出链头，next 指向旧头。
+                    self._meta.free_overflow_head = pid
+                    self._overflow_count += 1
+                    overflow_changed = True
                 else:
                     free_ids.append(pid)
                 existing.add(pid)
@@ -386,6 +485,12 @@ class DiskManager:
                     # 崩溃后 validate_free_list 会按页头复核。
                     pass
                 self._meta.set_free_page_ids(free_ids)
+                if overflow_changed:
+                    try:
+                        self._persist_meta()
+                    except OSError:
+                        # 头指针没落盘时，新挂的页在重启后只泄漏，不会复用活页。
+                        pass
         return accepted
 
     def truncate_free_tail(self) -> int:
@@ -397,7 +502,8 @@ class DiskManager:
         removed = 0
         with self._io_lock:
             free_ids = self._meta.free_page_ids()
-            free_set = set(free_ids) | set(self._overflow_free)
+            overflow_ids = self._overflow_page_ids()
+            free_set = set(free_ids) | set(overflow_ids)
             end = self.num_pages
             while end > 1 and (end - 1) in free_set:
                 end -= 1
@@ -405,7 +511,7 @@ class DiskManager:
             if removed == 0:
                 return 0
             kept_meta = [pid for pid in free_ids if pid < end]
-            kept_overflow = [pid for pid in self._overflow_free if pid < end]
+            kept_overflow = [pid for pid in overflow_ids if pid < end]
             # 截尾后把溢出页尽量回填进 page 0 数组，减少下一次崩溃的泄漏。
             room = META_FREE_CAPACITY - len(kept_meta)
             if room > 0 and kept_overflow:
@@ -419,7 +525,7 @@ class DiskManager:
             # 文件里仍然存在的空闲项。
             self._meta.next_page_id = end
             self._meta.set_free_page_ids(kept_meta)
-            self._overflow_free = kept_overflow
+            self._replace_overflow_chain(kept_overflow)
             self._persist_meta()
         return removed
 
@@ -481,6 +587,7 @@ class DiskManager:
         struct.pack_into("<I", buf, META_OFF_FREE_COUNT, len(free_ids))
         for i, pid in enumerate(free_ids):
             struct.pack_into("<I", buf, META_OFF_FREE_LIST + i * 4, pid)
+        struct.pack_into("<I", buf, META_OFF_FREE_OVERFLOW, self._meta.free_overflow_head)
         return bytes(buf)
 
     def _write_page_locked(

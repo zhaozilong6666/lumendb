@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1687 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1685 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1689 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1687 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -366,9 +366,10 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 仍是快照隔离（不是 PostgreSQL READ COMMITTED），静默切换会改变用户可见语义；
 默认串行短事务吞吐也更好。文件级空间回收已补 MVP：离线 VACUUM 摘掉链尾
 空页、REINDEX/VACUUM 旧索引页、普通 DML 的旧目录中间根页在提交后进入
-元数据页空闲表（page 0 最多 1008 项），分配优先复用；数组满后溢出页进
-进程内列表，本进程仍可复用并参与关闭截尾，但列表不持久化，崩溃/重启只泄漏
-空间、不会误用活页。关闭时先 checkpoint 再从文件尾截掉连续空闲页。中间空页
+元数据页空闲表（page 0 最多 1008 项），分配优先复用；数组满后溢出页挂进
+FREE 页 next 链（page 0 只存链头），链随元数据持久化，重启后仍可复用并参与
+关闭截尾；链损坏只泄漏空间、不会误用活页。关闭时先 checkpoint 再从文件尾
+截掉连续空闲页。中间空页
 仍只复用不搬移，在线 VACUUM 仍不摘页链。`VACUUM` 在线模式只保 RID、不重排
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
@@ -480,7 +481,7 @@ VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 `Transaction.freed_pages`；COMMIT 成功后才 `BufferPool.drop_pages` +
 `release_pages`，ROLLBACK 直接丢弃登记。`Database.close()` 先 checkpoint
 再截尾，避免恢复用旧 WAL 把已截页扩回。空闲表是提示性结构：释放时把页头写成 FREE，恢复 redo 后
-`validate_free_list` 按页头剔除陈旧项；崩溃丢失或溢出列表不持久化只泄漏空间，
+`validate_free_list` 按页头剔除陈旧项；崩溃丢失或溢出链损坏只泄漏空间，
 不会把活页交给分配器。新增 12 例空间回收测试；
 默认全量 1668。
 
@@ -541,13 +542,27 @@ DML）全部 Success，9m38s。
 多出的页进入该列表，`allocate_page` 在数组空后继续弹溢出页，
 `truncate_free_tail` 用“数组 + 溢出”并集识别文件尾并把剩余项回填数组；
 `free_page_count` / `free_page_ids()` 也返回合并结果。修复后同一场景
-`free_page_count` 为 1050；列表不持久化，重启后回到 1008，且若文件尾仍有
-目录活页，截尾不会搬移活页，文件可能仍不缩短。新增 1 例溢出页优先复用
-回归、改写容量溢出用例为“复用 + 截尾”；默认全量 1687 passed（167.92s），
-并发 1685 通过 + 2 skipped（177.14s）。
+`free_page_count` 为 1050；该实现的内存列表不持久化，重启后回到 1008（随后
+#43 换成持久化链），且若文件尾仍有目录活页，截尾不会搬移活页，文件可能仍
+不缩短。新增 1 例溢出页优先复用回归、改写容量溢出用例为“复用 + 截尾”；
+默认全量 1687 通过（167.92s），并发 1685 通过 + 2 skipped（177.14s）。
 
 CI #388 在 `f571dee` 上五个 job（Ubuntu/Windows 3.12/3.13 + Concurrent
 DML）全部 Success，5m24s。
+
+2026-11-27 持久化空闲表溢出链：#42 的内存列表解决了进程内复用，但重启后
+42 个溢出页仍会丢。page 0 offset 60 原本空着，新增
+`META_OFF_FREE_OVERFLOW` 单头指针；数组满后释放的页写成 FREE，并用页头
+offset 8 的 `next_page` 串成单向链。`allocate_page` 在数组空后从链头弹出，
+`release_pages` 把新页压到链头，`truncate_free_tail` 用数组+链并集识别文件尾
+并把剩余节点重建成链，`validate_free_list` 在恢复后按页头过滤并只在实际
+丢弃节点时重建。头指针随 `_persist_meta` / page 0 叠加写盘，`release_pages`
+只在溢出链变化时多写一次 page 0；链页写失败或头指针未落盘只会让对应页在
+重启后泄漏，不会复用活页。版本号不变，旧文件的 offset 60 为 0，自然表示
+空链。实测 4200 行 900B 表 `DROP TABLE` 后关闭仍是 1053 页（目录活页挡住
+文件尾），但重开 `free_page_count` 从 1008 变为 1050、链头指向 1050。新增
+2 例（溢出链跨重开复用、陈旧溢出头页复核）；默认全量 1689 passed
+（170.18s），并发 1687 通过 + 2 skipped（169.53s）。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
