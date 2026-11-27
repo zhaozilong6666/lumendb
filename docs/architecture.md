@@ -163,9 +163,12 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 **目录版本链（C 的第一切片）**：每次 schema 形状变化（建表/删表/加列/索引/
 重命名/视图）才把 `catalog_version` 加一，并在新目录 JSON 里写 `previous_root`
 指向上一条 schema 链；普通 DML 只更新页根，仍写新链但沿用同一
-`catalog_version`，不会伪造 schema 版本。旧链从不覆盖，`Catalog.history()`
-可沿 `previous_root` 回溯历史表定义，`Catalog.table_at(version, name)` 读出
-当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；每个版本还记录
+`catalog_version`，不会伪造 schema 版本。**schema 根链**从不覆盖：旧
+schema 根页必须保留，`Catalog.history()` 沿 `previous_root` 回溯历史表定义。
+普通 DML 产生的中间目录根不属于这条历史链，提交后直接进入空闲页表复用；
+这正是"目录只在 DDL 时变 schema、却在每次翻页时新建整链"不会把文件无界
+撑大的原因。
+`Catalog.table_at(version, name)` 读出当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；每个版本还记录
 UTC 微秒级 `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时刻之前的最近版本。
 `SHOW CATALOG VERSIONS` 暴露版本、表名、视图名、对象数和创建时间，
 `SHOW COLUMNS FROM t AT CATALOG VERSION n` 或 `AT TIME '…'` 直接读出历史列定义；
@@ -216,9 +219,20 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 `RETAIN` 不是自动保留策略。
 
 两种模式都按页写 **before/after image**，崩溃后恢复能重放，不会出现
-"VACUUM 之后行凭空消失/复活"。文件本身不会缩小（和 PostgreSQL 的普通
-`VACUUM` 一样）；没有 autovacuum、没有增量回收；在线模式的根记录/空洞槽位
-回收是下一件要做的事。
+"VACUUM 之后行凭空消失/复活"。
+
+离线 VACUUM 还会摘掉链尾连续的空页，并把它们交给文件级空闲页表；在线
+模式保持 RID 不变，不摘页链。空闲页表存在元数据页尾部（`free_count` +
+最多 1008 个 u32 页号），分配新页时优先复用；表满或崩溃丢掉空闲表只会
+泄漏空间，不会把仍被引用的页交给新对象。提交点后 `Database` 才把该事务
+登记的 `freed_pages` 交给空闲表（仍被 pin 的页跳过），回滚则直接丢弃这批
+登记，靠 WAL undo 指回旧页链。释放时把页头重写成 `FREE`；恢复 redo 结束后
+`validate_free_list` 逐项复核页头，持久表里"已被重新分配但仍记为空闲"的
+陈旧项会被剔除，宁可泄漏也不复用已提交页。`Database.close()` 在关闭 Buffer Pool、且
+先做一次 checkpoint 之后，才从文件尾截掉连续空闲页；checkpoint 保证下次
+恢复不会用旧 WAL 记录把已截掉的页 `ensure_page` 回来。中间空页留在空闲表
+里等复用，因此文件缩容是"尾部回收"，不是在线整理。没有 autovacuum、
+没有增量回收；在线模式的根记录/空洞槽位回收是下一件要做的事。
 
 ### 2.7 加列与旧记录
 

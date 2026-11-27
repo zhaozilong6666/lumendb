@@ -1758,6 +1758,46 @@ class BPlusTree:
             if page is not None:
                 self._bp.unpin(page.page_id)
 
+    def collect_pages(self) -> list[int]:
+        """收集从根可达的全部页号（内部页 + 叶子页）。
+
+        ``rebuild`` 会先丢根再插入，旧树不会再被任何目录项引用；调用方
+        在提交后可以把这份列表交给空闲页表复用。只读遍历，不改页内容。
+        """
+        if self.root_page == INVALID_PAGE_ID:
+            return []
+        page_ids: list[int] = []
+        visited: set[int] = set()
+
+        def walk(page_id: int) -> None:
+            if page_id in visited:
+                raise BTreeInvariantError(
+                    f"索引 {self.name} 的页链出现环",
+                    detail=f"重复页 {page_id}",
+                )
+            visited.add(page_id)
+            page = self._bp.fetch_page(page_id)
+            try:
+                if page.page_type not in (
+                    PageType.BTREE_LEAF,
+                    PageType.BTREE_INTERNAL,
+                ):
+                    raise BTreeInvariantError(
+                        f"索引 {self.name} 的页类型不合法",
+                        detail=f"page={page_id} type={page.page_type}",
+                    )
+                page_ids.append(page_id)
+                if self._is_leaf(page):
+                    return
+                _, children, _ = self._read_internal(page)
+                for child_id in children:
+                    walk(child_id)
+            finally:
+                self._bp.unpin(page_id)
+
+        walk(self.root_page)
+        return page_ids
+
     def rebuild(self, txn: Transaction, entries: Sequence[Tuple[Sequence[Any], RID]]) -> None:
         """丢弃旧树并从给定条目重建。用于 REINDEX 回收稀疏页。"""
         self.root_page = INVALID_PAGE_ID

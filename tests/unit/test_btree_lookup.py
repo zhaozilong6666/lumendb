@@ -77,9 +77,11 @@ def test_lookup_handles_multi_column_prefixes(env):
             got = trees["code_id"].lookup(txn, values)
             assert got == _reference_lookup(trees["code_id"], values)
 
-    # 只给第一列时，旧实现与新实现都按"前缀"匹配（tuple 比较的自然语义），
-    # 这里确认两者一致，而不是断言它为空。
-    assert trees["code_id"].lookup(txn, [3]) == _reference_lookup(trees["code_id"], [3])
+    # 只给第一列时，旧实现与新实现都按"前缀"匹配（tuple 比较的自然语义）。
+    # RID 的物理顺序随空闲页复用而变，前缀查询按集合比较，不押 RID 排序。
+    assert sorted(trees["code_id"].lookup(txn, [3])) == _reference_lookup(
+        trees["code_id"], [3]
+    )
     assert len(trees["code_id"].lookup(txn, [3])) > 1
 
     # 随机 120 组完整/不完整键做对照

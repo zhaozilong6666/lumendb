@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1656 passed（默认串行模式；`LUMEN_CONCURRENT_DML=1` 同一套
-  用例也全绿）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
+- 全量测试：1668 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1667 通过 + 1 skipped（仅跳过并发写模式显式事务 VACUUM 回滚这条既有限制）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
   34.40s → 0.81s（23.3 → 987.8 ops/s），并发 49.97s → 0.82s（16.0 → 976.1
@@ -363,9 +363,11 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 物理保存点。撤销的插入只标
 `FLAG_ABORTED`。`concurrent_dml` 仍保持 opt-in：不是正确性没底，而是显式事务
 仍是快照隔离（不是 PostgreSQL READ COMMITTED），静默切换会改变用户可见语义；
-默认串行短事务吞吐也更好。文件不缩盘仍是能力边界：整页死链已能在线回收（索引
-陈旧项按 key+RID 清掉、空页重置后移到链尾复用，反复维护不再每次长一页目录；
-但页号仍按文件尾部单调分配，峰值后不缩盘）。`VACUUM` 在线模式只保 RID、不重排
+默认串行短事务吞吐也更好。文件级空间回收已补 MVP：离线 VACUUM 摘掉链尾
+空页、REINDEX/VACUUM 旧索引页、普通 DML 的旧目录中间根页在提交后进入
+元数据页空闲表（最多 1008 项），分配优先复用；关闭时先 checkpoint 再从
+文件尾截掉连续空闲页。中间空页仍只复用不搬移，在线 VACUUM 仍不摘页链；
+空闲表溢出只泄漏空间，不会误用活页。`VACUUM` 在线模式只保 RID、不重排
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
@@ -467,6 +469,18 @@ VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 文件时同步替换账本。副本应用 `COMMIT` 时登记提交 LSN，每批应用后重写
 账本，因此副本的 `SHOW COMMIT LOG` / AS OF 覆盖基准备份之后的新提交。
 新增基准备份历史读与增量重建账本 2 例；默认全量 1656。
+
+2026-11-27 Step 4 文件级空间回收：`DiskManager` 在元数据页 offset 56 起维护
+空闲页表（u32 count + 最多 1008 个 u32），`allocate_page` 优先复用、
+`release_pages` 提交后登记、`truncate_free_tail` 从文件尾截连续空页。
+离线 VACUUM 把重排后的链尾空页摘链并登记，`BPlusTree.collect_pages` 收集
+旧索引树、`CatalogStore.save` 释放非 schema 版本的旧目录中间根页，统一进
+`Transaction.freed_pages`；COMMIT 成功后才 `BufferPool.drop_pages` +
+`release_pages`，ROLLBACK 直接丢弃登记。`Database.close()` 先 checkpoint
+再截尾，避免恢复用旧 WAL 把已截页扩回。空闲表是提示性结构：释放时把页头写成 FREE，恢复 redo 后
+`validate_free_list` 按页头剔除陈旧项；崩溃丢失或 1008 项溢出只泄漏空间，
+不会把活页交给分配器。新增 12 例空间回收测试；
+默认全量 1668。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败

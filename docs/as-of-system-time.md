@@ -79,6 +79,10 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
 - DDL 推进结构下界：当前 schema 不能安全解码 DDL 之前的旧页。于是所有被
   允许的目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要
   历史 schema 解码。
+- 文件级回收只释放"当前结构不再引用"的页：离线 VACUUM 的链尾空页、旧索引
+  树页、普通 DML 的旧目录中间根。schema 版本链的根页仍保留给
+  `SHOW CATALOG VERSIONS` / `table_at` 回溯；AS OF 数据扫描不读旧索引根，
+  只把索引当候选入口再回堆按 LSN 判可见性。
 - 目标点早于下界报 `BinderError`；晚于 `latest_commit_lsn` 也报 `BinderError`。
 
 ## 仍未交付

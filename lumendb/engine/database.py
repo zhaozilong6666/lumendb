@@ -418,6 +418,9 @@ class Database:
         # 同 xid 取更大的 LSN，避免 checkpoint 与裁剪之间的重复条目。
         self.txns.install_commit_lsns(dict(self.commit_ledger.entries()))
         self.recovery_report = self.recovery.recover()
+        # 恢复 redo 之后再复核空闲表：持久表可能落后于最后一次分配，
+        # 已被重新分配的页现在页头不是 FREE，必须从表中剔除。
+        self.disk.validate_free_list()
         self.txns.install_commit_lsns(self.recovery_report.commit_lsns)
         commit_entries = self.txns.commit_log()
         if commit_entries:
@@ -954,19 +957,12 @@ class Database:
                 self._exit_savepoint_mode(txn)
                 raise
             try:
-                self.txns.commit(txn)
-            except BaseException:
                 # 只有 COMMITTED 才说明 WAL 已 fsync 成功（或至少提交点已跨过）。
-                # `commit_record_written` 只表示 COMMIT 记录进了内存 buffer：
-                # fsync 失败时它既没有持久化、事务也仍是 ACTIVE；此时必须走
-                # abort 撤销页写并追加 ABORT 记录，否则它会一直持有 undo，
-                # 后续事务改同一页后，再回滚就会把后来的提交一起覆盖。
-                # 同步复制屏障失败时 txn.state 已是 COMMITTED，不能 undo。
-                if txn.state is not TxnState.COMMITTED:
-                    self.txns.abort(txn)
+                # commit_transaction 负责 abort/回收/checkpoint 的分流。
+                self.commit_transaction(txn)
+            except BaseException:
                 self._exit_savepoint_mode(txn)
                 raise
-            self._maybe_checkpoint()
             self._exit_savepoint_mode(txn)
             return Result(tag="COMMIT")
 
@@ -1022,19 +1018,57 @@ class Database:
         except BaseException:
             self.txns.abort(txn)
             raise
-        try:
-            self.txns.commit(txn)
-        except BaseException:
-            # 同上：用事务状态而不是“COMMIT 记录已写”来判断。记录进 buffer
-            # 不等于 fsync 成功；未 COMMITTED 就必须撤销，避免半提交事务
-            # 的 undo 在后续提交之后才执行、把别人的页改动覆盖掉。
-            if txn.state is not TxnState.COMMITTED:
-                self.txns.abort(txn)
-            raise
-        self._maybe_checkpoint()
+        self.commit_transaction(txn)
         return result
 
     # ------------------------------------------------------------------
+
+    def commit_transaction(self, txn, *, checkpoint: bool = True) -> None:
+        """统一提交入口：COMMIT 成功后立即回收本事务摘掉的页。
+
+        进程内 ``_run_unlocked`` 和线协议 ``pgwire`` 都必须走这里。任何
+        直接 ``txns.commit(txn)`` 的旁路都会让 ``freed_pages`` 永远只留在
+        Transaction 对象里，页链已经不可达、空间却永不回收。
+        """
+        try:
+            self.txns.commit(txn)
+        except BaseException:
+            # 同步屏障失败时事务已是 COMMITTED，页已不可达，仍要释放；
+            # 未 COMMITTED 则先 abort 撤销页写，不能提前复用。
+            if txn.state is TxnState.COMMITTED:
+                self._release_freed_pages(txn)
+            else:
+                self.txns.abort(txn)
+            raise
+        self._release_freed_pages(txn)
+        if checkpoint:
+            self._maybe_checkpoint()
+
+    def _release_freed_pages(self, txn) -> int:
+        """把已提交事务摘链/重建留下的页交给空闲页表。
+
+        只在 COMMIT 成功后调用：回滚需要靠 WAL undo 把旧根/旧页链指回来，
+        提前复用会让 undo 写进新对象的页。``drop_pages`` 只丢 ``pin==0``
+        的页；正在 flush 的页会被临时 pin，因而会跳过——不会出现"旧内容
+        写到刚被复用的页"的窗口；跳过的页只泄漏，不冒复用风险。
+        """
+        if not txn.freed_pages:
+            return 0
+        page_ids = list(txn.freed_pages)
+        txn.freed_pages.clear()
+        # 不 flush_all：这些页已不可达，脏内容不需要落盘。drop_pages 只丢
+        # pin==0 的页；正在 flush 的页会被临时 pin，因而会跳过——不会出现
+        # "旧内容写到刚被复用的页"的窗口。
+        try:
+            dropped = self.bp.drop_pages(page_ids)
+            if not dropped:
+                return 0
+            return self.disk.release_pages(dropped)
+        except Exception:
+            # 提交已经成功，空间回收只是提示性清理；任何失败都只能泄漏，
+            # 不能让调用方误以为 COMMIT 失败。
+            _log.exception("提交后释放页失败，页号将泄漏到本次进程退出")
+            return 0
 
     def checkpoint(self) -> None:
         with self._write_lock:
@@ -1179,12 +1213,30 @@ class Database:
             # 保存点写者锁，这里统一释放，避免 close 之后 no_readers 永久为真。
             if self._savepoint_txn is not None:
                 self._exit_savepoint_mode(self._savepoint_txn)
+            can_truncate = False
             try:
                 self.bp.flush_all()
+                if not self._read_only and self.disk.free_page_count:
+                    # 截尾前必须把 checkpoint 推进到当前 LSN：否则下次恢复会用
+                    # 旧 checkpoint 重放 WAL，``ensure_page`` 又把已截掉的页
+                    # 扩回来（甚至把孤儿页写成脏页），截断就白做了。
+                    # checkpoint 会裁剪 checkpoint 之前的 WAL 段，重放从
+                    # 当前 LSN 起步，不会再碰这些已释放页。
+                    try:
+                        self.recovery.checkpoint()
+                        can_truncate = True
+                    except Exception:
+                        _log.exception("关闭前 checkpoint 失败，跳过文件截尾")
             finally:
                 self.bp.close()
                 self.wal.close()
-                self.disk.close()
+                try:
+                    if can_truncate:
+                        # Buffer Pool 已关闭，此时没有页被 pin/缓存；把文件尾
+                        # 连续的已释放页真正截掉。中间空页仍留给后续分配复用。
+                        self.disk.truncate_free_tail()
+                finally:
+                    self.disk.close()
 
     def __enter__(self) -> "Database":
         return self

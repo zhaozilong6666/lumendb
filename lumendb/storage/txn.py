@@ -115,6 +115,9 @@ class Transaction:
     #: 自动提交的 SELECT 也会 begin/commit 一对，不能因为旧主被 fence 掉
     #: 就连读都不让做。
     wrote: bool = False
+    #: 本事务已经摘链/重建后不再被任何结构引用的页号。只在 COMMIT 后交给
+    #: DiskManager 复用；ROLLBACK 时直接丢弃，页面仍由 WAL undo 指回旧结构。
+    freed_pages: set[int] = field(default_factory=set)
     #: 入口就确定"这条语句只会读"的事务（自动提交的 SELECT/EXPLAIN/SHOW）。
     #: 它们不写 BEGIN/COMMIT/ABORT 记录，所以既不争 WAL 锁，也不在提交时
     #: 触发 fsync；MVCC 只需要内存里的结局表。

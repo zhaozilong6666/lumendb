@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import contextlib
 from collections import OrderedDict
-from typing import Optional
+from typing import Iterable, Optional
 
 from .. import faults
 from ..errors import StorageError
@@ -197,6 +197,33 @@ class BufferPoolManager:
         with self._lock:
             self._dirty.add(page.page_id)
             self._bump_version(page.page_id)
+
+    def drop_pages(self, page_ids: Iterable[int]) -> list[int]:
+        """丢弃已提交事务释放的页缓存；返回真正丢弃的页号。
+
+        只丢弃 ``pin==0`` 的页：正在刷盘的页会被临时 pin，天然被跳过，
+        不会出现"旧内容写到刚被复用的页"。释放页已不可达，脏内容无需
+        先落盘，直接丢掉缓存即可。
+        """
+        dropped: list[int] = []
+        with self._lock:
+            for raw in page_ids:
+                page_id = int(raw)
+                if self._pins.get(page_id, 0) > 0:
+                    continue
+                page = self._frames.pop(page_id, None)
+                if page is None:
+                    self._pins.pop(page_id, None)
+                    self._dirty.discard(page_id)
+                    self._fresh_pages.discard(page_id)
+                    # 页已被淘汰但仍可释放：不在缓存里不等于还被引用。
+                    dropped.append(page_id)
+                    continue
+                self._pins.pop(page_id, None)
+                self._dirty.discard(page_id)
+                self._fresh_pages.discard(page_id)
+                dropped.append(page_id)
+        return dropped
 
     # -- 日志与脏页 ---------------------------------------------------------
 

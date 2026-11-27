@@ -1015,7 +1015,63 @@ class HeapFile:
                 self._release(page, dirty=True)
 
         self.table.row_count_hint = len(keep)
+        self._release_empty_tail(txn)
         return len(keep), dead, rewritten
+
+    def _release_empty_tail(self, txn: Transaction) -> int:
+        """摘掉离线 VACUUM 后落在链尾的空页，并在提交后交给空闲页表。
+
+        离线 VACUUM 按链顺序从根页开始重排，因此空页只可能出现在尾部。
+        这里只改前一页的 ``next`` 和目录里的 ``last_page``；被摘页的槽位
+        目录不再有人读取，提交后由 ``DiskManager`` 复用。根页即使为空也
+        必须保留，保证表始终有一条可写页链。
+        """
+        page_id = self.table.root_page
+        last_nonempty = INVALID_PAGE_ID
+        empty_ids: list[int] = []
+        while page_id != INVALID_PAGE_ID:
+            page = self._fetch(page_id)
+            try:
+                if page.nslots:
+                    if empty_ids:
+                        raise StorageError(
+                            "离线 VACUUM 的空页不在链尾，拒绝摘链",
+                            detail=f"page={page_id} 在空页 {empty_ids[0]} 之后仍有记录",
+                        )
+                    last_nonempty = page_id
+                else:
+                    empty_ids.append(page_id)
+                page_id = page.next_page
+            finally:
+                self._release(page)
+        if not empty_ids:
+            return 0
+        if last_nonempty == INVALID_PAGE_ID:
+            # 全表为空：根页保留（保证始终有一条可写页链），它后面的空页
+            # 全部可以摘掉。根页本身即使为空也不释放。
+            root = self.table.root_page
+            tail = self._fetch(root)
+            try:
+                old = bytes(tail.buf)
+                self._apply_and_log(
+                    txn, tail, 8, struct.pack("<I", INVALID_PAGE_ID), old[8:12]
+                )
+            finally:
+                self._release(tail, dirty=True)
+            self.table.last_page = root
+            txn.freed_pages.update(pid for pid in empty_ids if pid != root)
+            return sum(1 for pid in empty_ids if pid != root)
+        tail = self._fetch(last_nonempty)
+        try:
+            old = bytes(tail.buf)
+            self._apply_and_log(
+                txn, tail, 8, struct.pack("<I", INVALID_PAGE_ID), old[8:12]
+            )
+        finally:
+            self._release(tail, dirty=True)
+        self.table.last_page = last_nonempty
+        txn.freed_pages.update(empty_ids)
+        return len(empty_ids)
 
     def _pack_rows(
         self, page: HeapPage, rows: list[tuple[list[Any], int]], index: int, txn: Transaction

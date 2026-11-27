@@ -46,6 +46,26 @@ class CatalogStore:
     def load(self) -> Optional[bytes]:
         return self.load_at_root(self.current_root())
 
+    def chain_page_ids(self, root: int) -> list[int]:
+        """沿 ``next_page`` 收集一条目录页链的页号；读不到就停。"""
+        if root == INVALID_PAGE_ID or root == 0:
+            return []
+        page_ids: list[int] = []
+        page_id = root
+        seen: set[int] = set()
+        while page_id != INVALID_PAGE_ID and page_id not in seen:
+            seen.add(page_id)
+            current = page_id
+            page = self._bp.fetch_page(current)
+            try:
+                if page.page_type != PageType.CATALOG:
+                    break
+                page_ids.append(current)
+                page_id = page.next_page
+            finally:
+                self._bp.unpin(current)
+        return page_ids
+
     def load_at_root(self, root: int) -> Optional[bytes]:
         """读取指定目录链；用于版本化目录回溯旧 schema。"""
         if root == INVALID_PAGE_ID or root == 0:
@@ -76,15 +96,21 @@ class CatalogStore:
 
     # ------------------------------------------------------------------
 
-    def save(self, txn: Transaction, payload: bytes) -> None:
+    def save(
+        self, txn: Transaction, payload: bytes, *, retain_old: bool = True
+    ) -> None:
         """把整份目录写成一条新页链，并把根页号写回元数据页。
 
-        每次保存都新建链（旧链成为垃圾页）。目录只在 DDL 时变化，这个取舍
-        换来的是"目录更新始终是一个整体"，不会出现半新半旧的两条链。
+        每次保存都新建链。``retain_old`` 表示旧链是否仍被新 payload 的
+        ``previous_root`` 引用：schema 版本切换时必须保留（历史 schema 要
+        沿它回溯）；普通 DML 更新 ``last_page`` 时旧链只是中间态，提交后
+        可以交给空闲页表复用，否则文件会随每次翻页线性增长。
         """
         if not payload:
             return
 
+        old_root = self.current_root()
+        old_pages = [] if retain_old else self.chain_page_ids(old_root)
         chunks = [
             payload[i : i + CHUNK_SIZE] for i in range(0, len(payload), CHUNK_SIZE)
         ]
@@ -156,6 +182,10 @@ class CatalogStore:
                 self._bp.unpin(0, dirty=True)
 
         txn.undo_log.append(undo_root)
+        if old_pages:
+            # 只有提交后才真正进入空闲页表；回滚时 undo_root 会指回旧链，
+            # freed_pages 由 Database 丢弃。
+            txn.freed_pages.update(old_pages)
 
 
 __all__ = ["CatalogStore", "CHUNK_SIZE"]

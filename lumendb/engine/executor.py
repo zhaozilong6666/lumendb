@@ -3374,8 +3374,13 @@ class Executor:
                     seen.add(normalized)
                 entries.append((key, rid))
             tree = self._tree_for(table, idx)
+            old_pages = tree.collect_pages()
             tree.rebuild(txn, entries)
             idx.root_page = tree.root_page
+            # rebuild 先丢根再重新插入，旧树页不会再被目录或叶子链引用；
+            # 提交后交给空闲页表复用。事务回滚时 freed_pages 直接丢弃，
+            # 旧根仍由 WAL undo 指回原页。
+            txn.freed_pages.update(old_pages)
             rebuilt += 1
             entries_total += len(entries)
         return rebuilt, entries_total

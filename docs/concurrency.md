@@ -558,8 +558,8 @@ Step 4 的前置项在这条路径上落地：
   由 `tests/unit/test_faults.py` 钉住“读盘 EIO 必须报错、不能装空页”。
 
 **仍未做 / 切默认模式前必须解决**：
-- 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认/
-  并发各 **1656 passed**，门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
+- 默认模式仍是串行；`LUMEN_CONCURRENT_DML=1` 全量已进 CI（Linux 3.12），默认 **1668 passed**、并发
+  **1667 通过 + 1 skipped**（跳过并发显式事务 VACUUM 回滚的既有限制），门禁脚本 3 轮 PASS（11 项，前两项 pytest 探针固定
   1 轮，已含 VACUUM 等待/在线回收与逻辑保存点探针）。
   I/O 失败窗口另见 [`docs/faults.md`](faults.md)：fsync 注入已挪到真正写完之后，
   覆盖“COMMIT 记录进 buffer 但未 durable”的窗口。
@@ -584,9 +584,11 @@ Step 4 的前置项在这条路径上落地：
   空页回收已补：整条死链连根回收后，先按 `(key, RID)` 精确清掉指向死版本的
   索引项（`_purge_stale_index_entries`），再把整页 `init_heap` 重置并移到链尾
   （`_reclaim_empty_pages`），槽位目录与旧版本链一起归零，后续插入可直接复用。
-  这样 tombstone 槽位目录不再永久占着整页空间；剩余边界是**文件本身不缩小**
-  （页号仍按文件尾部单调分配，没有 freelist/truncate），离线模式（无活跃事务）
-  仍重排 RID 并重建索引。VACUUM 结束的目录落盘也改成按
+  这样 tombstone 槽位目录不再永久占着整页空间。文件级回收已在离线路径补上：
+  事务提交后把摘链空页/旧索引页/旧目录中间根页放进元数据页空闲表，关闭时
+  先 checkpoint 再从文件尾截掉连续空闲页；在线模式仍保 RID、不摘页链。
+  剩余边界是**在线 VACUUM 不缩短页链**，且空闲表只有 1008 项，溢出只泄漏
+  空间、不复用；离线模式（无活跃事务）仍重排 RID 并重建索引。VACUUM 结束的目录落盘也改成按
   `_catalog_structure_fingerprint` 前后比较：在线回收没换根/链尾时不重写整条
   目录页链，避免维护次数直接变成文件页数增长；离线回收换 RID/索引根时仍落盘。
 

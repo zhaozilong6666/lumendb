@@ -32,9 +32,9 @@ def _count_saves(db, monkeypatch) -> list[int]:
     calls = [0]
     original = CatalogStore.save
 
-    def counting_save(self, txn, payload):
+    def counting_save(self, txn, payload, **kwargs):
         calls[0] += 1
-        return original(self, txn, payload)
+        return original(self, txn, payload, **kwargs)
 
     monkeypatch.setattr(CatalogStore, "save", counting_save)
     return calls

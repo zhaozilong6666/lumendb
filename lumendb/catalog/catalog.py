@@ -243,7 +243,7 @@ class Catalog:
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        self._store.save(txn, payload)
+        self._store.save(txn, payload, retain_old=schema_changed)
         if schema_changed:
             self._previous_root = previous_root
             self._last_schema_version = self.schema_version

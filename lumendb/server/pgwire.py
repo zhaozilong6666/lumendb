@@ -332,8 +332,7 @@ class PGWireServer:
                             database.txns.abort(txn)
                             raise
                         try:
-                            database.txns.commit(txn)
-                            database.maybe_checkpoint()
+                            database.commit_transaction(txn)
                         except BaseException:
                             if not getattr(txn, "commit_record_written", False):
                                 database.txns.abort(txn)
@@ -362,8 +361,7 @@ class PGWireServer:
                         database._exit_savepoint_mode(txn)
                         raise
                     try:
-                        database.txns.commit(txn)
-                        database.maybe_checkpoint()
+                        database.commit_transaction(txn)
                     finally:
                         database._exit_savepoint_mode(txn)
                     result = Result(tag="COMMIT")
@@ -518,8 +516,7 @@ class PGWireServer:
                 # 隐式事务失败后同样没有仍然有效的门户。
                 session.portals.clear()
                 raise
-            database.txns.commit(txn)
-            database.maybe_checkpoint()
+            database.commit_transaction(txn)
             # 语句级隐式事务结束，关闭本次事务创建的门户。
             session.portals.clear()
             return result

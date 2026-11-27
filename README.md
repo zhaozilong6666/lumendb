@@ -317,6 +317,7 @@ CI 见 `.github/workflows/ci.yml`：Ubuntu/Windows × Python 3.12/3.13 矩阵，
 - [x] 等值与范围的索引选择（`EXPLAIN` 可见）
 - [x] PostgreSQL wire protocol（simple + extended query，支持 `$1` 参数绑定）
 - [x] `VACUUM`：离线重排 RID/重建索引；有活跃事务时转保 RID 在线回收
+- [x] 文件级空间回收：元数据页空闲表 + 离线 VACUUM 链尾空页、旧索引树、普通 DML 旧目录中间根，提交后才复用；关闭前先 checkpoint 再截文件尾
 - [x] 代价模型基础设施：`plan/cost.py` 提供扫描/过滤/连接/投影/聚合/排序/集合/`LIMIT` 基数与 CPU 估算，`EXPLAIN` 输出 `rows≈/cpu≈` 标注，并作为左深连接顺序与哈希构建侧选择的输入
 - [x] 哈希连接构建侧选择：INNER 连接按估算选择较小的一侧建表，`EXPLAIN` 显示 `[build=left/right]`
 - [x] 左深动态规划连接顺序：3–8 个源按子集枚举选择 `rows + cpu` 最小的顺序；逗号连接和纯 INNER 显式 `JOIN` 链都会重排，外连接/混合 `JOIN`/超过 8 源保持原序；输出列顺序由投影还原；`EXPLAIN` 标记 `[order=dp] [candidates=N]`
