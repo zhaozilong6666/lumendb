@@ -198,6 +198,13 @@ class BufferPoolManager:
             self._dirty.add(page.page_id)
             self._bump_version(page.page_id)
 
+    def _write_disk_page(self, page_id: int, data: bytes) -> None:
+        """刷盘入口：page 0 必须叠加 DiskManager 的权威 meta 字段。"""
+        if page_id == 0:
+            self._disk.write_meta_page(data)
+        else:
+            self._disk.write_page(page_id, data)
+
     def drop_pages(self, page_ids: Iterable[int]) -> list[int]:
         """丢弃已提交事务释放的页缓存；返回真正丢弃的页号。
 
@@ -380,7 +387,7 @@ class BufferPoolManager:
                 page_lsn = page.page_lsn
             if page_lsn > 0:
                 self._wal.flush_upto(page_lsn)
-            self._disk.write_page(page_id, data)
+            self._write_disk_page(page_id, data)
             with self._lock:
                 if self._page_versions.get(page_id, 0) == version:
                     self._dirty.discard(page_id)
@@ -493,7 +500,7 @@ class BufferPoolManager:
             page_lsn = page.page_lsn
             if page_lsn > 0:
                 self._apply_wal_rule(page)
-            self._disk.write_page(page_id, data)
+            self._write_disk_page(page_id, data)
             self._dirty.discard(page_id)
             self.stats.page_writes += 1
         self.stats.evictions += 1

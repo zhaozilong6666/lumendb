@@ -195,7 +195,8 @@ def render(report: AuditReport) -> str:
         "候选键回堆解析，跨 checkpoint 历史 schema 解码仍未覆盖。"
         "文件级回收由元数据页空闲表（最多 1008 项）承接离线 VACUUM 空链尾、"
         "旧索引树和普通 DML 旧目录中间根，关闭前先 checkpoint 再截文件尾；"
-        "溢出或崩溃丢表只泄漏空间，不会复用仍被引用的页。"
+        "page 0 的整页刷盘/淘汰会用内存 meta 字段叠加快照，避免缓存旧副本"
+        "覆盖空闲表与高水位；溢出或崩溃丢表只泄漏空间，不会复用仍被引用的页。"
         "其它边界见 docs/as-of-system-time.md、docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)

@@ -439,23 +439,61 @@ class DiskManager:
                 )
             return data
 
+    def _overlay_meta_fields(self, data: bytes | bytearray) -> bytes:
+        """把 DiskManager 内存里的权威 meta 字段叠到 page 0 快照上。
+
+        ``BufferPool`` 可能缓存 page 0 的旧副本；若整页 flush 直接落盘，
+        会把 ``_persist_meta`` 刚写下的 next_page_id / checkpoint / 历史下界
+        / 空闲表覆盖回旧值。目录根 ``catalog_root`` 不叠：它由 CatalogStore
+        通过 BufferPool 维护，反而要以页快照为准。
+        """
+        buf = bytearray(data)
+        struct.pack_into("<I", buf, META_OFF_NEXT_PAGE, self._meta.next_page_id)
+        struct.pack_into("<Q", buf, META_OFF_NEXT_XID, self._meta.next_xid)
+        struct.pack_into("<Q", buf, META_OFF_CHECKPOINT_LSN, self._meta.checkpoint_lsn)
+        struct.pack_into("<Q", buf, META_OFF_HISTORY_FLOOR, self._meta.history_floor_lsn)
+        free_ids = self._meta.free_page_ids()
+        struct.pack_into("<I", buf, META_OFF_FREE_COUNT, len(free_ids))
+        for i, pid in enumerate(free_ids):
+            struct.pack_into("<I", buf, META_OFF_FREE_LIST + i * 4, pid)
+        return bytes(buf)
+
+    def _write_page_locked(
+        self, page_id: int, data: bytes | bytearray
+    ) -> None:
+        """已持 ``_io_lock`` 的页写底层；故障注入与 torn 语义集中在这里。"""
+        cut = _fault_torn("disk.write_page", len(data))
+        if cut is not None:
+            # torn write：前半页新内容、后半页旧内容，然后明确报错。
+            # 不能在这里写完整页再抛——那样测试不到恢复/校验路径。
+            self._fh.seek(page_id * PAGE_SIZE)
+            self._fh.write(data[:cut])
+            self._fh.flush()
+            raise OSError(5, "injected torn page write")
+        _fault_check("disk.write_page")
+        self._fh.seek(page_id * PAGE_SIZE)
+        self._fh.write(data)
+
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         if len(data) != PAGE_SIZE:
             raise StorageError(f"写入长度必须是 {PAGE_SIZE}，收到 {len(data)}")
         with self._io_lock:
             if page_id < 0 or page_id >= self.num_pages:
                 raise PageNotFoundError(f"页 {page_id} 未分配，不能写入")
-            cut = _fault_torn("disk.write_page", len(data))
-            if cut is not None:
-                # torn write：前半页新内容、后半页旧内容，然后明确报错。
-                # 不能在这里写完整页再抛——那样测试不到恢复/校验路径。
-                self._fh.seek(page_id * PAGE_SIZE)
-                self._fh.write(data[:cut])
-                self._fh.flush()
-                raise OSError(5, "injected torn page write")
-            _fault_check("disk.write_page")
-            self._fh.seek(page_id * PAGE_SIZE)
-            self._fh.write(data)
+            self._write_page_locked(page_id, data)
+
+    def write_meta_page(self, data: bytes | bytearray) -> None:
+        """写 page 0：先用内存 meta 字段覆盖旧页快照，再按普通页写下。
+
+        专门给 BufferPool 的整页刷盘路径用；恢复/备份的 ``write_page``
+        仍按原始页镜像写，避免把 WAL redo 里的 page 0 字段改掉。
+        """
+        if len(data) != PAGE_SIZE:
+            raise StorageError(f"写入长度必须是 {PAGE_SIZE}，收到 {len(data)}")
+        with self._io_lock:
+            if self.num_pages < 1:
+                raise PageNotFoundError("页 0 不存在")
+            self._write_page_locked(0, self._overlay_meta_fields(data))
 
     def sync(self) -> None:
         """把文件缓冲与元数据刷到磁盘（fsync，不是 fflush）。"""

@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import os
+import struct
 
 import pytest
 
 from lumendb.engine.database import Database
-from lumendb.storage.pager import DiskManager, PAGE_SIZE
+from lumendb.storage.pager import (
+    DiskManager,
+    META_OFF_FREE_COUNT,
+    META_OFF_FREE_LIST,
+    META_OFF_NEXT_PAGE,
+    PAGE_SIZE,
+)
 
 
 def _data_file(db: Database):
@@ -53,6 +60,40 @@ def test_disk_release_ignores_out_of_range_and_duplicate_pages(tmp_path):
         assert sorted(disk.free_page_ids()) == [1, 2]
     finally:
         disk.close()
+
+
+def test_meta_page_flush_keeps_disk_manager_fields(tmp_path):
+    """BufferPool 整页刷 page 0 时不能把 DiskManager 直写的 meta 字段盖回旧值。"""
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT)")
+        # 目录保存已经取过 page 0 并标脏；此时缓存里的 next_page_id/空闲表
+        # 还是旧副本。
+        assert 0 in db.bp._dirty
+        pid = db.disk.allocate_page()
+        assert db.disk.release_pages([pid]) == 1
+        assert db.disk.free_page_count == 1
+
+        db.bp.flush_page(0)
+        raw = db.disk.read_page(0)
+        assert struct.unpack_from("<I", raw, META_OFF_NEXT_PAGE)[0] == (
+            db.disk.meta.next_page_id
+        )
+        assert struct.unpack_from("<I", raw, META_OFF_FREE_COUNT)[0] == 1
+        assert struct.unpack_from("<I", raw, META_OFF_FREE_LIST)[0] == pid
+
+        # 淘汰路径同样要叠加；否则 page 0 被 LRU 淘汰时又会写回旧副本。
+        db.bp.fetch_page(0)
+        db.bp.unpin(0, dirty=True)
+        db.bp._evict(0)
+        raw = db.disk.read_page(0)
+        assert struct.unpack_from("<I", raw, META_OFF_NEXT_PAGE)[0] == (
+            db.disk.meta.next_page_id
+        )
+        assert struct.unpack_from("<I", raw, META_OFF_FREE_COUNT)[0] == 1
+        assert struct.unpack_from("<I", raw, META_OFF_FREE_LIST)[0] == pid
+    finally:
+        db.close()
 
 
 def test_vacuum_releases_empty_tail_and_shrinks_file(tmp_path):

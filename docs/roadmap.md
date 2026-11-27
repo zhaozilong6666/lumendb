@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1668 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1667 通过 + 1 skipped（仅跳过并发写模式显式事务 VACUUM 回滚这条既有限制）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
+- 全量测试：1669 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1668 通过 + 1 skipped（仅跳过并发写模式显式事务 VACUUM 回滚这条既有限制）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
   34.40s → 0.81s（23.3 → 987.8 ops/s），并发 49.97s → 0.82s（16.0 → 976.1
@@ -481,6 +481,13 @@ VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 `validate_free_list` 按页头剔除陈旧项；崩溃丢失或 1008 项溢出只泄漏空间，
 不会把活页交给分配器。新增 12 例空间回收测试；
 默认全量 1668。
+
+2026-11-27 元数据页缓存一致性：page 0 被 BufferPool 缓存后，整页刷盘/淘汰
+会把 `DiskManager._persist_meta` 刚写下的 `next_page_id`、`checkpoint_lsn`、
+历史下界和空闲表覆盖回旧快照（实测 flush 后 next_page_id 从 3 回退到 1）。
+新增 `write_meta_page`：写 page 0 前用内存 meta 字段叠加快照，只保留
+`catalog_root`；`flush_page` 与 LRU 淘汰两条路径都走它。新增 1 例回归，
+默认全量 1669；并发 1668 + 1 skipped。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败

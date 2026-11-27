@@ -230,7 +230,11 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 `validate_free_list` 逐项复核页头，持久表里"已被重新分配但仍记为空闲"的
 陈旧项会被剔除，宁可泄漏也不复用已提交页。`Database.close()` 在关闭 Buffer Pool、且
 先做一次 checkpoint 之后，才从文件尾截掉连续空闲页；checkpoint 保证下次
-恢复不会用旧 WAL 记录把已截掉的页 `ensure_page` 回来。中间空页留在空闲表
+恢复不会用旧 WAL 记录把已截掉的页 `ensure_page` 回来。page 0 被 Buffer
+Pool 缓存时，整页刷盘/淘汰不能直接写旧快照：`DiskManager.write_meta_page`
+先用内存里的 `next_page_id`、`next_xid`、`checkpoint_lsn`、历史下界和
+空闲表覆盖快照，只保留快照里的 `catalog_root`，避免一次 LRU 刷盘把刚持久化
+的空闲表/高水位写回旧值。中间空页留在空闲表
 里等复用，因此文件缩容是"尾部回收"，不是在线整理。没有 autovacuum、
 没有增量回收；在线模式的根记录/空洞槽位回收是下一件要做的事。
 
