@@ -119,8 +119,12 @@ class TestCommitIntegration:
 def _cluster(tmp_path, count: int = 3):
     nodes = []
     for i in range(count):
+        # 选举 RPC 超时不能压到 0.5s：Windows CI 在全量套件负载下曾两次
+        # 出现预投票通过、正式投票的单个响应排到 0.5s 之外，campaign 拿到
+        # 1/3 票就失败。2s 是 QuorumNode 的默认值，仍能在 peer 不可达时
+        # 快速失败，但不会被一次调度抖动误判成少数派。
         node = QuorumNode(
-            f"n{i}", state_path=tmp_path / f"n{i}.vote.json", timeout=0.5
+            f"n{i}", state_path=tmp_path / f"n{i}.vote.json", timeout=2.0
         ).start()
         nodes.append(node)
     peers = {node.node_id: (node.host, node.port) for node in nodes}
