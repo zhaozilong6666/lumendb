@@ -948,6 +948,37 @@ def test_logical_savepoint_rejects_vacuum_with_row_undo(tmp_path):
         db.close()
 
 
+def test_explicit_txn_rejects_vacuum_when_logical_rollback(tmp_path):
+    """并发写模式的显式事务回滚不能还原 VACUUM 物理回收的旧版本。
+
+    自动提交的 VACUUM 没有外层 ROLLBACK，仍然允许；这里钉住显式事务的安全
+    拒绝，避免 VACUUM 先删掉死版本、ROLLBACK 后行永久消失。
+    """
+    db = Database(
+        tmp_path / "explicit_vacuum", concurrent_dml=True, logical_savepoints=False
+    )
+    try:
+        db.execute_one("CREATE TABLE t (id INT, pad TEXT)")
+        pad = "z" * 900
+        for i in range(40):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+
+        db.execute_one("BEGIN")
+        db.execute_one("DELETE FROM t WHERE id > 0")
+        with pytest.raises(
+            NotSupportedError, match="并发写模式下显式事务内不能执行 VACUUM"
+        ):
+            db.execute_one("VACUUM t")
+        db.execute_one("ROLLBACK")
+
+        # 未提交的 DELETE + 被拒绝的 VACUUM：回滚后 40 行都应还在。
+        assert db.execute_one("SELECT count(*) FROM t").rows == [(40,)]
+        # 自动提交路径仍然可用。
+        db.execute_one("VACUUM t")
+    finally:
+        db.close()
+
+
 def test_logical_savepoint_reuses_key_and_row_after_rollback(tmp_path):
     db = Database(tmp_path / "logical_sp_reuse", concurrent_dml=True, logical_savepoints=True)
     server = PGWireServer(db)

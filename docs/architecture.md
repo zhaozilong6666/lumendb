@@ -221,6 +221,11 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 两种模式都按页写 **before/after image**，崩溃后恢复能重放，不会出现
 "VACUUM 之后行凭空消失/复活"。
 
+并发写模式（`BufferPool.logical_abort=True`）下，VACUUM 只允许自动提交事务。
+显式 `BEGIN` 事务内的 VACUUM 会直接返回 `0A000`：整事务回滚走逻辑可见性，
+堆页/B+ 树页没有物理原像；VACUUM 已经重排页链、回收死版本后，`ROLLBACK`
+无法把旧版本变回来。默认串行模式仍允许事务内 VACUUM，按页 undo 回滚。
+
 离线 VACUUM 还会摘掉链尾连续的空页，并把它们交给文件级空闲页表；在线
 模式保持 RID 不变，不摘页链。空闲页表存在元数据页尾部（`free_count` +
 最多 1008 个 u32 页号），分配新页时优先复用；表满或崩溃丢掉空闲表只会

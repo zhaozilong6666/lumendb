@@ -2226,6 +2226,8 @@ class TestAlterTable:
         db2.close()
 
     def test_vacuum_rollback_restores_rows_and_index(self, db):
+        if db._concurrent_dml:
+            pytest.skip("并发逻辑回滚下 VACUUM 被显式拒绝；见 test_concurrent_dml")
         db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
         db.execute_one("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
         db.execute_one("CREATE INDEX idx_name ON t (name)")

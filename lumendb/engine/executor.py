@@ -3397,6 +3397,16 @@ class Executor:
                 detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
                 hint="先 COMMIT 或 ROLLBACK 整个事务；需要事务内 VACUUM 时改用 --physical-savepoints",
             )
+        if self._bp.logical_abort and not txn.statement_scoped:
+            # 并发写模式的整事务回滚也走逻辑路径：堆页/B+ 树页不记物理原像。
+            # VACUUM 一旦重排页链、回收死版本，ROLLBACK 无法把旧版本变回来。
+            # 自动提交的 VACUUM 没有外层 ROLLBACK，仍然允许（在线/离线路径都走）。
+            raise NotSupportedError(
+                "并发写模式下显式事务内不能执行 VACUUM",
+                detail="VACUUM 会物理回收行 undo 仍依赖的旧版本，逻辑回滚无法还原",
+                hint="先 COMMIT 或 ROLLBACK 整个事务，再单独执行 VACUUM；"
+                "需要事务内 VACUUM 时改用默认串行模式",
+            )
         tables = (
             [self._catalog.get_table(stmt.table)]
             if stmt.table

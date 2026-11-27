@@ -73,7 +73,8 @@ def test_crashed_online_vacuum_keeps_visible_rows(tmp_path, monkeypatch):
 
     before = _physical_versions(db)
     vacuum = Session(database=db)
-    _run(server, vacuum, "BEGIN")
+    # 自动提交路径：并发写模式下显式事务内 VACUUM 会被拒绝（逻辑回滚不能
+    # 还原物理回收的旧版本）；崩溃恢复不依赖外层事务。
     result = _run(server, vacuum, "VACUUM")[0]
     assert result.affected > 0
     after_vacuum = _physical_versions(db)

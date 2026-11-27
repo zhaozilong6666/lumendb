@@ -6,8 +6,9 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1669 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1668 通过 + 1 skipped（仅跳过并发写模式显式事务 VACUUM 回滚这条既有限制）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
+- 全量测试：1671 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1669 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+  对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
   34.40s → 0.81s（23.3 → 987.8 ops/s），并发 49.97s → 0.82s（16.0 → 976.1
@@ -488,6 +489,18 @@ VACUUM/DDL 下界跨重启保持。当时默认/并发全量各 1647 例。
 新增 `write_meta_page`：写 page 0 前用内存 meta 字段叠加快照，只保留
 `catalog_root`；`flush_page` 与 LRU 淘汰两条路径都走它。新增 1 例回归，
 默认全量 1669；并发 1668 + 1 skipped。
+
+2026-11-27 并发写模式显式事务 VACUUM 门禁：整事务回滚走逻辑可见性、堆页/
+B+ 树页不记物理原像；事务内 VACUUM 一旦重排页链、回收死版本，`ROLLBACK`
+无法还原（实测 40 行表 `BEGIN→DELETE→VACUUM→ROLLBACK` 只剩 1 行）。
+入口在 `logical_abort` 且非自动提交事务时返回 `0A000`，先 COMMIT/ROLLBACK
+再单独 VACUUM；自动提交 VACUUM 仍走在线/离线路径。新增 1 例门禁回归，
+并把在线 VACUUM 崩溃用例改为自动提交。默认全量 1671；并发 1669 + 2 skipped。
+
+2026-11-27 Windows 提交账本替换重试：副本读账本与 checkpoint 重写并发时，
+`os.replace` 可能被杀毒/索引短暂锁住目标文件（`WinError 5`）。账本写入改为
+8 次线性退避重试；一次瞬时锁失败不再让整库回归红。新增 1 例重试回归，
+默认全量 1671。
 
 2026-11-25 修掉两个真实并发缺口：行锁前物化目标在链头未提交时误丢 RID，导致
 `affected=0`；checkpoint 在锁外 fsync 可能漏掉晚到的页写；屏障最终 fsync 失败

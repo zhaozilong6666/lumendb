@@ -476,7 +476,10 @@ Step 4 的前置项在这条路径上落地：
   因为页原像会和行 undo 的 RID/槽位假设冲突（实测 `SAVEPOINT→TRUNCATE→INSERT→
   ROLLBACK` 会误标原行）。`VACUUM` 不升级，始终拒绝。事务结束统一清空 undo 栈
   并复位捕获标志。并发模式下默认开启；显式 `logical_savepoints=False` 或
-  `--physical-savepoints` 退回物理保存点。别的会话执行 DDL/TRUNCATE 时
+  `--physical-savepoints` 退回物理保存点。**普通显式事务（非保存点）在并发
+  写模式下也不能执行 VACUUM**：整事务回滚走逻辑可见性、没有页原像，VACUUM
+  物理回收死版本后无法还原；入口返回 `0A000`，先 COMMIT/ROLLBACK 再单独执行。
+  自动提交的 VACUUM 仍走在线/离线路径。别的会话执行 DDL/TRUNCATE 时
   走 `ddl_guard`：拿独占门前与拿到门后各查一次活跃事务的行 undo，仍有则返回
   可重试的 `40001`，避免 `ALTER DROP COLUMN` 改行布局后行 undo 按新 schema
   解码旧版本而报列数不符；检查与拿门之间新产生的行 undo 由第二次检查兜住。
@@ -489,7 +492,7 @@ Step 4 的前置项在这条路径上落地：
   读者后也走同一套检查；否则它会绕过普通 `ddl_guard`。
 
 回归：
-- `tests/unit/test_concurrent_dml.py`（40 例：并发插入全提交、混合 DML + 半数回滚、
+- `tests/unit/test_concurrent_dml.py`（48 例：并发插入全提交、混合 DML + 半数回滚、
   逻辑回滚不可见 + VACUUM 回收、并发删除与读者、保存点等待独占并回滚、
   保存点跨线程释放、保存点事务内关闭、VACUUM 等待活跃事务、VACUUM 超时转在线、
   活跃 DDL 时拒绝在线回收、热点行无丢失更新；逻辑保存点另覆盖不阻塞其它写者、
