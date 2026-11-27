@@ -2921,7 +2921,9 @@ class Executor:
                     for n in dropped_names
                     if n in txn.constraint_modes
                 }
+                old_index_pages = self._tree_for(table, index).collect_pages()
                 self._catalog.drop_index(txn, name)
+                txn.freed_pages.update(old_index_pages)
                 for n in old_modes:
                     txn.constraint_modes.pop(n, None)
 

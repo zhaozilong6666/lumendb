@@ -325,6 +325,43 @@ def test_drop_index_releases_tree_pages(tmp_path, monkeypatch, concurrent):
         reopened.close()
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_drop_constraint_releases_index_pages(tmp_path, monkeypatch, concurrent):
+    """DROP CONSTRAINT 删除唯一/主键索引时也必须回收旧树页。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one(
+            "CREATE TABLE t (id INT PRIMARY KEY, pad TEXT, "
+            "CONSTRAINT uq_pad UNIQUE (pad))"
+        )
+        pad = "u" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, f"{pad}{i}"])
+        free_before = db.disk.free_page_count
+
+        db.execute_one("BEGIN")
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT uq_pad")
+        db.execute_one("ROLLBACK")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        assert db.disk.free_page_count <= free_before + 1
+
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT uq_pad")
+        assert db.disk.free_page_count > free_before + 10
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+        db.execute_one("ALTER TABLE t DROP CONSTRAINT t_pkey")
+        assert _rows(db, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(160,)]
+    finally:
+        reopened.close()
+
+
 def test_vacuum_empty_table_releases_all_but_root(tmp_path):
     db = Database(tmp_path / "db")
     try:

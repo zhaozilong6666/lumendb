@@ -200,7 +200,8 @@ def render(report: AuditReport) -> str:
         "并发写模式下显式事务内 VACUUM 返回 0A000（逻辑回滚无法还原物理回收），"
         "自动提交 VACUUM 仍走在线/离线路径；ALTER TABLE 的 shadow heap 切换根页"
         "后旧堆页登记进空闲表，回滚则丢弃登记、保留旧根；DROP TABLE / "
-        "DROP INDEX 删除目录项前收集堆页与索引树页，提交后同样回收。"
+        "DROP INDEX 删除目录项前收集堆页与索引树页，提交后同样回收；"
+        "DROP CONSTRAINT 删除唯一/主键索引同样先收集旧树页。"
         "其它边界见 docs/as-of-system-time.md、docs/concurrency.md 与 roadmap。"
     )
     return "\n".join(lines)

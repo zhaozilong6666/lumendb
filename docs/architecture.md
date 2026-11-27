@@ -235,7 +235,8 @@ DELETE 成功后把逆操作闭包压入 `txn.row_undo_log`。`ROLLBACK TO` 在�
 切换根页后，旧堆页链也会登记到 `txn.freed_pages`：DDL 开始时历史下界已经
 前移，旧堆页不再供 `AS OF` 读取；提交后这些页进入空闲表复用，回滚仍由
 页原像恢复旧根。`DROP TABLE` / `DROP INDEX` 在删除目录项前收集旧堆页与
-旧索引树页，提交后同样进入空闲表；回滚撤销目录项后旧页仍被引用，登记
+旧索引树页，提交后同样进入空闲表；`ALTER TABLE ... DROP CONSTRAINT` 删除
+PRIMARY/UNIQUE 索引时也先收集旧树页。回滚撤销目录项后旧页仍被引用，登记
 随事务丢弃。释放时把页头重写成 `FREE`；恢复 redo 结束后
 `validate_free_list` 逐项复核页头，持久表里"已被重新分配但仍记为空闲"的
 陈旧项会被剔除，宁可泄漏也不复用已提交页。`Database.close()` 在关闭 Buffer Pool、且
