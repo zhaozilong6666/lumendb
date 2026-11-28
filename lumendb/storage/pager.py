@@ -352,7 +352,10 @@ class DiskManager:
         with self._io_lock:
             free_ids = self._meta.free_page_ids()
             if free_ids:
-                pid = free_ids.pop()
+                # 取页号最小的空闲页，而不是栈式弹最高页：新根/新堆页落在
+                # 低页，关闭时高位空闲页才有机会被 truncate_free_tail 截掉。
+                pid = min(free_ids)
+                free_ids.remove(pid)
                 self._meta.set_free_page_ids(free_ids)
             elif self._meta.free_overflow_head and self._overflow_trusted:
                 # 数组空但溢出链还有页：继续复用，避免一次大 DROP 之后

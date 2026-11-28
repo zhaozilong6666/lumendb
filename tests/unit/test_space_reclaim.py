@@ -51,6 +51,20 @@ def test_disk_free_list_reuses_and_truncates_tail(tmp_path):
         disk.close()
 
 
+def test_disk_allocates_lowest_free_page_first(tmp_path):
+    """空闲页按页号从小到大复用，避免新页落在文件尾挡住截尾。"""
+    disk = DiskManager(tmp_path / "space.data")
+    try:
+        ids = [disk.allocate_page() for _ in range(3)]
+        assert ids == [1, 2, 3]
+        assert disk.release_pages([3, 1]) == 2
+        assert disk.allocate_page() == 1
+        assert disk.allocate_page() == 3
+        assert disk.free_page_count == 0
+    finally:
+        disk.close()
+
+
 def test_disk_release_ignores_out_of_range_and_duplicate_pages(tmp_path):
     disk = DiskManager(tmp_path / "space.data")
     try:
@@ -480,18 +494,17 @@ def test_free_list_capacity_overflow_is_reused_and_tail_truncated(tmp_path):
         assert disk.free_page_count == META_FREE_CAPACITY + 2
         assert len(disk.free_page_ids()) == META_FREE_CAPACITY + 2
 
-        # 仍可正常分配与读取，未出现页号越界；溢出页也算可用页。
+        # 低页优先：分配的是页 1，不是数组最高页 1008。
         pid = disk.allocate_page()
-        assert pid <= META_FREE_CAPACITY + 2
+        assert pid == 1
         disk.read_page(pid)
         assert disk.free_page_count == META_FREE_CAPACITY + 1
 
-        # 释放顺序把最后两页放进溢出列表；刚才的分配取自数组尾页 1008，
-        # 所以能从文件尾截掉的正是溢出页 1009/1010。
+        # 页 1 被占，页 2..1010 全在空闲表/溢出链里；从文件尾可以一路截到页 1。
         removed = disk.truncate_free_tail()
-        assert removed == 2
-        assert disk.num_pages == META_FREE_CAPACITY + 1
-        assert disk.free_page_count == META_FREE_CAPACITY - 1
+        assert removed == META_FREE_CAPACITY + 1
+        assert disk.num_pages == 2
+        assert disk.free_page_count == 0
     finally:
         disk.close()
 
@@ -644,6 +657,27 @@ def test_truncate_reclaims_heap_pages_and_shrinks_file(tmp_path, monkeypatch, co
     reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
     try:
         assert _rows(reopened, "SELECT id FROM t") == [(1,)]
+    finally:
+        reopened.close()
+
+
+def test_truncate_with_primary_index_shrinks_after_refill(tmp_path):
+    """TRUNCATE 后重建的索引根也要落在低空闲页，填一行后关闭仍能截尾。"""
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        pad = "w" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        db.execute_one("TRUNCATE TABLE t")
+        db.execute_one("INSERT INTO t VALUES (1, 'ok')")
+    finally:
+        db.close()
+
+    assert _file_pages(db) <= 6
+    reopened = Database(tmp_path / "db")
+    try:
+        assert _rows(reopened, "SELECT id FROM t WHERE id = 1") == [(1,)]
     finally:
         reopened.close()
 

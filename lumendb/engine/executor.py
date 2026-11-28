@@ -3521,7 +3521,7 @@ class Executor:
         )
 
     def _truncate(self, stmt: Truncate, txn: Transaction) -> Result:
-        """清空一到多张表：页链保留但每一页重置为空页，索引随之重建为空。
+        """清空一到多张表：复用最低旧堆页作空根，其余堆页提交后回收，索引随之重建为空。
 
         ``TRUNCATE a, b`` 在默认 ``RESTRICT`` 下允许一起清空有外键依赖的表，
         但只要某张被引用表的子表没有出现在同一列表中，就仍然拒绝。``CASCADE``
