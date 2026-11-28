@@ -591,8 +591,10 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 `next/prev/page_id` 和每个 payload 的 `previous_root`，一次性写 page 0 新根 +
 已摘除的空闲表，fsync 后再释放旧页并截尾。限制：目录不在最高活页、空闲页不够
 或重序列化后超过原页数时不搬，保留原行为。实测 4200 行场景 1053 → 3 页；
-160 行回归用例 43 → 3 页，重开后目录为空、再建表读写正常。新增 1 例；默认
-全量 1692 passed（131.95s），并发 1690 通过 + 2 skipped（141.06s）。
+160 行回归用例 43 → 3 页，重开后目录为空、再建表读写正常，历史链
+`previous_root` 仍能读出被 DROP 的表定义。新增 1 例；默认全量 1692 passed
+（131.95s），并发 1690 通过 + 2 skipped（141.06s）。CI #392 在 `b2133b0`
+上五个 job 全部 Success，6m41s。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
