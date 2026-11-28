@@ -952,6 +952,9 @@ class HeapFile:
 
         # 空页的旧槽位目录/版本链已经被整页重置，计进“重写页数”。
         rewritten.update(self._reclaim_empty_pages(txn, page_ids, keep))
+        # 空页已经被移到链尾；把它们从页链摘掉并交给空闲表，在线 VACUUM
+        # 也能让关闭截尾看到更短的堆链。根页始终保留。
+        self._release_empty_tail(txn)
 
         live_roots: set[RID] = set()
         for rid, header in headers.items():
@@ -1047,10 +1050,10 @@ class HeapFile:
     def _release_empty_tail(self, txn: Transaction) -> int:
         """摘掉离线 VACUUM 后落在链尾的空页，并在提交后交给空闲页表。
 
-        离线 VACUUM 按链顺序从根页开始重排，因此空页只可能出现在尾部。
-        这里只改前一页的 ``next`` 和目录里的 ``last_page``；被摘页的槽位
-        目录不再有人读取，提交后由 ``DiskManager`` 复用。根页即使为空也
-        必须保留，保证表始终有一条可写页链。
+        离线 VACUUM 按链顺序从根页开始重排，在线 VACUUM 则把整页空链移到
+        尾部，因此空页只可能出现在尾部。这里只改前一页的 ``next`` 和目录里的
+        ``last_page``；被摘页的槽位目录不再有人读取，提交后由 ``DiskManager``
+        复用。根页即使为空也必须保留，保证表始终有一条可写页链。
         """
         page_id = self.table.root_page
         last_nonempty = INVALID_PAGE_ID
@@ -1061,7 +1064,7 @@ class HeapFile:
                 if page.nslots:
                     if empty_ids:
                         raise StorageError(
-                            "离线 VACUUM 的空页不在链尾，拒绝摘链",
+                            "VACUUM 的空页不在链尾，拒绝摘链",
                             detail=f"page={page_id} 在空页 {empty_ids[0]} 之后仍有记录",
                         )
                     last_nonempty = page_id

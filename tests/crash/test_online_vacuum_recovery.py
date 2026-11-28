@@ -137,9 +137,10 @@ def test_crashed_online_vacuum_page_reclaim_keeps_chain_and_rows(tmp_path):
     db.catalog.mark_dirty()
     db.catalog.persist(vac)
     db.txns.commit(vac)
-    assert table.last_page == target_page
+    # 空页已从堆链摘掉，新的链尾不再是它。
+    assert table.last_page != target_page
 
-    # 重置后的页应立即能复用；旧键的索引项不得把新行当成命中。
+    # 旧键的索引项不得把新行当成命中。
     new_row = db.execute_one(
         f"INSERT INTO t VALUES (99, 99, '{'y' * 100}')"
     )

@@ -682,8 +682,8 @@ def test_vacuum_online_purges_stale_index_entries(env):
     txns.commit(reader)
 
 
-def test_vacuum_online_reclaims_empty_page_and_reuses_it(env):
-    """整页死链回收后，页移到链尾复用；旧索引项不能命中新行。"""
+def test_vacuum_online_reclaims_empty_page_without_stale_index_hits(env):
+    """整页死链回收后，页从堆链摘掉；旧索引项不能命中新行。"""
     heap, txns, bp, table = env
     idx = IndexDef(name="idx_age", table=table.name, columns=("age",))
     table.indexes[idx.name] = idx
@@ -726,14 +726,14 @@ def test_vacuum_online_reclaims_empty_page_and_reuses_it(env):
     assert kept == len(rids) - len(page_of[target])
     assert dead == len(page_of[target])
     assert pages >= 1
-    assert table.last_page == target
+    assert table.last_page != target
 
     reader = txns.begin()
     assert all(rid[0] != target for _key, rid in tree.scan_all(reader))
     new_rid = heap.insert(reader, [99, "y" * 100, 99])
     tree.insert(reader, [99], new_rid)
     txns.commit(reader)
-    assert new_rid[0] == target
+    assert new_rid[0] != target
     reader = txns.begin()
     assert heap.get(reader, new_rid) == [99, "y" * 100, 99]
     txns.commit(reader)

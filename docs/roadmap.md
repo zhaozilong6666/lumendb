@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1702 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1700 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1703 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1701 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -370,7 +370,7 @@ undo，事务内 DDL/TRUNCATE/VACUUM 会被拒绝；尚无行 DML 时 DDL/TRUNCA
 FREE 页 next 链（page 0 只存链头），链随元数据持久化，重启后仍可复用并参与
 关闭截尾；链损坏只泄漏空间、不会误用活页。关闭时先 checkpoint 再从文件尾
 截掉连续空闲页。中间空页
-仍只复用不搬移，在线 VACUUM 仍不摘页链。`VACUUM` 在线模式只保 RID、不重排
+仍只复用不搬移；在线 VACUUM 会把整页空链移到链尾后摘掉，交给空闲表。`VACUUM` 在线模式只保 RID、不重排
 （有活跃事务时等 5s 后自动转在线，不再报错；版本索引只保留 38 字节记录头，
 物理版本数默认上限 250,000，可由 Database/CLI 配置，超限失败关闭）。自动提交
 UPDATE 的 READ COMMITTED 色彩与显式事务的快照隔离已写成契约并由测试钉住。
@@ -584,11 +584,21 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
 全部 Success，6m07s。
 
+2026-11-28 在线 VACUUM 摘尾部空页：`vacuum_online` 的 `_reclaim_empty_pages`
+已经把整页死链重置并移到链尾，但没有调用 `_release_empty_tail`，空页仍留在
+堆链里。实测 200 行 900B 表全部删除后，在线 VACUUM 释放 50 页空闲表项，
+文件关闭仍是 53 页。改为在线回收后同样摘掉链尾空页：根页保留，其余空页
+改前一页 `next`/`last_page` 并登记 `freed_pages`，提交后进空闲表；关闭时
+文件缩到 3 页。在线模式仍不搬移中间非空页、不改变存活行 RID。更新原空页
+复用用例为“页从堆链摘掉、旧索引项不命中新槽位”，崩溃恢复用例改为断言
+链尾不再是空页。新增 1 例；默认全量 1703 passed（173.80s），并发 1701
+通过 + 2 skipped（170.27s）。
+
 2026-11-28 catalog 保留窗口可配置：`Database(catalog_history_limit=1000)`
 新增参数并校验正整数，构造 `Catalog(..., history_limit=...)`；CLI 三个子命令
 共用 `--catalog-history-limit`，默认仍是 1000。需要更快缩容或更短 AS OF
 目录历史时可以调小，不需要改代码。新增 CLI 接线用例：5 个版本窗口设 3 时
-`history()` 只返回 [5,4,3]，0 被拒绝。默认全量 1702 passed（169.20s），
+`history()` 只返回 [5,4,3]，0 被拒绝。当时默认全量 1702 项通过（169.20s），
 并发 1700 通过 + 2 skipped（174.42s）。CI #397 在
 `1508898` 上五个 job 全部 Success，6m27s。
 

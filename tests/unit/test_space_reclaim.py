@@ -930,3 +930,22 @@ def test_rollback_does_not_reclaim_pages_when_another_txn_committed(tmp_path):
         assert page.page_id not in db.disk.free_page_ids()
     finally:
         db.close()
+
+
+def test_online_vacuum_reclaims_empty_tail_pages_and_shrinks_file(tmp_path):
+    """在线 VACUUM 全删后应把空页摘出堆链并交给空闲表，关闭可截尾。"""
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT, payload TEXT)")
+    for i in range(200):
+        db.execute_one(f"INSERT INTO t VALUES ({i}, '{'x' * 900}')")
+    assert _file_pages(db) >= 40
+    db.execute_one("DELETE FROM t")
+    latest = max(lsn for _xid, lsn in db.txns.commit_log())
+    db.execute_one(f"VACUUM t RETAIN LSN {latest}")
+    assert len(db.disk.free_page_ids()) >= 40
+    db.close()
+    assert _file_pages(db) <= 5
+
+    db = Database(tmp_path)
+    assert db.execute_one("SELECT * FROM t").rows == []
+    db.close()
