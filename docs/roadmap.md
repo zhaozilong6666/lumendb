@@ -581,7 +581,8 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 强制把已走通前缀重建成线性链；`allocate_page` 在未校验前拒绝从链取页、头页
 页型不是 FREE 时直接清链并扩展文件。新增 2 例（环在 validate 后重建且不重复
 发页、validate 前直接分配只扩展文件）；默认全量 1691 passed（168.45s），
-并发 1689 通过 + 2 skipped（174.76s）。
+并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
+全部 Success，6m07s。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
