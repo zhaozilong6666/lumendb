@@ -593,7 +593,8 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 把 `_history_limit` 调到 3 的用例里，11 个版本只保留 [11,10,9]，关闭文件
 从 11 页缩到 4 页，重开后继续 DDL 仍只保留 3 版；显式事务内 DDL 裁剪后
 `ROLLBACK` 恢复原版本链。新增 3 例；默认全量 1701 passed（170.26s），并发
-1699 通过 + 2 skipped（176.91s）。
+1699 通过 + 2 skipped（176.91s）。CI #396 在
+`500e3f9` 上五个 job 全部 Success，7m15s。
 
 2026-11-28 目录版本不再为 TRUNCATE/REINDEX 增长：`bump_schema` 原先对
 `_SCHEMA_CHANGING_STATEMENTS` 全部推进 `schema_version`，而 `Catalog.persist`
