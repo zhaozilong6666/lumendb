@@ -1208,7 +1208,7 @@ class Database:
 
         在 checkpoint 之后、``bp.close`` 之后调用：此时没有页被 pin，目录
         页只通过 page 0 的 ``catalog_root`` 和 payload 里的 ``previous_root``
-        被引用。把所有 catalog 版本链（当前 + 历史）复制到低页，重写链内
+        被引用。把当前版本与保留窗口内的历史目录链复制到低页，重写链内
         ``next/prev/page_id`` 和每个 payload 的 ``previous_root``，再一次性
         写 page 0 新根 + 已摘除的空闲表；旧页在新根 fsync 之后才释放。
         任何一步不满足（目录不在最高活页、空闲页不够、payload 变长）就原样
@@ -1233,6 +1233,7 @@ class Database:
         chains: list[dict[str, Any]] = []
         seen_roots: set[int] = set()
         root = current_root
+        floor_version = 0
         while root not in (0, INVALID_PAGE_ID):
             if root in seen_roots:
                 return 0
@@ -1242,6 +1243,12 @@ class Database:
                 return 0
             pages, data = chain
             chains.append({"root": root, "pages": pages, "data": data})
+            version = int(data.get("catalog_version", 1))
+            if floor_version == 0:
+                floor_version = max(1, int(data.get("history_floor_version", 1)))
+            if version <= floor_version:
+                # 水位版本的 previous_root 指向已裁剪回收的页，不能跟过去。
+                break
             root = int(data.get("previous_root", 0) or 0)
 
         old_pages = [pid for chain in chains for pid in chain["pages"]]

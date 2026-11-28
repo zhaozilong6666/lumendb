@@ -169,12 +169,16 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 **目录版本链（C 的第一切片）**：每次 schema 形状变化（建表/删表/加列/索引/
 重命名/视图）才把 `catalog_version` 加一，并在新目录 JSON 里写 `previous_root`
 指向上一条 schema 链；普通 DML 只更新页根，仍写新链但沿用同一
-`catalog_version`，不会伪造 schema 版本。**schema 根链**从不覆盖：旧
-schema 根页必须保留，`Catalog.history()` 沿 `previous_root` 回溯历史表定义。
-普通 DML 产生的中间目录根不属于这条历史链，提交后直接进入空闲页表复用；
-`TRUNCATE` / `REINDEX` 同样只换堆/索引根页，不推进 `catalog_version`，避免
-重复 TRUNCATE 累积历史目录页。这正是"目录只在 DDL 时变 schema、却在每次
-翻页时新建整链"不会把文件无界撑大的原因。
+`catalog_version`，不会伪造 schema 版本。**schema 根链**默认保留最近
+1000 个版本：`Catalog.history()` 沿 `previous_root` 回溯历史表定义。新版本
+目录 JSON 记录 `history_floor_version`；写入后若超出窗口，把窗口底部之前
+的版本根页整链登记 `txn.freed_pages`，提交后进入空闲页表，`history()` /
+`table_at()` 读到水位即停。因此 20 次 `ALTER` 不再留下 20 条永久目录链，
+更老的历史 schema 不可查（窗口内仍可回溯）。普通 DML 产生的中间目录根不
+属于这条历史链，提交后直接进入空闲页表复用；`TRUNCATE` / `REINDEX` 同样
+只换堆/索引根页，不推进 `catalog_version`，避免重复 TRUNCATE 累积历史目录页。
+这正是"目录只在 DDL 时变 schema、却在每次翻页时新建整链"不会把文件无界
+撑大的原因。
 `Catalog.table_at(version, name)` 读出当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；每个版本还记录
 UTC 微秒级 `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时刻之前的最近版本。
 `SHOW CATALOG VERSIONS` 暴露版本、表名、视图名、对象数和创建时间，

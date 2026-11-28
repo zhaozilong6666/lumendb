@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1698 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1696 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1701 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1699 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -584,13 +584,24 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
 全部 Success，6m07s。
 
+2026-11-28 catalog 版本窗口回收：每次真正改形状的 DDL 都新增一条目录
+版本链，旧链永久保留；20 次 `ALTER` 后文件从 1 页涨到 22 页。新目录 JSON
+记录 `history_floor_version`，默认只保留最近 1000 个版本（与
+`history()` 默认上限一致）；新版本写入后把窗口底部之前的版本根页整链登记
+`txn.freed_pages`，提交后复用。`history()` / `table_at()` 读到水位即停，
+不跟随水位 payload 里已被回收的 `previous_root`；回滚恢复版本数和水位。
+把 `_history_limit` 调到 3 的用例里，11 个版本只保留 [11,10,9]，关闭文件
+从 11 页缩到 4 页，重开后继续 DDL 仍只保留 3 版；显式事务内 DDL 裁剪后
+`ROLLBACK` 恢复原版本链。新增 3 例；默认全量 1701 passed（170.26s），并发
+1699 通过 + 2 skipped（176.91s）。
+
 2026-11-28 目录版本不再为 TRUNCATE/REINDEX 增长：`bump_schema` 原先对
 `_SCHEMA_CHANGING_STATEMENTS` 全部推进 `schema_version`，而 `Catalog.persist`
 用同一个字段判断形状变化，导致每次 TRUNCATE 都新增一个可回溯目录版本；
 重复 5 次就留下 5 条历史目录链。拆出 `_shape_version`（只在列/表/索引/视图
 形状变化时递增），TRUNCATE/REINDEX 只推进计划缓存代际、不新增 catalog
 版本。5 次 TRUNCATE 后 `catalog_version` 保持 1、历史只有 `[1]`，关闭文件
-≤5 页。新增 1 例反复 TRUNCATE 版本/页数回归；默认全量 1698 passed
+≤5 页。新增 1 例反复 TRUNCATE 版本/页数回归；当时默认全量 1698 项通过
 （129.52s），并发 1696 通过 + 2 skipped（139.40s）。CI #395 在
 `000d384` 上五个 job 全部 Success，6m10s。
 

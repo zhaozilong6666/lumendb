@@ -1,5 +1,7 @@
 """版本化目录：只有 schema 形状变化才产生新版本，旧版本可回溯。"""
 
+import os
+
 import pytest
 
 from lumendb.engine.database import Database
@@ -265,3 +267,68 @@ def test_show_statistics_can_target_history(tmp_path, monkeypatch):
     with pytest.raises(TableNotFoundError):
         db.execute_one(f"SHOW STATISTICS FROM u AT CATALOG VERSION {first}")
     db.close()
+
+
+def _data_pages(tmp_path) -> int:
+    return os.path.getsize(tmp_path / "lumendb.data") // PAGE_SIZE
+
+
+def test_catalog_history_limit_prunes_old_versions_and_pages(tmp_path):
+    db = Database(tmp_path)
+    db.catalog._history_limit = 3
+    db.execute_one("CREATE TABLE t (id INT)")
+    for i in range(10):
+        db.execute_one(f"ALTER TABLE t ADD COLUMN c{i} INT")
+    assert db.catalog.catalog_version == 11
+    assert [v["catalog_version"] for v in db.catalog.history()] == [11, 10, 9]
+    assert not db.catalog.version_exists(8)
+    assert db.catalog.table_at(8, "t") is None
+    db.close()
+    assert _data_pages(tmp_path) <= 5
+
+    db = Database(tmp_path)
+    db.catalog._history_limit = 3
+    assert db.catalog.catalog_version == 11
+    assert [v["catalog_version"] for v in db.catalog.history()] == [11, 10, 9]
+    assert len(db.catalog.get_table("t").columns) == 11
+    for i in range(10, 15):
+        db.execute_one(f"ALTER TABLE t ADD COLUMN c{i} INT")
+    assert [v["catalog_version"] for v in db.catalog.history()] == [16, 15, 14]
+    db.close()
+    assert _data_pages(tmp_path) <= 5
+
+
+def test_catalog_history_prune_rolls_back_with_ddl(tmp_path):
+    db = Database(tmp_path)
+    db.catalog._history_limit = 3
+    db.execute_one("CREATE TABLE t (id INT)")
+    for i in range(4):
+        db.execute_one(f"ALTER TABLE t ADD COLUMN c{i} INT")
+    assert [v["catalog_version"] for v in db.catalog.history()] == [5, 4, 3]
+    db.execute_one("BEGIN")
+    db.execute_one("ALTER TABLE t ADD COLUMN discarded INT")
+    assert [v["catalog_version"] for v in db.catalog.history()] == [6, 5, 4]
+    db.execute_one("ROLLBACK")
+    assert db.catalog.catalog_version == 5
+    assert [v["catalog_version"] for v in db.catalog.history()] == [5, 4, 3]
+    assert len(db.catalog.get_table("t").columns) == 5
+    db.close()
+    db = Database(tmp_path)
+    assert [v["catalog_version"] for v in db.catalog.history()] == [5, 4, 3]
+    assert len(db.catalog.get_table("t").columns) == 5
+    db.close()
+
+
+def test_catalog_history_limit_prunes_existing_long_chain(tmp_path):
+    db = Database(tmp_path)
+    db.execute_one("CREATE TABLE t (id INT)")
+    for i in range(10):
+        db.execute_one(f"ALTER TABLE t ADD COLUMN c{i} INT")
+    assert len(db.catalog.history()) == 11
+    db.catalog._history_limit = 3
+    db.execute_one("ALTER TABLE t ADD COLUMN tail INT")
+    assert db.catalog.catalog_version == 12
+    assert [v["catalog_version"] for v in db.catalog.history()] == [12, 11, 10]
+    assert not db.catalog.version_exists(9)
+    db.close()
+    assert _data_pages(tmp_path) <= 5

@@ -409,6 +409,7 @@ SHOW TABLES [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
 SHOW VIEWS  [AT CATALOG VERSION n | AT TIME 'ISO-8601'];
                          -- 列出表/视图；带版本或时间时读历史目录，不读旧数据页
 SHOW CATALOG VERSIONS;   -- 目录版本链：版本、表名、视图名、对象数、创建时间；只读
+                         -- 默认只保留最近 1000 个版本，更老版本已裁剪回收
 SHOW COMMIT LOG [LIMIT n];
                          -- 跨 checkpoint 的持久提交账本；只读
                          -- LIMIT 0 返回空；只保留最近 commit_ledger_max_entries 条

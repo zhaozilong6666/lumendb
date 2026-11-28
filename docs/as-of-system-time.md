@@ -80,8 +80,9 @@ EXPLAIN SELECT * FROM t AS OF SYSTEM TIME LSN 123456;
   允许的目标点都在最近 DDL 之后，基表列布局与当前 schema 一致；不需要
   历史 schema 解码。
 - 文件级回收只释放"当前结构不再引用"的页：离线 VACUUM 的链尾空页、旧索引
-  树页、普通 DML 的旧目录中间根。schema 版本链的根页仍保留给
-  `SHOW CATALOG VERSIONS` / `table_at` 回溯；AS OF 数据扫描不读旧索引根，
+  树页、普通 DML 的旧目录中间根。schema 版本链默认保留最近 1000 个版本给
+  `SHOW CATALOG VERSIONS` / `table_at` 回溯，更老版本的目录页在写入新版本时
+  裁剪回收，因此时间定位不会早于保留窗口底部；AS OF 数据扫描不读旧索引根，
   只把索引当候选入口再回堆按 LSN 判可见性。
 - 目标点早于下界报 `BinderError`；晚于 `latest_commit_lsn` 也报 `BinderError`。
 

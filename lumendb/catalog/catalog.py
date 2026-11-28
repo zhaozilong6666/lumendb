@@ -95,8 +95,16 @@ def _utc_now_iso() -> str:
 
 
 class Catalog:
-    def __init__(self, store: CatalogStore) -> None:
+    #: 默认保留的 catalog 版本数；与 ``history()`` 的默认上限一致。
+    DEFAULT_HISTORY_LIMIT = 1000
+
+    def __init__(
+        self, store: CatalogStore, *, history_limit: int = DEFAULT_HISTORY_LIMIT
+    ) -> None:
+        if history_limit < 1:
+            raise ValueError("history_limit 必须不小于 1")
         self._store = store
+        self._history_limit = history_limit
         self._lock = threading.RLock()
         self.tables: dict[str, TableDef] = {}
         #: 逻辑 schema 版本序号；只在 schema 形状变化时递增，纯页根更新不增。
@@ -109,6 +117,10 @@ class Catalog:
         self._last_shape_version = 0
         #: 只在列/表/索引/视图形状变化时递增；TRUNCATE/REINDEX 只换根页不增。
         self._shape_version = 0
+        #: 当前版本链实际保留的版本数（含当前）；用于判断是否需要裁剪。
+        self._version_count = 0
+        #: 保留链最老的 catalog 版本号；更老版本的目录页已回收。
+        self._history_floor_version = 1
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
         self.views: dict[str, list[tuple[str, str]]] = {}
         #: 视图名 -> 显式列名（可选）；空列表表示沿用查询输出的列名。
@@ -182,6 +194,13 @@ class Catalog:
                 )
             self.catalog_version = int(data.get("catalog_version", 1))
             self._previous_root = int(data.get("previous_root", 0))
+            self._history_floor_version = int(data.get("history_floor_version", 1))
+            self._history_floor_version = min(
+                max(1, self._history_floor_version), max(1, self.catalog_version)
+            )
+            self._version_count = max(
+                1, self.catalog_version - self._history_floor_version + 1
+            )
             self.catalog_created_at = str(data.get("created_at", ""))
             for tdata in data.get("tables", []):
                 table = TableDef.from_json(tdata)
@@ -214,15 +233,23 @@ class Catalog:
             before_version = self.catalog_version - 1
             before_previous = self._previous_root
             before_created = self.catalog_created_at
+            before_count = self._version_count
+            before_floor = self._history_floor_version
+            self._version_count += 1
+            self._history_floor_version = max(
+                1, self.catalog_version - self._history_limit + 1
+            )
             self.catalog_created_at = _utc_now_iso()
 
             def undo_version() -> None:
                 # 回滚/失败的 DDL 不能留下一个“从未提交过”的 catalog 版本号。
                 # schema_version 不回滚（它只负责失效计划缓存），所以这里
-                # 只恢复版本序号、上一版根页和创建时间。
+                # 只恢复版本序号、上一版根页、创建时间与裁剪水位。
                 self.catalog_version = before_version
                 self._previous_root = before_previous
                 self.catalog_created_at = before_created
+                self._version_count = before_count
+                self._history_floor_version = before_floor
 
             # 在写盘之前登记：save 中途 EIO 时事务 abort 也要把版本号退回去。
             txn.undo_log.append(undo_version)
@@ -232,6 +259,7 @@ class Catalog:
                 "version": CATALOG_VERSION,
                 "catalog_version": self.catalog_version,
                 "previous_root": history_root,
+                "history_floor_version": self._history_floor_version,
                 "created_at": self.catalog_created_at,
                 "tables": [t.to_json() for t in self.tables.values()],
                 "views": [
@@ -256,7 +284,59 @@ class Catalog:
         if schema_changed:
             self._previous_root = previous_root
             self._last_shape_version = self._shape_version
+            if self._version_count > self._history_limit:
+                self._prune_history(txn, prune_tail=before_floor <= 1)
         self.dirty = False
+
+    def _prune_history(self, txn: Transaction, *, prune_tail: bool) -> None:
+        """回收裁剪水位以下的历史目录页。
+
+        版本链只允许从当前版本沿 ``previous_root`` 向后回溯。裁剪时保留
+        最老一版（``_history_floor_version``）的页，把更老的版本根页及其整条
+        链登记到 ``txn.freed_pages``；最老保留版本的 payload 里仍写着指向已
+        回收页的 ``previous_root``，但 ``history()`` 读到水位即停，不会跟过去。
+        """
+        root = self._previous_root
+        floor = self._history_floor_version
+        stale_pages: list[int] = []
+        seen: set[int] = set()
+        while root and root not in seen:
+            seen.add(root)
+            raw = self._store.load_at_root(root)
+            if not raw:
+                break
+            data = json.loads(raw.decode("utf-8"))
+            version = int(data.get("catalog_version", 1))
+            older = int(data.get("previous_root", 0))
+            if version < floor:
+                stale_pages.extend(self._store.chain_page_ids(root))
+                root = older
+                continue
+            if version == floor:
+                # 水位版本的链必须完整保留；它指向的上一版已滑出保留窗口。
+                if not older:
+                    break
+                stale_pages.extend(self._store.chain_page_ids(older))
+                if not prune_tail:
+                    break
+                tail = int(
+                    json.loads(
+                        self._store.load_at_root(older).decode("utf-8")
+                    ).get("previous_root", 0)
+                )
+                while tail and tail not in seen:
+                    seen.add(tail)
+                    stale_pages.extend(self._store.chain_page_ids(tail))
+                    raw_tail = self._store.load_at_root(tail)
+                    if not raw_tail:
+                        break
+                    tail = int(
+                        json.loads(raw_tail.decode("utf-8")).get("previous_root", 0)
+                    )
+                break
+            root = older
+        if stale_pages:
+            txn.freed_pages.update(stale_pages)
 
     # ------------------------------------------------------------------
     # 版本历史
@@ -268,17 +348,23 @@ class Catalog:
         result: list[dict] = []
         root = self._store.current_root()
         seen: set[int] = set()
+        floor_version: Optional[int] = None
         while root and root not in seen and len(result) < limit:
             seen.add(root)
             raw = self._store.load_at_root(root)
             if not raw:
                 break
             data = json.loads(raw.decode("utf-8"))
+            if floor_version is None:
+                floor_version = max(1, int(data.get("history_floor_version", 1)))
+            version = int(data.get("catalog_version", 1))
+            if version < floor_version:
+                break
             tables = data.get("tables", [])
             views = data.get("views", [])
             result.append(
                 {
-                    "catalog_version": int(data.get("catalog_version", 1)),
+                    "catalog_version": version,
                     "created_at": str(data.get("created_at", "")),
                     "root_page": root,
                     "tables": [
@@ -302,6 +388,8 @@ class Catalog:
                     ],
                 }
             )
+            if version == floor_version:
+                break
             root = int(data.get("previous_root", 0))
         return result
 
