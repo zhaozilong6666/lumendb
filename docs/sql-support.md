@@ -431,7 +431,8 @@ VACUUM [FULL] [table] [RETAIN LSN n];
                          -- 额外保留目标 LSN 仍可见的版本，并把结构下界停在 n；
                          -- 目标必须落在当前历史窗口内。不带表名处理所有表
 TRUNCATE [TABLE] table [, ...] [CASCADE | RESTRICT];
-                         -- 清空一到多张表（页链保留、逐页重置）；RESTRICT 要求
+                         -- 清空一到多张表（复用最低旧堆页作空根，其余页
+                         -- 提交后回收）；RESTRICT 要求
                          -- 所有引用目标表的子表同时出现在列表中，CASCADE 自动递归清空
 ```
 

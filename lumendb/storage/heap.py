@@ -1265,27 +1265,44 @@ class HeapFile:
         self._bp.mark_dirty(page)
 
     def truncate(self, txn: Transaction) -> int:
-        """清空整表：页链保留，每一页重置为空堆页。
+        """清空整表：复用最低的旧堆页作新根，其余堆页交给提交后回收。
 
-        比"逐行 DELETE + VACUUM"便宜得多：只需要按页写整页日志，代价与行数无关。
-        索引由调用方重建（执行器的 ``TRUNCATE`` 会做），返回清空前的行数估计。
+        旧实现保留整条页链逐页重置，文件尾永远缩不掉。TRUNCATE 走的是独占
+        的结构性写，执行期间没有并发读者，RID 可以整体换掉；这里把页链里
+        页号最小的页重置成空根，其余页在提交后进入空闲表。回滚由 WAL 页原像
+        恢复被重置的页、``_snapshot_table_state`` 恢复旧根，``freed_pages``
+        直接丢弃。没有旧页的空表才分配一个新根页。
         """
         txn.require_active()
         txn.wrote = True
         removed = self.table.row_count_hint
-        page_id = self.table.root_page
-        while page_id != INVALID_PAGE_ID:
-            page = self._fetch(page_id)
-            next_id, prev_id = page.next_page, page.prev_page
+        old_pages = self.collect_pages()
+        if old_pages:
+            root_id = min(old_pages)
+            page = self._fetch(root_id)
             try:
                 old = bytes(page.buf)
-                page.init_heap(page_id)
-                page.next_page = next_id
-                page.prev_page = prev_id
+                page.init_heap(root_id)
                 self._log_page_image(txn, page, old)
             finally:
                 self._release(page, dirty=True)
-            page_id = next_id
+            self.table.root_page = root_id
+            self.table.last_page = root_id
+            txn.freed_pages.update(pid for pid in old_pages if pid != root_id)
+        else:
+            page = self._bp.new_page(HeapPage, owner=txn)
+            try:
+                with page.latch:
+                    old = bytes(page.buf)
+                    page.init_heap(page.page_id)
+                    self._bp.log_page_update(
+                        txn.xid, page, 0, old, bytes(page.buf)
+                    )
+                    self._bp.mark_dirty(page)
+            finally:
+                self._bp.unpin(page.page_id, dirty=True)
+            self.table.root_page = page.page_id
+            self.table.last_page = page.page_id
         self.table.row_count_hint = 0
         return removed
 

@@ -618,6 +618,62 @@ def test_untrusted_overflow_chain_extends_before_validate(tmp_path):
         reopened.close()
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_truncate_reclaims_heap_pages_and_shrinks_file(tmp_path, monkeypatch, concurrent):
+    """TRUNCATE 复用最低旧堆页作根，其余页提交后回收，关闭时能截尾。"""
+    if not concurrent:
+        monkeypatch.delenv("LUMEN_CONCURRENT_DML", raising=False)
+    db = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        db.execute_one("CREATE TABLE t (id INT, pad TEXT)")
+        pad = "x" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+        assert _file_pages(db) > 20
+
+        db.execute_one("TRUNCATE TABLE t")
+        assert _rows(db, "SELECT count(*) FROM t") == [(0,)]
+        assert db.disk.free_page_count > free_before + 10
+        db.execute_one("INSERT INTO t VALUES (1, 'ok')")
+        assert _rows(db, "SELECT id FROM t") == [(1,)]
+    finally:
+        db.close()
+
+    assert _file_pages(db) <= 5
+    reopened = Database(tmp_path / "db", concurrent_dml=concurrent)
+    try:
+        assert _rows(reopened, "SELECT id FROM t") == [(1,)]
+    finally:
+        reopened.close()
+
+
+def test_truncate_rollback_restores_rows_and_does_not_release_pages(tmp_path):
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT, pad TEXT)")
+        pad = "y" * 900
+        for i in range(40):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        free_before = db.disk.free_page_count
+        pages_before = _file_pages(db)
+
+        db.execute_one("BEGIN")
+        db.execute_one("TRUNCATE TABLE t")
+        db.execute_one("ROLLBACK")
+        assert _rows(db, "SELECT count(*) FROM t") == [(40,)]
+        assert db.disk.free_page_count <= free_before + 1
+        assert _file_pages(db) == pages_before
+    finally:
+        db.close()
+
+    reopened = Database(tmp_path / "db")
+    try:
+        assert _rows(reopened, "SELECT count(*) FROM t") == [(40,)]
+    finally:
+        reopened.close()
+
+
 def test_close_relocates_tail_catalog_and_shrinks_dropped_table(tmp_path):
     """DROP 大表后 catalog 版本链压在文件尾：关闭时搬到低页再截尾。"""
     db = Database(tmp_path / "db")

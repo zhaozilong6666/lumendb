@@ -246,6 +246,9 @@ checkpoint、Buffer Pool 关闭后把各版本 catalog 链复制到空闲表最�
 链内 `next/prev/page_id` 与 payload 的 `previous_root`，一次写入新根和已摘除
 的空闲表，fsync 后才释放旧页；否则 `truncate` 不会搬移活页。4200 行 900B 表
 `DROP TABLE` 实测文件从 1053 页缩到 3 页，历史 catalog 页仍在链上。
+`TRUNCATE` 也把页链里页号最小的旧堆页重置为空根，其余堆页登记到
+`txn.freed_pages`，提交后进入空闲表；回滚靠 WAL 页原像恢复被重置页、靠表
+快照恢复旧根，旧页不释放。
 表满或崩溃丢掉空闲表只会泄漏空间，不会把仍被引用的页交给新对象。提交点后
 `Database` 才把该事务登记的 `freed_pages` 交给空闲表（仍被 pin 的页跳过），
 回滚则直接丢弃这批登记，靠 WAL undo 指回旧页链。`ALTER TYPE` / `DROP COLUMN`
