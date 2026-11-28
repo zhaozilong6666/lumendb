@@ -8,7 +8,9 @@ from __future__ import annotations
 import threading
 import logging
 import contextlib
+import json
 import os
+import struct
 import time
 from collections import deque
 from dataclasses import fields, is_dataclass
@@ -33,7 +35,8 @@ from ..storage.bufferpool import BufferPoolManager
 from ..storage.commit_ledger import CommitLedger
 from ..storage.history import HistoryWindow
 from ..storage.lock import LockManager
-from ..storage.pager import DiskManager
+from ..storage.pager import DiskManager, META_OFF_CATALOG_ROOT
+from ..storage.page import INVALID_PAGE_ID, PAGE_SIZE, PageType
 from ..storage.recovery import RecoveryManager
 from ..storage.txn import Transaction, TransactionManager, TxnState
 from ..storage.wal import WAL
@@ -1169,6 +1172,137 @@ class Database:
         """给服务端等非 ``Database._run`` 提交路径使用的公开钩子。"""
         self._maybe_checkpoint()
 
+    def _read_catalog_chain(self, root: int) -> Optional[tuple[list[int], dict]]:
+        """读一条 catalog 页链并解析 JSON；结构/类型不对返回 None。"""
+        pages: list[int] = []
+        parts: list[bytes] = []
+        pid = root
+        seen: set[int] = set()
+        limit = self.disk.num_pages
+        while pid not in (0, INVALID_PAGE_ID):
+            if pid <= 0 or pid >= limit or pid in seen:
+                return None
+            seen.add(pid)
+            raw = self.disk.read_page(pid)
+            if (
+                struct.unpack_from("<H", raw, 0)[0] != int(PageType.CATALOG)
+                or struct.unpack_from("<I", raw, 16)[0] != pid
+            ):
+                return None
+            pages.append(pid)
+            parts.append(bytes(raw[32:PAGE_SIZE]))
+            pid = struct.unpack_from("<I", raw, 8)[0]
+        if not pages:
+            return None
+        payload = b"".join(parts).rstrip(b"\x00")
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return pages, data
+
+    def _relocate_catalog_for_truncate(self) -> int:
+        """把文件尾的 catalog 版本链搬到空闲表最低页，返回搬迁页数。
+
+        在 checkpoint 之后、``bp.close`` 之后调用：此时没有页被 pin，目录
+        页只通过 page 0 的 ``catalog_root`` 和 payload 里的 ``previous_root``
+        被引用。把所有 catalog 版本链（当前 + 历史）复制到低页，重写链内
+        ``next/prev/page_id`` 和每个 payload 的 ``previous_root``，再一次性
+        写 page 0 新根 + 已摘除的空闲表；旧页在新根 fsync 之后才释放。
+        任何一步不满足（目录不在最高活页、空闲页不够、payload 变长）就原样
+        返回 0，让原有截尾逻辑处理。
+        """
+        disk = self.disk
+        if disk.num_pages <= 2:
+            return 0
+        free_ids = set(disk.free_page_ids())
+        highest_live = 0
+        for pid in range(disk.num_pages - 1, 0, -1):
+            if pid not in free_ids:
+                highest_live = pid
+                break
+        if highest_live == 0:
+            return 0
+
+        raw0 = disk.read_page(0)
+        current_root = struct.unpack_from("<I", raw0, META_OFF_CATALOG_ROOT)[0]
+        if current_root in (0, INVALID_PAGE_ID):
+            return 0
+        chains: list[dict[str, Any]] = []
+        seen_roots: set[int] = set()
+        root = current_root
+        while root not in (0, INVALID_PAGE_ID):
+            if root in seen_roots:
+                return 0
+            seen_roots.add(root)
+            chain = self._read_catalog_chain(root)
+            if chain is None:
+                return 0
+            pages, data = chain
+            chains.append({"root": root, "pages": pages, "data": data})
+            root = int(data.get("previous_root", 0) or 0)
+
+        old_pages = [pid for chain in chains for pid in chain["pages"]]
+        if max(old_pages) != highest_live:
+            return 0
+        old_set = set(old_pages)
+        candidates = sorted(pid for pid in free_ids if pid > 0 and pid not in old_set)
+        if len(candidates) < len(old_pages):
+            return 0
+
+        # 先按候选页算出新根，重写 previous_root 后再检查每链页数是否够。
+        cursor = 0
+        mapping: dict[int, int] = {}
+        for chain in chains:
+            count = len(chain["pages"])
+            chain["new_pages"] = candidates[cursor : cursor + count]
+            mapping[chain["root"]] = chain["new_pages"][0]
+            cursor += count
+        payloads: dict[int, bytes] = {}
+        for chain in chains:
+            data = dict(chain["data"])
+            prev = int(data.get("previous_root", 0) or 0)
+            data["previous_root"] = mapping.get(prev, 0) if prev else 0
+            payload = json.dumps(
+                data, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if len(payload) > len(chain["new_pages"]) * (PAGE_SIZE - 32):
+                return 0
+            payloads[chain["root"]] = payload
+
+        chosen = [pid for chain in chains for pid in chain["new_pages"]]
+        if not disk.reserve_free_pages(chosen):
+            return 0
+
+        for chain in chains:
+            new_pages = chain["new_pages"]
+            payload = payloads[chain["root"]]
+            for i, pid in enumerate(new_pages):
+                next_pid = (
+                    new_pages[i + 1] if i + 1 < len(new_pages) else INVALID_PAGE_ID
+                )
+                prev_pid = new_pages[i - 1] if i > 0 else INVALID_PAGE_ID
+                buf = bytearray(PAGE_SIZE)
+                struct.pack_into("<H", buf, 0, int(PageType.CATALOG))
+                struct.pack_into("<I", buf, 8, next_pid)
+                struct.pack_into("<I", buf, 12, prev_pid)
+                struct.pack_into("<I", buf, 16, pid)
+                chunk = payload[i * (PAGE_SIZE - 32) : (i + 1) * (PAGE_SIZE - 32)]
+                buf[32 : 32 + len(chunk)] = chunk
+                disk.write_page(pid, buf)
+
+        raw0 = bytearray(disk.read_page(0))
+        struct.pack_into(
+            "<I", raw0, META_OFF_CATALOG_ROOT, mapping[current_root]
+        )
+        disk.write_meta_page(raw0)
+        disk.sync()
+        # 新根已经落盘；旧链这时才允许变成 FREE 页。
+        disk.release_pages(old_pages)
+        return len(old_pages)
+
     def close(self) -> None:
         """关闭数据库句柄。
 
@@ -1232,6 +1366,12 @@ class Database:
                 self.wal.close()
                 try:
                     if can_truncate:
+                        # 目录版本链若正好压在文件尾，truncate 不能搬移活页；
+                        # 先把它复制到空闲表低页，旧页释放后截尾才有意义。
+                        try:
+                            self._relocate_catalog_for_truncate()
+                        except Exception:
+                            _log.exception("关闭时搬迁目录页失败，跳过目录搬迁")
                         # Buffer Pool 已关闭，此时没有页被 pin/缓存；把文件尾
                         # 连续的已释放页真正截掉。中间空页仍留给后续分配复用。
                         self.disk.truncate_free_tail()

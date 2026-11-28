@@ -515,6 +515,34 @@ class DiskManager:
                         pass
         return accepted
 
+    def reserve_free_pages(self, page_ids: Iterable[int]) -> bool:
+        """从空闲表摘除指定页，供关闭时搬迁目录页使用。
+
+        只改内存空闲表，不写页内容、不落 page 0；调用方把新页写好并更新
+        catalog_root 后，用一次 page 0 写同时持久化“新根 + 已摘除的空闲页”。
+        只要有一个页号不在可信空闲集合里就整体拒绝，避免把非空闲页交出去。
+        """
+        chosen = {int(pid) for pid in page_ids}
+        if not chosen:
+            return False
+        with self._io_lock:
+            free_ids = self._meta.free_page_ids()
+            overflow_ids = self._overflow_page_ids()
+            available = set(free_ids) | set(overflow_ids)
+            if not chosen <= available:
+                return False
+            self._meta.set_free_page_ids(
+                [pid for pid in free_ids if pid not in chosen]
+            )
+            kept_overflow = [pid for pid in overflow_ids if pid not in chosen]
+            if kept_overflow != overflow_ids or (
+                self._meta.free_overflow_head and not kept_overflow
+            ):
+                self._replace_overflow_chain(kept_overflow)
+            else:
+                self._overflow_count = len(kept_overflow)
+            return True
+
     def truncate_free_tail(self) -> int:
         """从文件尾移除连续的空闲页，返回物理截掉的页数。
 

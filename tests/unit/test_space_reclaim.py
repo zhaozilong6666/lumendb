@@ -618,6 +618,40 @@ def test_untrusted_overflow_chain_extends_before_validate(tmp_path):
         reopened.close()
 
 
+def test_close_relocates_tail_catalog_and_shrinks_dropped_table(tmp_path):
+    """DROP 大表后 catalog 版本链压在文件尾：关闭时搬到低页再截尾。"""
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT, pad TEXT)")
+        pad = "x" * 900
+        for i in range(160):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        db.execute_one("DROP TABLE t")
+        assert _file_pages(db) > 20
+    finally:
+        db.close()
+
+    assert _file_pages(db) == 3  # page 0 + 当前 catalog + 历史 catalog
+    reopened = Database(tmp_path / "db")
+    try:
+        assert _rows(reopened, "SHOW TABLES") == []
+        # 历史链也搬了：previous_root 必须还能读出被 DROP 的表定义。
+        prev = reopened.catalog._previous_root
+        payload = reopened.catalog._store.load_at_root(prev)
+        assert payload and b'"name":"t"' in payload
+        reopened.execute_one("CREATE TABLE u (id INT PRIMARY KEY, v TEXT)")
+        reopened.execute_one("INSERT INTO u VALUES (1, 'ok')")
+        assert _rows(reopened, "SELECT * FROM u") == [(1, "ok")]
+    finally:
+        reopened.close()
+
+    again = Database(tmp_path / "db")
+    try:
+        assert _rows(again, "SELECT * FROM u") == [(1, "ok")]
+    finally:
+        again.close()
+
+
 def test_overflow_free_chain_survives_reopen(tmp_path):
     from lumendb.storage.pager import META_FREE_CAPACITY
 

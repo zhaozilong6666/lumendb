@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1691 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1689 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1692 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1690 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -580,9 +580,19 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 时把计数清零并标 `_overflow_trusted=False`；`validate_free_list` 用完整标记
 强制把已走通前缀重建成线性链；`allocate_page` 在未校验前拒绝从链取页、头页
 页型不是 FREE 时直接清链并扩展文件。新增 2 例（环在 validate 后重建且不重复
-发页、validate 前直接分配只扩展文件）；默认全量 1691 passed（168.45s），
+发页、validate 前直接分配只扩展文件）；默认全量 1691 通过（168.45s），
 并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
 全部 Success，6m07s。
+
+2026-11-27 目录页搬迁缩容：`DROP TABLE` 后空闲页已够，但当前 catalog 根与
+`previous_root` 历史链正好压在文件尾，`truncate_free_tail` 不搬移活页，4200 行
+900B 表仍停在 1053 页。关闭时在 checkpoint、Buffer Pool/WAL 关闭后，若 catalog
+链是最高活页，就把所有 catalog 版本链复制到空闲表最低页，重写链内
+`next/prev/page_id` 和每个 payload 的 `previous_root`，一次性写 page 0 新根 +
+已摘除的空闲表，fsync 后再释放旧页并截尾。限制：目录不在最高活页、空闲页不够
+或重序列化后超过原页数时不搬，保留原行为。实测 4200 行场景 1053 → 3 页；
+160 行回归用例 43 → 3 页，重开后目录为空、再建表读写正常。新增 1 例；默认
+全量 1692 passed（131.95s），并发 1690 通过 + 2 skipped（141.06s）。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记
