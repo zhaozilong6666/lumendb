@@ -276,7 +276,8 @@ class Executor:
         self._acquire_writer_lock(stmt, txn)
         if type(stmt) in _SCHEMA_CHANGING_STATEMENTS:
             # DDL 可能替换表/索引对象、改列形状；绑定计划缓存按版本号失效。
-            self._catalog.bump_schema()
+            # TRUNCATE/REINDEX 只换根页、不改 schema 形状，不新增目录版本。
+            self._catalog.bump_schema(shape=type(stmt) not in {Truncate, Reindex})
         self._params = list(params) if params else []
         self._recursive_rows = {}
         # Binder 保存 CTE 作用域和参数；每条语句必须从干净的作用域开始，

@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1697 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1695 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1698 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1696 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -584,12 +584,21 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
 全部 Success，6m07s。
 
+2026-11-28 目录版本不再为 TRUNCATE/REINDEX 增长：`bump_schema` 原先对
+`_SCHEMA_CHANGING_STATEMENTS` 全部推进 `schema_version`，而 `Catalog.persist`
+用同一个字段判断形状变化，导致每次 TRUNCATE 都新增一个可回溯目录版本；
+重复 5 次就留下 5 条历史目录链。拆出 `_shape_version`（只在列/表/索引/视图
+形状变化时递增），TRUNCATE/REINDEX 只推进计划缓存代际、不新增 catalog
+版本。5 次 TRUNCATE 后 `catalog_version` 保持 1、历史只有 `[1]`，关闭文件
+≤5 页。新增 1 例反复 TRUNCATE 版本/页数回归；默认全量 1698 passed
+（129.52s），并发 1696 通过 + 2 skipped（139.40s）。
+
 2026-11-28 空闲页低页优先分配：`allocate_page` 原先从 page 0 空闲数组
 `pop()` 最高页，TRUNCATE 后重建的主键索引根落到页 41，关闭时文件只能缩到
 42 页（再插一行只到 6 页）。改为数组内取页号最小的空闲页；溢出链仍从链头
 取。主键表场景 160 行 44 页 TRUNCATE 后插一行，关闭缩到 6 页（保留页 3 空
 洞：目录搬迁先把活页复制到安全空闲页，旧根释放后不能再原地覆盖）；无索引
-场景仍缩到 ≤5 页。新增低页分配与主键表缩容 2 例；默认全量 1697 passed
+场景仍缩到 ≤5 页。新增低页分配与主键表缩容 2 例；默认全量 1697 项通过
 （133.02s），并发 1695 通过 + 2 skipped（132.09s）。
 
 2026-11-28 TRUNCATE 堆页回收：旧实现保留整条堆页链逐页重置，160 行 900B 表

@@ -105,8 +105,10 @@ class Catalog:
         self._previous_root = 0
         #: 当前 schema 版本的创建时间（UTC ISO-8601），用于按时间定位目录版本。
         self.catalog_created_at = ""
-        #: 最近一次落盘的 schema_version，用来识别“这次 persist 是否改形状”。
-        self._last_schema_version = 0
+        #: 最近一次落盘时的形状版本，用来识别“这次 persist 是否改形状”。
+        self._last_shape_version = 0
+        #: 只在列/表/索引/视图形状变化时递增；TRUNCATE/REINDEX 只换根页不增。
+        self._shape_version = 0
         #: 视图名 -> ``AS`` 之后的词法 token 列表；只读、不落数据页。
         self.views: dict[str, list[tuple[str, str]]] = {}
         #: 视图名 -> 显式列名（可选）；空列表表示沿用查询输出的列名。
@@ -126,9 +128,16 @@ class Catalog:
         self._index_root_locks: dict[tuple[str, str], threading.RLock] = {}
 
     @_locked
-    def bump_schema(self) -> None:
-        """标记 schema 形状已变化；所有按旧版本缓存的计划立即失效。"""
+    def bump_schema(self, *, shape: bool = True) -> None:
+        """失效计划缓存；``shape=True`` 时同时推进持久 catalog 版本。
+
+        TRUNCATE/REINDEX 只换根页、不改列/索引形状，调用方传 ``shape=False``：
+        schema_version 仍递增（旧计划里的页对象可能过期），但不会为每次
+        TRUNCATE 累积一个可回溯的目录版本页。
+        """
         self.schema_version += 1
+        if shape:
+            self._shape_version += 1
 
     @_locked
     def mark_dirty(self) -> None:
@@ -193,13 +202,13 @@ class Catalog:
         self.schema_version += 1
         # schema_version 是进程内计划缓存代际，不是持久值；重开库后从当前
         # 代际起算，避免把一次普通 DML 的目录保存误判成 schema 变化。
-        self._last_schema_version = self.schema_version
+        self._last_shape_version = self._shape_version = self.catalog_version
 
     @_locked
     def persist(self, txn: Transaction) -> None:
         txn.wrote = True
         previous_root = self._store.current_root()
-        schema_changed = self.schema_version != self._last_schema_version
+        schema_changed = self._shape_version != self._last_shape_version
         if schema_changed:
             self.catalog_version += 1
             before_version = self.catalog_version - 1
@@ -246,7 +255,7 @@ class Catalog:
         self._store.save(txn, payload, retain_old=schema_changed)
         if schema_changed:
             self._previous_root = previous_root
-            self._last_schema_version = self.schema_version
+            self._last_shape_version = self._shape_version
         self.dirty = False
 
     # ------------------------------------------------------------------

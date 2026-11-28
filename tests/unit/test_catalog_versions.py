@@ -4,6 +4,7 @@ import pytest
 
 from lumendb.engine.database import Database
 from lumendb.errors import TableNotFoundError
+from lumendb.storage.pager import PAGE_SIZE
 
 
 def test_catalog_version_advances_only_on_schema_shape(tmp_path):
@@ -16,7 +17,37 @@ def test_catalog_version_advances_only_on_schema_shape(tmp_path):
     assert db.catalog.catalog_version == 1, "纯页根/统计更新不能伪造 schema 版本"
     db.execute_one("ALTER TABLE t ADD COLUMN v INT")
     assert db.catalog.catalog_version == 2
+    db.execute_one("TRUNCATE TABLE t")
+    assert db.catalog.catalog_version == 2, "TRUNCATE 只换根页，不能新增 schema 版本"
+    db.execute_one("REINDEX TABLE t")
+    assert db.catalog.catalog_version == 2, "REINDEX 只重建索引页，不能新增 schema 版本"
     db.close()
+
+
+def test_repeated_truncate_does_not_accumulate_catalog_versions(tmp_path):
+    db = Database(tmp_path / "db")
+    try:
+        db.execute_one("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+        pad = "v" * 900
+        for i in range(80):
+            db.execute_one("INSERT INTO t VALUES ($1, $2)", [i, pad])
+        for _ in range(5):
+            db.execute_one("TRUNCATE TABLE t")
+            db.execute_one("INSERT INTO t VALUES (1, 'ok')")
+        assert db.catalog.catalog_version == 1
+        assert [h["catalog_version"] for h in db.catalog.history()] == [1]
+    finally:
+        db.close()
+
+    data_file = tmp_path / "db" / "lumendb.data"
+    assert data_file.stat().st_size // PAGE_SIZE <= 5
+    reopened = Database(tmp_path / "db")
+    try:
+        assert reopened.catalog.catalog_version == 1
+        assert [h["catalog_version"] for h in reopened.catalog.history()] == [1]
+        assert reopened.execute_one("SELECT id FROM t").rows == [(1,)]
+    finally:
+        reopened.close()
 
 
 def test_history_keeps_old_columns_and_survives_reopen(tmp_path):

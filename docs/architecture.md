@@ -172,8 +172,9 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 `catalog_version`，不会伪造 schema 版本。**schema 根链**从不覆盖：旧
 schema 根页必须保留，`Catalog.history()` 沿 `previous_root` 回溯历史表定义。
 普通 DML 产生的中间目录根不属于这条历史链，提交后直接进入空闲页表复用；
-这正是"目录只在 DDL 时变 schema、却在每次翻页时新建整链"不会把文件无界
-撑大的原因。
+`TRUNCATE` / `REINDEX` 同样只换堆/索引根页，不推进 `catalog_version`，避免
+重复 TRUNCATE 累积历史目录页。这正是"目录只在 DDL 时变 schema、却在每次
+翻页时新建整链"不会把文件无界撑大的原因。
 `Catalog.table_at(version, name)` 读出当时的列；`Catalog.view_at(version, name)` 读出当时的视图 token/依赖；每个版本还记录
 UTC 微秒级 `created_at`，`Catalog.version_at_or_before(ts)` 可定位某时刻之前的最近版本。
 `SHOW CATALOG VERSIONS` 暴露版本、表名、视图名、对象数和创建时间，
