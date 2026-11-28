@@ -170,7 +170,7 @@ DML 也会在首次接触表时登记 `root_page`/`last_page`/`row_count_hint` �
 重命名/视图）才把 `catalog_version` 加一，并在新目录 JSON 里写 `previous_root`
 指向上一条 schema 链；普通 DML 只更新页根，仍写新链但沿用同一
 `catalog_version`，不会伪造 schema 版本。**schema 根链**默认保留最近
-1000 个版本：`Catalog.history()` 沿 `previous_root` 回溯历史表定义。新版本
+1000 个版本（`Database(catalog_history_limit=...)` / CLI `--catalog-history-limit` 可调）：`Catalog.history()` 沿 `previous_root` 回溯历史表定义。新版本
 目录 JSON 记录 `history_floor_version`；写入后若超出窗口，把窗口底部之前
 的版本根页整链登记 `txn.freed_pages`，提交后进入空闲页表，`history()` /
 `table_at()` 读到水位即停。因此 20 次 `ALTER` 不再留下 20 条永久目录链，

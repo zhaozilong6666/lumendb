@@ -73,6 +73,9 @@ def _open_database(args: argparse.Namespace) -> Database:
         vacuum_online_max_versions=int(
             getattr(args, "vacuum_online_max_versions", 250_000)
         ),
+        catalog_history_limit=int(
+            getattr(args, "catalog_history_limit", 1000)
+        ),
     )
 
 
@@ -264,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=250_000,
             help="在线 VACUUM 允许的物理版本上限（默认 250000，超限失败关闭）",
+        )
+        p.add_argument(
+            "--catalog-history-limit",
+            type=int,
+            default=1000,
+            help="保留最近多少个 catalog 版本（默认 1000；更老版本的目录页回收）",
         )
         if name == "exec":
             p.add_argument("sql", help="要执行的 SQL")

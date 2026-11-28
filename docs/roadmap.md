@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1701 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1699 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1702 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1700 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -584,6 +584,13 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 并发 1689 通过 + 2 skipped（174.76s）。CI #391 在 `37208db` 上五个 job
 全部 Success，6m07s。
 
+2026-11-28 catalog 保留窗口可配置：`Database(catalog_history_limit=1000)`
+新增参数并校验正整数，构造 `Catalog(..., history_limit=...)`；CLI 三个子命令
+共用 `--catalog-history-limit`，默认仍是 1000。需要更快缩容或更短 AS OF
+目录历史时可以调小，不需要改代码。新增 CLI 接线用例：5 个版本窗口设 3 时
+`history()` 只返回 [5,4,3]，0 被拒绝。默认全量 1702 passed（169.20s），
+并发 1700 通过 + 2 skipped（174.42s）。
+
 2026-11-28 catalog 版本窗口回收：每次真正改形状的 DDL 都新增一条目录
 版本链，旧链永久保留；20 次 `ALTER` 后文件从 1 页涨到 22 页。新目录 JSON
 记录 `history_floor_version`，默认只保留最近 1000 个版本（与
@@ -592,7 +599,7 @@ page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇�
 不跟随水位 payload 里已被回收的 `previous_root`；回滚恢复版本数和水位。
 把 `_history_limit` 调到 3 的用例里，11 个版本只保留 [11,10,9]，关闭文件
 从 11 页缩到 4 页，重开后继续 DDL 仍只保留 3 版；显式事务内 DDL 裁剪后
-`ROLLBACK` 恢复原版本链。新增 3 例；默认全量 1701 passed（170.26s），并发
+`ROLLBACK` 恢复原版本链。新增 3 例；当时默认全量 1701 项通过（170.26s），并发
 1699 通过 + 2 skipped（176.91s）。CI #396 在
 `500e3f9` 上五个 job 全部 Success，7m15s。
 

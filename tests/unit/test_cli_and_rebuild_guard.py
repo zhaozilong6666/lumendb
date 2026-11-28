@@ -63,6 +63,31 @@ class TestCliFence:
         with pytest.raises(ValueError, match="正整数"):
             Database(tmp_path / "db-bad", vacuum_online_max_versions=0)
 
+    def test_catalog_history_limit_reaches_database(self, tmp_path):
+        """目录版本保留窗口可从 CLI/构造参数收紧，不必只靠默认 1000。"""
+        args = _args(
+            "exec",
+            "--path", str(tmp_path / "db-history"),
+            "--catalog-history-limit", "3",
+            "SELECT 1",
+        )
+        assert args.catalog_history_limit == 3
+        db = _open_database(args)
+        try:
+            assert db.catalog._history_limit == 3
+        finally:
+            db.close()
+        db = Database(tmp_path / "db-history2", catalog_history_limit=3)
+        try:
+            db.execute_one("CREATE TABLE t (id INT)")
+            for i in range(4):
+                db.execute_one(f"ALTER TABLE t ADD COLUMN c{i} INT")
+            assert [v["catalog_version"] for v in db.catalog.history()] == [5, 4, 3]
+        finally:
+            db.close()
+        with pytest.raises(ValueError, match="正整数"):
+            Database(tmp_path / "db-history-bad", catalog_history_limit=0)
+
     def test_concurrent_dml_switch_reaches_the_database(self, tmp_path):
         """CLI 也能开并发 DML，不用只靠环境变量。"""
         args = _args(
