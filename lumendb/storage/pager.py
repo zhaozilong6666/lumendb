@@ -184,6 +184,9 @@ class DiskManager:
         #: page 0 数组满后仍被释放的页，挂成 FREE 页 next 链；头指针在
         #: META_OFF_FREE_OVERFLOW。计数缓存避免每次 free_page_count 都走链。
         self._overflow_count = 0
+        #: 启动时链是否完整走通。崩溃可能发生在重建链的中途（节点已改写、
+        #: page 0 头还是旧的），留下环或越界指针；未校验前分配器不得使用。
+        self._overflow_trusted = False
 
         try:
             existed = self.path.exists() and self.path.stat().st_size > 0
@@ -249,45 +252,45 @@ class DiskManager:
             self._meta.set_free_page_ids(valid)
             self._persist_meta()
 
-    def _load_overflow_chain(self) -> None:
-        """启动时加载溢出链，建立计数；不做页头复核（恢复前可能仍是旧内容）。"""
+    def _walk_overflow_chain(self) -> tuple[list[int], bool]:
+        """按链头走一遍溢出链，返回（已走通的页号，是否完整到链尾）。
+
+        只做结构遍历，不核对页头类型：恢复前页头可能还是旧内容。遇到越界、
+        环、与 page 0 数组重复或读页失败就返回 ``False``，让调用方知道
+        这条链不可信；已走通的前缀可能仍有有效 FREE 页，交给 validate 处理。
+        """
         limit = self.num_pages
         seen = set(self._meta.free_page_ids())
         ids: list[int] = []
         pid = self._meta.free_overflow_head
         while pid:
             if pid <= 0 or pid >= limit or pid in seen:
-                break
+                return ids, False
             seen.add(pid)
             ids.append(pid)
-            if len(ids) > limit:  # pragma: no cover - 防御性环保护
-                break
             try:
                 raw = self.read_page(pid)
             except (PageNotFoundError, OSError):
-                break
+                return ids, False
             pid = Page(pid, raw).next_page
-        self._overflow_count = len(ids)
+        return ids, True
+
+    def _load_overflow_chain(self) -> None:
+        """启动时加载溢出链，建立计数与可信标记。
+
+        链不完整时计数先按 0 处理、``_overflow_trusted=False``：分配器在
+        ``validate_free_list`` 重建前不会从链里取页，避免环把已分配页再发一次。
+        """
+        ids, complete = self._walk_overflow_chain()
+        self._overflow_count = len(ids) if complete else 0
+        self._overflow_trusted = complete
 
     def _overflow_page_ids(self) -> list[int]:
-        """按链头遍历溢出页；遇到越界/环/重复立即停，避免无限循环。"""
-        limit = self.num_pages
-        seen = set(self._meta.free_page_ids())
-        ids: list[int] = []
-        pid = self._meta.free_overflow_head
-        while pid:
-            if pid <= 0 or pid >= limit or pid in seen:
-                break
-            seen.add(pid)
-            ids.append(pid)
-            if len(ids) > limit:  # pragma: no cover - 防御性环保护
-                break
-            try:
-                raw = self.read_page(pid)
-            except (PageNotFoundError, OSError):
-                break
-            pid = Page(pid, raw).next_page
-        return ids
+        """返回可信的溢出链页号；未走通/未校验的链一律视为空。"""
+        if not self._overflow_trusted:
+            return []
+        ids, complete = self._walk_overflow_chain()
+        return ids if complete else []
 
     def _replace_overflow_chain(self, page_ids: list[int]) -> None:
         """把给定页号重建成 FREE 链，并更新 page 0 头指针。"""
@@ -303,6 +306,7 @@ class DiskManager:
         self._fh.flush()
         self._meta.free_overflow_head = head
         self._overflow_count = len(page_ids)
+        self._overflow_trusted = True
 
     def _persist_meta(self) -> None:
         """把 next_page_id / next_xid / checkpoint_lsn 写回 page 0。
@@ -350,7 +354,7 @@ class DiskManager:
             if free_ids:
                 pid = free_ids.pop()
                 self._meta.set_free_page_ids(free_ids)
-            elif self._meta.free_overflow_head:
+            elif self._meta.free_overflow_head and self._overflow_trusted:
                 # 数组空但溢出链还有页：继续复用，避免一次大 DROP 之后
                 # 本进程只能向文件尾扩展。
                 head = self._meta.free_overflow_head
@@ -361,13 +365,27 @@ class DiskManager:
                 else:
                     pid = head
                     page = Page(pid, self.read_page(pid))
-                    next_pid = page.next_page
-                    if next_pid <= 0 or next_pid >= self.num_pages:
-                        next_pid = 0
+                    if page.page_type != PageType.FREE:
+                        # 头页已经被写成别的页型：链不可信，宁可扩展文件也
+                        # 不能把仍被引用的页再发一次。
+                        self._meta.free_overflow_head = 0
                         self._overflow_count = 0
+                        pid = self.num_pages
                     else:
-                        self._overflow_count -= 1
-                    self._meta.free_overflow_head = next_pid
+                        next_pid = page.next_page
+                        if next_pid <= 0 or next_pid >= self.num_pages:
+                            next_pid = 0
+                            self._overflow_count = 0
+                        else:
+                            self._overflow_count -= 1
+                        self._meta.free_overflow_head = next_pid
+            elif self._meta.free_overflow_head:
+                # 启动时链没走通（环/越界/读失败），validate_free_list 尚未
+                # 重建：整条链放弃，只在本次扩展文件；空间泄漏优先于复用活页。
+                self._meta.free_overflow_head = 0
+                self._overflow_count = 0
+                self._overflow_trusted = False
+                pid = self.num_pages
             else:
                 pid = self.num_pages
             buf = bytearray(PAGE_SIZE)
@@ -389,15 +407,17 @@ class DiskManager:
         持久化的空闲表可能落后于实际页分配：崩溃前最后一次 ``_persist_meta``
         之后，某个空闲页可能已被分配并写入一个已提交对象。恢复 redo 完成后
         这些页的页头不再是 ``FREE``；这里逐项读页头复核，非 FREE 或页号
-        不匹配的条目直接丢弃（只泄漏，不复用）。page 0 数组最多 1008 项，
-        进程内溢出列表通常为空；一并复核，避免运行期调用后留下陈旧项。
+        不匹配的条目直接丢弃（只泄漏，不复用）。page 0 数组最多 1008 项；
+        溢出链按 next 走通后再逐项复核。若链走不通（环/越界/读失败），
+        已走通的 FREE 前缀重建成线性链，环尾丢弃，避免分配器把环里已复用的
+        页再发一次。
         """
         valid: list[int] = []
         valid_overflow: list[int] = []
         dropped = 0
         meta_changed = False
         with self._io_lock:
-            raw_overflow = self._overflow_page_ids()
+            raw_overflow, chain_complete = self._walk_overflow_chain()
             for pid in self._meta.free_page_ids() + raw_overflow:
                 if pid <= 0 or pid >= self.num_pages:
                     dropped += 1
@@ -421,8 +441,10 @@ class DiskManager:
             if valid != self._meta.free_page_ids():
                 self._meta.set_free_page_ids(valid)
                 meta_changed = True
-            if valid_overflow != raw_overflow or (
-                self._meta.free_overflow_head and not valid_overflow
+            if (
+                not chain_complete
+                or valid_overflow != raw_overflow
+                or (self._meta.free_overflow_head and not valid_overflow)
             ):
                 self._replace_overflow_chain(valid_overflow)
                 meta_changed = True

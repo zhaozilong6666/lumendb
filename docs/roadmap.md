@@ -6,8 +6,8 @@ LumenDB 是一个长期项目。路线图按“基础设施 → 优化器 → �
 
 ## 当前基线
 
-- 全量测试：1689 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
-  1687 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
+- 全量测试：1691 passed（默认串行模式）；`LUMEN_CONCURRENT_DML=1` 为
+  1689 通过 + 2 skipped（并发写模式的显式事务 VACUUM 回滚被明确拒绝，
   对应用例按模式跳过）。故障注入覆盖 fsync/WAL 追加/页写/torn/ENOSPC，见
   [`docs/faults.md`](faults.md)。
 - DML 单列等值条件已索引下推：8 线程 ×1000 行 + 800 次热点自增，默认热点
@@ -561,7 +561,7 @@ offset 8 的 `next_page` 串成单向链。`allocate_page` 在数组空后从链
 重启后泄漏，不会复用活页。版本号不变，旧文件的 offset 60 为 0，自然表示
 空链。实测 4200 行 900B 表 `DROP TABLE` 后关闭仍是 1053 页（目录活页挡住
 文件尾），但重开 `free_page_count` 从 1008 变为 1050、链头指向 1050。新增
-2 例（溢出链跨重开复用、陈旧溢出头页复核）；默认全量 1689 passed
+2 例（溢出链跨重开复用、陈旧溢出头页复核）；默认全量 1689 通过
 （170.18s），并发 1687 通过 + 2 skipped（169.53s）。
 
 CI #389 在 `0316c5d` 上只有 Windows 3.12 失败：两个同步复制 campaign 用例
@@ -571,6 +571,17 @@ CI #389 在 `0316c5d` 上只有 Windows 3.12 失败：两个同步复制 campaig
 真的不可达；其余四个 job 全绿。`b54edea` 把测试集群的 `QuorumNode(timeout=...)`
 从 0.5s 放宽到默认 2s，仍保留“不可达 peer 快速失败”的语义。CI #390 在该提交上
 五个 job 全部 Success，6m38s；测试数不变，仍是 1689。
+
+2026-11-27 溢出链损坏防护：`_replace_overflow_chain` 先逐页改写 `next` 再写
+page 0 头，崩溃可能停在中间，留下环或越界指针。旧遍历遇到环只“停下”，
+`validate_free_list` 看到已走通前缀都是 FREE 就不会重建；把数组和环内页都
+分配完后，头指针会落在已分配页上，下一次 `allocate_page` 把活页再发一次。
+修法：`_walk_overflow_chain` 返回“是否走到链尾”，`_load_overflow_chain` 不完整
+时把计数清零并标 `_overflow_trusted=False`；`validate_free_list` 用完整标记
+强制把已走通前缀重建成线性链；`allocate_page` 在未校验前拒绝从链取页、头页
+页型不是 FREE 时直接清链并扩展文件。新增 2 例（环在 validate 后重建且不重复
+发页、validate 前直接分配只扩展文件）；默认全量 1691 passed（168.45s），
+并发 1689 通过 + 2 skipped（174.76s）。
 
 2026-11-27 DROP CONSTRAINT 索引页回收：`ALTER TABLE ... DROP CONSTRAINT`
 删除 PRIMARY/UNIQUE 约束时先 `drop_index` 再改表结构；旧索引树页没有登记

@@ -544,6 +544,80 @@ def test_truncate_refills_overflow_free_pages_into_meta(tmp_path):
         disk.close()
 
 
+def test_overflow_chain_cycle_is_rebuilt_before_allocation(tmp_path):
+    """崩溃在重建链中途可能留下环；校验后必须变线性链，不能把已分配的
+    环内页再发一次。"""
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    path = tmp_path / "space.data"
+    disk = DiskManager(path)
+    try:
+        for _ in range(META_FREE_CAPACITY + 2):
+            disk.allocate_page()
+        disk.release_pages(range(1, META_FREE_CAPACITY + 3))
+        head = disk.meta.free_overflow_head
+        assert head
+        second = Page(head, disk.read_page(head)).next_page
+        assert second
+        # 模拟链尾指向链头：head -> second -> head。
+        raw = bytearray(disk.read_page(second))
+        struct.pack_into("<I", raw, 8, head)
+        disk.write_page(second, raw)
+    finally:
+        disk.close()
+
+    reopened = DiskManager(path)
+    try:
+        # 未校验前整条链不可信，只能看到 page 0 数组。
+        assert reopened.free_page_count == META_FREE_CAPACITY
+        assert reopened.validate_free_list() == 0
+        assert reopened.free_page_count == META_FREE_CAPACITY + 2
+        assert len(set(reopened.free_page_ids())) == META_FREE_CAPACITY + 2
+
+        pages_before = reopened.num_pages
+        allocated = [
+            reopened.allocate_page() for _ in range(META_FREE_CAPACITY + 2)
+        ]
+        assert len(set(allocated)) == META_FREE_CAPACITY + 2
+        extra = reopened.allocate_page()
+        # 环内两页已经取过一次，再分配只能向文件尾扩展，不能复用它们。
+        assert extra == pages_before
+        assert extra not in allocated
+    finally:
+        reopened.close()
+
+
+def test_untrusted_overflow_chain_extends_before_validate(tmp_path):
+    """validate 之前的直接 DiskManager 调用也不能从环里取页。"""
+    from lumendb.storage.pager import META_FREE_CAPACITY
+
+    path = tmp_path / "space.data"
+    disk = DiskManager(path)
+    try:
+        for _ in range(META_FREE_CAPACITY + 2):
+            disk.allocate_page()
+        disk.release_pages(range(1, META_FREE_CAPACITY + 3))
+        head = disk.meta.free_overflow_head
+        second = Page(head, disk.read_page(head)).next_page
+        raw = bytearray(disk.read_page(second))
+        struct.pack_into("<I", raw, 8, head)
+        disk.write_page(second, raw)
+    finally:
+        disk.close()
+
+    reopened = DiskManager(path)
+    try:
+        pages_before = reopened.num_pages
+        for _ in range(META_FREE_CAPACITY):
+            assert reopened.allocate_page() <= META_FREE_CAPACITY
+        assert reopened.free_page_count == 0
+        extra = reopened.allocate_page()
+        assert extra == pages_before
+        assert reopened.num_pages == pages_before + 1
+    finally:
+        reopened.close()
+
+
 def test_overflow_free_chain_survives_reopen(tmp_path):
     from lumendb.storage.pager import META_FREE_CAPACITY
 
